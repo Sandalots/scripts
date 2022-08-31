@@ -1,6 +1,9 @@
 
 # Scripts
-A collection of baked Scripts for Sir Sandalots.
+A collection of useful Scripts for Sir Sandalots.
 
 # Content Included:
-- tk
+- Node Scripts
+- Shell Scripts
+- Python Scripts
+- 
