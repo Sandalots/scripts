@@ -1,4 +1,6 @@
 require_relative 'db.rb'
+require 'tk'
+
 class Main
     def initialize(list)
         @episodeList = list
