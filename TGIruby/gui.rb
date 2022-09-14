@@ -4,7 +4,7 @@ require 'tk'
 root = TkRoot.new { title "Hello, World!" }
 root.geometry("280x300")
 root.title("The Great Intelligence")
-
+root.resizable(0,0)
 
 TkLabel.new(root) do
    text 'The Great Intelligence'
