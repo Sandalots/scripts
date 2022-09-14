@@ -2,17 +2,23 @@ require_relative 'tg.rb'
 require 'tk'
 
 root = TkRoot.new { title "Hello, World!" }
-root.geometry("400x400")
+root.geometry("280x300")
 root.title("The Great Intelligence")
+
 
 TkLabel.new(root) do
    text 'The Great Intelligence'
+   font TkFont.new('times 15 bold')
    pack { padx 15 ; pady 15; side 'left' }
 end
 Lbl = TkLabel.new(root) do
    text
    pack { padx 15 ; pady 15; side 'left' }
 end
-Lbl['text'] = $episodes.keys.sample
+Lbl['text'] = $episodes.keys.sample.capitalize()
+
+root.bind("ButtonRelease-1") {
+   Lbl['text'] = $episodes.keys.sample.capitalize()
+}
 
 Tk.mainloop
