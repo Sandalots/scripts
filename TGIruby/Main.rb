@@ -21,4 +21,7 @@ root.bind("ButtonRelease-1") {
    Lbl['text'] = $episodes.keys.sample.capitalize()
 }
 
+root.bind("ButtonRelease-3") {
+   root.destroy()
+}
 Tk.mainloop
