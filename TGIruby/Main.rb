@@ -2,7 +2,7 @@ require_relative 'tg.rb'
 require 'tk'
 
 root = TkRoot.new { title "Hello, World!" }
-root.geometry("280x300")
+root.geometry("280x100")
 root.title("The Great Intelligence")
 root.resizable(0,0)
 
