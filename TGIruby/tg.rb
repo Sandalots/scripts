@@ -1,6 +1,5 @@
 require_relative 'db.rb'
 
-
 class Main
     def initialize(list)
         @episodeList = list

@@ -72,9 +72,6 @@
     "a christmas carol": 71
 }
 
-
 def getRandom() 
     puts $episodes.keys.sample
 end
-
-#invoke getrandom function
