@@ -1,3 +1,4 @@
+require_relative 'tg.rb'
 require 'tk'
 
 root = TkRoot.new { title "Hello, World!" }
