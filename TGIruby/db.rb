@@ -69,7 +69,21 @@
     "the lodger": 68,
     "the pandorica opens": 69,
     "the big bang": 70,
-    "a christmas carol": 71
+    "a christmas carol": 71,
+    "the impossible astronaut": 72,
+    "day of the moon": 73,
+    "the curse of the black spot": 74,
+    "the doctor's wife": 75,
+    "the rebel flesh": 76,
+    "the almost people": 77,
+    "a good man goes to war": 78,
+    "let's kill hitler": 79,
+    "night terrors": 80,
+    "the girl who waited":81,
+    "the god complex":82,
+    "closing time":83,
+    "the wedding of river song":84
+    
 }
 
 def getRandom() 
