@@ -1,1 +1,1 @@
-# Scripts by @Sandalots
+# Scripts 
