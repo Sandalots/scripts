@@ -1,0 +1,1203 @@
+unit Measure;     { OS Performance Measurement Routines }
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+interface
+uses
+  (*$U object/driverdefs.obj *)
+  DriverDefs,
+  (*$U object/hwint.obj *)
+  HWInt,
+  (*$U object/sysglobal.obj *)
+  GLOBALDATA,
+  (*$U object/procprims.obj *)
+  Proc_Prims,
+  (*$U object/mmprim.obj *)
+  MMPRIMITIVES,
+  (*$U object/asynctr.obj *)
+  asynctr,
+  (*$U object/clock.obj *)
+  clock,
+  (*$U object/genio.obj *)
+  genio,
+  (*$U object/twiggy.obj *)
+  twiggy,
+  (*$U object/vmstuff.obj *)
+  vmstuff,
+  (*$U object/sfileio.obj *)
+  sfileio,
+  (*$U object/fsprim.obj *)
+  fs_primitives,
+  (*$U object/fsui.obj *)
+  FS_Interface,
+  (*$U object/osunitio.obj*)
+  osunitio,
+  (*$U object/mm0.obj *)
+  MEMORYMANAGER,
+  (*$U object/ds0.obj *)
+  DATASEGS,
+  (*$U object/exceprim.obj *)
+  exceprim,
+  (*$U object/eventchn.obj *)
+  eventchn,
+  (*$U object/objio.obj *)
+  ObjIO,
+  (*$U object/load.obj *)
+  Loader;
+
+
+const
+  max_SCHist = subc_max;         { 'maximum' system call # in sys call histogram }
+  e_nologging = 20;            (* error logging is not enabled *)
+
+type
+
+  (***********************************)
+  (*                                 *)
+  (* Logging commands                *)
+  (*                                 *)
+  (***********************************)
+  Tlog_cmds = (log_dump,log_flush,log_reset,log_shutdown);
+
+  (***************************************)
+  (*                                     *)
+  (* STATISTICS RECORD                   *)
+  (*                                     *)
+  (***************************************)
+
+  statRec = record
+              measData_ptr: absptr;      (* address of measurements table *)
+              log_sdb: sdb_ptr;          (* ptr to sdb for logging facility *)
+              log_ecrefnum: int2;        (* event channel refnum *)
+              log_fsrefnum: int2;        (* system.log refnum *)
+              spic_sdb: sdb_ptr;         (* sdb used by sampling facility *)
+              alarm: alarmNumber;        (* alarm used by sampling facility *)
+            end;
+
+  p_statRec = ^statRec;
+
+  (***************************************)
+
+  (*$IFC debug1*)
+  { for accessing system call histogram and miscellaneous counters }
+  ptr_MeasCounters = ^meas_Table;
+  (*$ENDC*)
+
+
+procedure SYS_STAT(var errnum: int2; funct: int2; parmaddr: int4);
+
+function LOGGING: boolean;
+
+procedure LOG(var errnum: integer; ptr_arr: absptr);
+
+procedure LOG_NEWCMD(var errnum: integer; cmd: Tlog_cmds);
+
+procedure LOG_INIT(ec_refnum: integer);
+
+procedure LOG_HANDLER;
+
+procedure Init_MeasInfo;
+
+procedure Lock_debugRes;
+
+procedure Unlock_debugRes;
+
+(*$IFC debug1 *)
+procedure CHK_SAMPLER(var name: pathname; globid: int4);
+
+procedure ShowSeg (segSdb_ptr : sdb_ptr;  mrbtPtr : mrbt_ptr);
+
+procedure MemoryContents (mrbtPtr : mrbt_ptr);
+(*$ENDC*)
+
+implementation
+
+const
+  version = 1;
+  log_sz_udata = 12;           (* size of user data in log record *)
+
+  (*$IFC DEBUG1*)
+  log_num_entry = 128;         (* no. of log entries in each of 2 log buffers *)
+  (*$ELSEC*)
+  log_num_entry = 15;          (* no. of log entries in each of 2 log buffers *)
+  (*$ENDC*)
+
+
+type
+
+(*******************************************)
+(*  TYPES FOR SAMPLING STATISTICS          *)
+(*******************************************)
+spicSrec = record
+             offset: int4;      (* offset to first sampling bucket *)
+             size: int2;        (* size of segment *)
+             nameaddr: int4;    (* index to name of segment *)
+           end;
+
+spicSarray = array[0..127] of SpicSrec;
+
+spicRec = record
+            apsegs: spicSarray; (* seg info for sampling Apps Program *)
+            ossegs: spicSarray; (* seg info for sampling OS *)
+            bucketsize: int2;   (* bucket size for sampling *)
+            gid: int4;          (* global id of process being sampled *)
+            alarmdelay: milliseconds; (* ms between each sample *)
+            progname: e_name;   (* name of program *)
+            nextfreebyte: int4; (* next free location is sampler data seg *)
+          end;
+
+
+(*******************************************)
+(*  TYPES FOR LOGGING FACILITY             *)
+(*******************************************)
+  p_log_data = ^log_data;
+  p_log_udata = ^log_udata;
+  p_log_entry = ^log_entry;
+  p_log_buffer = ^log_buffer;
+
+  log_h = record
+            buff_ptr: array[1..2] of int4;         (* ptr to each buffer *)
+            buff_inuse: int2;                      (* number of current buffer *)
+            buff_index: int2;                      (* position within buffer *)
+            buff_max_entry: int2;                  (* max entries in buffer *)
+            buff_next_dump: int2;                  (* next buffer to dump to file*)
+            buff_dump: array[1..2] of boolean;     (* true if buffer needs dumping*)
+            buff_overflow: boolean;                (* true if buffers overflowed*)
+            buff_command: Tlog_cmds;               (* the current buffer command*)
+            cur_block: int2;                       (* the current blk for twiggy*)
+          end;
+
+  log_udata = array[1..log_sz_udata] of int1;      (* user data array*)
+  log_entry = record
+                udata: log_udata;                  (* user data in log record*)
+                time: int4;                        (* time stamp in log record*)
+              end;
+
+  log_buffer = array[1..log_num_entry] of log_entry;
+
+  log_data = record
+               log_header: log_h;                     (* header in data area *)
+               log_b1: log_buffer;                    (* 1st log record buffer *)
+               log_b2: log_buffer;                    (* 2nd log record buffer *)
+             end;
+
+(*******************************************)
+
+(*$IFC DEBUG1*)
+procedure ICSAMPLER; external;
+(*$ENDC*)
+
+(*$S MeasSeg *)
+
+procedure Init_MeasInfo;
+  { procedure to initialize the system data structures necessary to do
+    performance measurements on the OS.  These structures include instruction
+    sampling data segments, system call histogram counters, and various other
+    counters and times. }
+
+  var
+    stat_ptr : p_statRec;                    { for initializing statRec info }
+    i : integer;                             { for zeroing counters }
+
+  begin
+    if not GetSpace (Sizeof (statRec), b_sysglobal_ptr, stataddr) then
+      begin
+        stataddr := ord(nil);
+        (*$IFC debug2*)
+        writeln ('   *** Couldn''t GetSpace for statRec ***')
+        (*$ENDC*)
+      end
+    else
+      begin  { initialize measurement structures }
+        stat_ptr := pointer(stataddr);
+        with stat_ptr^ do
+          begin
+            (*$IFC debug1*)
+            measData_ptr := ord(@measTable);
+            (*$ELSEC*)
+            measData_ptr := ORD(nil);
+            (*$ENDC*)
+
+            log_sdb := nil;
+            log_ecrefnum:=0;
+            log_fsrefnum:=0;
+            spic_sdb := nil;
+            alarm := 0
+          end;
+
+        (*$IFC debug1*)
+        with measTable do
+          begin
+            for i := 1 to subc_max do
+               scHist[i] := 0;
+
+            for i := 1 to 50 do
+              misc[i] := 0
+          end;
+        (*$ENDC*)
+      end { initialize };
+
+    (*$IFC debug1 *)
+    if lb_enabled then Lock_debugRes
+    (*$ENDC *)
+  end { Init_MeasInfo };
+
+(*$IFC debug1*)
+procedure Get_MeasInfo (userCntrs_ptr : ptr_MeasCounters;
+                        firstCounter, lastCounter : int2);
+  var
+    i : int2;                                { for zeroing counters }
+
+  begin
+    userCntrs_ptr^ := measTable;
+
+    if firstCounter <> 0 then
+      with measTable do
+        begin
+          if firstCounter > 0 then
+            for i := firstCounter to lastCounter do
+              misc[i] := 0
+          else
+            begin  { reset everything }
+              for i := 1 to subc_max do
+                scHist[i] := 0;
+
+              for i := 1 to  49 do
+                misc[i] := 0
+            end
+        end { with }
+  end { Get_MeasInfo };
+(*$ENDC*)
+
+
+(*$S kr_mmgr *)
+function LOGGING(*  : boolean *);
+
+  (*****************************************)
+  (*                                       *)
+  (* True if system logging operational.   *)
+  (*                                       *)
+  (*****************************************)
+
+  var
+    c_statRec: p_statrec;
+
+  begin
+    c_statRec:=pointer(stataddr);
+    if c_statRec^.log_sdb <> nil then logging:=true
+                                 else logging:=false;
+  end;(* LOGGING*)
+
+
+(*$S debugRes *)
+procedure INFORM_LOGGER;
+
+  (***************************************)
+  (*                                     *)
+  (* Send event to the process which is  *)
+  (* managing the SYSTEM.LOG file.       *)
+  (*                                     *)
+  (***************************************)
+  var
+    interval: timestmp_interval;
+    event: s_eventblk;
+    clktime: time_rec;
+    c_statRec: p_statRec;
+    errnum: int2;
+
+  begin
+    (* send event to root process to handle system.log file *)
+    with interval do
+      begin
+        sec:=0;
+        msec:=0;
+      end;
+    event[0]:=-1;  (* event from log facility *)
+
+    c_statRec:=pointer(stataddr);
+    SEND_EVENT_CHN(errnum,c_statRec^.log_ecrefnum,@event,interval,clktime);
+  end;
+
+function Seg_of_Caller: int2; external;
+
+(*$S debugRes *)
+procedure SetLock (count : int2);
+  { procedure to set the lock count for segment debugRes to the specified value }
+
+  var
+    sysMRBT : mrbt_ptr;                      { ptr to system MRBT }
+    seg_sdb : sdb_ptr;                       { ptr to SDB for debugRes segment }
+
+  begin
+    sysMRBT := pointer(s_mrbt_addr);
+    with sysMRBT^[Seg_of_Caller] do
+      begin
+        seg_sdb := pointer(sdbRP + b_sysglobal_ptr);
+        seg_sdb^.lockcount := count
+      end
+  end { SetLock };
+
+procedure Lock_debugRes;
+  { procedure to cause debugRes segment to be swapped in, if necessary, and
+    locked }
+
+  begin
+    SetLock (1)
+  end { Lock_debugRes };
+
+procedure Unlock_debugRes;
+  { procedure to cause debugRes to be unlocked and subsequently swapped out, if
+    necessary }
+
+  begin
+    if not Logging then SetLock (0)
+  end { Unlock_debugRes };
+
+(*$S debugRes *)
+procedure LOG2(var errnum: integer; ptr_arr: absptr);
+
+  (*****************************************)
+  (*                                       *)
+  (* Log the passed data array to the      *)
+  (* System.Log file if logging is active. *)
+  (*                                       *)
+  (*****************************************)
+
+  var
+    c_data: p_log_data;
+    c_entry: p_log_udata;
+    c_buffer: p_log_buffer;
+    c_statRec: p_statRec;
+
+  begin
+    c_statRec:=pointer(stataddr);
+
+    (* calculate ptr to log data seg *)
+    c_data:=pointer(logrealmem+ord4(c_statRec^.log_sdb^.memaddr)*hmempgsize*2);
+
+    c_entry:=pointer(ptr_arr); (* ptr to new entry *)
+    with c_data^.log_header do
+      begin
+        if buff_inuse = 0 then
+          begin (* all buffers are full *)
+            buff_overflow:=true;
+          end
+         else
+          begin (* a buffer is available *)
+            c_buffer:=pointer(ord(c_data)+buff_ptr[buff_inuse]);
+
+            c_buffer^[buff_index].udata:=c_entry^; (* store new entry *)
+            c_buffer^[buff_index].time:=TIMER;     (* timestamp entry *)
+
+            buff_index:=buff_index+1;
+            if buff_index > buff_max_entry then
+              begin (* buffer is full - switch to other buffer and inform *)
+                    (* the logging process *)
+
+                buff_index:=1;
+                buff_dump[buff_inuse]:=true; (* buffer is now used *)
+                if buff_inuse = 1
+                  then if not buff_dump[2]
+                         then buff_inuse:=2
+                         else buff_inuse:=0
+                  else if not buff_dump[1]
+                         then buff_inuse:=1
+                         else buff_inuse:=0;
+
+                if buff_inuse <> 0 then INFORM_LOGGER;
+              end;
+          end;
+      end; (*with*)
+    errnum:=0;
+  end;(* LOG2 *)
+
+
+(*$S kr_mmgr *)
+procedure LOG(* var errnum: integer; ptr_arr: absptr *);
+
+  (*****************************************)
+  (*                                       *)
+  (* Log the passed data array to the      *)
+  (* System.Log file if logging is active. *)
+  (*                                       *)
+  (*****************************************)
+
+  begin
+    if not LOGGING
+      then errnum:=e_mmbase+e_nologging
+      else LOG2(errnum,ptr_arr);
+  end;(*log*)
+
+
+(*$S MeasSeg *)
+procedure DEFINE_LOG(ds_ptr: absptr; ec_refnum, log_refnum: integer);
+
+  (********************************************)
+  (*                                          *)
+  (* The segment being used for collection of *)
+  (* log information and the event channel    *)
+  (* refnum and the file system refnum to     *)
+  (* awake the logger process are stored in   *)
+  (* SYSGLOBAL for use by LOG procedure.      *)
+  (*                                          *)
+  (********************************************)
+
+  var
+    c_mmu: int2;
+    c_syslocal: slocal_ptr;
+    c_mrbt: mrbt_ptr;
+    c_sdb: sdb_ptr;
+    c_mmrb: mmrb_ptr;
+    c_statRec: p_statRec;
+
+  begin
+    c_mmu:= ds_ptr div maxmmusize;
+    c_syslocal:=pointer(b_syslocal_ptr);
+    c_mrbt:=pointer(c_syslocal^.mrbt_addr);
+    c_sdb:=pointer(c_mrbt^[c_mmu].sdbRP + b_sysglobal_ptr);
+    c_mmrb:=pointer(mmrb_addr);
+    with c_sdb^ do
+      begin
+        lockcount:=lockcount+1;
+        with c_mmrb^ do sys_swap_space:=sys_swap_space - ord4(memsize)*mempgsize;
+      end;
+
+    c_statRec:=pointer(stataddr);
+    with c_statRec^ do
+      begin
+        log_ecrefnum:=ec_refnum;
+        log_fsrefnum:=log_refnum;
+        log_sdb:=c_sdb;
+      end;
+  end; (*DEFINE_LOG*)
+
+
+
+procedure LOG_NEWCMD(* var errnum: int2; cmd: Tlog_cmds *);
+
+  (************************************)
+  (*                                  *)
+  (* A new logging command will be    *)
+  (* passed on to the logging process.*)
+  (*                                  *)
+  (************************************)
+
+  var
+    c_data: p_log_data;
+    c_statRec: p_statRec;
+
+  begin
+    if not LOGGING
+      then errnum:=e_mmbase+e_nologging
+      else
+       begin (* logging operational *)
+         c_statRec:=pointer(stataddr);
+
+         (* calculate ptr to log data seg *)
+         c_data:=pointer(logrealmem + ord4(c_statRec^.log_sdb^.memaddr)*mempgsize);
+         c_data^.log_header.buff_command:=cmd;
+         INFORM_LOGGER;
+         errnum:=0;
+       end;
+  end;(*LOG_NEWCMD*)
+
+
+
+  procedure LOG_HANDLER;
+
+    (******************************************************)
+    (*                                                    *)
+    (* Handle the logging request.                        *)
+    (*                                                    *)
+    (******************************************************)
+
+    label 10;
+
+    var
+      c_data: p_log_data;
+      i: int2;
+      actual: int4;
+      c_log_event: array[1..log_sz_udata] of int1;
+      dummy: int2;
+      shutdown: boolean;
+      l_command: Tlog_cmds;
+      c_statrec: p_statrec;
+      log_refnum: int2;
+      errnum: int2;
+
+    procedure LOG_DOWN;
+      (* Recover from errors during dump to the SYSTEM.LOG file *)
+
+      begin
+        (* shut down logging *)
+        c_data^.log_header.buff_inuse:=0;
+        c_statrec^.log_sdb:=nil;
+        CLOSE_OBJECT(errnum,log_refnum);
+        goto 10; (*take error exit*)
+      end;(*log_down*)
+
+    begin
+      errnum:=0;
+      c_statrec:=pointer(stataddr);
+      log_refnum:=c_statrec^.log_fsrefnum;
+      c_data:=pointer(MMU_BASE(ldsn1mmu));
+      with c_data^.log_header do
+        begin
+          l_command:=buff_command;
+          repeat
+            begin (* a command to process *)
+              buff_command:=log_dump;
+              if l_command=log_shutdown then
+                begin
+                  shutdown:=true;
+                  l_command:=log_flush; (* force the log to be flushed *)
+                end
+               else shutdown:=false;
+
+              if l_command = log_reset then
+                begin   (* reset the log file *)
+                  (*$IFC DEBUG1*)
+                  if TRACE(trecord,98) then
+                    begin (*log is being dumped to twiggy*)
+                      cur_block:=300;
+                    end
+                   else
+                  (*$ENDC*)
+                    begin (*normal operation of log file*)
+                      READ_DATA(errnum,log_refnum,ord(@dummy),0,actual,absolute,0);
+                      if errnum <> 0 then LOG_DOWN;
+                      TRUNCATE(errnum,log_refnum);
+                      if errnum <> 0 then LOG_DOWN;
+                      COMPACT(errnum,log_refnum);
+                      if errnum <> 0 then LOG_DOWN;
+                    end;
+
+                  (* throw away any logged entries *)
+                  buff_inuse:=1;
+                  buff_index:=1;
+                  buff_next_dump:=1;
+                  buff_dump[1]:=false;
+                  buff_dump[2]:=false;
+                  buff_overflow:=false;
+
+                  (* log a new header entry *)
+                  c_log_event[1]:=1;
+                  for i:=2 to log_sz_udata do c_log_event[i]:=0;
+                  LOG(errnum,ord(@c_log_event));
+                end
+               else
+                begin (* command other than reset *)
+                  while buff_dump[buff_next_dump] do
+                    begin  (* dump any buffers that are full *)
+                      (*$IFC DEBUG1*)
+                      if TRACE(trecord,98) then
+                        begin  (*log dump to lower twiggy*)
+                          dummy:=sizeof(log_buffer) div 512;
+                          UNITIO(errnum,2{lower twiggy},
+                                 ord(c_data)+buff_ptr[buff_next_dump],
+                                 dummy,cur_block,actual,without_header,writeop);
+                          cur_block:=cur_block+dummy;
+                        end
+                       else
+                      (*$ENDC*)
+                        begin  (*normal log operation to system.log*)
+                          WRITE_DATA(errnum,log_refnum,
+                                     ord(c_data)+buff_ptr[buff_next_dump],
+                                     SIZEOF(log_buffer),actual,sequential,0);
+                        end;
+                      if errnum <> 0 then LOG_DOWN;
+                      buff_dump[buff_next_dump]:=false;
+                      if buff_next_dump = 1
+                        then buff_next_dump:=2
+                        else buff_next_dump:=1;
+                    end;(*while*)
+
+                  if buff_inuse = 0 then buff_inuse:=1;
+
+                  if buff_overflow then
+                    begin (* buffers overflowed before being dumped - add *)
+                          (* an overflow event *)
+                      c_log_event[1]:=2;
+                      for i:=2 to log_sz_udata do c_log_event[i]:=0;
+                      LOG(errnum,ord(@c_log_event));
+                    end;
+
+                  if (l_command = log_flush) and
+                     (buff_index <> 1) then
+                    begin (* request to flush partially filled buffer *)
+                      (*$IFC DEBUG1*)
+                      if TRACE(trecord,98) then
+                        begin  (*dump log to lower twiggy*)
+                          dummy:=sizeof(log_buffer) div 512;
+                          UNITIO(errnum,2{lower twiggy},
+                                 ord(c_data)+buff_ptr[buff_inuse],
+                                 dummy,cur_block,actual,without_header,writeop);
+                          cur_block:=cur_block+dummy;
+                        end
+                       else
+                      (*$ENDC*)
+                        begin  (*normal log operation to system.log*)
+                          WRITE_DATA(errnum,log_refnum,
+                                     ord(c_data)+buff_ptr[buff_inuse],
+                                     (buff_index-1)*SIZEOF(log_entry),actual,
+                                     sequential,0);
+                        end;
+                      if errnum <> 0 then LOG_DOWN;
+                      buff_index:=1;
+                    end;
+
+                  if shutdown then LOG_DOWN; (* shut it down *)
+                end;
+              l_command:=buff_command; (* get command now *)
+            end;
+          until l_command = log_dump;
+        end;(*with*)
+
+10: (* ERROR EXIT *)
+
+    end;(*LOG_HANDLER*)
+
+
+
+
+procedure LOG_INIT(* ec_refnum: integer *);
+
+  (*******************************************)
+  (*                                         *)
+  (* Initialize the system.log operation.    *)
+  (*   o Open the system.log file; create one*)
+  (*     if it does not exist.               *)
+  (*   o Allocate private, memory resident   *)
+  (*     data segment for collection of log  *)
+  (*     events.                             *)
+  (*                                         *)
+  (*******************************************)
+
+  label 10;
+
+  var
+    log_name: pathname;
+    i, errnum: int2;
+    newlog, ds_openF, log_openF: boolean;
+    memsize: int4;
+    c_log_event: array[1..log_sz_udata] of int1;
+    c_data: p_log_data;
+    ds_ptr: absptr;
+    log_refnum, ds_refnum: int2;
+
+  begin
+    newlog:=false;
+    ds_openF:=false;
+    log_openF:=false;
+    log_name:='SYSTEM.LOG';
+    OPEN(errnum,log_name,log_refnum,[dread,append]);
+    if errnum > 0 then goto 10; (*do not log if file not present*)
+    log_openF:=true;
+
+    memsize:=SIZEOF(log_data);
+    MAKE_DATASEG(errnum,log_name,memsize,0,ds_refnum,ds_ptr,1,ds_private);
+    if errnum <> 0 then goto 10;
+    ds_openF:=true;
+
+    Lock_debugRes;
+
+    c_data:=pointer(ds_ptr);
+    with c_data^.log_header do
+      begin
+        buff_ptr[1]:=SIZEOF(log_h);
+        buff_ptr[2]:=SIZEOF(log_h)+SIZEOF(log_buffer);
+        buff_inuse:=1;
+        buff_index:=1;
+        buff_max_entry:=log_num_entry;
+        buff_next_dump:=1;
+        buff_dump[1]:=false;
+        buff_dump[2]:=false;
+        buff_overflow:=false;
+        buff_command:=log_dump;
+
+        cur_block:=300; (* begin dumping log to block 300 of twiggy if enabled*)
+
+      end;
+
+    DEFINE_LOG(ds_ptr,ec_refnum,log_refnum);
+
+    if newlog then
+      begin
+        (* log a header entry *)
+        c_log_event[1]:=1;
+        for i:=2 to log_sz_udata do c_log_event[i]:=0;
+        LOG(errnum,ord(@c_log_event));
+      end;
+    EXIT(log_init);
+
+10: (*ERROR EXIT*)
+    if log_openF then CLOSE_OBJECT(errnum,log_refnum);
+    if ds_openF then CLOSE_DATASEG(errnum,ds_refnum);
+
+  end; (*LOG_INIT*)
+
+
+(*$IFC debug1*)
+procedure ShowSeg (* segSdb_ptr : sdb_ptr;  mrbtPtr : mrbt_ptr *);
+  { procedure to display information about a particular segment in memory while
+    doing memory scheduling for a particular process. }
+
+  procedure ShowSyslocal;
+    { procedure to 'display' a syslocal name and associated process }
+
+    var
+      glob_list_head : ptr_gplisthead;    { ptr to global list head }
+      scan_ptr : ptr_PCB;                 { ptr to scan through PCB list }
+      sdbRP : relptr;                     { relptr to the syslocal sdb }
+
+    begin
+      sdbRP := ord(segSdb_ptr) - b_sysglobal_ptr;
+      glob_list_head := pointer(glob_pcb_list);
+
+      with glob_list_head^ do
+        begin
+          scan_ptr := gplist_head_ptr;
+          while (scan_ptr <> nil) and (scan_ptr^.slocal_sdbRP <> sdbRP) do
+            scan_ptr := scan_ptr^.gplist_ptr;
+        end;
+
+      write ('Syslocal          ', scan_ptr^.glob_id:3, '     ')
+    end { ShowSyslocal };
+
+
+  procedure ShowData;
+    { procedure to 'display' a data segment name and associated process }
+    var
+      segName : string[16];               { segment name for display }
+      seg_fcbptr : sfcb_ptr;              { ptr to FCB for file behind segment }
+      i : int2;                           { for left justifying names }
+
+    begin
+      with segSdb_ptr^ do
+        if discaddr.fid = 0 then
+          seg_fcbptr := nil
+        else
+          seg_fcbptr := pointer(discaddr.fid + b_sysglobal_ptr);
+
+      if seg_fcbptr = nil then
+        segName := 'Data Seg        '
+      else
+        with seg_fcbptr^ do
+          if Length(fname) > 16 then
+            segName := Copy (fname, 1, 16)
+          else
+            begin
+              segName := fname;
+              for i := Length(fname)+1 to 16 do
+                segName := Concat (segName, ' ')   { left justified }
+            end;
+
+      write (segName, '          ')
+    end { ShowData };
+
+
+  begin  { ShowSeg }
+    with segSdb_ptr^ do
+      begin
+        write (memaddr:5);   write ('     ');
+        case sdbtype of
+          free    : begin
+                      write ('free     ');
+                      write ('                          ')
+                    end;
+
+          code    : begin
+                      write ('code     ');
+                      ShowCode (segSdb_ptr, mrbtPtr)
+                    end;
+
+          data    : begin
+                      write ('data     ');
+                      ShowData
+                    end;
+
+          stack   : begin
+                      write ('stack    ');
+                      write ('Stack                     ')
+                    end;
+
+          slocal  : begin
+                      write ('sysloc   ');
+                      ShowSysloc
+                    end;
+          otherwise write ('unkown!  ')
+        end { case };
+
+        (*write ('  ???     ');   { process - 2/3/5 chars }*)
+
+        write (ord4(memsize)*mempgsize:7);
+        write ('   ');
+
+        if sdbtype <> free then
+          begin  { assigned region }
+            if sdbtype = code then
+              write ('       ')
+            else
+              write (disclength:7);
+            write ('    ');
+
+            if sdbstate.overlayF then write ('OC      ')
+              else write ('         ');
+            if lockcount > 0 then write (lockcount:2)
+          end { assigned region };
+
+        writeln
+      end { with }
+  end { ShowSeg };
+
+
+procedure MemoryContents (* mrbtPtr : mrbt_ptr *);
+  { procedure to display the segments/regions in memory and accumulate the
+    current resident and swappable spaces }
+
+  var
+    scanSdb_ptr : sdb_ptr;                { for scanning memory areas }
+    mmrbPtr : mmrb_ptr;                   { ptr to MMRB }
+    numCode : int2;                       { total # code segs }
+    numData : int2;                       { total # data segs }
+    numFree : int2;                       { total # free regions }
+    numOCs : int2;                        { total # overlay candidates }
+    totFree : int2;                       { free space in pages }
+    totOC : int2;                         { overlay space in pages }
+    totPages : int2;                      { total space in pages }
+    totSwap : int2;                       { total swappable space }
+    totRes : int2;                        { total resident space }
+
+
+  procedure Accumulate;
+    { procedure to accumulate various space sizes - e.g. free regions, overlay
+      candidates, resident and swappable spaces. }
+
+    begin
+      with scanSdb_ptr^ do
+        begin
+          case sdbtype of
+            free : numFree := numFree + 1;
+            code : numCode := numCode + 1;
+            data : numData := numData + 1
+          end;
+
+          if sdbstate.overlayF then
+            begin
+              numOCs := numOCs + 1;
+              totOC := totOC + memsize
+            end;
+
+          if sdbtype = free then
+            totFree := totFree + memsize
+          else if ((length > disclength) and (sdbtype <> code)) or
+                  (lockcount > 0) then
+            totRes := totRes + memsize
+          else
+            totSwap := totSwap + memsize
+        end { with }
+    end { Accumulate };
+
+
+  begin  { MemoryContents }
+    writeln;   writeln;   writeln;
+    writeln ('                         Current Contents of Memory');
+    writeln;
+    if Trace (spare3, 80) then
+      writeln ('address   type     name            process  mem size  disk size  OverLay  Lock');
+    mmrbPtr := pointer(mmrb_addr);
+
+    numCode := 0;                       { total # code segs }
+    numData := 0;                       { total # data segs }
+    numFree := 0;                       { total # free regions }
+    numOCs := 0;                        { total # overlay candidates }
+    totFree := 0;                       { free space in pages }
+    totOC := 0;                         { overlay space in pages }
+    totPages := 0;                      { total space in pages }
+    totSwap := 0;                       { total swappable space }
+    totRes := 0;                        { total resident space }
+
+    { display all regions in memory }
+    with mmrbPtr^ do
+      begin
+        scanSdb_ptr := pointer(ord(head_sdb.memchain.fwd_link));
+
+        while scanSdb_ptr <> @tail_sdb do
+          begin
+            if Trace (spare3, 80) then
+              begin
+                if scanSdb_ptr = clock_ptr then
+                  writeln ('*** Clock pointer ***');
+
+                ShowSeg (scanSdb_ptr, mrbtPtr)
+              end;
+            Accumulate;
+            scanSdb_ptr := pointer(ord(scanSdb_ptr^.memchain.fwd_link))
+          end
+      end { with mmrbPtr^ };
+
+    { display summary information }
+    writeln;
+    writeln ('#code segs     = ', numCode:3, '   free space        = ',
+             ord4(totFree)*mempgsize:7,
+             '   resident space  = ', ord4(totRes)*mempgsize:7);
+    writeln ('#data segs     = ', numData:3, '   overlay space     = ',
+             ord4(totOC)*mempgsize:7,
+             '   swappable space = ', ord4(totSwap)*mempgsize:7);
+    writeln ('#overlay cands = ', numOCs:3,   '   total avail space = ',
+             ord4(totFree+totOC)*mempgsize:7,
+             '   total space     = ', ord4(totRes+totSwap)*mempgsize:7);
+    writeln ('#free regions  = ', numFree:3);
+    writeln
+  end { MemoryContents };
+(*$ENDC*)
+
+
+(*$S MeasSeg *)
+
+procedure SYS_STAT(* var errnum: int2; funct: int2; parmaddr: int4 *);
+
+  (**********************************************)
+  (*                                            *)
+  (* Generalized privileged interface into OS   *)
+  (* for collecting statistics                  *)
+  (*                                            *)
+  (**********************************************)
+
+   label 10;
+
+   (*$IFC debug1 *)
+   type
+     OSseg_log = record
+                   ev_type: int1;       { type = 27}
+                   ev_segT: int1;       { seg type}
+                   ev_sdb:  sdb_ptr;    { seg sdb ptr }
+                   ev_maddr: int2;      { memory address }
+                   ev_segn: int2;       { segment number }
+                   re_res1: int2;       { reserved }
+                 end;
+   (*$ENDC*)
+
+   var
+     (*$IFC debug1 *)
+     parmarr: parmcheck;
+     userCntrs_ptr : ptr_MeasCounters;
+     firstC_ptr, lastC_ptr : ^int2;
+     c_event: OSseg_log;
+     c_sdb: sdb_ptr;
+     (*$ENDC*)
+
+     c_mmu, alarmno: int2;
+     c_statRec: p_statRec;
+     c_syslocal: slocal_ptr;
+     c_mrbt: mrbt_ptr;
+     c_spicRec: ^spicRec;
+     plog_rtn: ^boolean;
+     log_cmd: Tlog_cmds;
+
+   begin
+     (*$IFC debug3 *)
+     if TRACE(mm,99) then writeln('Sys_Stat called');
+     (*$ENDC*)
+
+     case funct of
+       1: (* LOGGING *)
+         begin
+           (*$IFC debug1 *)
+           with parmarr do
+             begin
+               numcheck:=1;
+               parms[1].addr:=parmaddr;
+               parms[1].readwrite:=true;
+             end;
+           if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+           (*$ENDC*)
+
+           plog_rtn:=pointer(parmaddr);
+           plog_rtn^:=LOGGING;
+           errnum:=0;
+         end;
+
+       2: (* LOG_NEWCMD *)
+         begin
+           (*$IFC debug1 *)
+           parmarr.numcheck:=0;
+           if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+           (*$ENDC*)
+
+           case parmaddr of
+             0: log_cmd:=log_dump;
+             1: log_cmd:=log_flush;
+             2: log_cmd:=log_reset;
+             3: log_cmd:=log_shutdown;
+             OTHERWISE begin
+                         errnum:=e_dsbase + e_badstatcall;
+                         goto 10;
+                       end;
+           end(*case*);
+
+           LOG_NEWCMD(errnum,log_cmd);
+         end;
+
+       3: (* LOG *)
+         begin
+           (*$IFC debug1 *)
+           with parmarr do
+             begin
+               numcheck:=1;
+               parms[1].addr:=parmaddr;
+               parms[1].readwrite:=false;
+             end;
+           if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+           (*$ENDC*)
+
+           LOG(errnum,parmaddr);
+         end;
+
+       (*$IFC debug1 *)
+       4: (*Sampler enable*)
+         begin
+           errnum:=0;
+
+           with parmarr do
+             begin
+               numcheck:=1;
+               parms[1].addr:=parmaddr;
+               parms[1].readwrite:=false;
+             end;
+           if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+
+           ALARMASSIGN(alarmno,ord(@ICSAMPLER));
+           if alarmno = 0
+             then errnum:=e_dsbase+e_nosysresources
+             else
+              begin
+                c_statRec:=pointer(stataddr);
+                c_mmu:=parmaddr div maxmmusize;
+                c_syslocal:=pointer(b_syslocal_ptr);
+                c_mrbt:=pointer(c_syslocal^.mrbt_addr);
+                c_statRec^.spic_sdb:=pointer(c_mrbt^[c_mmu].sdbRP+b_sysglobal_ptr);
+                c_statRec^.alarm:=alarmno;
+                with c_statRec^.spic_sdb^ do
+                  begin
+                    lockcount:=lockcount+1;
+                    (*compute address of sampler data segment *)
+                    c_spicRec:=pointer(ord4(realmemmmu)*maxmmusize +
+                                       ord4(memaddr)*mempgsize);
+                    ALARMRELATIVE(alarmno,c_spicRec^.alarmdelay); (*alarm in x ms*)
+                  end;
+              end;
+         end;
+       (*$ENDC*)
+
+       (*$IFC DEBUG1*)
+       5:  (* Sampler disable *)
+         begin
+           errnum:=0;
+           c_statRec:=pointer(stataddr);
+           if c_statRec^.spic_sdb <> nil then
+             begin
+               with c_statRec^.spic_sdb^ do
+                 begin
+                   lockcount:=lockcount-1;
+                   (*compute address of sampler data segment *)
+                   c_spicRec:=pointer(ord4(realmemmmu)*maxmmusize +
+                                      ord4(memaddr)*mempgsize);
+                 end;
+               c_statRec^.spic_sdb:=nil;
+               ALARMRETURN(c_statRec^.alarm); (* release the alarm *)
+               c_statRec^.alarm:=0;
+             end;
+         end;
+       (*$ENDC*)
+
+       (*$IFC DEBUG1*)
+       6:  { Return system call histogram information }
+         begin
+           with parmarr do
+             begin
+               numcheck:=1;
+               parms[1].addr:=parmaddr;
+               parms[1].readwrite:=true;
+               parms[2].addr:=parmaddr+Sizeof(measTable)-1;
+               parms[2].readwrite:=true;
+             end;
+           if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+
+           userCntrs_ptr := pointer(parmaddr);
+           firstC_ptr := pointer(parmaddr);
+           lastC_ptr := pointer(parmaddr + 2);
+           Get_MeasInfo (userCntrs_ptr, firstC_ptr^, lastC_ptr^)
+         end;
+
+       7:  { Record OS code segment info in System.Log }
+         begin
+           c_mrbt:=pointer(s_mrbt_addr);
+           for c_mmu:=codespacemmu to lsyscodemmu do
+             begin
+               with c_mrbt^[c_mmu] do
+                 begin
+                   if sdbRP <> 0 then
+                     begin (*mmu maps a segment*)
+                       c_sdb:=pointer(sdbRP + b_sysglobal_ptr);
+                       with c_event do
+                         begin
+                           ev_type:=27;
+                           ev_segT:=ord(c_sdb^.sdbtype);
+                           ev_sdb:=c_sdb;
+                           ev_maddr:=c_sdb^.memaddr;
+                           ev_segn:=c_mmu;
+                         end;(*with*)
+                       LOG(errnum,ord(@c_event));
+                     end;
+                 end;(*with*)
+             end;(*for*)
+         end;
+       (*$ENDC*)
+
+       OTHERWISE errnum:=e_dsbase + e_badstatcall;
+     end(*case funct *);
+
+10: (* error exit *)
+   end;(* Sys_Stat *)
+
+
+
+(*$IFC DEBUG1*)
+(*$S ProcStart *)
+
+procedure CHK_SAMPLER(* var name: pathname; globid: int4 *);
+  (* check if name is the file to be sampled *)
+
+  var
+    c_statRec: p_statrec;
+    c_spicRec: ^spicRec;
+    progunit: int2;
+    fname: e_name;
+    sfnum: int2;
+    errnum: int2;
+    pname: pathname;
+
+  begin
+    c_statRec:=pointer(stataddr);
+    if c_statRec <> nil
+      then if c_statRec^.spic_sdb <> nil then
+             begin
+               (* calculate addr of sampler data seg *)
+               c_spicRec:=pointer(ord4(realmemmmu)*maxmmusize +
+                                  ord4(c_statRec^.spic_sdb^.memaddr)*mempgsize);
+
+               SplitPathname (errnum, name, progunit, pname);
+               UPSHIFT(@pname);
+               if pname[1] = '>' then Delete (pname, 1, 1);
+               fname := pname;
+               if fname = c_spicRec^.progname then c_spicRec^.gid:=globid;
+             end;
+  end;(*CHK_SAMPLER*)
+
+(*$S MeasSeg *)
+(*$ENDC*)
+
+end.
+
+ÿ

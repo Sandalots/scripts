@@ -1,0 +1,476 @@
+UNIT PRIAM;
+
+
+      (*  By Wendell Henry  1/17/83                                             *)
+      (*  Copyright 1983, 1984, Apple Computer Inc.                             *)
+      (*                                                                        *)
+      (*  A device specific driver for the Priam.  It uses the generic hard disk*)
+      (*  driver HDISK.  This driver will interface to the E and T controller.  *)
+
+INTERFACE
+
+  USES
+      (*$Uobject/driverdefs.obj*)
+      driverdefs,
+      (*$Uobject/driversubs.obj*)
+      driversubs;
+
+   function DRIVER (parameters: param_ptr): integer;
+
+IMPLEMENTATION
+
+  (*$R-*)                        (*rangecheck off *)
+  (*$SETC PriamDebug=FALSE*)     (*Debug Mode *)
+
+  CONST
+    (* hdisk commands *)
+    readcmd   = 0;
+    writecmd  = 1;
+
+    (* responses to hdisk *)
+    ok        = 0;
+    waitint   = 1;
+    errbase   = 1000;
+    initerr   = 1000;
+    formaterr = 1001;
+    baddcontrol=1002;
+    nospace   = 1003;
+    badxferlen= 1004;
+    badcal    = 1005;
+    writerr   = 1006;
+    readerr   = 1007;
+    Treaderr  = 1008;
+    Twriterr  = 1009;
+    Tconerr   = 1010;
+
+    (* drive commands - same as offset into driver's command jump table*)
+    initdisk  = 0;         (* initialize drive          *)
+    interrupt = 2;         (* process interrupt         *)
+    readdisk  = 4;         (* read data - retry enabled *)
+    writedisk = 6;         (* write data - retry enabled*)
+    format    = 8;         (* format disk               *)
+    downdisk  = 10;        (* sequence down drive       *)
+
+  TYPE
+    hbyte = -128..127;
+
+    inp_rec = record                  (*input parameters to driver *)
+                parm0: hbyte;         (*parameter 0   *)
+                parm1: hbyte;
+                parm2: hbyte;
+                parm3: hbyte;
+                parm4: hbyte;
+                parm5: hbyte;
+              end;
+    out_rec = record                  (*output parameters from driver*)
+                result0: hbyte;       (*result 0 - transaction status*)
+                result1: hbyte;       (*additional result bytes      *)
+                result2: hbyte;
+                result3: hbyte;
+                result4: hbyte;
+                result5: hbyte;
+              end;
+
+    ext_drive_cb = record    (*extension to drive_cb *)
+              (**)   hwbase: longint;      (* base address in I/O space *)
+              (**)   hwparity: longint;    (* base address of parity flag *)
+              (**)   device: hbyte;        (* device number*)
+              (**)   command: hbyte;       (* command to driver *)
+              (**)   response:integer;     (* response command from driver*)
+              (**)   input: inp_rec;       (* input parms to driver *)
+              (**)   output:out_rec;       (* result parms from driver *)
+              (**)   pe: hbyte;            (* parity state of I/O transfer*)
+              (**)   state: hbyte;         (* current state of driver *)
+              (**)   retries: integer;     (* # retries this request *)
+              (**)   tot_retries: integer; (* Total # retries this drive *)
+              (**)   error: integer;       (* Error from sector transfer *)
+              (**)   nxfercnt: integer;    (* Next blk xfer count*)
+              (**)   cxfercnt: integer;    (* Current blk xfer count*)
+              (**)   ctrltype: hbyte;      (* Controller type*)
+
+              (**)   packetLen: hbyte;     (* Number of valid bytes in packet*)
+              (**)   packet: array[0..15] of hbyte; (* Packet command*)
+
+                     (* Packet status report *)
+              (**)   pid: hbyte;           (* Packet id *)
+              (**)   pstate: hbyte;        (* Packet state *)
+              (**)   ptdf: hbyte;          (* Termination device flag *)
+              (**)   ppristat: hbyte;      (* Primary termination status *)
+              (**)   psecstat: hbyte;      (* Secondary termination status *)
+              (**)   pres1: hbyte;         (* Unused *)
+              (**)   poffset: integer;     (* Packet offset *)
+              (**)   plength: integer;     (* Packet length *)
+              (**)   pstepcode: hbyte;     (* Current step operation code *)
+              (**)   pstepnumb: hbyte;     (* Current step number *)
+              (**)   psectnumb: longint;   (* Total number of records copied *)
+              (**)   psdev: hbyte;         (* Source device select *)
+              (**)   psstat: hbyte;        (* Source device status *)
+              (**)   pssupstat: hbyte;     (* Supplemental source status *)
+              (**)   psaddr1: hbyte;       (* Source transfer address *)
+              (**)   psaddr2: hbyte;
+              (**)   psaddr3: hbyte;
+              (**)   pisectstep: longint;  (* Numb records input this copy step *)
+              (**)   pddev: hbyte;         (* Destination device select *)
+              (**)   pdstat: hbyte;        (* Destination device status *)
+              (**)   pdsupstat: hbyte;     (* Supplemental destination status *)
+              (**)   pdaddr1: hbyte;       (* Destination transfer address *)
+              (**)   pdaddr2: hbyte;
+              (**)   pdaddr3: hbyte;
+              (**)   posectstep: longint;  (* Numb records output this copy step*)
+              (**)   rtn_pstat: longint;   (* Return address from read_pstat*)
+                   end;
+
+   ptr_ext_drive_cb = ^ext_drive_cb;
+
+   procedure PRIAMASM(cb_ptr: absptr); external;
+
+{
+   procedure FINISH_NONIOREQ(drivecb_ptr: hdiskcb_ptr; error: integer);
+
+     var
+       ptrsysg: ^longint;
+       prevints: intson_type;
+
+     begin
+       with drivecb_ptr^, req_hd_ptr^ do
+         begin
+           ptrsysg:=pointer(bsysglob);
+           hard_error:=error;
+           UNBLK_REQ(req_hd_ptr,error=0);
+           INTSOFF(allints,prevints);
+           DEQUEUE(dev_chain,ptrsysg^);
+           INTSON(prevints);
+         end;(*with drivecb_ptr, req_hd_ptr*)
+     end;(*FINISH_NONIOREQ*)
+}
+
+   procedure START_NONIOREQ(var errnum: integer; drivecb_ptr: hdiskcb_ptr);
+
+     var
+       extdrivecb_ptr: ptr_ext_drive_cb;
+
+     begin
+       with drivecb_ptr^ do
+         begin
+           extdrivecb_ptr:=pointer(ext_ptr);
+           with req_hd_ptr^, extdrivecb_ptr^ do
+             begin
+               reqstatus.reqsrv_f := in_service;  (* from active to in_service *)
+               cur_info_ptr := pointer(req_extent);
+               case operatn of
+                 2:  command:=initdisk;
+                 3:  command:=format;
+               end; (*case*)
+               PRIAMASM(ord(drivecb_ptr));
+               errnum:=response;
+               if errnum <> waitint then
+                 begin
+                   IODONE(drivecb_ptr,response);
+                   (*$IFC PriamDebug*)
+                   if TRACE(DD,10) then
+                     begin
+                       writeln('Error formatting Priam disk #',device);
+                       D_STATUS;
+                     end;
+                   (*$ENDC*)
+                 end;
+             end;(*with req_hd_ptr, extdrivecb_ptr*)
+         end;(*with drivecb_ptr*)
+     end;(*START_NONIOREQ*)
+
+
+   procedure NONIO_REQ (var errnum: integer; drivecb_ptr: hdiskcb_ptr;
+                        drvcmd: int1);
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:  Build a request for format or initdisk      *)
+        (*                                                           *)
+        (* Input Parameters:  device control block                   *)
+        (*                    drive command (format or initdisk)     *)
+        (*                                                           *)
+        (*************************************************************)
+
+   VAR
+     d_ptr: absptr;
+     leftlink: reqptr_type;
+     ptrsysg: ^longint;
+     ints: intson_type;
+     reqptr: reqptr_type;
+
+   begin
+     ptrsysg := pointer(bsysglob);
+     errnum := nospace;
+     if GETSPACE(sizeof(reqblk), ptrsysg^, d_ptr) then
+       begin
+         errnum := 0;
+         reqptr := pointer (d_ptr);  (*point to the request*)
+
+         (* initialize the request block *)
+
+         WITH reqptr^, drivecb_ptr^ do
+           begin
+             with list_chain do    (* set up request block linkage *)
+               begin
+                 fwd_link := ord(@fwd_link) - ptrsysg^;
+                 bkwd_link := fwd_link
+               end;
+
+             cfigptr := config_addr;
+             operatn := drvcmd;
+             req_extent := ord(nil);(*no extension block present for non-io req*)
+
+             LINK_TO_PCB (reqptr);  (*add to pcb queue*)
+
+             (*add to device queue*)
+
+             INTSOFF(int_prio,ints);                    (* disable interrupts *)
+             leftlink := pointer(req_hd_ptr^.dev_chain.bkwd_link - sizeof(rb_headT)
+                           + ptrsysg^);
+             if req_hd_ptr = dummy_req_ptr then
+               req_hd_ptr := reqptr; (*place at end of queue unless its the only one*)
+             cur_num_requests := cur_num_requests+1;
+             ENQUEUE (dev_chain, leftlink^.dev_chain, ptrsysg^);
+             if cur_num_requests = 1 then START_NONIOREQ(errnum,drivecb_ptr);
+             INTSON(ints);
+             if errnum = waitint then BLK_REQ(reqptr,reqptr);
+
+             (*Process will continue here after completion of request*)
+             errnum:= hard_error;
+             CANCEL_REQ(reqptr);
+           end; (*WITH reqptr^, drivecb_ptr^*)
+       end;
+    end; (*nonio_req*)
+
+
+   function DRIVER(* parameters: param_ptr): integer *);
+     (*Main routine of Priam Driver*)
+
+     label 100;
+
+     type
+       h4bits = 0..15;
+       discsz_rec = packed record
+                      sta: hbyte;
+                      hds: h4bits;   (* number of heads *)
+                      cyl1: h4bits;  (* hi order number of cylinders *)
+                      cyl2:hbyte;    (* lo order number of cylinders *)
+                      sec: hbyte;    (* number of sectors per track  *)
+                    end;
+
+
+
+     var
+       discsz_ptr: ^discsz_rec;
+       extdrivecb_ptr: ptr_ext_drive_cb;
+       drivecb_ptr: hdiskcb_ptr;
+       extdevrec_ptr: ^ext_diskconfig;
+       newextdrivecb: absptr;
+       sector_ptr: ^longint;
+       dc_rec_ptr: ^dc_rec;
+       error: integer;
+       parm: params;
+       i: integer;
+       ptrsysg: ^longint;
+
+     (*$IFC PriamDebug*)
+     procedure D_STATUS;
+       (* Display result registers from drive *)
+       begin
+         if TRACE(DD,10) then
+           begin
+             with extdrivecb_ptr^.output do
+               begin
+                 writeln('R0= ',result0,' R1= ',result1);
+                 writeln('R2= ',result2,' R3= ',result3);
+                 writeln('R4= ',result4,' R5= ',result5);
+               end;
+           end;
+       end; (*D_STATUS*)
+     (*$ENDC*)
+
+     begin
+       with parameters^, configptr^ do
+         case fnctn_code of
+
+          dinterrupt: (*device interrupt*)
+            begin
+              drivecb_ptr:=pointer(cb_addr);
+              with drivecb_ptr^ do
+                begin
+                  extdrivecb_ptr:=pointer(ext_ptr);
+                  with extdrivecb_ptr^ do
+                    begin
+                      command:=interrupt;
+                      PRIAMASM(ord(drivecb_ptr));
+                      driver:=response;
+                      if response <> waitint then IODONE(drivecb_ptr,response);
+                    end;(*with extdrivecb_ptr*)
+                end;(*with drivecb_ptr*)
+            end;(*dinterrupt*)
+
+          dinit:  (* first stage to initialize disk unit *)
+            begin
+              USE_HDISK(configptr); (*use HDISK to handle sector headers *)
+              goto 100;             (*go call HDISK*)
+            end;(*dinit*)
+
+          hdinit:  (* final stage to initialize disk unit *)
+            begin
+              drivecb_ptr:=pointer(cb_addr);
+              driver:=nospace; (* insufficient resources *)
+              ptrsysg:=pointer(bsysglob);
+              if GETSPACE(sizeof(ext_drive_cb),ptrsysg^,newextdrivecb) then
+                begin
+                  extdrivecb_ptr:=pointer(newextdrivecb);
+                  drivecb_ptr^.ext_ptr:=newextdrivecb;
+                  with extdrivecb_ptr^ do
+                    begin
+                      hwparity:= ord4(iospacemmu)*$20000 +
+                                 ord4($4000)*slot_no;(*lo select space*)
+                      hwbase:= hwparity + $2000; (*hi select space *)
+                      response:=0;
+                      device:=iochannel*16;
+                      retries:=0;
+                      tot_retries:=0;
+                      pe:=0;
+                      NONIO_REQ(error,drivecb_ptr,2); (*have driver init device*)
+                      driver:=error;
+                      if error <> 0 then
+                        begin (* error response from driver *)
+                          (*$IFC PriamDebug*)
+                          if TRACE(DD,10) then
+                            begin
+                              writeln('Error initializing Priam Disk #',device);
+                              D_STATUS;
+                            end;
+                          (*$ENDC*)
+                          RELSPACE(newextdrivecb,ptrsysg^); (*release cb extension *)
+                          drivecb_ptr^.ext_ptr:=ord(nil);
+                        end
+                       else
+                        begin (* initialization complete *)
+                          discsz_ptr:=@output.result0;
+                          extdevrec_ptr:=pointer(ext_addr);
+                          with discsz_ptr^ do extdevrec_ptr^.num_bloks:=
+                            ord4(cyl1*256 + cyl2) * ord4(hds) * ord4(sec);
+                          with extdevrec_ptr^ do
+                            begin
+                              num_bloks:=num_bloks-strt_blok-2;
+                              rvrs_hdr:=0; (*headers at beginning of sector*)
+                            end;
+
+                        end;
+                    end;(*with extdrivecb_ptr*)
+                end;
+            end; (*hdinit*)
+
+          hddown:  (* down the device *)
+            begin
+              drivecb_ptr:=pointer(cb_addr);
+              with drivecb_ptr^ do
+                begin
+                  extdrivecb_ptr:=pointer(ext_ptr);
+                  with extdrivecb_ptr^ do
+                    begin
+                      command:=downdisk; (*sequence down disk*)
+                      PRIAMASM(ord(drivecb_ptr));
+                    end;
+                  ptrsysg:=pointer(bsysglob);
+                  RELSPACE(ext_ptr,ptrsysg^); (*release cb extension *)
+                  ext_ptr:=ord(nil);
+                end;
+              driver:=0;
+            end;(*hddown*)
+
+          hdskio:  (* perform I/O *)
+            begin
+              drivecb_ptr:=pointer(cb_addr);
+              extdrivecb_ptr:=pointer(drivecb_ptr^.ext_ptr);
+              with extdrivecb_ptr^ do
+                begin
+                  if drivecb_ptr^.cur_info_ptr^.read_flag
+                    then command:=readdisk
+                    else command:=writedisk;
+                  sector_ptr:=@input.parm0;
+                  sector_ptr^:=drivecb_ptr^.cur_info_ptr^.blkno;
+                  PRIAMASM(ord(drivecb_ptr));
+                  driver:=response;
+                  if response <> waitint then
+                    begin (* error response from driver *)
+                      (*$IFC PriamDebug*)
+                      if TRACE(DD,10) then
+                        begin
+                          write('Error ');
+                          if drivecb_ptr^.cur_info_ptr^.read_flag
+                            then write('reading ')
+                            else write('writing ');
+                          writeln('Priam Disk #',device);
+                          D_STATUS;
+                        end;
+                      (*$ENDC*)
+
+                      IODONE(drivecb_ptr,response);
+                    end;
+                end;(*with extdrivecb_ptr*)
+            end;(*hdskio*)
+
+          dskunclamp: (* Unclamp request *)
+             driver := 685;  (*not an ejectable media*)
+
+          dskformat: (* format *)
+            begin
+              drivecb_ptr:=pointer(cb_addr);
+              extdrivecb_ptr:=pointer(drivecb_ptr^.ext_ptr);
+              with extdrivecb_ptr^ do
+                begin
+                  NONIO_REQ(error,drivecb_ptr,3); (*have driver format device*)
+                  driver:=error;
+                  if error <> 0 then
+                  (*$IFC PriamDebug*)
+                  if error <> 0 then
+                    begin
+                      if TRACE(DD,10) then
+                        begin
+                          writeln('Error formatting Priam disk #',device);
+                          D_STATUS;
+                        end;
+                    end;
+                  (*$ENDC*)
+                end;(*with extdrivecb_ptr*)
+            end;(*dskformat*)
+
+          dcontrol: (* device control *)
+            begin
+              dc_rec_ptr := pointer(parptr);
+              with dc_rec_ptr^ do
+                if dversion <> 2
+                  then driver := baddcontrol (*wrong application version*)
+                  else
+                   begin
+                     driver:=0;
+                     case dcode of
+                      20: begin  (*get disk status*)
+                            ar10[0] := 4;  (*good disk*)
+                            ar10[1] := 0;
+                            ar10[2] := 999;  (*don't know how many *)
+                                             (*blocks are available*)
+                            ar10[3] := 0;
+                            ar10[4] := 1;  (*sparing always enabled*)
+                            ar10[5] := 1;
+                            ar10[6] := 0;
+                          end;
+                      otherwise driver := baddcontrol;
+                     end;(*case*)
+                   end;
+            end;(*dcontrol*)
+
+          otherwise
+            begin
+100:          CALL_HDISK(error,configptr,parameters);
+              driver:=error;
+            end;
+         end;(*case fnctn_code*)
+
+     end;(*DRIVER*)
+end.
+ÿ

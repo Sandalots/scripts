@@ -1,0 +1,803 @@
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+{File source/ldlfs}
+
+UNIT LDLFS;                    { Lisa File System }
+
+INTERFACE
+
+USES
+    (*$U object/ldutil.obj*)              ldutil,
+    (*$U object/prof.obj*)                lddrivers, {same as 'twig.obj'}
+    (*$U object/driverdefs.obj*)          driverdefs,
+    (*$U object/sysglobal.obj*)           globalda,
+    (*$U object/procprims.obj*)           proc_prims,
+    (*$U object/asynctr.obj*)             asynctr,
+    (*$U object/genio.obj*)               genio,
+    (*$U object/twiggy.obj*)              twiggy,
+    (*$U object/vmstuff.obj *)            vmstuff,
+    (*$U object/sfileio.obj *)            sfileio,
+    (*$U object/fsdir.obj *)              fs_directory,
+    (*$U object/fsprim.obj *)             fs_primitives;
+
+
+TYPE
+
+   filename = string[64];
+
+  {This only appears in the interface so assembler can '.ref' the declaration of
+   driver_call, below.}
+   fake_parms = record { (WARNING!!  This record is declared in LDRCALL, too.) }
+                   error:     integer;
+                   opcode:    integer;
+                   addr:      longint;
+                   header:    longint;
+                   blok:      longint;
+                   count:     longint;
+                   result:    boolean;
+                   longvalue: longint;
+                   wordvalue: integer;
+                   bytevalue: byte;
+                   path:      filename;
+                end; {of fake_parms}
+
+
+procedure initmedia(bootdevice, firstblock : integer);
+function  openinput (var inputfile:filename) : boolean;
+procedure fillbuf (byteadr:longint);
+function  getbyte : byte;
+function  getword : integer;
+function  getlong : longint;
+procedure movemultiple (bytecount:longint; destination:longint);
+
+procedure DRIVER_CALL(var parms: fake_parm);
+
+
+IMPLEMENTATION
+
+(*$R-*)
+
+       (*************************************************************)
+       (* Module Data Description:
+       (*   The data base defined for the Lisa File System is large and
+       (*   complex, larger than I can adequately describe here.  Some of the
+       (*   highlights are noted, but a complete description is best
+       (*   provided by the file system itself.
+       (*
+       (*   A root catalog is found via a description in the MDDF, for media
+       (*   data description file, found at the page 0.
+       (*
+       (*   Standard input is defined by a LD_FILEMAP (of pages), which
+       (*      points to which block holds each page of the file.
+       (*   BUF is the buffer holding the data for one of those pages.
+       (*   HDR catches the 24-byte header for those each block read.
+       (*   CURR_PAGE says which is the current page,
+       (*   NEXT_BYTE points to the next byte of that page in BUF.
+       (*   LAST_PAGE shows which is the last page within the LD_FILEMAP,
+       (*
+       (*************************************************************)
+
+CONST
+   btree_fsversion =  16;  {first FS version structured using b-trees}
+
+   ldmapmax = 1023;
+
+  {opcodes identifying each of the loader calls:}
+  {WARNING!!  These constants are declared in LDRCALL, too.}
+   call_open = 0;
+   call_fill = 1;
+   call_byte = 2;
+   call_word = 3;
+   call_long = 4;
+   call_move = 5;
+   call_read = 6;
+
+
+TYPE
+   sentryptr = ^s_entry;
+   ld_pagetype = array [0..511] of byte;   (* 512 bytes long*)
+   ld_hdrtype = pagelabel;                 (*  24 bytes long*)
+
+
+VAR
+   btree_buf: array[0..2047] of byte; {2K BUFFER FOR PIGGY B_TREE LOOKUP}
+
+   ld_filemap : array[0..ldmapmax] of mapentry;
+
+   buf : ld_pagetype;           {allocates space for file contents}
+   hdr : ld_hdrtype;
+
+   nextbyte : integer;          {index of next byte of file data}
+   last_page : integer;         {last significant page in map}
+   curr_page : longint;         {current (level-2) page loaded into buf}
+                                { (is longint so long-math is performed) }
+
+   catalog : s_entry;           {root catalog descriptor}
+
+   slist_addr : longint;        {page where sfile list begins}
+   slist_packing : integer;     {number of s_entries per block}
+   map_offset : integer;        {offset in pages from hints to map}
+   catentries : integer;        {number of catalog entries}
+   smalloffset : integer;       {bytes to filemap base. (page releative) }
+   bufsize : integer;           {data bytes per page}
+   fs_version : integer;        {file system version}
+   tree_depth : integer;        {b-tree (maximum?) node depth}
+   root_page: longint;          {?}
+   driveselect,                 {which drive/volume to use, if relevant}
+   block0 : integer;            {first block of filesystem}
+
+
+
+procedure LDRTRAP; external;
+       (*************************************************************)
+       (* Description:
+       (*    Assembler routine allowing the OS to call 'driver_call', below.
+       (*************************************************************)
+
+
+procedure READ_PAGE(spage : longint);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read a a page into the data/code buffer.
+       (*
+       (* Input Parameters:
+       (*    Spage - (logical) page number.
+       (*
+       (*************************************************************)
+var
+   status : integer;
+   ptr1, ptr2 : ^integer;
+begin
+   ptr1 := @buf;
+   ptr2 := @hdr;
+   READ_BLOCK(status, driveselect, block0 + spage, ptr1^, ptr2^);
+   if status <> 0 then
+     begin
+       TRAP(bootdeviceflop);
+     end;
+   end; {of read_page}
+
+
+
+function FIND_SENTRY(sfilenumb : integer) : sentryptr;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Find a pointer to the sfile descriptor (s_entry),
+       (*       for the file idenified by an sfile number.
+       (*
+       (* Input Parameters:
+       (*    Sfilenumb - sfile's identifier.
+       (*
+       (* Output Parameters:
+       (*    Sentryptr - Returns the pointer to the file descriptor.
+       (*
+       (*************************************************************)
+var
+   spage : longint;
+   soffset : integer;
+begin
+   spage := (sfilenumb div slist_packing) + slist_addr;
+   soffset := (sfilenumb mod slist_packing) * sizeof(s_entry);
+   READ_PAGE(spage);
+   find_sentry := pointer( ord4(@buf) + soffset);
+end; {of find_sentry}
+
+
+
+{binary tree asssembler: }
+procedure  Make_Key (parentID  : integer;
+                       ptrName   : ename_ptr;
+                       ptrKey    : key_ptr);  external;
+
+procedure  Search_Node ( ptrRec     : rec_ptr;
+                           ptrOffst   : offset_ptr;
+                           nentries   : integer;
+                           ptrKey     : key_ptr;
+                           keySize    : integer;
+                       var index      : integer;
+                       var result     : boolean);   external;
+
+
+procedure LD_SEARCH(fname: e_name; var found: boolean; var where: sentryptr);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Seek a file in a bTree flavor root catalog, returning the file's
+       (*    sfile number.
+       (*
+       (*************************************************************)
+const
+   ROOT_NID   = 0;     (* Root directory node ID *)
+   KEY_SIZE   = 36;    (* Size of record key in bytes *)
+   pagesize = 512;              { physical memories page size}
+var
+   ptrBase  : rec_ptr;
+   ptrOffst : offset_ptr;
+   ptrNode  : node_ptr;
+   ptrPg    : page_ptr;
+   index    : integer;
+   level    : integer;
+   page     : longint;
+   fkey     : Reckey;
+   ptrB     : rec_ptr;
+   entry    : objrec;
+   error    : integer;
+   i: integer;
+   ptr1, ptr2 : ^integer;
+
+begin
+    found := FALSE;
+
+   { Make the unique key that corresponds to fname in the root directory}
+    Make_Key(ROOT_NID, @fname, @fkey);
+    page := root_page;
+
+   { Setup convenient points into 2K buffer}
+    ptrBase := @btree_buf;
+    ptrNode := pointer(ord(ptrbase) + (NODE_SIZE - sizeof(NodeDesc)));
+    ptroffst:= pointer(ord(ptrNode) - sizeof(integer) );
+
+    for level := 1 to tree_depth do
+    begin
+      ptr2 := @hdr;
+      ptr1 := @btree_buf;
+      for i := 0 to 3 do
+         begin
+            READ_BLOCK(error, driveselect, block0 + page + i, ptr1^, ptr2^);
+            ptr1 := pointer( ord4(ptr1) + pagesize);
+            if error <> 0 then TRAP(bootdeviceflop);
+         end; {of filling btree_buffer}
+
+      if level < tree_depth then
+      begin
+        (* Interior Node *)
+        index := 0;
+        if ptrNode^.nkeys > 1 then
+        begin
+          (* search the node *)
+          Search_Node(pointer(ord(ptrBase) + sizeof(longint)),
+                      pointer(ord(ptrOffst) - sizeof(integer)),
+                      ptrNode^.nkeys - 1,
+                      @FKey,
+                      KEY_SIZE,
+                      index,
+                      found );
+          if found then index := index + 1;
+        end{if};
+
+        ptrPg := pointer(ord(ptrBase) + ptrOffst^[-index]);
+        page := ptrPg^;
+      end
+      else
+        (* Leaf Node *)
+        Search_Node(ptrBase, ptrOffst, ptrNode^.nkeys, @fkey, KEY_SIZE,
+             index, found);
+
+    end{for};
+
+    if found then
+    begin
+       {extract the record from the node and return it}
+       ptrB := pointer(ord(ptrBase) + ptrOffst^[-index]);
+       moveleft(ptrB^, entry, sizeof(objrec) );
+       where := FIND_SENTRY(entry.sfile);
+    end;{if}
+
+end {of Ld_Search};
+
+
+
+function OPEN_FILE(sentry : sentryptr) : longint;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Open a file, for use as standard input.
+       (*
+       (* Input Parameters:
+       (*    Sentry - A pointer to the file descriptor.
+       (*
+       (* Output Parameters:
+       (*    Open_file - returns the file size.
+       (*
+       (*************************************************************)
+var
+   i : integer;
+   ldbuf : ld_pagetype;
+   fmap : ^filemap;
+   fmapoffset : integer;
+   ptr1, ptr2 : ^integer;
+   status : integer;
+   filesize : longint;         {bytes in this file}
+   next_map_page : longint;    {filesystem page address of next filemap page}
+   map_index,                  {index into fs filemap}
+   ld_index,                   {index into loader's image of fs filemap}
+   max_index : integer;        {number of filemap entries (for a given page)}
+   abspage : integer;          {current page within file}
+begin
+   filesize := sentry^.filesize;
+   last_page := (filesize - 1) div bufsize;
+   open_file := filesize;
+   curr_page := -1;                      { start with empty file }
+   nextbyte := bufsize;
+
+  {lastly, read the ENTIRE filemap}
+
+   for i := 0 to ldmapmax do
+      with ld_filemap[i] do
+         begin
+            address := 0;
+            cpages := 0;
+         end;
+   fmapoffset := smalloffset;
+   ptr1 := @ldbuf;
+   ptr2 := @hdr;
+   ld_index := 0;
+   next_map_page := sentry^.hintaddr+map_offset;
+   abspage := 0;
+   repeat
+      if next_map_page=0 then
+         begin
+          TRAP(fserror);
+         end;
+      READ_BLOCK(status, driveselect, next_map_page+block0, ptr1^, ptr2^);
+      if status <> 0 then
+        begin
+          TRAP(bootdeviceflop);
+        end;
+      map_index := 0;
+      fmap := pointer(ord4(@ldbuf) + fmapoffset);
+      fmapoffset := 0;  {for all succeeding pages}
+      max_index := fmap^.max_entries;
+      while (map_index<=max_index) do
+         begin
+            if ld_index>ldmapmax then TRAP(fserror);
+            with ld_filemap[ld_index] do
+               begin
+                  address := fmap^.map[map_index].address;
+                  cpages := fmap^.map[map_index].cpages;
+                  if cpages=0 then TRAP(fserror);
+                  abspage := abspage + cpages;
+                  if (abspage > last_page) then EXIT(open_file);
+               end;
+            ld_index := ld_index + 1;
+            map_index := map_index + 1;
+         end;
+      next_map_page := hdr.fwdlink;
+   until false; {never happens}
+
+end; {of open_file}
+
+
+
+procedure SHIFTNAME (var namestring : e_name);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert the string to upper case.
+       (*
+       (* Input/Output Parameters:
+       (*    Namestring - the string.
+       (*
+       (*************************************************************)
+var i, diff : integer;
+begin
+  diff := ord ('a') - ord ('A');
+  for i := 1 to length (namestring) do
+  begin
+    if namestring [i] in ['a'..'z'] then namestring [i] :=
+          chr (ord (namestring [i]) - diff);
+  end;
+end;    (* of procedure upshift *)
+
+
+
+function LDHASH (var istring : e_name; maxindex : integer ) : integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Find the catalog entry number from a catalog name.
+       (*
+       (* Input Parameters:
+       (*    Istring - the name.
+       (*
+       (* Output Parameters:
+       (*    Maxindex - returns the number of entries in the ENTIRE catalog.
+       (*    Ldhash - returns the catalog entry number of the first poke.
+       (*
+       (*************************************************************)
+var temp : longint;
+    l, m : integer;
+begin
+  l := length (istring);
+  if l <= 0 then ldhash := 0
+  else
+  begin
+    temp := ord (istring [1]) * (ord (istring [l]) + 1); (* fibonacci-like series *)
+    if l > 2 then m := l - 2 else m := 0;    (* number of middle characters *)
+    while m > 0 do
+    begin
+      temp := temp + (ord (istring [m+1]) * (ord (istring [m+2]) + 1));
+      m := m - 1;
+    end;
+    if temp < 0 then temp := -temp;
+    ldhash := (temp mod maxindex);
+  end;
+end;   (* of function ldhash *)
+
+
+
+function LOOKUP_ENAME(filesname : e_name; var itsit : sentryptr) : boolean;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Find the sfile descriptor, given the file name.
+       (*
+       (* Input Parameters:
+       (*    Filesname - the file's name.
+       (*
+       (* Output Parameters:
+       (*    Itsit - A famous ice cream, pointing to the file
+       (*               descriptor, IF the file name was found.
+       (*    Lookup_ename - returns whether the file was found.
+       (*
+       (*************************************************************)
+label 10;
+var
+   this_centry : centry;
+   whether_found : boolean;
+   curr_entry, left_togo : integer;
+   uppername : e_name;
+   junk : integer;
+begin
+   junk := OPEN_FILE(@catalog);
+   left_togo := catentries;
+   SHIFTNAME(filesname);
+   curr_entry := LDHASH(filesname, catentries);
+   FILLBUF( ord4(curr_entry) * sizeof(centry) );
+   whether_found := false;
+   repeat
+      MOVEMULTIPLE(sizeof(this_centry), ord4(@this_centry) );
+      uppername := this_centry.name;
+      SHIFTNAME(uppername);
+      if (this_centry.cetype = emptyentry) then
+         goto 10; {file not found}
+      if (filesname = uppername) and (this_centry.cetype = fileentry) then
+      begin
+         whether_found := true;
+         itsit := FIND_SENTRY(this_centry.sfile);
+         goto 10;
+      end;
+      left_togo := left_togo - 1;
+      curr_entry := curr_entry + 1;
+      if curr_entry=catentries then
+         begin
+            curr_entry := 0;
+            FILLBUF(0); {re-position to front of catalog}
+         end;
+   until left_togo = 0; {falls through ONLY when not found AND entire catalog FULL}
+
+ 10:
+   lookup_ename := whether_found;
+end; {of lookupename}
+
+
+
+procedure INITMEDIA {var bootdevice, firstblock : integer};
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize the lisa file system.
+       (*
+       (* Input Parameters:
+       (*   Firstblock - of the filesystem.
+       (*   Bootdevice - drive/logical volume to boot from.
+       (*
+       (* Output Parmeters:
+       (*   Ejectdev - 'Ldutil' unit var, so ejectable media
+       (*       can be at crash time.
+       (*
+       (*************************************************************)
+const
+   adr_loader_link = $204;      {adr of pointer to loader drivers, for use by OS}
+   BAD = -1;                    (* Generic bad value *)
+var
+   mddf : mddfptr;
+   sroot : sentryptr;
+   poker : ^integer;
+   lpoker : ^longint;
+begin
+   lpoker := pointer(adr_loader_link);  {link OS to assembler handling driver calls}
+   lpoker^ := ord(@ldrtrap);
+   driveselect := bootdevice;
+   ejectdev := driveselect;     {in case of loader crash}
+   DEVINIT(firstblock, driveselect); {initialize boot device/drivers}
+   block0 := firstblock;
+   READ_PAGE(0);        {buf := mddf, which is always at logical page 0}
+   mddf := @buf;
+   if (mddf^.mddfaddr <> 0) then TRAP(fserror);
+   bufsize := mddf^.datasize;
+   slist_addr := mddf^.slist_addr;
+   slist_packing := mddf^.slist_packing;
+   catentries := mddf^.rootmaxentries;
+   map_offset := mddf^.map_offset;
+   smalloffset := mddf^.smallmap_offset;
+   fs_version := mddf^.fsversion;
+   tree_depth := mddf^.tree_depth;
+   root_page := mddf^.root_page;
+   if root_page = BAD then TRAP(fserror);
+   if fs_version < btree_fsversion then {use conventional lookup}
+      begin
+         sroot := FIND_SENTRY(mddf^.rootsnum);
+         with sroot^ do
+         begin
+            catalog.hintaddr := hintaddr;
+            catalog.fileaddr := fileaddr;
+            catalog.filesize := filesize;
+         end;
+      end; {of reading (conventional) catalog}
+end; {of initmedia}
+
+
+
+function OPENINPUT { (var inputfile:filename) : boolean };
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Locate a file in the Lisa file system, and open it
+       (*     as standard input, positioning the read pointer to
+       (*     the front of the file.
+       (*
+       (* Input Parameters:
+       (*    Inputfile - the file's name.
+       (*
+       (* Output Parameters:
+       (*    Openinput - Returns whether the file was opened.
+       (*
+       (*************************************************************)
+var
+   found : boolean;
+   input_sentry : sentryptr;
+   wom : longint;       {write only memory}
+begin
+   if fs_version < btree_fsversion then {use conventional lookup}
+      found := LOOKUP_ENAME(inputfile, input_sentry)
+   else {use b_tree lookup}
+      LD_SEARCH(inputfile, found, input_sentry);
+   openinput := found;
+   if found then
+      wom := OPEN_FILE(input_sentry);
+end; { of openinput }
+
+
+
+procedure FIND_POSITION(block: absptr; var adr,len: absptr);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Given a block within a the standard input file, determine
+       (*    the page address of that block, and how many contiguous
+       (*    blocks are available from there.
+       (*
+       (* Input Parameters:
+       (*    block - position within std input file.
+       (*    adr - returns the page address.
+       (*    len - returns the number of contiguous pages from adr.
+       (*
+       (*************************************************************)
+var
+   abspage : integer;
+   nextentry : integer;
+   numb_pages : integer;
+begin
+   nextentry := 0;
+   abspage := 0;
+   repeat
+      if nextentry>ldmapmax then TRAP(fserror);
+      numb_pages := ld_filemap[nextentry].cpages;
+      if numb_pages=0 then TRAP(fserror);
+      if (abspage+numb_pages>block) then
+         begin
+            adr := ld_filemap[nextentry].address + (block - abspage);
+            if adr = 0 then TRAP(fserror);
+            len := numb_pages - (block - abspage);
+            EXIT(find_position);
+         end
+      else
+         begin
+            nextentry := nextentry + 1;
+            abspage := abspage + numb_pages;
+         end;
+   until false;  {exits explicitly within loop}
+end; {of FIND_POSITION}
+
+
+procedure FILLBUF {byteadr:absptr};
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Fills the read buffer from standard input.
+       (*
+       (* Input Parameters:
+       (*    Byteadr - position to begin reading within the file.
+       (*
+       (*************************************************************)
+var
+   old_curr_page : longint;
+   blocknumb : longint;
+   length : longint;
+begin
+   old_curr_page := curr_page;
+   curr_page := byteadr div bufsize;
+   if (curr_page<0) or (curr_page>last_page) then
+      TRAP(fserror);
+   nextbyte := byteadr - curr_page * bufsize;
+   if curr_page<>old_curr_page then
+   begin
+      FIND_POSITION(curr_page, blocknumb, length);
+      READ_PAGE(blocknumb)
+   end; {of had to read a new page of the file in to memory}
+end; { of fillbuf }
+
+
+
+function GETBYTE { returns byte } ;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read a byte from standard input.
+       (*
+       (* Output Parameters:
+       (*    Getbyte - Returns the byte read.
+       (*
+       (*************************************************************)
+begin
+   if nextbyte = bufsize then
+      FILLBUF( (curr_page+1) * bufsize);
+   getbyte :=buf[nextbyte];
+   nextbyte := nextbyte + 1;
+end;  { of getbyte }
+
+
+
+function GETWORD { returns integer } ;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read a word from standard input.
+       (*
+       (* Output Parameters:
+       (*    Getword - Returns the word read
+       (*
+       (*************************************************************)
+const
+   shift1byte = $100;     {use with ord4(shift1byte) to force LONG math}
+var
+   lastbyte : integer;
+   value : integer;
+begin
+   value := GETBYTE * ord4(shift1byte);
+   lastbyte := GETBYTE;
+   if lastbyte < 0 then
+      lastbyte := lastbyte + ord4(shift1byte);{undo sign extend of last byte}
+   getword := value + lastbyte;
+end;  { of getword }
+
+
+
+function GETLONG { returns long integer } ;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read a long integer from standard input.
+       (*
+       (* Output Parameters:
+       (*    Getlong - Returns the value read;
+       (*
+       (*************************************************************)
+const
+   shift2bytes = $10000;
+var
+   value : longint;
+   lastword : longint;
+begin
+   value := GETWORD * ord4(shift2bytes);
+   lastword := GETWORD;
+   if lastword < 0 then
+      lastword := lastword + ord4(shift2bytes);   {undo sign extend}
+   getlong := value + lastword;
+end;  { of getlong }
+
+
+
+procedure MOVEMULTIPLE { bytecount : longint; destination : absptr } ;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read a variable number of bytes from standard input
+       (*       to memory.  Relatively small requests are fulfilled
+       (*       from the buffer.  A request of more than a block more
+       (*       than what is available from the buffer is read directly
+       (*       from disk to the destination address.
+       (*
+       (* Input Parameters:
+       (*    Bytecount - number of bytes to read.
+       (*    Destination - Where to store them.
+       (*
+       (*************************************************************)
+var
+   ptr1, ptr2: ^integer;
+   status : integer;
+   movecount : integer;
+   blocknumb, length, pages, bytes_read : absptr;
+begin
+   repeat
+      movecount := bufsize - nextbyte;
+      if movecount > bytecount then movecount := bytecount;
+      if movecount>0 then
+         MOVER( ord4(@buf[nextbyte]), destination, movecount);
+      destination := destination + movecount;
+      bytecount := bytecount - movecount;
+      nextbyte := nextbyte + movecount;
+      while bytecount >= bufsize do  {DONT read into memory unless}
+         begin                       {  the request is for pages.}
+            if (curr_page<0) or (curr_page>last_page) then
+               TRAP(fserror);
+            FIND_POSITION(curr_page+1, blocknumb, length);
+            ptr1 := pointer(destination);
+            ptr2 := @hdr;
+            pages := bytecount DIV bufsize;         {calc number of pages needed}
+            if (length>pages) then length := pages; {calc number of pages to read}
+            if length>0 then
+               begin
+                  READ_SEQ(status, driveselect, block0+blocknumb,
+                                length, ptr1^, ptr2^);
+                  if (status<>0) then
+                     TRAP(bootdeviceflop);
+                  bytes_read := length * bufsize;
+                  destination := destination + bytes_read;
+                  bytecount := bytecount - bytes_read;
+                  blocknumb := blocknumb + length;
+                  curr_page := curr_page + length;
+               end;
+         end;
+      if bytecount > 0 then
+         FILLBUF( (curr_page+1) * bufsize);
+   until bytecount = 0;
+end; { of movemultiple }
+
+
+procedure DRIVER_CALL(*var parms: fake_parm*);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Handles all the driver calls, made by the OS, to init bootable CDs.
+       (*
+       (*************************************************************)
+var
+   ptr1, ptr2: ^integer;
+begin
+with parms do
+   begin
+      case opcode of
+         call_open: result := OPENINPUT(path);
+         call_fill: FILLBUF(addr);
+         call_byte: bytevalue := GETBYTE;
+         call_word: wordvalue := GETWORD;
+         call_long: longvalue := GETLONG;
+         call_move: MOVEMULTIPLE(count, addr);
+         call_read:
+            begin
+               ptr1 := pointer(addr);
+               ptr2 := pointer(header);
+               READ_SEQ(error, driveselect, block0+blok, count, ptr1^, ptr2^);
+            end;
+         otherwise TRAP(ill_opcode);
+      end; {of case}
+   end; {of with}
+end; {of driver_calls}
+
+
+end. { of unit ldlfs}
+ÿ

@@ -1,0 +1,475 @@
+
+
+; ASSEMBLY LANGUAGE SUPPORT ROUTINES FOR MEMORY MANAGER
+; Copyright 1983, 1984, Apple Computer, inc.
+
+
+               .INCLUDE source/pascaldefs.text  ; EQUs for Pascal structures
+
+               .REF     MACSBUG
+
+               .REF     EXPAND_POOLSPACE
+               .REF     SYS_CALLED
+               .REF     ALARMRELATIVE
+               .REF     SYSTEM_ERROR
+               .REF     INTSOFF
+               .REF     INTSON
+               .REF     GETSPACE
+               .REF     ENQUEUE
+               .REF     SIGNAL_SEM
+
+               .IF      DEBUG1
+               .REF     LOG
+               .REF     MAKE_OC
+               .ENDC
+
+;--------------------------------------------------------
+; Error numbers
+E_MMBASE       .EQU     500
+E_NOFREEZE     .EQU     10
+
+;--------------------------------------------------------
+; SDB Offsets
+MEMCHAIN       .EQU     0
+MEMADDR        .EQU     8
+MEMSIZE        .EQU     10
+LOCKCOUNT      .EQU     12
+SDBTYPE        .EQU     13
+SDBSTATE       .EQU     14
+PAD1           .EQU     15
+LENGTH         .EQU     16
+PACKEDLEN      .EQU     20
+DISCADDR       .EQU     24
+NUMBOPEN       .EQU     30
+PAD2           .EQU     31
+NEWLENGTH      .EQU     32
+DISCLENGTH     .EQU     34
+IO_COUNT       .EQU     38
+FREEZE_COUNT   .EQU     39
+SRBRP          .EQU     40
+
+;----------------------------------------------------------
+; SEGSTATES bit positions
+MEMORYF        .EQU     7
+MOTIONF        .EQU     6
+DELETEF        .EQU     5
+PCB_WF         .EQU     4
+SWAPERRF       .EQU     3
+OVERLAYF       .EQU     2
+RELEASEF       .EQU     1
+RES1           .EQU     0
+
+;-----------------------------------------------------------
+;MMRB Offsets
+HD_QIOREQ_LIST .EQU     0
+SEG_WAIT_SEM   .EQU     4
+;-----------------------------------------------------------
+;QIOREQ Offsets
+QIOREQ_LIST    .EQU     0
+SDB_ADDR       .EQU     4
+PIOREQ         .EQU     8
+SZ_QIOREQ      .EQU     12             ; size of QIOREQ record
+
+SHFTCNT        .EQU     17             ; amount to shift out seg offset
+SEGMASK        .EQU     $7F            ; mask to extract seg number
+OFFMASK        .EQU     $1FFFF         ; mask to extract seg offset
+;
+; function     EXP_POOLSPACE(size: int2; b_area: absptr): boolean
+;
+;    (* verify that a free space pool can be expanded *)
+;    (*  - interrupts must be on                      *)
+;    (*  - must not be on supervisor stack            *)
+;    (*  - size is the minimum size expansion needed  *)
+;    (*  - b_area is the base of the pool to be grown *)
+;    (*  NOTE: can only be called by GETSPACE         *)
+
+               .PROC    EXP_POOLSPACE
+
+               .DEF     SEG_OF_CALLER
+               .DEF     UNPACKCODE
+               .DEF     INIT_BP
+               .DEF     CREATE_BP
+               .DEF     SET_BP
+               .DEF     CLR_BP
+
+               .IF      DEBUG1
+               .DEF     ICSAMPLER
+               .DEF     LOGMARK
+               .DEF     UNMAPCODE
+               .ENDC
+
+SIZE           .EQU     12             ; input parameter size
+B_AREA         .EQU     8              ; input parameter b_area
+RETURN         .EQU     14             ; function return
+NOGOOD         .EQU     $2000          ; supv bit in SR
+;
+               LINK     A6,#0
+               CLR.W    -(SP)          ; function return = false
+               MOVE     SR,D0          ; get status register
+               ANDI.W   #NOGOOD,D0     ; test supervisor bit
+               BNE      @1             ; branch if on supervisor stk
+               MOVE.L   SIZE(A6),-(SP) ; get size
+               MOVE.L   B_AREA(A6),-(SP) ; get b_area
+               JSR      EXPAND_P       ; call EXPAND_POOLSPACE
+@1             MOVE.W   (SP)+,RETURN(A6) ;function return
+               UNLK     A6
+               MOVE.L   (SP)+,A0       ; get return address
+               ADDQ.L   #6,A7          ; pop input parameter
+               JMP      (A0)           ; return
+
+;-------------------------------------------------------
+;
+; function SEG_OF_CALLER;
+;
+;  (* returns the segment number of the procedure that
+;     called the caller of SEG_OF_CALLER *)
+;
+;     When SYS_CALLED = TRUE assumes stack is in the following form:
+;
+;             PC       seg # desired
+;            LINK
+;             .
+;             .
+;             0        word for return value
+;             PC       call to seg_of_caller
+;
+;     When SYS_CALLED = FALSE assumes return PC is in SCB.PCVALUE
+;-------------------------------------------------------
+;
+;
+SEG_OF_CALLER  CLR.W    -(SP)          ; function return
+               JSR      SYS_CALLED     ;
+               MOVE.W   (SP)+,D0       ; get function return
+               BNE.S    @1             ; jump if called within os
+               ;
+               ; called from user state - get pc from SCB
+               ;
+               MOVEA.L  SGLOBAL,A0     ; ptr to sysglobal
+               MOVEA.L  B_SYSLOC(A0),A0; ptr to syslocal
+               LEA      SCB(A0),A0     ; ptr to SCB
+               MOVE.L   PCVALUE(A0),D0 ; get caller's PC
+               BRA.S    @2             ; go extract segment #
+               ;
+               ; called from within OS - get pc from the stack
+               ;
+@1             MOVE.L   4(A6),D0       ; get caller's return PC
+               ;
+               ; extract segment #
+               ;
+@2             MOVEQ    #SHFTCNT,D1    ; shift count
+               LSR.L    D1,D0          ; get rid of seg offset
+               ANDI.W   #SEGMASK,D0    ; extract seg number
+               MOVE.W   D0,4(SP)       ; return seg number
+               RTS                     ; return
+
+;
+;   Procedures for supporting low level debugging functions of lisaBug
+;
+;
+INITADDR       .EQU     $4B0           ; address of Init_BP
+CREATEADDR     .EQU     $4B4           ; address of Create_BP
+SETADDR        .EQU     $4B8           ; address of Set_BP
+CLRADDR        .EQU     $4BC           ; address of Clr_BP
+;
+;
+;   procedure Init_BP (DCT_addr, anyBPs_addr : int4);
+;     { procedure to jump to lisaBug procedure to initialize break point
+;       facility for the OS. }
+;
+INIT_BP        MOVEA.L  INITADDR,A0    ; get address of Init_BP in A0
+               JMP      (A0)           ; go there
+;
+;   procedure Create_BP (proc_id, BP_addr : int4;  var error : int2);
+;     { procedure to jump to lisaBug procedure to create a break point at the
+;       specified logical address for the specified process.  Error returns are
+;         0 - ok
+;         1 - break point already exists
+;         2 - lisaBug table overflow
+;         3 - specified address is odd
+;     }
+;
+CREATE_BP      MOVEA.L  CREATEADDR,A0  ; get address of Create_BP in A0
+               JMP      (A0)           ; go there
+
+;
+;   procedure Set_BP (proc_id : int4);
+;     { procedure to jump to lisaBug procedure to establish break points for
+;       the specified process. }
+;
+SET_BP         MOVEA.L  SETADDR,A0     ; get address of Set_BP in A0
+               JMP      (A0)           ; go there
+
+;
+;   procedure Clr_BP (proc_id : int4);
+;     { procedure to jump to lisaBug procedure to clear break points for the
+;       specified process. }
+;
+CLR_BP         MOVEA.L  CLRADDR,A0     ; get address of Clr_BP in A0
+               JMP      (A0)           ; go there
+
+
+
+               .IF      DEBUG1
+;   procedure ICSAMPLER;
+;     { record the sample for segment and pc }
+;     { this procedure invoked by timer alarm}
+;
+
+MMTRACE        .EQU     $214             ; memory location of MMTRACE field
+SPICSDB        .EQU     12               ; statRec offset to spic_sdb
+ALARM          .EQU     16               ; statRec offset to alarm
+;
+APSEGS         .EQU     0                ; spicRec offset to apsegs
+OSSEGS         .EQU     1280             ; spicRec offset to ossegs
+BUCKETSZ       .EQU     2560             ; spicRec offset to bucketsize
+SPICGID        .EQU     2562             ; spicRec offset to gid
+ALARMDLY       .EQU     2566             ; spicRec offset to alarmdelay
+;
+BKTOFFSET      .EQU     0                ; spicSarray offset to bucket offset
+
+
+ICSAMPLER      MOVEA.L  SGLOBAL,A0       ; b_sysglobal_ptr
+               MOVEA.L  SYSA5(A0),A5     ; setup A5
+               MOVE.L   STATADDR(A0),A0  ; get statRec addr
+               MOVE.L   SPICSDB(A0),A1   ; get SpicSdb addr
+               BTST     #6,SDBSTATE(A1)  ; test sdbstate.motionF
+               BEQ      @1               ; jump if not in motion
+@9             MOVE.W   ALARM(A0),-(SP)  ; alarm number
+               MOVEQ    #10,D0
+               MOVE.L   D0,-(SP)         ; 10ms delay
+               JSR      ALARMRELATIVE    ; call AlarmRelative
+               BRA      @100             ; exit
+@1             MOVEA.L  #MMTRACE,A2
+               CMPI.W   #$64,(A2)        ; Should we be sampling?
+               BNE      @9               ; jump if no
+               MOVE.W   MEMADDR(A1),D0   ; get sdb.memaddr
+               LSL.L    #8,D0
+               LSL.L    #1,D0            ; memaddr*512
+               ADDI.L   #REALMMU,D0      ; realmmu+memaddr*512
+               MOVE.L   D0,A1            ; spicRec addr
+               MOVE.L   SPICGID(A1),D1   ; get spicRec.gid
+               BEQ      @90              ; jump if not sampling yet
+               MOVEA.L  SGLOBAL,A2       ; b_sysglobal_ptr
+               CMPI.L   #-1,D1           ; sampling regardless of process?
+               BNE      @5               ; jump if sampling specific process
+               MOVE.L   C_PCB(A2),D2     ; c_pcb_ptr
+               BEQ      @2               ; no current process so sample in OS
+               MOVE.L   D2,A2
+               TST.B    DOMAIN(A2)       ; test domain of process
+               BEQ      @2               ; in domain 0 so sample in OS
+               BRA      @90              ; in user code so no sample taken
+@5             MOVE.L   C_PCB(A2),D2     ; c_pcb_ptr
+               BEQ      @90              ; jump if no process executing
+               MOVE.L   D2,A2
+               CMP.L    GLOB_ID(A2),D1   ; sample id = c_pcb.id
+               BNE      @90              ; jump if not correct process
+               TST.B    DOMAIN(A2)       ; test domain of process
+               BEQ      @2               ; jump if in domain 0
+               LEA      APSEGS(A1),A2    ; spicSarray addr
+               BRA      @3
+@2             LEA      OSSEGS(A1),A2    ; spicSarray addr
+@3             MOVE.L   $70(SP),D1       ; get PC at time of interrupt
+               MOVE.L   D1,D4            ; copy PC
+               MOVEQ    #SHFTCNT,D3
+               LSR.L    D3,D1            ; shift out offset
+               ANDI.W   #SEGMASK,D1      ; extract seg #
+               MULS     #10,D1           ; size of spicSarray entry
+               ADDA     D1,A2            ; spicSarray[segno]
+               MOVE.L   BKTOFFSET(A2),D2 ; get offset to bucket
+               BEQ      @90              ; jump if not sampling segment
+               MOVE.L   D2,A2
+               ADDA.L   D0,A2            ; spicRec addr + offset
+               ANDI.L   #OFFMASK,D4      ; extract PC offset
+               DIVS     BUCKETSZ(A1),D4  ; PC offset div bucketsize
+               EXT.L    D4
+               ASL.L    #2,D4            ; (PCoffset div bucketsize)*4
+               ADDA.L   D4,A2            ; bucket addr
+               ADDQ.L   #1,(A2)          ; increment sample count
+@90            MOVE.W   ALARM(A0),-(SP)  ; alarm number
+               MOVE.L   ALARMDLY(A1),-(SP); alarmdelay
+               JSR      ALARMRELATIVE    ; call AlarmRelative
+@100           RTS                       ; return
+               .ENDC
+
+
+               .IF      DEBUG1
+;  procedure LOGMARK;
+;    (* Log a user marker in system.log file *)
+;
+LOGMARK        LINK     A6,#0
+               MOVEM.L  D0-D7/A0-A5,-(SP); save all registers
+               MOVEA.L  SGLOBAL,A0       ; get sysglobal base
+               MOVE.L   SYSA5(A0),A5     ; setup A5 for Pascal
+               CLR.W    -(SP)            ; cell for errnum
+               MOVE.L   SP,-(SP)         ; address of errnum
+               PEA      EVENT            ; event to be logged
+               JSR      LOG              ; log the user event
+               MOVE.W   (SP)+,D0         ; pop errnum
+               MOVEM.L  (SP)+,D0-D7/A0-A5; restore registers
+               UNLK     A6               ;
+               RTS                       ; return
+               .ASCII   'LOGMARK '
+EVENT          .WORD    $7F00            ; user log marker
+               .BLOCK   10,0
+               .ENDC
+
+               .IF      DEBUG1
+;  procedure UNMAPCODE;
+;    (* make every code segment in the system an overlay candidate *)
+;
+UNMAPCODE      LINK     A6,#0
+               MOVEM.L  D0-D7/A0-A5,-(SP); save all registers
+               MOVEA.L  SGLOBAL,A0       ; get sysglobal base
+               MOVE.L   SYSA5(A0),A5     ; setup A5 for Pascal
+               MOVE.L   STATADDR(A0),A3  ; get statrec address
+               MOVE.L   4(A3),D5         ; get log sdb address (STOPPER)
+               BEQ.S    @3               ; stop if logging shut down
+               MOVE.L   D5,A4
+@1             MOVE.L   (A4),A4          ; get next sdb address
+               CMPI.B   #1,13(A4)        ; sdbtype = code?
+               BNE.S    @2               ; jump if no
+               MOVE.L   A4,-(SP)         ; push sdb address
+               JSR      MAKE_OC          ; call Make_OC
+@2             CMP.L    A4,D5            ; next sdb = stopper?
+               BNE.S    @1               ; jump if no
+@3             MOVEM.L  (SP)+,D0-D7/A0-A5; restore registers
+               UNLK     A6               ;
+               RTS                       ; return
+               .ASCII   'UNMAPCOD'
+               .ENDC
+
+               .INCLUDE SOURCE/UNPACK.TEXT
+
+
+;procedure FREEZE_SEG(* var errnum: int2; c_sdb: absptr; offset: int4;
+;                           ioreq_addr: absptr; var buffaddr: absptr *);
+;
+;
+;       (**********************************************************)
+;       (*                                                        *)
+;       (* Description:                                           *)
+;       (*    Freezes the  segment in memory.  Once frozen the    *)
+;       (*    segment cannot be moved or swapped until it is un-  *)
+;       (*    frozen.  If the segment is in motion then the freeze*)
+;       (*    will not take place.  The ioreq will be queued until*)
+;       (*    the freeze can take place, at which time the driver *)
+;       (*    will be notified via the RESTART_IO call.  When the *)
+;       (*    segment is frozen the offset will be transformed    *)
+;       (*    into an address which can be used by the driver.    *)
+;       (*                                                        *)
+;       (* Input Parameters:                                      *)
+;       (*    c_sdb  - the segment to be frozen.                  *)
+;       (*    offset - the seg relative address of the io buffer  *)
+;       (*    ioreq_addr - a ptr to the ioreq needing the segment *)
+;       (*                 frozen.  If a freeze cannot take place *)
+;       (*                 this ptr will be saved and returned to *)
+;       (*                 the driver when the freeze can be tried*)
+;       (*                 again.                                 *)
+;       (*                                                        *)
+;       (* Output Parameters:                                     *)
+;       (*    errnum - indicates the success of the freeze request*)
+;       (*    buffaddr - offset transformed into an address which *)
+;       (*               is valid for the driver.                 *)
+;       (*                                                        *)
+;       (* Error Conditions:                                      *)
+;       (*    errnum = 0 Successful lock                          *)
+;       (*           = 1 Segment in motion - unable to freeze     *)
+;       (*                                                        *)
+;       (**********************************************************)
+
+              .PROC    FREEZE_SEG
+BUFFADDR      .EQU     4
+IOREQ_ADDR    .EQU     8
+OFFSET        .EQU     12
+C_SDB         .EQU     16
+ERRNUM        .EQU     20
+
+NO_INTS       .EQU     $07000000
+
+               MOVEM.L  4(SP),D0-D2/A0-A1
+               BTST     #MOTIONF,SDBSTATE(A0)   ;Seg in motion?
+               BNE      @100
+               CLR.W    (A1)                    ;Errnum = 0
+               MOVE.W   MEMADDR(A0),D1
+               EXT.L    D1
+               ADD.W    D1,D1                   ;memaddr*2
+               ASL.L    #8,D1                   ;memaddr*512
+               ADD.L    D2,D1                   ;+offset
+               ADDI.L   #REALMMU,D1             ;+realmmu offset
+               MOVE.L   D0,A1
+               MOVE.L   D1,(A1)                 ;return bufaddr
+               ADDQ.B   #1,FREEZE_COUNT(A0)
+@10            MOVE.L   (SP)+,A0
+               LEA      20(SP),SP
+               JMP      (A0)
+@100           ;Segment is in motion
+               SUBA.W   #6,SP                   ;Long for return/word for function
+               MOVE.W   #SZ_QIOREQ,-(SP)
+               MOVE.L   SGLOBAL,-(SP)
+               PEA      8(SP)
+               JSR      GETSPACE
+               MOVE.W   (SP)+,D0
+               BEQ      @200                    ;Unable to get sysglobal space
+               MOVE.L   (SP)+,A0
+               MOVE.L   C_SDB(SP),SDB_ADDR(A0)
+               MOVE.L   IOREQ_ADDR(SP),PIOREQ(A0)
+               MOVE.L   D3,-(SP)                ;Save D3
+               MOVE.L   A0,D3                   ;Save pioreq ptr
+               MOVEA.L  SGLOBAL,A1
+               MOVE.L   MMRB_ADDR(A1),D2
+               MOVE.L   #NO_INTS,-(SP)          ;1 word return/1 word int level
+               PEA      2(SP)
+               JSR      INTSOFF
+               MOVE.L   D3,-(SP)
+               MOVE.L   D2,A1
+               PEA      HD_QIOREQ_LIST(A1)
+               MOVE.L   SGLOBAL,-(SP)
+               JSR      ENQUEUE
+               JSR      INTSON
+               MOVE.L   (SP)+,D3                ;Restore D3
+               MOVE.L   ERRNUM(SP),A0
+               MOVE.W   #E_MMBASE+E_NOFREEZE,(A0)
+               BRA      @10
+@200           ;Unable to get sysglobal space
+               MOVE.W   #10582,-(SP)
+               JSR      SYSTEM_ERROR
+
+;procedure UNFREEZE_SEG(* c_sdb: absptr *);
+;
+;
+;       (**********************************************************)
+;       (*                                                        *)
+;       (* Description:                                           *)
+;       (*    The freeze count of the segment 'c_sdb' will be     *)
+;       (*    decremented.  If freeze_count = 0 then a process    *)
+;       (*    waiting for count=0 will be unimpeded.              *)
+;       (*                                                        *)
+;       (* Input Parameters:                                      *)
+;       (*    c_sdb  - the sdb ptr to the segment to be unfrozen. *)
+;       (*                                                        *)
+;       (**********************************************************)
+
+              .PROC    UNFREEZE_SEG
+C_SDB         .EQU      4
+
+               MOVE.L   C_SDB(SP),A0
+               SUBQ.B   #1,FREEZE_COUNT(A0)
+               BNE.S    @1
+               BCLR     #PCB_WF,SDBSTATE(A0)    ;Process waiting?
+               BNE      @2                      ;Skip if yes
+@1             MOVE.L   (SP)+,A0
+               ADDQ     #4,SP
+               JMP      (A0)
+@2             MOVE.L   SGLOBAL,A0
+               MOVE.L   MMRB_ADDR(A0),A0
+               PEA      SEG_WAIT_SEM(A0)
+               JSR      SIGNAL_SEM
+               BRA.S    @1
+
+
+               .END
+
+
+
+
+ÿ

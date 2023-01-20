@@ -1,0 +1,501 @@
+
+(* File L:F32Input, Version 16 October 1982.  *)
+
+function f32_integral ; external ;
+function f32_fraction ; external ;
+function f32_ilogb ; external ;
+function f32_scale ; external ;
+function f32_kind  ; external ;
+function f32_minus ;  external ;
+
+procedure x%sto ( r : real ; var x : oldsextended ) ; external ;
+function  x%tos  ( var x : oldsextended ) : real ; external ;
+function x%comp  ( var x, y : oldsextended ) : integer ; external ;
+procedure x%mul  ( var x, y, Z : oldsextended ) ; external ;
+procedure x%div  ( var x, y, z : oldsextended ) ; external ;
+procedure x%int  ( var x, z : oldsextended ) ; external ;
+procedure x%dec  ( var s : fp_string ; var x : oldsextended ; var e : integer ) ;
+        external ;
+procedure x%todec ( var x : oldsextended ; var s : fp_string ) ; external ;
+procedure x%pot  ( p : integer ; var x : oldsextended ) ; external ;
+
+(*$S f32 *)
+
+procedure f32postinput ( name : fp_string ; var s : fp_string ; var x : real ) ;
+        (* Routine to set up trapping for a Pascal Real Arithmetic ascii to real
+        routine. *)
+
+var
+r : fp_traprecord ;
+
+begin (* f32postinput *)
+with r do
+        begin (* with *)
+        gettexcepset( es ) ;
+        optype1 := tfp_string ;
+        op1 :=  @ s  ;
+        op2 := nil ;
+        resulttype := tfp_real ;
+        result :=  @ x   ;
+        procname := @ name ;
+        fp_postoperation ( r) ;
+        end   (* with *) ;
+end   (* f32postinput *) ;
+
+procedure f32postoutput ( name : fp_string ; var x : real ; var s : fp_string ) ;
+        (* Routine to set up trapping for a Pascal Real Arithmetic real to ascii
+        routine. *)
+
+var
+r : fp_traprecord ;
+
+begin (* f32postoutput *)
+with r do
+        begin (* with *)
+        gettexcepset( es ) ;
+        optype1 := tfp_real   ;
+        op1 :=  @ x  ;
+        op2 := nil ;
+        resulttype := tfp_string ;
+        result :=  @ s   ;
+        procname := @ name ;
+        fp_postoperation ( r) ;
+        end   (* with *) ;
+end   (* f32postoutput *) ;
+
+procedure asciireal 
+        ( Fileio : boolean ; var Infile : text ; 
+        var S :fp_string ; First, Last : integer ; var Next : integer ;
+        var Z : real ; var Error : boolean ) ;
+
+(* Converts characters to Z, considering zeros, denormalized,
+infinities, and NANs.
+        If Fileio is true, reads characters from file Infile and converts
+to Z.  All characters read are put in S.
+        If Fileio is false, converts S to Z;
+Starts scanning at S[First] and does not look beyond S[Last].
+Next is set to the first character that was not scanned.
+If the entire string is scanned, Next is set to length(S)+1.
+        Error is set true if the entire input is rejected.
+If Error is True then Z will be NaN'11'.
+        Valid numeric syntax is any number of leading blanks followed by
+optional sign, optional digits, optional decimal point, optional digits,
+optional exponent field.  The last consists of E followed by optional
+sign and optional digits.
+        Valid syntax for infinities is any number of leading blanks
+followed by a string of two or more identical sign characters,
+either +++... or ---...
+        Valid syntax for NANs is any number of leading blanks,
+optional sign, the letters NAN in any case, then an optional
+string delimited by quotes '.
+        The NaN significand string is to be interpreted as a hex significand.
+The maximum significand string is NaN'7FFF:FF' for real.
+The colon separates bits 15 and 16 of the significand, counting from the
+left.
+If the NaN significand string can't be so interpreted, NaN'12' is returned,
+but Error is False.
+*)
+
+type
+
+stringclass = (nonnumeric, truezero, nonzero) ; (* types of fp_string *)
+
+var
+current : char ; (* Current input character *)
+class : stringclass ;
+sub : fp_string ;
+casefound, xsign, esign : boolean ;
+ee, ie : integer ;
+i, zcount, sp, size, thelast : integer ;
+xi, pt : oldsextended ;
+ts : integer ;
+fps : fp_statustype ;
+trapcoming : boolean ;
+
+procedure f32%concatchar ( var s : fp_string ; c : char ) ;
+        (* Appends c to s. *)
+begin
+s := concat(s,' ') ;
+s[length(s)] := c ;
+end ;
+
+function upcase ( c : char ) : char ;
+begin
+if ('a' <= c) and (c <= 'z') then upcase := chr(ord(c)-32) else upcase := c ;
+end ;
+
+function digital : boolean ;
+        (* Returns true if current character is in '0'..'9' *)
+begin (* digital *)
+        digital := ('0' <= current) and (current <= '9') ;
+end   (* digital *) ;
+
+procedure bump ; 
+begin (* bump *)
+if fileio then 
+        begin (* read from file *)
+        if eoln(infile) then current := '~' else 
+                begin
+                read( infile, current ) ;
+                f32%concatchar( s, current ) ;
+                current := upcase(current) ;
+                end ;
+        end   (* read from file *)
+        else
+        begin
+        if sp <= thelast then 
+                begin
+                current := upcase(s[sp]) ;
+                sp := sp + 1 ;
+                end 
+                else
+                begin
+                current := '~' ;
+                end ;
+        end ;
+end ;
+
+function makeinf : real ;
+        (* Returns +Infinity.  *)
+var
+l1, l2 : longint ;
+r : record
+case boolean of
+false : ( rr : real ) ;
+true  : ( ri : longint ) ;
+end ;
+
+begin
+l1 := 32640 ; l2 := 65536 ;
+r.ri := l1 * l2  ; (* Make 7F800000 *)
+makeinf := r.rr ;
+end ;
+
+function makenan ( s : fp_string ) : real ;
+        (* Returns NAN with significand described by s.  *)
+const
+maxlerror = $7FFF ; (* Maximum NAN significand.  *)
+type
+nib = 0..15 ;
+var
+lc2, lc3 : longint ; (* Constants.  *)
+
+rx : record
+case boolean of
+false : ( r : real ) ;
+true  : ( l : longint ) ;
+end ;
+is : integer ;
+lerror, lindex : longint ;
+lextra : boolean ;
+lfactor : 0..16 ;
+nindex : 0..2 ;
+
+procedure bump ; (* Moves pointer *)
+begin is := is + 1 ; end ;
+
+function gethexit : nib  ; (* Gets hexit and moves pointer *)
+begin (* gethexit *)
+if ('0' <= s[is]) and (s[is] <= '9')  then
+        gethexit := ord(s[is]) - 48
+else
+        gethexit := ord(s[is]) - 55 ;
+bump ;
+end   (* gethexit *) ;
+
+function hexset : boolean ;
+        (* Returns true if s[is] is a hex character.  *)
+var c : char ;
+begin (* hexset *)
+c := s[is] ;
+hexset := ( ('0' <= c) and (c <= '9') ) or ( ('A' <= c) and (c <= 'F') ) ;
+end   (* hexset *) ;
+
+begin
+lc2 := 32640 ; lc3 := 65536 ;
+s := concat(s,'~') ; (* Add delimiter.  *)
+is := 1 ;
+lerror := 0 ;
+while hexset and (lerror < maxlerror) do
+        begin
+        lerror := 16 * lerror + gethexit ;
+        end ;
+lindex := 0 ; lextra := false ;
+if s[is] = ':' then
+        begin (* Supplemental field *)
+        bump ;
+        lfactor := $10 ;
+        while (lfactor > 0) and (hexset) do
+                begin (* Get index hexit *)
+                lindex := lindex + lfactor * gethexit ;
+                lfactor := lfactor div $10 ;
+                end   (* Get index hexit *) ;
+        while hexset do 
+                begin (* Get extra hexit *)
+                if s[is] <> '0' then lextra := true ;
+                bump ;
+                end   (* Get extra hexit *) ;
+        end   (* Supplemental field *) ;
+if (is <> length(s)) or ( lerror > maxlerror) or lextra 
+        or ((lerror+lindex) = 0) then  
+        begin (* Bad input *)
+        lerror := nanascnan ;  
+        lindex := 0 ;
+        end   (* Bad input *) ;
+with rx do 
+        begin
+        l :=  lc2 * lc3  + $100 * lerror + lindex ;
+        makenan := r ;
+        end ;
+end ;
+
+begin
+statusprelude ( fps ) ;
+if fileio then 
+        begin (* initialize file *)
+        s := '' ;
+        end   (* initialize file *)
+        else
+        begin (* initialize string *)
+        sp := first ;
+        if sp > length(s) then sp := 1 ;
+        thelast := length(s) ;
+        if thelast > last then thelast := last ;
+        end   (* initialize string *) ;
+bump ; (* Get first character.  *)
+class := nonnumeric ;
+error := false ;
+xsign := false ;
+
+while current = ' ' do bump ; (* Remove leading blanks.  *)
+
+if current = '+' then bump else if current = '-' then 
+        begin 
+        (* handle negative *)
+        xsign := true ;
+        bump
+        end ;
+
+casefound := false ; (* Will be set true if we find a INF or NAN.  *)
+case current of
+'+' : begin (* Positive infinity? *)
+        casefound := true ;
+        if xsign then 
+                begin
+                error := true ;
+                end 
+                else 
+                begin
+                while current = '+' do bump ;
+                z := makeinf ;
+                end ;
+        end ;
+
+'-' : begin (* Negative infinity? *)
+        casefound := true ;
+        if xsign then 
+                begin
+                while current = '-' do bump ;
+                z :=  makeinf ;
+                end 
+                else 
+                begin
+                error := true ;
+                end ;
+        end ;
+
+'N' : begin (* NAN? *)
+        casefound := true ;
+        error := true ; (* Easiest to assume worst.  *)
+        bump ;
+        if current = 'A' then 
+        begin (* NA *)
+        bump ;
+        if current = 'N' then 
+        begin (* NAN *) 
+        bump ;
+        sub := '' ;
+        error := false ;
+        if current = '''' then 
+                begin (* NAN' *)
+                bump ;
+        while (current <> '''') and (' ' <= current) and (current <= '~')   do 
+                        begin (* printing *)
+                        if current <> ' ' then f32%concatchar(sub,upcase(current)) ;
+                        bump ;
+                        end   (* printing *) ;
+                if current = '''' then bump ;
+                end   (* NAN' *) ;
+        end   (* NAN *) ;
+        z := makenan(sub) ;
+        end   (* NA *) ;
+        end   (* NAN? *);
+
+end (* case *) ;
+
+if not casefound then 
+        begin (* It's a number?  *)
+ee := 0 ;
+ie := 0 ;
+sub := '' ;
+while current = '0' do 
+        begin
+        class := truezero ;
+        bump ; (* delete leading zeros *)
+        end ;
+while digital  do 
+        begin (* digits before point *)
+        class := nonzero ;
+        f32%concatchar(sub, current) ;
+        bump
+        end ;
+if current = '.' then 
+        begin (* check for point *)
+        bump ;
+        while digital do 
+                begin (* process digits after point *)
+                if (current <> '0') then class := nonzero 
+                else if class = nonnumeric then class := truezero ;
+                if class <> truezero then f32%concatchar( sub, current) ;
+                ie := ie - 1 ;
+                bump ; 
+                end ;  
+        end ;
+if current = 'E' then 
+        begin 
+        bump ; (* handle E for exponent *)
+        esign := false ;
+        if current = '+' then bump else if current='-' then 
+                begin (* exponent sign *)
+                esign := true ;
+                bump
+                end ;
+        while digital do 
+                begin (* exponent digits *)
+                if ee >= 1000 then 
+                        begin
+                        ee := 999 ;
+                        error := true ;
+                        end ;
+                ee := 10 * ee + ord(current) - 48 ;
+                bump  
+                end ;
+        if esign then ee := - ee ;
+        end ;
+
+case class of 
+
+nonnumeric : 
+        begin (* nonnumeric *)
+        error := true ;
+        end   (* nonnumeric *) ;
+
+truezero : begin
+        z := 0 ;
+        end ;
+
+nonzero : begin
+        ee := ee + ie ;
+        if ee < 0 then begin
+                zcount := length(sub) ;
+                while sub[zcount] = '0' do zcount := zcount - 1 ;
+                zcount := length(sub) - zcount ; (* Zcount gets the number
+                        of trailing zeros.  *)
+                if zcount > (-ee) then zcount := -ee ;
+                if zcount > 0 then 
+                        begin (* Clip some trailing zeros.  *)
+                        ee := ee + zcount ;
+                        delete( sub, length(sub)-zcount+1, zcount ) ;
+                        end ;
+                end ;
+
+        if ee > 0 then begin
+                zcount := 9 - length(sub) ;
+                if ee < zcount then zcount := ee ;
+                if zcount > 0 then 
+                        begin (* Add trailing zeros to reduce
+                                ee.  *)
+                        ee := ee - zcount ;
+                        for i := 1 to zcount do sub := concat(sub,'0') ;
+                        end ;
+                end ;
+
+x%dec ( sub, xi, ie ) ;
+ee := ee + ie ;
+if ee <> 0 then 
+        begin
+        if ee > 99 then ee := 99 ; (* Insure overflow *)
+        if ee < -99 then ee := -99 ; (* Insure underflow.  *)
+        x%pot( abs(ee), pt ) ;
+        if ee > 0 then 
+                begin
+                x%mul ( xi, pt, xi ) ;
+                end
+        else if ee < 0 then 
+                begin
+                x%div ( xi, pt, xi ) ;
+                end ;
+        end ;
+z := x%tos(xi) ;
+end ;
+
+end ;
+end ;
+
+if error then 
+        begin (* set up error nan *)
+        z := makenan( inerrstring ) ;
+        setxcpn(invop,true) ; 
+        end   (* set up error nan *) ;
+if xsign then z := - z ;
+if not fileio then next := sp ;
+statuspostlude( fps, trapcoming  ) ;
+if trapcoming then f32postinput( 'asciireal', s, z ) ;
+end ;
+
+procedure string_f32 ;
+begin
+asciireal ( false, input, s, first, last, next, z, error ) ;
+end ;
+
+procedure read_f32 ;
+var next : integer ;
+begin
+asciireal ( true, Infile, Readchars, 0, 0, next, z, error ) ;
+end ;
+
+function p_f32 ;
+var
+i, next : integer ;
+error : boolean ;
+xx : real ;
+t : fp_string ;
+
+begin (* p_f32 *)
+asciireal( false, input, s, 1, length(s), next, xx, error ) ;
+for i := next to length(s) do error := error or (s[i] <> ' ') ;
+        (* It's all right to have trailing blanks, but otherwise an
+        incomplete scan is an error. *)
+if error then 
+        begin (* error *)
+        t := concat('NaN''',inerrstring,'''');
+        asciireal( false, input,
+                t,1,5+length(inerrstring),
+                next, xx, error ) ;
+        end   (* error *) ;
+p_f32 := xx ;
+end   (* p_f32 *) ;
+
+function f32_r_r (* var f : text ) : real *);
+        (* The Pascal procedure called via %r_r to read a real value
+        from Infile.  *)
+var
+s : fp_string ;
+next : integer ; z : real ; error : boolean ;
+
+begin (* f32_r_r *)
+asciireal ( true, F, s, 0, 0, next, z, error ) ;
+f32_r_r := z ;
+end   (* f32_r_r *) ;
+
+ÿ

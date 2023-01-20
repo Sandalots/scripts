@@ -1,0 +1,519 @@
+;       SONYASM.TEXT - SONY driver assembly language portion
+
+;       By Dave Offen (for use with Twiggy drives).
+;       Copyright 1983, 1984, Apple Computer Inc.
+;
+;       Modified by Rich Castro for use with SONY driver - 9/30/83
+;
+
+        ;SONY controller defs
+
+DISKCMD  .EQU   1               ;$81=RWTS COMD, $83=SEEK,$85=CLR INT STAT,
+                                ;  86=ENABLE, 87=DISABLE
+DISKPARM .EQU   3               ;0=READ, 1=WRITE, 2=UNCLAMP, 3=FORMAT, 4=VERIFY
+DISKDRIV .EQU   5               ;0=TOP, 80=BOTTOM
+DISKHEAD .EQU   7               ;0-1
+DISKSEC  .EQU   9               ;0-12, FORMATTED 2:1 INTERLEAVE
+DISKTRAK .EQU   $B              ;0-79, 0 IS OUTSIDE.
+DISKCNFM .EQU   $F              ;FORMAT CONFIRMATION BYTE
+DISKERR  .EQU   $11             ;NON-ZERO MEANS ERROR ON INTERRUPT
+DISKFLG  .EQU   $13             ;FLAG FOR SINGLE OR DOUBLE SIDED DISK
+DISKSKING .EQU  $19             ;=$FF WHEN BUSY SEEKING OR PARKING
+DISKIN   .EQU   $41             ;NON-ZERO MEANS DISK IS IN DRIVE
+DISKSTAT .EQU   $5F             ;INTERRUPT SOURCE
+DISKB2   .EQU   $B9             ;ENDING DATA BITSLIP ERROR COUNT
+DISKCS   .EQU   $95             ;CHECKSUM ERROR COUNT
+DISKHDR  .EQU   $3E8            ;offset to header
+DISKDATA .EQU   $400            ;offset to data
+
+CMDINDEX .EQU   $FB             ;INDEX TO COMMAND SAVE BUFFER
+INDX_OFST .EQU  $103            ;ADDITIONAL OFFSET INTO COMMAND BUFFER
+DISKPRC  .EQU   $0              ;OFFSET TO PREVIOUS COMMAND CODE
+DISKPRP  .EQU   $2              ;OFFSET TO PREVIOUS PARAM, DRIVE, HEAD, SECTOR
+DISKPRT  .EQU   $A              ;OFFSET TO PREVIOUS TRACK
+
+LOWER    .EQU   $80             ;id for lower drive
+TOPSIDE  .EQU   0               ;ID FOR TOP SIDE
+BOTSIDE  .EQU   1               ;ID FOR BOTTOM SIDE
+SNYSNGL  .EQU   800             ;# OF BLOCKS PER SIDE ON SONY DISK
+
+CLRISTAT .EQU   $85             ;CLEAR INT MASK CMD
+ENBLDRV  .EQU   $86             ;ENABLE INT CMD
+
+WAIT_INT .EQU   1               ;WAIT FOR INT RESPONSE
+BADPARMS .EQU   2               ;BAD BLOCK # REQUESTED
+
+
+        .PROC   SONYASM
+;-----------------------------------------------------------------
+;       PROCEDURE SONYASM (DRIVECB_PTR:ABSPTR)
+;
+;       Command interpreter routine.  Decodes input parms and
+;       jumps to appropriate routine.
+;
+;
+
+;DRIVECB OFFSETS
+CONFIGADDR .EQU        0                   ;Configinfo entry address
+EXT_PTR    .EQU        CONFIGADDR+4        ;Configinfo index
+RAW_DATA   .EQU        EXT_PTR+4           ;Ptr to raw data buffer
+RAW_HEADER .EQU        RAW_DATA+4          ;Ptr to raw header buffer
+X_LENG     .EQU        RAW_HEADER+4        ;Offset from raw_data to data buffer
+SECT_LEFT  .EQU        X_LENG+4            ;The total sectors required
+;
+;
+;EXT_DRIVE_CB OFFSETS
+HWBASE     .EQU        0                   ;Device base address
+COMMAND    .EQU        HWBASE+4            ;High level command being issued
+GO_CMD     .EQU        COMMAND+1           ;Go-byte command for disk interface
+BLOCK      .EQU        GO_CMD+1            ;Requested block
+RESPONSE   .EQU        BLOCK+2             ;Return command to high level driver
+ERR        .EQU        RESPONSE+2          ;Response to high level command
+INT_STAT   .EQU        ERR+2               ;Interrupt status
+CSERR      .EQU        INT_STAT+1          ;Checksum error count
+
+
+;  Decode incoming command, call appropriate routine
+
+           MOVEM.L     D2-D5/A2-A4,-(SP)        ;Save Pascal Registers
+           MOVE.L      32(SP),A4                ;Drive control block in A4
+           MOVE.L      EXT_PTR(A4),A3           ;Drivecb extension in A3
+           CLR         RESPONSE(A3)             ;Zero return code initially
+           CLR         ERR(A3)                  ;Zero error code initially
+           MOVEA.L     HWBASE(A3),A2            ;Shared memory address in A2
+           MOVE.B      GO_CMD(A3),D0            ;Get go-byte command
+           BNE.S       CMDDSK                   ;skip if disk cmd
+           MOVE.B      COMMAND(A3),D0           ;else get sub-commmand
+           EXT.W       D0
+           MOVE.W      CMD_TABLE(D0),D0         ;get routine address
+           JSR         CMD_TABLE(D0)            ;and go execute it
+           BRA.S       RETURN                   ;then exit
+
+
+CMD_TABLE
+           .WORD       INITDISK-CMD_TABLE       ;Initialize disk
+           .WORD       INTERRUPT-CMD_TABLE      ;Process interrupt
+           .WORD       FINISH_READ-CMD_TABLE    ;finish read operation
+           .WORD       ISDISKIN-CMD_TABLE       ;check for disk in place
+
+CMDDSK     CMPI.B      #$81,D0                  ;RWTS command?
+           BNE.S       @1                       ;skip if not
+           CMPI.B      #1,COMMAND(A3)           ;write cmd?
+           BNE.S       @1                       ;skip if not
+           JSR         START_WRITE              ;go do write if yes
+@1         JSR         START_RWTS               ;else go do command
+;
+RETURN     MOVEM.L     (SP)+,D2-D5/A2-A4        ;Restore Registers
+           MOVE.L      (SP)+,A0                 ;Return Address
+           ADDQ        #4,SP                    ;Pop input parameter
+           JMP         (A0)                     ;Return
+
+
+;---------------------------------------------------------------------
+;
+;       START_RWTS
+;
+;       This routine is called from for doing read, seek
+;       verify and reset disk interrupts.
+;       It is also called from START_WRITE and FINISH_READ for doing read
+;       or write.  Err is returned when previous command didn't cause interrupt.
+;
+;---------------------------------------------------------------------
+
+START_RWTS
+@0      TST.B   DISKCMD(A2)
+        BNE.S   @0                      ;TEST IF PREV COMMAND TAKEN
+
+        MOVE.B  DISKERR(A2),D1          ;ERROR CODE FROM PREVIOUS COMMAND
+        BEQ.S   @4
+        EXT.W   D1
+        ADDI.W  #1800,D1                ;ERROR BASE FOR SONY ROM ERRORS
+        MOVE.W  D1,ERR(A3)              ;RETURN ERROR CODE IF NON_ZERO
+@4      MOVE.B  GO_CMD(A3),D1           ;HOLD NEXT CMD IN D1
+        CMPI.B  #$81,D1
+        BNE.S   @7                      ; NOT RWTS COMMAND
+
+        ;INTERRUPT-GENERATING COMMAND
+
+        CLR.L   D0
+        MOVE    BLOCK(A3),D0            ;GET BLOCK REQUESTED
+        JSR     CONVERT                 ;CONVERT TO SIDE/TRACK/SECTOR
+        MOVE.B  D0,D2                   ;SAVE SECTOR
+        MOVE.B  COMMAND(A3),D0          ;GET COMMAND
+        LSL     #8,D0
+        MOVE.B  #LOWER,D0               ;DRIVE ALWAYS = LOWER
+        SWAP    D0
+        MOVE.B  D5,D0                   ;GET SIDE (HEAD)
+        LSL     #8,D0
+        MOVE.B  D2,D0                   ;FINALLY RESTORE SECTOR
+
+        MOVEP.L D0,DISKPARM(A2)         ;WRITE COMMAND, DRIVE, SIDE, SECTOR
+        MOVE.B  D4,DISKTRAK(A2)         ;COPY TRACK
+        CMPI.B  #3,COMMAND(A3)          ;FORMAT COMMAND?
+        BNE.S   @6
+        MOVE.B  #-1,DISKCNFM(A2)        ;YES, SET UP "CONFIRMATION BYTE"
+@6      MOVE.B  D1,DISKCMD(A2)          ;START UP THE DISK WITH $81
+        MOVE    #WAIT_INT,RESPONSE(A3)  ;WAIT FOR INTERRUPT CMD
+        RTS                             ;RETURN
+
+        ;NON-INTERRUPTING COMMAND
+
+@7      CMPI.B  #$83,D1                 ;SEEK?
+        BNE.S   @8
+        CMPI.B  #$FF,DISKSKING(A2)      ;YES
+        BEQ.S   @9                      ;DON'T SEEK WHILE PARKING OR STILL SEEKING
+
+        MOVE.B  #LOWER,DISKDRIV(A2)     ;SET DRIVE ID
+        MOVE.B  BLOCK(A3),D0            ;GO GET HEAD/TRACK
+        JSR     CONVERT                 ; FROM BLOCK #
+        MOVE.B  D5,DISKHEAD(A2)
+        MOVE.B  D4,DISKTRAK(A2)
+
+@8      MOVE.B  COMMAND(A3),DISKPARM(A2) ;COPY PARAMETER FOR THIS COMMAND
+        MOVE.B  D1,DISKCMD(A2)           ;DO A 80, 83, 85, 86 OR 89 COMMAND
+
+@9      RTS                              ;RETURN TO CALLER
+
+
+;----------------------------------------------------------------------
+;
+;       FINISH_READ
+;
+;       Copy data from disk buffer to data and header buffers.
+;
+;----------------------------------------------------------------------
+
+FINISH_READ
+        MOVEM.L D6-D7/A2,-(SP)          ;DON'T CLOBBER NEEDED REGS
+
+        ;UNPACK THE 12 BYTE HEADER INTO 24 BYTES
+
+@1      MOVEA.L #DISKHDR,A1             ;12 BYTE HEADER AREA
+        ADDA.L  A2,A1                   ;ADD BASE ADDRESS OF SHARED MEM
+        MOVEP.L 01(A1),D0               ;VERSION & VOLUME
+        MOVEP.W 09(A1),D1
+        SWAP    D1                      ;FILEID IN LEFT WORD
+                                        ;DON'T KNOW ABSPAGE YET (IGNORE D2)
+        MOVEP.W 13(A1),D3
+        EXT.L   D3                      ;RELPAGE
+        MOVEP.W 17(A1),D4               ;FWDLINK W/DATAUSED
+        MOVEP.W 21(A1),D5               ;BKWDLINK W/ DATAUSED
+        MOVE    D5,D1                   ;ASSEMBLE DATAUSED INTO LOW WORD OF D1
+        LSR     #5,D1
+        MOVE    D4,D6
+        AND     #$F800,D6
+        ADD     D6,D1
+        LSR     #6,D1
+        MOVE    #$07FF,D6               ;UNPACK BKWDLINK & FWDLINK
+        AND     D6,D4
+        CMP     D6,D4
+        BNE.S   @2
+        EXT.W   D4                      ;7FF => FFFFFFFF
+@2      EXT.L   D4
+        AND     D6,D5
+        CMP     D6,D5
+        BNE.S   @3
+        EXT.W   D5                      ;7FF => FFFFFFFF
+@3      EXT.L   D5
+        MOVEA.L RAW_HEADER(A4),A0       ;HEADER DESTINATION ADDRESS
+        MOVEM.L D0-D5,(A0)              ;COPY THE 24 HEADER BYTES
+
+        MOVEA.L RAW_DATA(A4),A0         ;WITH DATA BUFFER POINTER IN A0
+        ADD.L   X_LENG(A4),A0           ;ADJUST BUFFER ADDRESS
+        MOVE    #512,D0                 ;SET UP FOR 512 BYTE DATA XFER
+
+        ;WITH DESTINATION ADDRESS IN A0, LENGTH (EVEN MULTIPLE OF 32) IN D0
+        ;AND SOURCE IN LAST (D0) BYTES OF DISK BUFFER
+
+        EXT.L   D0
+        ADDA.L  D0,A0                   ;POINT TO END OF DESTINATION
+        MOVEA.L #DISKDATA+1024,A1       ;AND END OF SOURCE
+        ADDA.L  A2,A1                   ;ADD BASE ADDRESS OF SHARED MEM
+        LSR     #5,D0
+        MOVE    D0,A2                   ;NUMBER OF 32-BYTE TRANSFERS
+        MOVE    A0,D0                   ;CKECK FOR ODD ADDRESS
+        AND     #1,D0
+        BEQ.S   @5                      ;SKIP IF EVEN
+
+        ;TRANSFER TO ODD ADDRESS (WHAT A PAIN!)
+
+        SUBQ    #2,A1
+        MOVE.B  1(A1),-(A0)             ;MOVE 1 BYTE TO GET ON EVEN BOUNDARY
+        SUBQ    #1,A2                   ;LOOP THROUGH 32 BYTES 1 TIME FEWER
+@4      LEA     -64(A1),A1
+        MOVEP.L 1(A1),D0                ;MOVE FROM SOURCE TO REGS
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D0-D7,-(A0)             ;MOVE FROM REGISTERS TO DESTINATION
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE     @4                      ;MOVE 32 MORE?
+        LEA     -64(A1),A1              ;31 REMAIN TO XFER
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D1-D7,-(A0)             ;MOVE 28 BYTES FROM REGISTERS TO DEST
+        MOVEP.W 5(A1),D0                ;MOVE LAST 3 BYTES
+        MOVE.W  D0,-(A0)
+        MOVE.B  3(A1),-(A0)
+        BRA.S   @6                      ;DONE
+
+        ;TRANSFER TO EVEN ADDRESS
+
+@5      LEA     -64(A1),A1
+        MOVEP.L 1(A1),D0                ;MOVE FROM SOURCE TO REGS
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D0-D7,-(A0)             ;MOVE FROM REGISTERS TO DESTINATION
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE     @5                      ;MOVE 32 MORE?
+
+@6      MOVEM.L (SP)+,D6-D7/A2          ;RESTORE REGS
+        RTS                             ;RETURN
+
+
+;-----------------------------------------------------------------------
+;
+;       START_WRITE
+;
+;       Copy header and data and into DISK buffer and
+;       initiate write.
+;
+;-----------------------------------------------------------------------
+
+START_WRITE
+        MOVEM.L D6-D7/A2,-(SP)       ;DON'T CLOBBER NEEDED REGS
+
+        ;PACK HEADER OF 24 BYTES INTO 12 IN HEADER BUFFER
+
+        MOVE.L  RAW_HEADER(A4),A0       ;GET HEADER BUFFER ADDRESS
+        MOVEA.L #DISKHDR,A1             ;DESTINATION ADDRESS OF 12 BYTE BUFFER
+        ADDA.L  A2,A1                   ;ADD BASE ADDRESS OF SHARED MEM
+        MOVEM.L (A0),D0-D5              ;READ ENTIRE HEADER
+        MOVEP.L D0,01(A1)               ;VERSION, VOLUME
+        LSL.W   #6,D1                   ;SHIFT DATAUSED LEFT 6
+        MOVE    D1,D0
+        AND     #$F800,D0               ;MSB OF DATAUSED
+        AND     #$07FF,D4
+        ADD     D0,D4                   ;PACKED WITH FWDLINK
+        MOVEP.W D4,17(A1)
+        LSL.W   #5,D1
+        AND     #$07FF,D5
+        ADD     D1,D5                   ;PACK LSB OF DATAUSED WITH BKWDLINK
+        MOVEP.W D5,21(A1)
+        SWAP    D1
+        MOVEP.W D1,09(A1)               ;FILEID
+        MOVEP.W D3,13(A1)               ;RELPAGE
+
+        MOVE.L  RAW_DATA(A4),A0         ;GET DATA BUFFER ADDRESS
+        ADD.L   X_LENG(A4),A0           ; WITH OFFSET
+        LEA     24(A1),A1               ;ADDRESS OF DISK DATA BUFFER (OFFSET FROM HEADER BUFFER)
+        MOVEA   #15,A2                  ;15*32 = 512-32 BYTES TO MOVE IN 1ST LOOP
+
+        ;COPY 512 BYTES FROM MEMORY TO DISK BUFFER.  A0=MEMORY (SOURCE) ADDRESS,
+        ;A1=DISK BUFFER ADDRESS, A2 = NUMBER OF 32-BYTE BLOCKS TO TRANSFER - 1.
+
+        MOVE    A0,D0                   ;CHECK FOR ODD ADDRESS
+        LSR     #1,D0                   ;PUT "ODD-FLAG" IN X AND C
+        BCC.S   @7                      ;SKIP IF EVEN
+
+        ;TRANSFER FROM ODD ADDRESS
+
+        MOVE.B  (A0)+,1(A1)             ;COPY 1ST BYTE TO GET ON  EVEN ADDRESS
+        ADDQ    #2,A1
+
+        ;EVEN OR ODD ADDRESS -- FIRST XFER 480 BYTES USING MOVEM LOOP
+
+@7      MOVEM.L (A0)+,D0-D7             ;CAN'T USE MOVEM AT END OF XFER BECAUSE
+                                        ; CAUSES BUS ERROR IF AT END OF SEGMENT
+        MOVEP.L D0,01(A1)
+        MOVEP.L D1,09(A1)
+        MOVEP.L D2,17(A1)
+        MOVEP.L D3,25(A1)
+        MOVEP.L D4,33(A1)
+        MOVEP.L D5,41(A1)
+        MOVEP.L D6,49(A1)
+        MOVEP.L D7,57(A1)
+        LEA     64(A1),A1
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE.S   @7
+        MOVEM.L (A0)+,D0-D6             ;COPY REMAINING 31 OR 32 BYTES TO FINISH XFER
+        MOVEP.L D0,01(A1)
+        MOVEP.L D1,09(A1)
+        MOVEP.L D2,17(A1)
+        MOVEP.L D3,25(A1)
+        MOVEP.L D4,33(A1)
+        MOVEP.L D5,41(A1)
+        MOVEP.L D6,49(A1)
+        SUBX    D0,D0                   ;TEST "ODD-FLAG" STILL IN X
+        BPL.S   @8                      ;SKIP IF ORIGINALLY STARTED ON EVEN ADDRESS
+        MOVE.W  (A0)+,D0                ;ODD ADDRESS -- ONLY 3 MORE TO GO
+        MOVEP.W D0,57(A1)
+        MOVE.B  (A0)+,61(A1)
+        BRA.S   @9                      ;DONE
+
+        ;WAS TRANSFER FROM EVEN ADDRESS --  XFER LAST 4 BYTES
+
+@8      MOVE.L  (A0)+,D0                ;MOVEM WOULD CAUSE BUS ERROR @ SEGMENT END
+        MOVEP.L D0,57(A1)
+
+        ;NOW DO THE WRITE
+
+@9      MOVEM.L (SP)+,D6-D7/A2          ;RESTORE NEEDED REGS
+        RTS                             ; AND RETURN
+
+
+;------------------------------------------------------------------------
+;
+;       DISK INTERRUPT HANDLER
+;
+;       Reads interrupt status and returns results to higher level
+;       driver.
+;
+;------------------------------------------------------------------------
+
+INTERRUPT
+
+;  Get interrupt status and error results
+
+        MOVE.B  DISKSTAT(A2),INT_STAT(A3)       ;SET VARIABLES IN RECORD PASSED
+        MOVE.B  DISKERR(A2),D1                  ;ERROR CODE FROM PREVIOUS COMMAND
+        BEQ.S   @4
+        EXT.W   D1
+        ADDI.W  #1800,D1                        ;ERROR BASE FOR SONY ROM ERRORS
+        MOVE.W  D1,ERR(A3)                      ;RETURN ERROR CODE IF NON_ZERO
+@4      MOVE.B  DISKCS(A2),D0
+        ADD.B   DISKB2(A2),D0                   ;SUM SOFT WRITE ERRS
+        SCS     D1
+        OR.B    D0,D1
+        BPL.S   @1
+        MOVEQ   #$7F,D0                         ;IF CARRY OR NEG, SET TO $7F
+@1      MOVE.B  D0,CSERR(A3)                    ; & MOVE INTO CHECKSUM ERR COUNT
+
+        RTS
+
+
+;-----------------------------------------------------------------------
+;
+;       INITDISK
+;
+;       Init disk interface to clear all pending ints, then enable drive.
+;       Call only during initialization when disks are idle
+;-------------------------------------------------------------------------
+
+INITDISK
+        MOVE.B  #CLRISTAT,GO_CMD(A3)    ;FIRST CLEAR ALL PENDING INTS
+        MOVE.B  #$FF,COMMAND(A3)
+        JSR     START_RWTS
+        MOVE.B  #ENBLDRV,GO_CMD(A3)     ;THEN ENABLE THE DRIVE
+        MOVE.B  #$80,COMMAND(A3)
+        JSR     START_RWTS
+        RTS
+
+;-----------------------------------------------------------------------
+;
+;       ISDISKIN
+;
+;       See if DISK is inserted.
+;       Call only during initialization when both disks are idle
+;-------------------------------------------------------------------------
+
+ISDISKIN
+        CLR.L   D0               ;CLEAR FOR USE
+        MOVE.B  DISKIN(A2),D0    ;CHECK FOR DRIVE
+        MOVE    D0,RESPONSE(A3)  ;RETURN RESULT
+        RTS                      ; AND EXIT
+
+;----------------------------------------------------------------------------
+;       CONVERT
+;
+;       Convert block # to head/track/sector.
+;       Assumes D0 = block #
+;       Returns D0 = sector
+;               D4 = track
+;               D5 = head (side)
+;----------------------------------------------------------------------------
+
+CONVERT MOVE.L  D1,-(SP)                ; save reg
+        MOVE    #SNYSNGL+SNYSNGL,D1     ; set max # of blocks
+        LSR.W   #1,D1                   ; initialize starting chunk
+        MOVE.W  D1,D3
+        CMP.W   D0,D1                   ; blk >= top side ?
+        BLE.S   BOTTOM
+        LEA     SNYENDT,A0              ; start at last byte+1 of SONY table
+        MOVE.W  #-1,D5                  ; decr track on top side
+        MOVE.W  D3,D1
+        BRA.S   LOOP1
+BOTTOM  MOVE.W  D1,D3                   ; save max block count
+        CMP.W   D0,D1                   ; blk >= entire disk ?
+        BLE.S   CVERR                   ; error if yes
+        LEA     SNYENDB,A0              ; else start at last byte+1 of SONY table
+        MOVE.W  #1,D5                   ; incr track on bottom side
+        MOVE.W  D3,D1
+LOOP1   MOVE.W  D1,D3
+        MOVE.L  -(A0),D1
+        CMP.W   D0,D1
+        BGT.S   LOOP1
+        MOVE.W  D3,D1
+        CLR.W   D4
+        MOVE.B  (A0),D4
+        CLR.W   D2
+        MOVE.B  1(A0),D2
+        BRA.S   LOOP2E
+;
+; D5 = 1 OR -1, D4 = TRK, D3 = SAV LIMIT, D2 = BLK DELTA, D1 = BLK LIMIT, D0 = BLK
+;
+LOOP2   ADD.W   D5,D4                   ; next track
+LOOP2E  SUB.W   D2,D1
+        CMP.W   D0,D1                   ; blk >= start_chunk ?
+        BGT.S   LOOP2
+FNDBLK  SUB.W   D1,D0                   ; sector
+        TST.W   D5
+        BMI.S   @1
+        MOVEQ   #BOTSIDE,D5
+        BRA.S   @2
+@1      MOVEQ   #TOPSIDE,D5
+@2      MOVE.L  (SP)+,D1                ; restore D1
+        RTS
+
+CVERR   MOVE    #BADPARMS,RESPONSE(A3)  ;notify higher level driver of error
+        MOVE.L  (SP)+,D1                ; restore D1
+        RTS
+
+;
+; TABLE FOR SONY 800/1600 BLOCK DISKS
+;
+        .WORD   15*256+12,0     ; 192
+        .WORD   31*256+11,192   ; 176
+        .WORD   47*256+10,368   ; 160
+        .WORD   63*256+9,528    ; 144
+        .WORD   79*256+8,672    ; 128
+SNYENDT .WORD   0
+        .WORD   64*256+8,800    ; 128
+        .WORD   48*256+9,928    ; 144
+        .WORD   32*256+10,1072  ; 160
+        .WORD   16*256+11,1232  ; 176
+        .WORD   0*256+12,1408   ; 192
+SNYENDB .WORD   0
+
+
+        .END
+
+
+ÿ

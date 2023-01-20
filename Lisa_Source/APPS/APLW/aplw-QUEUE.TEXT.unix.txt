@@ -1,0 +1,511 @@
+{$I APLW/COMPFLAGS }                                            {gdf 1/16/84}
+
+UNIT Queue;
+
+(* Copyright 1983, 1984, Apple Computer Inc. *)
+
+{ med  3/7/84 -- fixed fSymOk}
+{ gdf  2/29/84 -- put in Janis' tyevInChar stuff  }
+{ gdf  2/24/84 -- insert trace calls for segmentation  }
+{ gdf  1/21/84 -- change Enqueue to EnqueueLotus  }
+{ crc 11/12/82 -- Reset fDbgOK and fSymOK; set D+/D- based on fSymOK }
+{ crc  9/24/82 -- added tyevDShred }
+{ crc  9/17/82 -- added tyevDPut }
+{ jrm  8/26/82 -- added .fAutoScroll to EvDsc }
+{ jrm  8/10/82 -- tyevDOpen => tyevResume; added tyevDfClose, tyevSuspend;
+                  added .cRefnum, .windowCurr to EvDsc, TWindow from UnitBox }
+{ jrm  7/ 1/82 -- removed tyevOpen and tyevClose }
+{ jrm  6/29/82  --  USES changes: LisaGraf => QuickDraw; moved USES UnitFile }
+{ crc  6/02/82 -- Conditional compilation }
+{ jrm  5/26/82 -- removed TPrcs definition }
+{ crc  4/02/82 -- USES changes for new font manager }
+{ edited by bas 9/05/81 }
+
+INTERFACE
+
+USES {$IFC sampcalls}                                               {gdf 2/24/84}
+        {$U aplw/tracecalls.obj} tracecalls,
+     {$ENDC}
+     {$U Obj:UnitStd.Obj  } UnitStd,
+     {$U Obj:UnitHz.Obj   } UnitHz,
+     {$U LibOS/Syscall.Obj }   Syscall,
+     {$U Obj:UnitFile.Obj } UnitFile,
+     {$U Obj:Storage.Obj  } Storage,
+     {$U Obj:QuickDraw.Obj } QuickDraw,
+     {$U Obj:FontMgr.Obj  } FontMgr,
+     {$U Obj:WM.Events.Obj} Events,
+     {$U Obj:WmlStd       } WmlStd,
+     {$U Obj:WM.Menus.Obj } Menus,
+     {$U Obj:AlertMgr.Obj } AlertMgr;
+
+{$Setc fDbgPrv := fDbgOK}    {Compiler constants.}
+{$Setc fDbgOK  := fDebugging}
+
+CONST
+     {$IFC NOT fDbgOk} fTstQue = FALSE; {$ENDC}
+
+     ibktInit = 0;
+     ibktLst = 20;
+
+TYPE TWindow = WindowPtr;
+
+     TTyev = ( tyevTimeout, tyevDwn, tyevMove, tyevUp, tyevDblClick,
+               tyevTripleClick, tyevKey, tyevInChar, tyevUpdate, tyevActivated,
+               tyevDeactivated, tyevScroll, tyevPScroll, tyevThumb,
+               tyevCmd, tyevAbort, tyevNull, tyevPopdown,
+               tyevScNew, tyevScResize, tyevScKill, tyevPaneKill,
+               tyevEnd, tyevResume, tyevDClose, tyevDCopy, tyevDTerminate,
+               tyevDfClose, tyevSuspend, tyevDPut, tyevDShred,
+               tyevInternalRepeat );
+
+     TActArea = RECORD
+                   rAct: TR;
+                   fInRect: TF;
+                END;
+
+      { directions to be included in scroll bars }
+     TDir = (dirUp, dirDwn, dirRt, dirLft);
+     TSdir = SET OF TDir;
+
+     TEvDsc = RECORD        { event descriptor }
+                tyev: TTyev;
+                r: TR;
+                obox: TC;
+                ch: CHAR;
+                fAlphaKey, fShiftKey, fAppleKey, fCodeKey, fRepeatKey: TF;
+                fMouseButton: TF;
+                dir: TDir;
+                cPct: TC;
+                imid: TC;
+                imtd: TC;
+                refCon: LONGINT; { Note 1 }
+                scid: TC;        { Note 2 }
+                scidOld: TC;     { Note 3 }
+                fid: TC;         { Note 4 }
+                dcdAdjust: TCd;  { Note 5 }
+                fAdjFront: TF;   { Note 6 }
+                      (* spPathname: STRING[255]; Note 7 *)
+                cRefnum: TC;     {Note 8}
+                windowCurr: TWindow;
+                fAutoScroll: TF; { Note 9 }
+                END;
+
+    { Notes for evDsc:
+        1.  killed pane's refCon (tyevPaneKill)
+        2.  scroll chain id for tyevScroll, tyevPScroll, tyevThumb, tyevScNew,
+            tyevScResize, tyevScKill
+        3.  scroll chain id for scroll chain that spawned the new scroll chain
+            on a split (tyevScNew)
+        4.  folder id for tyevOpen, tyevClose, tyevActivated, tyevDeactivated
+        5.  relative corner adjustment for tyevScResize.  Only one dimension
+            of the corner is adjusted: horizontal for horizontal scroll chains,
+            vertical for vertical scroll chains.
+        6.  which corner was adjusted for tyevResize (TRUE => topLeft corner,
+            FALSE => botRight corner.
+        7.  for filer commands this = filerExt.thePrefix - replaced by pathGlobal
+            to save space, since we never enqueue more than one pathname - i.e.,
+            we'd better not !!!!
+        8.  for filer commands, this = filerExt.theDf (gag!!!)
+        9.  for tyevMove, TRUE iff the cursor was dragged outside of the panes
+            of a folder.
+     }
+
+     TArgevdsc = ARRAY[0..0] OF TEvDsc;
+     TPrgevdsc = ^TArgevdsc;
+     THrgevdsc = ^TPrgevdsc;
+
+     TQ = RECORD
+           oIn, oOut: TC;
+           cbItemQ: TC;
+           oMaxQ: TC;
+           hzQueue: THz;
+           hrgevdsc: THrgevdsc;
+          END;
+
+{$IFC fDbgOk}
+
+    TBkt = RECORD
+         dt:     TL;
+         cEnter: TC;
+         END;
+    TPbkt = ^TBkt;
+
+    TBop = RECORD
+         ibkt:  TC;
+         t:     TL;
+         END;
+    TPbop = ^TBop;
+
+    TTmd = RECORD
+         pbopCur: TPbop;
+         dtBeginOvh: TL;
+         dtEndOvh: TL;
+         argbkt:  ARRAY [-1..ibktLst] OF TBkt;
+         argbop: ARRAY [-1..ibktLst] OF TBop;
+         END;
+    TPtmd = ^TTmd;
+{$ENDC}
+
+VAR
+     WPAlerts: TAlertFile;
+     theEvDsc: TEvDsc; {replaces lotus input loop local in testbox}
+     oboxDwn: TC; {moved from queue}
+{$IFC fDbgOk}
+     fTstQue: TF;
+     tmd: TTmd;
+{$ENDC}
+
+PROCEDURE InitQueue(VAR q: TQ; hz: THz);
+PROCEDURE EnqueueLotus(VAR q: TQ; pItem: TP);
+FUNCTION  FPeekQueue(VAR q: TQ; pItem: TP): TF;
+FUNCTION  FDequeue(VAR q: TQ; pItem: TP): TF;
+{$ifc fDbgOk}
+PROCEDURE PxR(sp: TSp; VAR r: TR);
+PROCEDURE PxTyEv (VAR tyev: TTyev);
+PROCEDURE PxEvDsc(VAR evDsc: TEvDsc);
+{$endc}
+FUNCTION  TyvhNOT(tyvh: TTyvh): TTyvh;
+PROCEDURE KillLotus;
+
+{$IFC fDbgOk}
+   FUNCTION PtmdBeginTiming : TPtmd;
+   PROCEDURE BeginIbkt(ibkt: TB; ptmd: TPtmd);
+   PROCEDURE EndIbkt(ptmd: TPtmd);
+   PROCEDURE EndTiming;
+{$ENDC}
+
+IMPLEMENTATION
+
+{$IFC fSymOK }
+{$D+ }
+{$ELSEC }
+{$D- }
+{$ENDC }
+
+CONST cevdscLim = 20;
+      cevdscMore = 20;
+
+{$IFC fDbgOk}
+
+   FUNCTION PtmdBeginTiming;
+   VAR
+   ibkt: TC;
+   BEGIN
+   {$IFC sampcalls}  ALogCall;  {$ENDC}
+   FOR ibkt := 0 TO ibktLst DO
+        BEGIN
+        WITH tmd.argbkt[ibkt] DO BEGIN dt:= 0; cEnter := 0; END;
+        END;
+   tmd.dtBeginOvh := 0; tmd.dtEndOvh := 0;
+   tmd.argbop[-1].ibkt := -1;
+   tmd.pbopCur := @tmd.argbop[0];
+   BeginIbkt(ibktInit, @tmd);
+   tmd.dtBeginOvh := ElapsTime - tmd.argbop[0].t;
+   EndIbkt(@tmd);
+   tmd.dtEndOvh := ElapsTime - tmd.argbop[-1].t;
+   WITH tmd.argbkt[0] DO BEGIN dt:= 0; cEnter := 0; END;
+   WRITELN('Begin timing; estimate of Begin/End overhead is ', tmd.dtBeginOvh, '/',
+     tmd.dtEndOvh);
+   BeginIbkt(0, @tmd);
+   PtmdBeginTiming := @tmd;
+   END;
+
+   PROCEDURE BeginIbkt{ibkt: TC, ptmd: Ptmd};
+   VAR
+   ibktPrv: TC;
+   pbopPrv: TPbop;
+   tCur:   TL;
+   BEGIN
+   {$IFC sampcalls}  ALogCall;  {$ENDC}
+   pbopPrv := POINTER(ORD(tmd.pbopCur) - SIZEOF(TBop));
+   tmd.pbopCur^.ibkt := ibkt;
+   tCur := ElapsTime;
+   ibktPrv := pbopPrv^.ibkt;
+   WITH tmd.argbkt[ibktPrv] DO dt := dt + (tCur - pbopPrv^.t);
+   tmd.pbopCur^.t := tCur + tmd.dtBeginOvh;
+   tmd.pbopCur := POINTER(ORD(tmd.pbopCur) + SIZEOF(TBop));
+   END;
+
+   PROCEDURE EndIbkt{ptmd: TPtmd};
+   VAR
+   tCur: TL;
+   ibkt: TC;
+   pbopPrv: TPbop;
+   BEGIN
+   {$IFC sampcalls}  ALogCall;  {$ENDC}
+   tmd.pbopCur := POINTER(ORD(tmd.pbopCur) - SIZEOF(TBop));
+   pbopPrv := POINTER(ORD(tmd.pbopCur) - SIZEOF(TBop));
+   tCur := ElapsTime;
+   ibkt := tmd.pbopCur^.ibkt;
+   WITH tmd.argbkt[ibkt] DO
+        BEGIN
+        dt := dt + (tCur - tmd.pbopCur^.t);
+        cEnter := cEnter + 1;
+        END;
+   pbopPrv^.t := tCur + tmd.dtEndOvh;
+   END;
+
+   PROCEDURE EndTiming;
+   VAR
+   tTotal: TL;
+   ibkt: TC;
+   BEGIN
+   {$IFC sampcalls}  ALogCall;  {$ENDC}
+   EndIbkt(@tmd);
+   IF tmd.pbopCur <> @tmd.argbop[0] THEN
+        WRITELN('ERROR IN EndTiming - Begins and Ends do not match');
+   tTotal := 0;
+   FOR ibkt := 0 TO ibktLst DO
+        tTotal := tTotal + tmd.argbkt[ibkt].dt;
+   WRITELN('EndTiming - Total virtual time: ', tTotal);
+   FOR ibkt := 0 TO ibktLst DO
+      WITH tmd.argbkt[ibkt] DO
+        BEGIN
+        IF cEnter <> 0 THEN
+             WRITELN('ibkt: ', ibkt, ', dt: ', dt, ', = ',
+               (dt * 100) DIV tTotal : 4, '%, cEnter: ', cEnter);
+        END;
+   END;
+{$ENDC}
+
+{$S LWMisc}
+PROCEDURE KillLotus;
+VAR bPainless: TB;
+    pPainless: TP;
+BEGIN
+   {$IFC sampcalls}  ALogCall;  {$ENDC}
+   pPainless := POINTER(ORD(0));
+   bPainless := pPainless^; (* Sayonara, friends... *)
+END;
+
+
+{$S LWCommand}
+{------------------------------------------}
+FUNCTION TyvhNOT {(tyvh: TTyvh): TTyvh};
+{------------------------------------------}
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+IF tyvh = tyvhH THEN TyvhNOT := tyvhV
+                ELSE TyvhNOT := tyvhH;
+END;
+
+{$ifc fDbgOk}
+{$S LWDebug}
+{--------------------------------}
+PROCEDURE PxR { (sp: TSp; VAR r: TR) };
+{--------------------------------}
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+WITH r DO WRITELN(sp, '[', left : 1, ', ', top : 1, '] [',
+                                   right : 1, ', ', bottom : 1, ']');
+END;
+
+{-----------------------}
+PROCEDURE PxQueue(VAR q: TQ);
+{-----------------------}
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+WITH q DO
+   BEGIN
+   WRITE(' queue: ', ORD(@q) : 1, ' oIn: ', oIn : 1, ' oOut: ', oOut : 1);
+   WRITE(' cbItem: ', cbItemQ : 1);
+   WRITELN;
+   WRITE(' oMaxQ: ', oMaxQ : 1, ' hrgevdsc ', ORD(hrgevdsc) : 1);
+   WRITE(' hzQueue:  ', ORD(hzQueue) : 1);
+   WRITELN
+   END;
+END;
+{$endc}
+
+{$S LWCreate}
+{------------------------------------------}
+PROCEDURE InitQueue { (VAR q: TQ; hz: THz) };
+{------------------------------------------}
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+WITH q DO
+   BEGIN
+   oIn := 0; oOut := 0;
+   cbItemQ := SIZEOF(TEvDsc);
+   oMaxQ := cevdscLim * SIZEOF(TEvDsc);
+   hzQueue := hz;
+   hrgevdsc := POINTER(ORD(HAllocate(hz, oMaxQ)));
+   END
+END;
+
+{$S LWCommand}
+{------------------------------------------}
+FUNCTION  FDequeue { (VAR q: TQ; pItem: TP): TF};
+{------------------------------------------}
+VAR pSrc: TP; pevDsc: ^TEvDsc;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+{$ifc fDbgOk}
+IF fTstQue THEN BEGIN WRITELN('Dequeue called.'); PxQueue(q); END;
+{$endc}
+WITH q DO
+   BEGIN
+   IF oIn = oOut THEN
+        FDequeue := FALSE
+   ELSE BEGIN
+        FDequeue := TRUE;
+        pSrc := POINTER(ORD(hrgevdsc^) + oOut);
+        MoveRgch(POINTER(ORD(pItem)), POINTER(ORD(pSrc)), cbItemQ);
+        oOut := oOut + cbItemQ;
+        IF oOut >= oMaxQ THEN oOut := 0;
+        END;
+   END;
+END;
+
+{$S LWActive}
+{--------------------------------------}
+PROCEDURE EnqueueLotus { (VAR q: TQ; pItem: TP) };
+{--------------------------------------}
+VAR oInNew: TC; pDst: TP; cbMore: TC;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+{$ifc fDbgOk}
+IF fTstQue THEN BEGIN WRITELN('EnqueueLotus called.'); PxQueue(q); END;
+{$endc}
+WITH q DO
+     BEGIN
+     oInNew := oIn + cbItemQ;
+     IF oInNew >= oMaxQ THEN oInNew := 0;
+     IF oInNew = oOut THEN (* must expand the queue *)
+          BEGIN
+          cbMore := cevdscMore*cbItemQ;
+          ChangeSizeH(hzQueue, POINTER(ORD(hrgevdsc)), oMaxQ + cbMore);
+          MoveRgch(POINTER(ORD(hrgevdsc^) + oOut + cbMore),
+                          POINTER(ORD(hrgevdsc^) + oOut), oMaxQ - oOut);
+          oOut := oOut + cbMore;
+          oMaxQ := oMaxQ + cbMore;
+          END;
+     pDst := POINTER(ORD(hrgevdsc^) + oIn);
+     MoveRgch(POINTER(ORD(pDst)), POINTER(ORD(pItem)), cbItemQ);
+     oIn := oInNew;
+     END;
+END;
+
+
+{$S LWType}
+{------------------------------------------}
+FUNCTION  FPeekQueue { (VAR q: TQ; pItem: TP): TF};
+{------------------------------------------}
+VAR pSrc: TP; pevDsc: ^TEvDsc;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+IF fTstQue THEN BEGIN WRITELN('FPeekQueue called.'); END;
+WITH q DO
+   BEGIN
+   IF oIn = oOut THEN
+        FPeekQueue := FALSE
+   ELSE BEGIN
+        FPeekQueue := TRUE;
+        pSrc := POINTER(ORD(hrgevdsc^) + oOut);
+        MoveRgch(POINTER(ORD(pItem)), POINTER(ORD(pSrc)), cbItemQ);
+        {$ifc fDbgOk}
+        IF fTstQue THEN
+           BEGIN
+           WRITELN('FPeekQueue is returning:');
+           pevDsc := POINTER(ORD(pItem));
+           PxEvDsc(pevDsc^);
+           WRITELN;
+           END;
+        {$endc}
+        END;
+   END;
+END;
+
+{$ifc fDbgOk}
+{$S LWDebug}
+{-----------------------------------}
+PROCEDURE PxTyEv { (VAR tyev: TTyev)};
+{-----------------------------------}
+BEGIN;
+     CASE tyev OF
+      tyevTimeout:     WRITE('Timeout');
+      tyevDwn:         WRITE('Down');
+      tyevMove:        WRITE('Move');
+      tyevDblClick:    WRITE('DoubleClick');
+      tyevTripleClick: WRITE('TripleClick');
+      tyevUp:          WRITE('Up');
+      tyevNull:        WRITE('Null');
+      tyevKey:         WRITE('Key');
+      tyevInChar:      WRITE('InChar');
+      tyevUpdate:      WRITE('Update');
+      tyevActivated:   WRITE('Activated');
+      tyevDeactivated: WRITE('Deactivated');
+      tyevScroll:      WRITE('Scroll');
+      tyevPScroll:     WRITE('Page Scroll');
+      tyevThumb:       WRITE('Thumb');
+      tyevAbort:       WRITE('Abort');
+      tyevCmd:         WRITE('Cmd');
+      tyevPopdown:     WRITE('Popdown');
+   (*
+      tyevOpen:        WRITE('Open');
+      tyevClose:       WRITE('Close');
+   *)
+      tyevScNew:       WRITE('New  Sc');
+      tyevScResize:    WRITE('Resize Sc');
+      tyevScKill:      WRITE('Kill Sc');
+      tyevPaneKill:    WRITE('Kill Pane');
+      tyevEnd:         WRITE('End Event');
+      tyevResume:      WRITE('Resume');
+      tyevDClose:      WRITE('Doc Close');
+      tyevDCopy:       WRITE('Doc Copy');
+      tyevDPut:        WRITE('Doc Put');
+      tyevDShred:      WRITE('Doc Shred');
+      tyevDfClose:     WRITE('Disk Removed');
+      tyevDTerminate:  WRITE('Doc Terminate');
+      tyevInternalRepeat: WRITE('tyevInternalRepeat');
+      END;
+END;
+{-----------------------------------}
+PROCEDURE PxEvDsc { (VAR evDsc: TEvDsc) };
+{-----------------------------------}
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+WITH evDsc DO
+     BEGIN
+     WRITE(' obox: ', obox : 1);
+     WRITE(' tyev: ');
+     PxTyEv (tyev);
+     WRITE(' ch: "', ch, '"');
+     CASE tyev OF
+        tyevResume, tyevDClose:
+                      WRITE(' windowCurr = ', ORD(windowCurr) : 1);
+     (* tyevOpen, tyevClose, *)  tyevActivated, tyevDeactivated:
+                      WRITE(' fid: ', fid : 1);
+        tyevScroll,
+        tyevPScroll:  BEGIN
+                      WRITE(' scid: ', scid : 1);
+                      CASE dir OF
+                         dirRt:  WRITE(' Right');
+                         dirLft: WRITE(' Left');
+                         dirUp:  WRITE(' Up');
+                         dirDwn: WRITE(' Down');
+                         END;
+                      END;
+        tyevThumb:    WRITE(' scid: ', scid : 1, ' ', cPct:1, '%');
+        tyevScResize: WRITE(' scid: ', scid : 1, ', fAdjFront? ', fAdjFront, ', by ',
+                            dcdAdjust);
+        tyevScNew:    WRITE(' scid: ', scid : 1, ', scidOld: ', scidOld);
+        tyevScKill:   WRITE(' scid: ', scid : 1);
+        tyevPaneKill: WRITE(' refCon: ', refCon : 1);
+        tyevPopdown:  WRITE(' imtd = ', imtd : 1);
+        tyevDfClose:  WRITE(' cRefnum = ', cRefnum : 1);
+        tyevSuspend, tyevDCopy: WRITE(' windowCurr = ', ORD(windowCurr) : 1);
+        END;
+     PxR(' r: ', r);
+     WRITE(' alpha: ', fAlphaKey:1);
+     WRITE(' shift: ', fShiftKey:1);
+     WRITE(' apple: ', fAppleKey:1);
+     WRITE(' code: ', fCodeKey:1);
+     WRITE(' mouse: ', fMouseButton:1);
+     WRITE(' autoscroll: ', fAutoScroll:1);
+     WRITELN;
+     END;
+END;
+{$endc}
+END.
+ÿ

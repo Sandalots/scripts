@@ -1,0 +1,598 @@
+
+(*  MM0  *)
+
+
+(*$R-*)
+(*$G+*)
+
+UNIT MEMORYMANAGER;  (* MEMORY MANAGER *)
+
+(*  Copyright 1983, 1984, Apple Computer, Inc. *)
+
+INTERFACE
+
+USES
+(*$U object/DRIVERDEFS.OBJ*)
+     driverdefs,
+(*$U object/HWINT.OBJ*)
+     hwint,
+(*$U object/SYSGLOBAL.OBJ*)
+     globalda,
+(*$U object/PROCPRIMS.OBJ*)
+     proc_prims,
+(*$U object/MMPRIM.OBJ*)
+     mmprimitives,
+(*$U object/ASYNCTR.OBJ*)
+     asynctr,
+(*$U object/GENIO.OBJ*)
+     genio,
+(*$U object/TWIGGY.OBJ*)
+     twiggy,
+(*$U object/VMSTUFF.OBJ*)
+     vmstuff,
+(*$U object/SFILEIO.OBJ*)
+     sfileio,
+(*$U object/FSPRIM.OBJ*)
+     fs_primitives,
+(*$U object/FSUI.OBJ*)
+     fs_interface;
+
+  (* all error codes are defined in MMPRIM *)
+
+TYPE
+
+  (***********************************)
+  (*                                 *)
+  (* Refnum Descriptor Block (REFDB) *)
+  (*                                 *)
+  (***********************************)
+
+  (* types of data segments *)
+  ds_kind = (ds_syslocal,ds_stack,ds_user);
+
+
+  ptr_ds_refdb = ^ds_refdb;    (* Ptr to refdb record *)
+  ds_refdb = record
+               header: refdbHead;  (* refdb header info *)
+               a_sdb_ptr: sdb_ptr;       (* Ptr to corresponding SDB *)
+               ldsn: int2;     (* ldsn to which this seg can be bound *)
+               no_ldsn: int2;  (* number of ldsns required by segment *)
+               access: int1; (* access rights of segment *)
+               dstype: ds_kind; (* type of data segment *)
+               ds_refnum: int2; (* refnum associated with this refdb *)
+               fs_refnum: int2; (* refnum assigned to data seg by file sys *)
+               creatorF: boolean;(* true if seg was created by this process *)
+               boundF: boolean; (* true if seg is bound to ldsn *)
+               privateF: boolean;(* true if seg is not sharable *)
+               unitid: int2;    (* the device # containing the data seg *)
+             end;
+
+
+seg_priority =
+    (ok_to_swap,          {hypothetical segment priority values, actual}
+     keep_resident,       {  value are TO BE DETERMINED.}
+     na_priority);
+
+
+
+procedure CHECK_DS(c_sdb_ptr: sdb_ptr);
+
+function CHECK_CS(seg_numb: int2; offset: int4): int2;
+
+function Check_Stack (overflow_addr : absptr) : boolean;
+
+procedure Size_Stack (var errnum : int2;  delta_size : int4);
+
+procedure MEMMGR;
+
+procedure BLD_SEG(kind: Tsdbtype; csize: int4; newsize: int2; disca: addrdisc;
+                  discspace: int4; pkedLen: int4; var c_sdb_ptr: sdb_ptr);
+
+procedure REL_SEG(c_sdb_ptr: sdb_ptr);
+
+procedure FLUSH_SEG(var errnum: int2; c_sdb_ptr: sdb_ptr);
+
+procedure Close_SysSegs;
+
+procedure Evap_SysSegs;
+
+procedure CVT_NAME(fs_refnum: int2; var unitno, sfileid: int2;
+                   var fcbptr: sfcb_ptr);
+
+function MMVERSION: integer;
+
+function GetFree(size: int2; var allocaddr: int2) : boolean;
+
+procedure MOVE_MEMMGR;
+
+procedure SET_SEGPRIORITY(c_sdb_ptr: sdb_ptr; spriority: seg_priority);
+
+procedure MM_INIT;
+
+procedure MAKE_FREE(maddr, msize: int2);
+
+function BLDPGLEN(length: absptr): absptr;
+
+procedure MAKE_REGION(var c_sdb_ptr: sdb_ptr; c_memaddr, c_memsize, c_packedSize,
+                      c_unpackedSize, c_offset: int4; c_priority: seg_priority;
+                      c_sdbtype: Tsdbtype; link_sdb: boolean);
+
+procedure MEM_CLEANUP(stksdb_ptr, slsdb_ptr: sdb_ptr);
+
+procedure LOCKSEG(var errnum: integer);
+
+procedure UNLOCKSEGS(var errnum: integer);
+
+procedure fs3Lock(var errnum: integer);   { temp definition }
+
+procedure LOCKOS(var errnum: integer);
+
+procedure PE_EVENT(pe_access: int1; pe_type: int2; pe_addr: int4;
+                   pe_onsupvstk: boolean);
+
+procedure SAVE_OC(c_sdb_ptr: sdb_ptr; ordpcb: absptr);
+
+procedure MAKE_OC(c_sdb: sdb_ptr);
+
+procedure Exp_SegDiskSize (c_sdb_ptr : sdb_ptr);
+
+IMPLEMENTATION
+
+CONST
+  version = 55;        (* version number of this unit *)
+
+TYPE
+
+(*********************************)
+(*                               *)
+(* SEGLOCK record                *)
+(* (keeps track of segments      *)
+(*  locked by a process. )       *)
+(*                               *)
+(*********************************)
+
+seglock = record
+            chain: linkage;
+            lockedsdbRP: relptr;
+          end;
+
+seglock_ptr = ^seglock;
+
+
+(******************************)
+(*                            *)
+(* START PRIMARY CODE         *)
+(*                            *)
+(******************************)
+
+
+(*$S kr_mmgr*)
+
+
+procedure INIT_SWAPIN(aSeg_sdb_ptr: sdb_ptr); forward;
+
+function SEG_OF_CALLER: int2; external;
+
+procedure Load_Init;  external;   { in unit Loader }
+
+(*$IFC debug2 *)
+procedure CodeSwapError (csSdb_ptr : sdb_ptr;  error : int2;
+                         mrbtPtr : mrbt_ptr);  external;
+  { in unit Loader }
+(*$ENDC *)
+
+(*$IFC debug1 *)
+procedure MemoryContents (mrtbtPtr : mrbt_ptr);  external;
+  { in unit Measure }
+(*$ENDC *)
+
+function UNPACKCODE(version: longint; pinbuff,poutbuff,ptable: absptr;
+                    sizepacked,sizeunpacked: int2) : int2; external;
+
+function LOGGING: boolean; external;
+
+procedure LOG(var errnum: integer; ptr_arr: absptr); external;
+
+function MMVERSION;
+(* return the version of this unit *)
+begin
+  mmversion:=version;
+end; (* MMVERSION *)
+
+
+procedure P_ENQUEUE(var newlink, leftlink: p_linkage);
+
+begin
+  newlink.fwd_link:=leftlink.fwd_link;
+  newlink.fwd_link^.bkwd_link:=@newlink;
+  leftlink.fwd_link:=@newlink;
+  newlink.bkwd_link:=@leftlink;
+end;
+
+procedure P_DEQUEUE(var link: p_linkage);
+
+begin
+  link.bkwd_link^.fwd_link:=link.fwd_link;
+  link.fwd_link^.bkwd_link:=link.bkwd_link;
+end;
+
+
+
+procedure REMOVESDB(c_sdb: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The sdb defined by c_sdb will be removed from the   *)
+       (*    list of allocated segments and free segments.       *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb - the sdb to be removed                       *)
+       (*                                                        *)
+       (**********************************************************)
+
+   var
+     c_mmrb: mmrb_ptr;
+     n_sdb: sdb_ptr;
+
+   begin
+     c_mmrb:=pointer(mmrb_addr);
+     with c_sdb^ do
+       begin
+         P_DEQUEUE(memchain); (* remove sdb from allocated memory list *)
+
+         (* if sdb is free then remove from free list *)
+         if sdbtype = free then P_DEQUEUE(freechain);
+       end;(*with*)
+   end;(*REMOVESDB*)
+
+
+procedure TAKE_FREE(free_sdb: sdb_ptr; upd_avail: boolean);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The sdb of type free will be removed from the chain *)
+       (*    of allocated memory and the chain of free memory.   *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    free_sdb - the pointer to the sdb to be removed.    *)
+       (*    upd_avail- if true the avail_space counter in c_mmrb*)
+       (*               will be updated                          *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_mmrb: mmrb_ptr;
+
+  begin
+    with free_sdb^ do
+      begin
+        if sdbtype <> free then SYSTEM_ERROR(10598)
+         else
+          begin
+            REMOVESDB(free_sdb);
+
+            (*$IFC DEBUG2*)
+            if TRACE(mm,0) then writeln(' TAKE_FREE of sdb at memaddr = ',memaddr);
+            (*$ENDC*)
+
+            if upd_avail then
+              begin
+                (* update available free space counter in working set *)
+                c_mmrb:=pointer(mmrb_addr);
+                c_mmrb^.avail_space:=c_mmrb^.avail_space - memsize;
+              end;
+          end;
+      end; (* with *)
+  end; (*TAKE_FREE*)
+
+
+procedure MERGE_FREE(c_sdb_ptr: sdb_ptr);
+  (* merge two adjacent free regions into one region *)
+
+  var
+    right_sdb: sdb_ptr;
+    c_mmrb: mmrb_ptr;
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    with c_sdb_ptr^ do
+      begin
+        right_sdb:=pointer(ord(memchain.fwd_link));
+        while (right_sdb^.sdbtype = free) and
+              (ord(right_sdb) = (ord(freechain.fwd_link) - oset_freechain)) do
+          begin (* next allocated sdb and next free sdb are one and the same *)
+            (* merge the two adjacent free regions *)
+
+            (*$IFC DEBUG2*)
+            if TRACE(mm,0) then
+              begin
+                writeln(' merge_free - memaddr = ',memaddr,' size = ',memsize);
+                writeln('       with - memaddr = ',right_sdb^.memaddr,
+                        ' size = ',right_sdb^.memsize);
+              end;
+            (*$ENDC*)
+
+            (* if clock_ptr is right_sdb then set clock_ptr to c_sdb_ptr*)
+            if c_mmrb^.clock_ptr = right_sdb then c_mmrb^.clock_ptr:=c_sdb_ptr;
+
+            (* combine sizes *)
+            memsize:=memsize + right_sdb^.memsize;
+
+            (* get rid of right sdb *)
+            TAKE_FREE(right_sdb,false);
+            (* calculate new right_sdb *)
+            right_sdb:=pointer(ord(memchain.fwd_link));
+          end;(*while*)
+      end; (*with*)
+  end;(*MERGE_FREE*)
+
+
+procedure INSERTSDB(c_sdb: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The sdb will be linked into the list of allocated   *)
+       (*    segments.  If the sdb is of type free then the sdb  *)
+       (*    will also be linked into the list of free segments. *)
+       (*    Both lists are linked in memory address order.      *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb - the sdb which is to be linked.              *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_mmrb: mmrb_ptr;
+    left_sdb: sdb_ptr;
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+
+    (* link c_sdb into allocated memory chain *)
+    left_sdb:=@c_mmrb^.head_sdb; (* head of allocated chain *)
+    while left_sdb^.memaddr <= c_sdb^.memaddr
+      do left_sdb:=pointer(ord(left_sdb^.memchain.fwd_link));
+    left_sdb:=pointer(ord(left_sdb^.memchain.bkwd_link));
+    P_ENQUEUE(c_sdb^.memchain,left_sdb^.memchain);
+
+
+    (* if free then link c_sdb into free memory chain *)
+    if c_sdb^.sdbtype = free then
+      begin
+        left_sdb:=@c_mmrb^.head_sdb; (* head of free chain *)
+        while left_sdb^.memaddr <= c_sdb^.memaddr
+          do left_sdb:=pointer(ord(left_sdb^.freechain.fwd_link) - oset_freechain);
+        left_sdb:=pointer(ord(left_sdb^.freechain.bkwd_link) - oset_freechain);
+        P_ENQUEUE(c_sdb^.freechain,left_sdb^.freechain);
+        MERGE_FREE(c_sdb); (* merge any free areas to right *)
+        MERGE_FREE(left_sdb); (* merge any free areas to left *)
+      end;
+  end; (*INSERTSDB*)
+
+
+
+procedure MAKE_FREE(* maddr, msize: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Construct a sdb of type free at the memory location *)
+       (*    specified by maddr.  Link this free sdb into the    *)
+       (*    allocated memory chain and the chain of free space. *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    maddr - the page address of the region to be freed  *)
+       (*    msize - the number of free pages                    *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    new_sdb: sdb_ptr;
+    c_mmrb: mmrb_ptr;
+
+  begin
+    (* construct sdb in free area *)
+    new_sdb:=pointer(ord4(maddr)*hmempgsize*2 + logrealmem);
+    c_mmrb:=pointer(mmrb_addr);
+    with new_sdb^ do
+      begin
+        memaddr:=maddr;
+        memsize:=msize;
+        sdbtype:=free;
+        lockcount:=0;
+
+        (*$IFC DEBUG2*)
+        if TRACE(mm,0) then
+          begin
+            writeln(' MAKE_FREE of region at ',maddr,' of size ',msize);
+          end;
+          (*$ENDC*)
+
+        (* link new sdb into chain of allocated memory *)
+        INSERTSDB(new_sdb);
+      end; (* with *)
+
+    (* update available free space counter in working set *)
+    c_mmrb^.avail_space:=c_mmrb^.avail_space + msize;
+  end;(* MAKE_FREE *)
+
+
+procedure LOCKSEG(* var errnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The segment issuing this call will be locked into   *)
+       (*    memory.                                             *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    The segment number of the calling process is        *)
+       (*    obtained from the last frame on the stack.          *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    None                                                *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*    If not used carefully this facility can result in a *)
+       (*    deadlock of physical memory.                        *)
+       (*                                                        *)
+       (**********************************************************)
+
+   var
+     seg_numb: int2;
+     c_syslocal_ptr: slocal_ptr;
+     c_mrbt: mrbt_ptr;
+     ordptr: absptr;
+     c_seglock: seglock_ptr;
+     c_sdb: sdb_ptr;
+
+   begin
+     errnum:=0;
+
+     seg_numb:=SEG_OF_CALLER; (* get segment number of caller*)
+     c_syslocal_ptr:=pointer(b_syslocal_ptr);
+     if SYS_CALLED
+       then c_mrbt:=pointer(s_mrbt_addr) (* in system code - use system's mrbt *)
+       else c_mrbt:=pointer(c_syslocal_ptr^.mrbt_addr); (* use process mrbt *)
+
+     with c_mrbt^[seg_numb] do
+       begin
+         if sdbRP <> 0 then
+           begin (* a segment is defined *)
+             (* construct lock seg record and link it in chain *)
+             if GETSPACE(SIZEOF(seglock),b_syslocal_ptr,ordptr) then
+               begin (* able to get space for record *)
+                 c_seglock:=pointer(ordptr);
+                 with c_seglock^ do
+                   begin
+                     lockedsdbRP:=sdbRP;
+                     ENQUEUE(chain,c_syslocal_ptr^.hd_seglock_list,b_syslocal_ptr);
+                   end;(*with*)
+                 c_sdb:=pointer(sdbRP + b_sysglobal_ptr);
+                 with c_sdb^ do lockcount:=lockcount+1; (* increment lock count *)
+               end
+              else
+               begin
+                 errnum:=e_mmbase + e_noresources
+               end;
+           end;
+       end;(*with*)
+     end; (*LOCKSEG*)
+
+
+procedure UNLOCKSEGS(* var errnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    All segments locked by this process will be unlocked*)
+       (*                                                        *)
+       (**********************************************************)
+
+   var
+     c_syslocal_ptr: slocal_ptr;
+     l_seglock_ptr, f_seglock_ptr: seglock_ptr;
+     c_sdb: sdb_ptr;
+
+   begin
+     c_syslocal_ptr:= pointer(b_syslocal_ptr);
+     with c_syslocal_ptr^ do
+       begin
+         l_seglock_ptr:=@hd_seglock_list.fwd_link; (*stopper*)
+         f_seglock_ptr:=pointer(hd_seglock_list.fwd_link + b_syslocal_ptr);
+         while f_seglock_ptr <> l_seglock_ptr do
+           begin (* unlock each segment the process has locked *)
+             c_sdb:=pointer(f_seglock_ptr^.lockedsdbRP + b_sysglobal_ptr);
+             with c_sdb^ do lockcount:=lockcount - 1;
+             DEQUEUE(f_seglock_ptr^.chain,b_syslocal_ptr);
+             RELSPACE(ord(f_seglock_ptr),b_syslocal_ptr);
+             f_seglock_ptr:=pointer(hd_seglock_list.fwd_link + b_syslocal_ptr);
+           end;(*while*)
+       end;(*with*)
+     errnum:=0;
+   end; (*UNLOCKSEGS*)
+
+
+
+(*$S fs1*)
+procedure fs1Lock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S fs2*)
+procedure fs2Lock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S fs3*)
+procedure fs3Lock(* var errnum: integer *);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S fs4*)
+procedure fs4Lock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S fs5*)
+procedure fs5Lock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S fs7*)
+procedure fs7Lock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+(*$S init*)
+procedure initLock(var errnum: integer);
+  begin
+    LOCKSEG(errnum);
+  end;
+
+
+(*$S kr_mmgr*)
+procedure LOCKOS(* var errnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The specific segments required for file transfer    *)
+       (*    across diskettes will be locked into memory.  They  *)
+       (*    can be unlocked by calling UNLOCKSEGS.              *)
+       (*                                                        *)
+       (**********************************************************)
+
+   label 10;
+
+   begin
+     (* A procedure in each required segment will be called *)
+     fs1Lock(errnum);
+     if errnum > 0 then goto 10;
+     fs2Lock(errnum);
+     if errnum > 0 then goto 10;
+     fs3Lock(errnum);
+     if errnum > 0 then goto 10;
+     fs4Lock(errnum);
+     if errnum > 0 then goto 10;
+     fs5Lock(errnum);
+     if errnum > 0 then goto 10;
+     fs7Lock(errnum);
+     if errnum > 0 then goto 10;
+     initLock(errnum);
+10: (*ERROR EXIT*)
+   end; (*LOCKOS*)
+
+
+
+(*$Isource/MM1.TEXT*)
+(*$Isource/MM2.TEXT*)
+(*$Isource/MM3.TEXT*)
+(*$Isource/MM4.TEXT*)
+
+
+end.
+ÿ

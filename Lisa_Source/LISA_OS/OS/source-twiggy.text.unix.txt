@@ -1,0 +1,1930 @@
+UNIT TWIGGY;
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+
+INTERFACE
+
+  USES
+      (*$Uobject/driverdefs.obj*)
+        driverdefs,
+      (*$Uobject/hwint.obj*)
+        hwint,
+      (*$Uobject/sysglobal.obj*)
+        globalda,
+      (*$Uobject/procprims.obj*)
+        proc_prims,
+      (*$Uobject/mmprim.obj*)
+        mmprimitives,
+      (*$Uobject/asynctr.obj*)
+        asynctr,
+      (*$Uobject/genio.obj*)
+        genio;
+
+
+  TYPE
+
+    interrupt_data_type = record        (*data passed to/from 6505 shared memory*)
+                rwts_cmd:  int1;
+                drive:  -1..1;
+                head:  0..1;
+                sector:  0..22;
+                cyl:  0..45;
+                cmd:  int1;
+                err:  int1;
+                cs_er_cnt:  int1;
+                int_stat:  packed record
+                                bot_int: boolean;
+                                bot_done: boolean;
+                                bot_button: boolean;
+                                bot_in: boolean;
+                                top_int: boolean;
+                                top_done: boolean;
+                                top_button: boolean;
+                                top_in: boolean
+                           end;
+                error_counts:  array [0..3]  of int1
+    end;
+
+    procedure INIT_TWIGGLOB (var err: integer; driv: integer);
+
+    function TWIGIO (parameters: param_ptr): integer;
+
+(*$IFC TWIGGYBUILD *)
+    procedure TWIG_INT (var twigint_data: interrupt_data_type);
+(*$ENDC*)
+
+    procedure TWIGOFF;
+
+    procedure PARAMEMINIT;
+
+    procedure PARAMEM_WRITE;
+
+  IMPLEMENTATION
+    (*$S krgenio*)
+
+    (*$IFC not debug2*)
+    (*$R-*) (*rangecheck off unless debug mode*)
+    (*$ENDC*)
+
+    CONST  (*changes to these constants may require rewriting START_WRITE, START_RWTS,
+                and FINISH_READ*)
+
+      mxindx = 93;      (*index into sequential_addrs table*)
+      goaway = -119;    (*=$89.  Disable twiggy command*)
+      enabstat = -122;  (*=$86.  Enable interrupts command*)
+      clristat = -123;  (*=$85.  Clear interrupt status command*)
+      seek = -125;      (*=$83.  Seek command*)
+      excmd = -127;     (*=$81.  Execute twiggy RWTS command (read or write).*)
+      nulcmd = -128;    (*=$80.  Null command*)
+      readcmd = 0;      (*twiggy read command*)
+      writecmd = 1;     (*twiggy write command*)
+      clampcmd = 9;     (*twiggy clamp command*)
+      unclampcmd = 2;   (*twiggy unclamp command*)
+      formatcmd = 3;    (*twiggy format command*)
+      mx_soft = 2;      (*maximum # soft checksum errors allowed before rewrite*)
+      not_issued = 9;   (*error returned when pending ints not cleared*)
+      vererr = $15;     (*error returned when verify fails*)
+      read_err = $17;   (*error returned when read failed*)
+      write_err = $18;  (*error returned when write failed*)
+      timtrkerr = $1A;  (*error returned when timing track not present. bug #170*)
+      spareindex = 68;  (*index of spare track in sequential_addrs table*)
+      errbase = 610;    (*error number base*)
+      syserrbase = 10610;
+      romerrbase = 1800;(*error base for twiggy rom errors*)
+      syromerrbase = 11800;(*error base for twiggy rom system errors*)
+      premenderr = 658; (*premature end of file in chained header read*)
+      vfyerr = 659;     (*header read verify error*)
+
+    TYPE
+      drvno_type = 0..1;
+
+      ptr_remap_table = ^remap_table;
+      remap_table = record
+                      osid: integer; (*self-identify OS bad block table sector*)
+                      version: integer; (*bad block table version*)
+                      numbad: integer; (*number of entries in bad_blok array*)
+                      bad_blok: array[0..15] of integer
+                                  (*  >= 0: bad block number.
+                                      = -1: available.
+                                      = -2: sector in remap area is bad. *)
+                    end;
+
+      pglbl_ptr = ^pagelabel;
+
+    VAR
+      rwts_data: interrupt_data_type;
+
+      (*table to get cyl, head, sector, given block-number*)
+      (*see INIT_TWIGGLOB for initialization.*)
+
+(*$IFC TWIGGYBUILD *)
+      sequential_addrs: array [0..mxindx] of 0..1702;
+(*$ENDC*)
+
+      (*state info for current disk request*)
+
+        cur_drive: -1..1;   (*-1 if none active *)
+(*$IFC TWIGGYBUILD *)
+        soft_header: pagelabel; (*the buffer used to compare header data on input*)
+        num_sectors_left: integer;
+        cur_req_ptr: reqptr_type;
+        cur_info_ptr: extdptr_type;
+        success_flag: boolean;
+        worstwarning: integer;
+        twigerr: integer;
+        twigcserr: integer;
+        raw_data_ptr: longint;
+        raw_header_ptr: pglbl_ptr;
+        cur_head: integer;
+        cur_trk: integer;
+        same_req: boolean;
+        fs_st_blk: integer; (*copied from configinfo for current request*)
+        internal_buffer: longint;
+        orig_header: pagelabel;
+        orig_hdr_ptr: pglbl_ptr;
+        orig_block: integer;
+        final_block: integer;
+        orig_index: integer;
+        needs_verify: boolean;
+        needs_rewrite: boolean;
+
+
+      drive_cb: array[drvno_type] of record  (*info relevant to each drive's queue*)
+                  req_hd_ptr: reqptr_type;        (*next request to be serviced*)
+                  dummy_req_ptr: reqptr_type;     (*phoney request at cyl -1 or 32767*)
+                  cur_num_requests: integer;      (*not counting dummy request*)
+                  notconfigured: boolean;         (*T if this drive not configured*)
+                  verifying_now: boolean;         (*T if re-read all writes*)
+                  rewriting: boolean;             (*T if re-write reads w/checksum*)
+                  newspares: boolean;             (*T if can update bad blk tbl*)
+                  oktospare: boolean;             (*T if user says ok to set
+                                                  newspares to T when not full*)
+                  bbtabl1_bad: boolean;           (*primary bad block table bad*)
+                  eject_pending: boolean;         (*button pressed, not ejectd*)
+                  disk_present: (nodisk,somedisk,notreadable,notOS,gooddisk);
+                                                  (*status of disk in drive*)
+                  (*alternative read/write state for dealing with bad blocks *)
+                  alt_rd_state: (clamp1_st,
+                                 rddir1_st,rddir2_st,rddir3_st,rddir4_st,rddir5_st,
+                                 format1_st,format2_st,format3_st,format4_st,
+                                 unclmp1_st,unclmp2_st,
+                                 writer1_st,writer2_st,writer3_st,
+                                 verify1_st,verify2_st,verify3_st,verify4_st,
+                                   verify5_st,verify6_st,verify7_st,
+                                 rewrt1_st,rewrt2_st,rewrt3_st,rewrt4_st,rewrt5_st,
+                                 nuthin);
+                  lock_fails: integer;            (*# times LK_REGION fails*)
+                  remap_ptr: ptr_remap_table;        (*pointer to bad sector table*)
+                  padding: array [1..6] of int1   (*fill record to 32 bytes*)
+      end;
+(*$ENDC*)
+
+    procedure START_WRITE (buffer: absptr; hdr: pagelabel;
+                           rwts: interrupt_data); external;
+
+    procedure START_RWTS (rwts: interrupt_data); external;
+
+    procedure FINISH_READ (buffer: absptr; var hdr: pagelabel;
+                           rwts: interrupt_data); external;
+
+    function ISTWIGIN (driv: drvno_type): boolean; external;
+
+    procedure A5SETUP; external;
+
+    procedure W_PARAM_MEM (data: absptr); external;
+
+(*$IFC TWIGGYBUILD *)
+    procedure START_NEW_REQUEST (drv: integer); forward;
+(*$ENDC*)
+
+    procedure PARAMEMINIT;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Initialize alarm handler for parameter mem. *)
+       (*               AND for unblk_req queu.                     *)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+     begin
+       cur_drive := -1;
+       ALARMASSIGN (param_mem.alarm_ref, ord(@PARAMEM_WRITE));
+       ALARMASSIGN (unblk_alarm, ord(@TIMER_UNBLK));
+       unblk_tail := nil
+     end;
+
+    procedure PARAMEM_WRITE;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Write data from sysglobal to parameter      *)
+       (*               memory if twiggy or sony is idle.           *)
+       (*                                                           *)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  parameter memory updated from sysglobal    *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+     TYPE
+       diagrec = packed record
+                   pad1: 0..1;
+                   diagbit: boolean; (*bit 6 is only one of interest*)
+                   pad2: -32..31;
+                   pad3: int1
+                 end;
+     VAR
+       prevints: intson_type;
+       diskdiag_ptr: ^diagrec;
+
+     begin
+        A5SETUP; (*sets up A5 when called as alarm routine*)
+        INTSOFF (twigints, prevints);
+        diskdiag_ptr := pointer (iospacemmu*$20000 + $0D801);
+        if diskdiag_ptr^.diagbit{SONY} and (cur_drive < 0){TWIGGY} then (*disk idle*)
+          W_PARAM_MEM (ord(@param_mem.parm_mem))
+        else (*wait 1 second then try again*)
+          ALARMRELATIVE (param_mem.alarm_ref, 1000);
+        INTSON (prevints)
+     end;
+
+
+    procedure SEND_COMMAND;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Send a command from "rwts_data", and report *)
+       (*               errors.                                     *)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  never returns if error                     *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+    begin
+      START_RWTS (rwts_data);
+      if rwts_data.err <> 0 then
+        SYSTEM_ERROR (rwts_data.err + syromerrbase)
+    end; (*send_command*)
+
+
+    procedure TWIGOFF;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Turn off Twiggy before powering off machine.*)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  no more Twiggy access allowed              *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+    begin
+        if cur_drive >= 0 then
+          SYSTEM_ERROR (syserrbase + 14); (*can't turn off while busy*)
+        rwts_data.cmd := goaway;     (*set up for RWTS command*)
+        SEND_COMMAND
+    end; (*twigoff*)
+
+(*$IFC TWIGGYBUILD *)
+    procedure NEW_TRACK (index: integer);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  update variables required when changing     *)
+       (*               tracks.                                     *)
+       (*                                                           *)
+       (*                                                           *)
+       (* Input Parameters:  index is index into sequential_addrs[].*)
+       (*                                                           *)
+       (* Output Parameters:  unit global variables are changed.    *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      begin
+        if index <= 45 then
+        begin (*on top surface*)
+          cur_head := 0;
+          cur_trk := index;
+        end
+        else
+        begin (*on bottom surface*)
+          cur_head := 1;
+          if index < 92 then (*normal address space of side 2*)
+            cur_trk := 91 - index
+          else (*spare track is at end of address space*)
+            cur_trk := 91 - spareindex
+        end
+      end;
+
+
+    procedure NEXT_SECTOR;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  update variables required when changing     *)
+       (*               sectors.                                    *)
+       (*                                                           *)
+       (*                                                           *)
+       (* Input Parameters:                                         *)
+       (*                                                           *)
+       (* Output Parameters:  unit global variables are changed.    *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        i: integer;
+
+      begin
+        WITH cur_info_ptr^ do
+        begin (*upddate cyl # for current request*)
+          if misc1 = (spareindex-1) then(*next index of sequential_addrs table*)
+            i := 2  (*skip track with spare blocks on it*)
+          else
+            i := 1;
+          if (blkno+1) = sequential_addrs[misc1+i] then
+          begin (*changing tracks*)
+            misc2 := 0; (*sector #*)
+            misc1 := misc1 + i; (*skip track with spare blocks on it*)
+            NEW_TRACK (misc1)
+          end
+          else
+            misc2 := misc2 + 1 (*next sector*)
+        end
+      end;
+
+
+    procedure FIN_REQUEST (drv: integer);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Complete the current request.               *)
+       (*                                                           *)
+       (* Input Parameters:  dr is next drive with a request, or -1 *)
+       (*               if none, or -2 if need to decide next drive.*)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Twigints must be off.         *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+    VAR
+      req_ptr: reqptr_type;
+      dr: integer;
+
+    begin
+      if drv = -2 then
+      begin (*still need to pick drive for next request*)
+        dr := cur_drive;
+        if drive_cb[1-dr].cur_num_requests > 0 then
+          dr := 1-dr (*other drive*)
+        else
+          if drive_cb[dr].cur_num_requests <= 1 then
+            dr := -1 (*no drive*)
+      end
+      else (*already have drive selected*)
+        dr := drv;
+
+
+      (* check for errors *)
+
+      WITH drive_cb[cur_drive] do
+      begin
+        if cur_info_ptr <> nil then
+        WITH cur_req_ptr^, cur_info_ptr^ do
+        begin (*normal read or write request*)
+          if success_flag then
+          begin
+            if io_mode = chained_headers then (*update final transfer length*)
+              xfer_count := xfer_count + soft_hdr.dataused
+            else
+              xfer_count := xfer_count + 512;
+            if worstwarinig <> 0 then
+            begin
+              hard_error := worstwarning;
+              success_flag := false
+            end
+          end
+          else (*got some error*)
+            if twigerr = read_err then
+              if twigcserr = 0 then
+                hard_error := 606 (*unformatted sector likely*)
+              else
+                hard_error := errbase + 7 (*checksum error*)
+            else
+              if twigerr <> 0 then
+                hard_error := romerrbase + twigerr; (*misc i/o error*)
+
+
+          UNFREEZE_SEG (buff_rdb_ptr);  (*allow data to move*)
+          ADJ_IO_CNT (false, buff_rdb_ptr);  (*allow data to be swapped*)
+
+        end;
+
+        UNBLK_REQ (cur_req_ptr, success_flag);
+        alt_rd_state := nuthin;
+
+        (* remove from the top of the queue *)
+
+        cur_num_requests := cur_num_requests - 1;
+        req_ptr := CHAIN_FORWARD (cur_req_ptr^.dev_chain);
+        if cur_num_requests > 0 then
+          if req_ptr = dummy_req_ptr then
+          WITH req_ptr^ do
+          begin (*if dummy at head, skip over it and reverse its cylinder number*)
+            if reqspec_info = -1 then
+              reqspec_info := 32767
+            else
+              reqspec_info := -1;
+            req_ptr := CHAIN_FORWARD (dev_chain);
+          end;
+
+        req_hd_ptr := req_ptr;
+        DEQUEUE (cur_req_ptr^.dev_chain, b_sysglobal_ptr);
+        rwts_data.cmd := nulcmd; (*sending null twice makes sure clristat completed*)
+        SEND_COMMAND;
+        SEND_COMMAND;
+
+        (*start next request *)
+
+        if dr >= 0 then
+          START_NEW_REQUEST (dr)
+        else (*no more requests pending, check for parameter memory update*)
+          cur_drive := -1;
+      end
+    end; (*fin_req*)
+
+    function ALTERED_STATES: boolean;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description: Perform the function required by alt_rd_state*)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  returns FALSE if remainder of START_  *)
+       (*                     DISK should be skipped.               *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Called from within START_DISK,*)
+       (*    with same_req = success_flag = true upon entry.        *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+    VAR
+      i, j, index: integer;
+      tempdir_ptr: ptr_remap_table;
+      scratch_header: pglbl_ptr;
+
+         procedure ZERO_HEADER;
+            (*************************************************************)
+            (*                                                           *)
+            (* Description:  Zero out soft_header.                       *)
+            (*                                                           *)
+            (*************************************************************)
+
+         begin
+           WITH soft_header do
+           begin (*write a zero header into the bad block first*)
+             version := 0;
+             datastat := dataok;
+             filler := 0;
+             volume := 0;
+             fileid := 0;
+             dataused := 0;
+             relpage := 0;
+             fwdlink := 0;
+             bkwdlink:= 0
+           end
+         end;
+
+         procedure WRITE_BBDIR (sec: integer);
+            (*************************************************************)
+            (*                                                           *)
+            (* Description:  Update bad block directory on sector 0 or 13*)
+            (*                                                           *)
+            (*************************************************************)
+
+         begin
+           WITH drive_cb[cur_drive] do
+           begin
+             rwts_data.sector := sec;
+             rwts_data.head := 1;
+             rwts_data.cyl := 91 - spareindex;
+             rwts_data.rwts_cmd := writecmd;
+             rwts_data.cmd := excmd;
+             START_WRITE (ord(remap_ptr), soft_header, rwts_data);
+             if rwts_data.err <> 0 then
+               SYSTEM_ERROR (rwts_data.err + syromerrbase)
+           end
+         end; (*WRITE_BBDIR*)
+
+
+    begin
+      ALTERED_STATES := false; (*usually don't do continue after returning*)
+      WITH drive_cb[cur_drive] do
+      case alt_rd_state of
+
+        (*clamp*)
+
+        clamp1_st: begin (*clamp the disk*)
+          rwts_data.rwts_cmd := clampcmd;
+          rwts_data.cmd := excmd;
+          SEND_COMMAND;
+          alt_rd_state := rddir1_st (*once clamped, read in directory*)
+        end; (*clamp1_st*)
+
+        (*read bad block directory*)
+
+        rddir1_st: begin (*start first attempt to read directory*)
+          rwts_data.head := 1;
+          rwts_data.cyl := 91 - spareindex;
+          rwts_data.sector := 0;
+          rwts_data.rwts_cmd := readcmd;
+          rwts_data.cmd := excmd;
+          SEND_COMMAND;
+          newspares := false; (*initialize "no new sparing" until successfully
+                                 read bad block directory*)
+          alt_rd_state := rddir2_st
+        end; (*rddir1_st*)
+
+        rddir2_st,rddir3_st,rddir4_st,rddir5_st: begin (*done with directory read*)
+          if twigerr = 0 then (*read bad block table ok*)
+          begin
+            rwts_data.cmd := nulcmd;
+            scratch_header := pointer(internal_buffer);
+            FINISH_READ (internal_buffer, scratch_header^, rwts_data);
+              (*internal buffer gets header, then overwritten with data*)
+            if rwts_data.err <> 0 then
+              SYSTEM_ERROR (rwts_data.err + syromerrbase);
+            tempdir_ptr := pointer(internal_buffer);
+            WITH tempdir_ptr^ do
+            if (osid = $4AFC) and (version = 1) and (numbad <= 16) and
+               (numbad >= 0) then
+            begin (*have bad block directory*)
+              disk_present := gooddisk;
+              newspares := (oktospare and (numbad < 16));  (*allow sparing?*)
+              case alt_rd_state of
+                rddir2_st: alt_rd_state := rddir5_st; (*1st good, read 2nd to see if good*)
+                rddir5_st: begin (*both look ok*)
+                  bbtabl1_bad := numbad <> remap_ptr^.numbad; (*one's bad if diff*)
+                  if numbad < remap_ptr^.numbad then
+                    tempdir_ptr := remap_ptr; (*use orig directory already read *)
+                  alt_rd_state := nuthin
+                end;
+                otherwise begin (*1st dir was bad, but 2nd is ok*)
+                  bbtabl1_bad := true;
+                  alt_rd_state := nuthin
+                end
+              end;
+              remap_ptr^ := tempdir_ptr^; (*copy the bad block table*)
+            end
+            else (*bad osid*)
+              case alt_rd_state of
+                rddir2_st: alt_rd_state := rddir4_st; (*try the alternate directory*)
+                rddir5_st: begin (*1st ok, 2nd is not*)
+                  bbtabl1_bad := true;
+                  alt_rd_state := nuthin
+                end;
+                otherwise begin (*both bad osid's*)
+                  disk_present := notOS;
+                  alt_rd_state := nuthin
+                end
+              end
+          end
+          else (*error reading bad block directory*)
+            case alt_rd_state of
+              rddir2_st: alt_rd_state := rddir3_st; (*try alternate directory*)
+              rddir3_st: begin (*neither directory sector readable*)
+                disk_present := notreadable;
+                alt_rd_state := nuthin
+              end;
+              rddir4_st: begin (*1st was readable, but no osid*)
+                disk_present := notOS;
+                alt_rd_state := nuthin
+              end;
+              rddir5_st: begin (*1st ok, 2nd not readable*)
+                bbtabl1_bad := true;
+                alt_rd_state := nuthin
+              end
+            end;
+
+          if alt_rd_state = nuthin then
+            ALTERED_STATES := true (*done reading directory.  Continue orig I/O*)
+          else
+          begin (*start up alternate directory read*)
+            rwts_data.sector := 13;
+            rwts_data.rwts_cmd := readcmd;
+            rwts_data.cmd := excmd;
+            SEND_COMMAND
+          end
+        end; (*rddir2_st,rddir3_st,rddir4_st,rddir5_st*)
+
+        (*format*)
+
+        format1_st: begin
+          rwts_data.cmd := excmd;
+          rwts_data.head := 0;
+          rwts_data.cyl := 0;
+          rwts_data.rwts_cmd := formatcmd;
+          SEND_COMMAND;
+          WITH remap_ptr^ do (*initialize bad block directory in memory*)
+          begin
+            osid := $4AFC;
+            version := 1;
+            numbad := 0;
+            for j := 0 to 15 do (*mark all sectors of remap table as available*)
+              bad_blok[j] := -1
+          end;
+          ZERO_HEADER;
+          alt_rd_state := format2_st
+        end; (*format1_st*)
+
+        format2_st: begin
+          alt_rd_state := format3_st;
+          if twigerr = 0 then (*format completed successfully*)
+            WRITE_BBDIR (13) (*write sector 13 1st, then identical in 0*)
+          else
+            ALTERED_STATES := ALTERED_STATES  (*re-enter in "format3_st" state*)
+        end; (*format2_st*)
+
+        format3_st: begin (*write second copy of bad block dir., if 1st was ok*)
+          alt_rd_state := format4_st;
+          if twigerr = 0 then (*1st completed successfully*)
+            WRITE_BBDIR (0) (*write sector 13 1st, then identical in 0*)
+          else
+            ALTERED_STATES := ALTERED_STATES  (*re-enter in "format4_st" state*)
+        end; (*format3_st*)
+
+        format4_st: begin (*finished formatting*)
+          if twigerr <> 0 then
+          begin (*error writing bad block directory*)
+            disk_present := notreadable;
+            newspares := false; (*don't allow sparing*)
+            success_flag := false
+          end
+          else
+          begin (*successfully formatted for the OS*)
+            bbtabl1_bad := false;
+            disk_present := gooddisk;
+            newspares := oktospare;  (*allow sparing?*)
+          end;
+          FIN_REQUEST(-2)  (*finish with success or failure*)
+        end; (*format4_st*)
+
+        (*unclamp*)
+
+        unclmp1_st: begin
+          rwts_data.cmd := excmd;
+          rwts_data.rwts_cmd := unclampcmd;
+          SEND_COMMAND;
+          alt_rd_state := unclmp2_st
+        end; (*unclmp1st*)
+
+        unclmp2_st: begin
+          eject_pending := false;
+          FIN_REQUEST (-2) (*finish with success*)
+        end; (*unclmp2_st*)
+
+
+        (*spare on write error during write (writer1_st) or verify (verify6_st)*)
+
+        writer1_st,verify2_st,verify6_st,rewrt4_st:
+        WITH remap_ptr^ do
+        begin (*write failure means spare the block*)
+          for j := 0 to numbad-1 do (*look thru table for match*)
+            if cur_info_ptr^.blkno = bad_blok[j] then (*matches logical block number*)
+              bad_blok[j] := -2; (*mark the block within remap area as unusable*)
+          bad_blok[numbad] := cur_info_ptr^.blkno; (*add new entry to bad block table*)
+          numbad := numbad + 1;
+          newspares := (numbad < 16);  (*allow further sparing?*)
+          osid := $4AFC;
+          version := 1;
+          ZERO_HEADER;
+          WRITE_BBDIR (0); (*initiate write to 1st bad block directory*)
+          alt_rd_state := succ(alt_rd_state) (*next write 2nd copy of bad block dir *)
+        end;
+
+    (*spare on write-error(writer2_st), spare on read-verify(verify3_st),
+       or spare on re-write during read-verify*)
+
+        writer2_st,verify3_st,verify7_st,rewrt5_st:
+        begin (*write second copy of bad block dir.*)
+          WRITE_BBDIR (13);
+          case alt_rd_state of
+            writer2_st: alt_rd_state := writer3_st;
+            verify3_st,verify7_st: alt_rd_state := verify4_st;
+            rewrt5_st: alt_rd_state := rewrt1_st;
+          end
+        end;
+
+        writer3_st: begin
+          ALTERED_STATES := true; (*start up the original write again*)
+          alt_rd_state := nuthin
+        end; (*writer3_st*)
+
+        (*verify blocks just written by re-reading all*)
+
+        verify1_st:
+          WITH cur_info_ptr^ do
+          begin
+            if ((twigerr <> 0) or (twigcserr > 0)) and newspares and
+             (blkno >= fs_st_blk) then
+            begin (*spare the block we had trouble reading*)
+              ZERO_HEADER;
+              raw_header_ptr := @soft_header;
+              read_flag := false; (*cause a write to happen*)
+              alt_rd_state := verify2_st;
+              ALTERED_STATES := true  (*writes the zero-header into bad block*)
+            end
+            else
+              if twigerr <> 0 then
+              begin (*return with error on verify*)
+                success_flag := false;
+                read_flag := false; (*this was originally a write request before
+                                        verifying*)
+                FIN_REQUEST (-2) (*finish with error*)
+              end
+              else (*no errors*)
+                if blkno = final_block then
+                begin (*done*)
+                  read_flag := false; (*this was originally a write request before
+                                          verifying*)
+                  FIN_REQUEST (-2) (*finish with success*)
+                end
+                else
+                begin (*successful intermediate read*)
+                  NEXT_SECTOR;
+                  blkno := blkno + 1; (*increment sequential block number*)
+                  ALTERED_STATES := true (*start the next read*)
+                end
+          end; (*verify1_st*)
+
+        verify4_st:
+          WITH cur_info_ptr^ do
+          begin
+            i := blkno - orig_block;
+            j := ord4(512) * i; (*displacement to current data*)
+            raw_header_ptr := @soft_header;
+            case io_mode of
+              with_header: begin
+                soft_header := orig_header;
+                if i > 0 then (*past 1st block*)
+                WITH soft_header do begin
+                  relpage := relpage + i;
+                  fwdlink := fwdlink + i;
+                  bkwdlink := fwdlink - 2;
+                  if blkno = final_block then
+                  begin
+                    fwdlink := last_fwd_link;
+                    dataused := last_data_used
+                  end
+                end
+              end;
+              raw_io: raw_header_ptr := pointer(resolved_addr + ord4(24) * i);
+              (*without_header uses already zero'd soft_header*)
+            end;
+            WITH remap_ptr^ do
+              rwts_data.sector := numbad + ord(numbad > 12); (*newest spare sector*)
+            rwts_data.rwts_cmd := writecmd;
+            rwts_data.cmd := excmd;
+            START_WRITE (raw_data_ptr + j, raw_header_ptr^, rwts_data);
+            if rwts_data.err <> 0 then
+              SYSTEM_ERROR (rwts_data.err + syromerrbase);
+            alt_rd_state := verify5_st
+        end; (*verify4_st*)
+
+        verify5_st:
+          if twigerr <> 0 then (*error on previous write*)
+            if newspares then (*spare it*)
+            begin
+              alt_rd_state := verify6_st;
+              ALTERED_STATES := ALTERED_STATES (*on write error, re-enter w/diff state*)
+            end
+            else
+            begin (*error with no room for sparing*)
+              success_flag := false;
+              FIN_REQUEST (-2) (*finish with error*)
+            end
+          else
+          begin (*no write error*)
+            cur_info_ptr^.read_flag := true;
+            alt_rd_state := verify1_st;
+            ALTERED_STATES := true (*re-read the current block*)
+          end; (*verify5_st*)
+
+        (*rewrite on successful read with checksum errors*)
+
+        rewrt1_st: begin
+          soft_header := orig_header; (*make sure original header is there for write*)
+          raw_header_ptr := orig_hdr_ptr;
+          cur_info_ptr^.read_flag := false;
+          alt_rd_state := rewrt2_st;
+          ALTERED_STATES := true (*re-write the block just read*)
+        end; (*rewrt1_st*)
+
+        rewrt2_st: begin
+          cur_info_ptr^.read_flag := true;
+          if twigerr <> 0 then (*error on previous write*)
+          begin
+            success_flag := false;
+            FIN_REQUEST (-2) (*finish with error*)
+          end
+          else
+          begin (*no write error*)
+            alt_rd_state := rewrt3_st;
+            ALTERED_STATES := true (*re-read the current block, but no data copy*)
+          end
+        end; (*rewrt2_st*)
+
+        rewrt3_st:
+          WITH cur_info_ptr^ do
+          begin
+            if ((twigerr <> 0) or (twigcserr > 0)) and newspares and
+             (blkno >= fs_st_blk) then
+            begin (*spare the block we had trouble reading*)
+              ZERO_HEADER;
+              raw_header_ptr := @soft_header; (*restored again in rewrt1_st*)
+              read_flag := false; (*cause a write to happen*)
+              alt_rd_state := rewrt4_st;
+              ALTERED_STATES := true  (*writes the zero-header into bad block*)
+            end
+            else
+              if twigerr <> 0 then
+              begin (*return with error on verify*)
+                success_flag := false;
+                FIN_REQUEST (-2) (*finish with error*)
+              end
+              else (*no errors*)
+              begin
+                alt_rd_state := nuthin;
+                ALTERED_STATES := true;  (*restart the read so rest of twig_int
+                                           will execute following the read*)
+              end
+          end; (*rewrt3_st*)
+
+      end (*case*)
+    end; (*altered_states*)
+
+    procedure START_DISK;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start a read,  write  or verify one sector  *)
+       (*            on a twiggy disk.  Then update unit globals    *)
+       (*            in anticipation of next interrupt.             *)
+       (*                                                           *)
+       (* Input Parameters:  unit globals:  rwts_data,              *)
+       (*                     cur_info_ptr^.                        *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Makes 6505 shared memory inaccessible      *)
+       (*   until the 6505 causes an interrupt.                     *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Twigints must be off.         *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        i,j: integer;
+        contin: boolean;
+
+      begin
+        success_flag := true;
+        same_req := true;
+
+        (*check alternate read/write state first*)
+
+        if drive_cb[cur_drive].alt_rd_state <> nuthin then
+          contin := ALTERED_STATES (*perform alternative sub-command & update alt_rd_state*)
+        else
+          contin := true;
+
+        if contin then
+        begin (*continue whenever ALTERED_STATES hasn't started some operation*)
+          rwts_data.cmd := excmd;     (*set up for RWTS command*)
+          rwts_data.head := cur_head;
+          rwts_data.cyl := cur_trk;
+          WITH cur_info_ptr^ do
+          begin
+            rwts_data.sector := misc2;
+
+            (*remap bad blocks*)
+
+            i := blkno;  (*hold integer logical block number*)
+            WITH drive_cb[cur_drive].remap_ptr^ do
+            for j := 0 to numbad-1 do (*look thru table for match*)
+              if i = bad_blok[j] then (*matches logical block number*)
+              begin (*remap the i/o to its bad sector on spare track, lower surface*)
+                rwts_data.head := 1;
+                rwts_data.cyl := 91 - spareindex;
+                rwts_data.sector := j + 1 + ord(j>11); (*entries 0-11
+                     represent sectors 1-12, entries 12-15 rep. sectors 14-17*)
+                j := numbad (*exit the loop*)
+              end;
+
+            (*start the read or write*)
+
+            if read_flag then
+            begin
+              rwts_data.rwts_cmd := readcmd;
+              START_RWTS (rwts_data)   (*start the read*)
+            end
+            else
+            begin  (*write*)
+              rwts_data.rwts_cmd := writecmd;
+              START_WRITE (raw_data_ptr+xfer_count, raw_header_ptr^, rwts_data)
+            end;
+
+            if rwts_data.err <> 0 then
+            begin (*error on prior seek*)
+              success_flag := false;
+              cur_req_ptr^.hard_error := rwts_data.err + romerrbase;
+              same_req := false;
+              needs_verify := false
+            end
+          end
+        end
+      end;  (*start_disk*)
+
+     procedure START_NEW_REQUEST (*drv: integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Initialize unit globals and make first I/O  *)
+       (*   call for the request at the head of the drive's queue.  *)
+       (*                                                           *)
+       (* Input Parameters: drv is drive number.                    *)
+       (*   Unit globals referenced:  drive_cb[drv].req_hd_ptr^.-   *)
+       (*                             sequential_addrs[].-          *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Unit globals:  num_sectors_left, cur_drive,*)
+       (*                     cur_info_ptr, cur_req_ptr, rwts_data. *)
+       (*   Request changed from active to in-service.              *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Twigints must be off. ACT_IOMR*)
+       (*   must be in effect.                                      *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+       VAR
+         j,er: integer;
+         p_extconfig: ^ext_diskconfig;
+
+       begin
+
+         (*set up global vars for this request *)
+
+         cur_drive := drv;
+         rwts_data.drive := drv; (*remains valid throughout this I/O request*)
+         cur_req_ptr := drive_cb[drv].req_hd_ptr;
+         cur_req_ptr^.reqstatus.reqsrv_f := in_service;  (*from active to in_service*)
+         cur_info_ptr := pointer(cur_req_ptr^.req_extent);
+         WITH cur_info_ptr^, drive_cb[cur_drive] do
+         case cur_req_ptr^.operatn of
+           2: begin (*start format operation*)
+             if alt_rd_state = clamp1_st then
+             begin
+               rwts_data.rwts_cmd := clampcmd;
+               rwts_data.cmd := excmd;
+               SEND_COMMAND;
+               alt_rd_state := format1_st
+             end
+             else
+             begin
+               alt_rd_state := format1_st;
+               START_DISK
+             end
+           end; (*format*)
+
+           3: begin (*unclamp*)
+             rwts_data.cmd := excmd;
+             rwts_data.rwts_cmd := clampcmd; (*1st clamp, then unclamp*)
+             SEND_COMMAND;
+             disk_present := nodisk;
+             alt_rd_state := unclmp1_st
+           end; (*unclamp*)
+
+           0,1: begin (*read or write*)
+
+             (*next try to lock the data buffer in memory*)
+
+             FREEZE_SEG (er, buff_rdb_ptr, buff_offset, ord(cur_req_ptr),
+                          resolved_addr);
+
+             if er<>0 then
+             begin (*lock didn't work.  Restart_io will be called later*)
+               lock_fails := lock_fails + 1;
+             end
+             else
+             begin (*data is locked, start up the I/O*)
+               needs_rewrite := rewriting and read_flag;
+               needs_verify := verifying_now and not read_flag;
+               if needs_verify then
+               begin (*save some starting state when doing write with verify*)
+                 orig_header := soft_hdr;
+                 orig_block := blkno;
+                 orig_index := misc1
+               end;
+               worstwarning := 0;
+               num_sectors_left := num_chunks;
+               p_extconfig:= pointer(cur_req_ptr^.cfigptr^.ext_addr);
+               fs_st_blk := p_extconfig^.fs_strt_blok;
+               raw_header_ptr := @soft_hdr;
+               raw_data_ptr := resolved_addr;
+               case io_mode of
+                 raw_io: begin
+                   raw_header_ptr := pointer(resolved_addr);
+                   if num_chunks = 1 then
+                     raw_data_ptr := resolved_addr + 24 (*speed optimization*)
+                   else
+                     raw_data_ptr := resolved_addr + ord4(24)*num_chunks
+                 end;
+                 chained_hdrs: soft_header := soft_hdr;
+               end; (*case*)
+
+               NEW_TRACK (misc1);
+               if alt_rd_state = nuthin then
+               begin (*start the pre-seek if nothing else pending*)
+                 rwts_data.cmd := seek;
+                 rwts_data.head := cur_head;
+                 rwts_data.cyl := cur_trk;
+                 SEND_COMMAND
+               end;
+               START_DISK
+             end
+           end (*read or write*)
+         end (*case*)
+       end; (*start_new_request*)
+
+  procedure NEXT_HDR (var info: disk_extend; last: boolean);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Update the next software header             *)
+       (*                                                           *)
+       (* Input Parameters:  Info is the request block extension    *)
+       (*   containing the software header to be updated.  Last is  *)
+       (*   true if this is the last header to be updated this      *)
+       (*   request.                                                *)
+       (*                                                           *)
+       (* Output Parameters:  The updated soft_hdr in the request.  *)
+       (*                                                           *)
+       (* Side Effects:  none                                       *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  begin
+    WITH info.soft_hdr do
+      begin (*abspage can be ignored in all of this, since it's not stored anyway*)
+        bkwdlink := fwdlink - 1;
+        relpage := relpage + 1;
+        if last then
+        begin
+          fwdlink := info.last_fwd_link;
+          dataused := info.last_data_used
+        end
+        else
+          fwdlink := fwdlink + 1
+      end
+  end; (*next_hdr*)
+
+
+  procedure NONIO_REQ (var errnum: integer; devconfig: ptrdevrec; var req_ptr:
+                        reqptr_type);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Build a request for format or verify        *)
+       (*                                                           *)
+       (* Input Parameters:  device index into configinfo           *)
+       (*                                                           *)
+       (* Output Parameters:  pointer to request block              *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  call with twignits off        *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    d_ptr: absptr;
+    leftlink: reqptr_type;
+
+  begin
+        if not GETSPACE(sizeof(reqblk), b_sysglobal_ptr, d_ptr) then
+          errnum := errbase + 9
+        else
+        begin
+          errnum := 0;
+          req_ptr := pointer (d_ptr);  (*point to the request*)
+
+          (* initialize the request block *)
+
+          WITH req_ptr^, drive_cb[devconfig^.iochannel] do
+          begin
+            cfigptr := devconfig;
+            req_extent := ord(nil);  (* no extension block present for non-io req*)
+            reqspec_info := req_hd_ptr^.reqspec_info; (*use same cyl # as cur*)
+
+             (*add to pcb queue*)
+
+            LINK_TO_PCB (req_ptr);
+
+            (*add to device queue*)
+
+            leftlink := pointer(req_hd_ptr^.dev_chain.bkwd_link - sizeof(rb_headT)
+                          + b_sysglobal_ptr);
+            if req_hd_ptr = dummy_req_ptr then
+              req_hd_ptr := req_ptr; (*place at end of queue unless its the only one*)
+            cur_num_requests := cur_num_requests+1;
+            ENQUEUE (dev_chain, leftlink^.dev_chain, b_sysglobal_ptr)
+          end
+        end
+   end; (*nonio_req*)
+
+(*$ENDC *)
+
+
+    function TWIGIO; (*parameters: param_ptr): integer*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Twiggy device-dependent user I/O request    *)
+       (*                                                           *)
+       (* Input Parameters:  Req is the partially initialized      *)
+       (*   request block.  Blkno is the s-file block number.       *)
+       (*   Req^.reqspec_info will hold the cylinder number.       *)
+       (*   Req^.req_extent points to disk-extend record      *)
+       (*   which holds info necessary to do I/O to the twiggy.     *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  The request is added to the queue for the  *)
+       (*   appropriate drive.  If no twiggy's are busy, the request*)
+       (*   is started up immediately.                              *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    errnum, i, block_no: integer;
+    ext_ptr: extdptr_type;
+    ints: intson_type;
+    req, first_req_ptr,
+    left_sort_ptr, right_sort_ptr, head_sort_ptr, new_sort_ptr: reqptr_type;
+    new_cyl, left_cyl, right_cyl: integer;
+    status: reqsts_type;
+    dc_rec_ptr: ^dc_rec;
+
+  begin
+    TWIGIO := 0;
+
+(*$IFC TWIGGYBUILD *)
+
+    case parameters^.fnctn_code of
+    dskio:
+      begin
+        ext_ptr := pointer(parameters^.req^.req_extent);
+        WITH ext_ptr^, drive_cb[parameters^.configptr^.iochannel] do
+        if disk_present = nodisk then
+          TWIGIO := errbase + 4   (*diskette not present*)
+        else
+        if oktospare and (blkno >= sequential_addrs[92]) then
+          TWIGIO := errbase + 3  (*can't do I/O with sparing beyond FS limits*)
+        else
+        begin
+          block_no := blkno;
+          TWIGIO := 0;  (*no errors*)
+
+          (*use block number to look up cylinder and logical sector-on-cylinder *)
+
+          i := mxindx;
+          if block_no < sequential_addrs[46] then
+            i := 46;  (*cut search of table in half*)
+          repeat i := i-1 until block_no >= sequential_addrs[i];
+          WITH parameters^.req^ do
+            if i <= 45 then (*top of disk*)
+              reqspec_info := i (*track number same as i on top*)
+            else (*bottom of disk*)
+              if i < 92 then
+                reqspec_info := i - 46 (*align with inverse track # on bottom*)
+              else
+                reqspec_info := spareindex - 46; (*access directly to spare track!*)
+
+          blkno := block_no;  (*keep current block number in blkno*)
+          misc2 := block_no - sequential_addrs[i]; (*sector #*)
+          misc1 := i;  (*remember table index here*)
+
+
+      (*Add the new request to the device queue, sorted by cylinder.
+       *Every queue contains a "dummy" request whose cylinder number is either
+       *smaller than any valid cylinder (-1) or larger than any valid cylinder
+       *(32767).  The cylinder numbers of the requests along the device queue
+       *monotonically increase or decrease until the dummy is reached.  The cylinder
+       *numbers then reverse directions and monotonically decrease or increase
+       *until they reach the same cylinder number as the request at the head of
+       *the queue.  This ordering of the queue allows the interrupt handler to
+       *pull the next request from the top of the queue, maintaining optimal seek
+       *ordering.  The drive will pick up all requests which are in the same
+       *direction of head travel, before it services requests in the other direction.
+       *The dummy request is at the head of the queue only when the queue is empty.*)
+
+
+          INTSOFF (twigints, ints);
+          left_sort_ptr := req_hd_ptr;
+          head_sort_ptr := left_sort_ptr; (*remember where we started*)
+          new_cyl := parameters^.req^.reqspec_info;
+          if cur_num_requests = 0 then
+            (*point head to new req*)
+            req_hd_ptr := parameters^.req
+          else
+          begin
+            left_cyl := left_sort_ptr^.reqspec_info;
+            if left_cyl = new_cyl then (*past dummy if same as current cylinder*)
+              left_sort_ptr := dummy_req_ptr;
+            right_sort_ptr := CHAIN_FORWARD(left_sort_ptr^.dev_chain);
+            right_cyl := right_sort_ptr^.reqspec_info;
+
+            (* look for insertion point *)
+
+            while (right_sort_ptr<>head_sort_ptr) and
+              ( (right_cyl=new_cyl) or ( (new_cyl>right_cyl) and (new_cyl>left_cyl) )
+                               or ( (new_cyl<right_cyl) and (new_cyl<left_cyl) ) ) do
+            begin (*chain forward one link if not at insertion point*)
+              left_sort_ptr := right_sort_ptr;
+              left_cyl := right_cyl;
+              right_sort_ptr := CHAIN_FORWARD (left_sort_ptr^.dev_chain);
+              right_cyl := right_sort_ptr^.reqspec_info
+            end
+          end;
+
+          (* insert it *)
+
+          cur_num_requests := cur_num_requests+1;
+          ENQUEUE (parameters^.req^.dev_chain, left_sort_pointer^.dev_chain,
+                   b_sysglobal_ptr);
+          if cur_drive < 0 then
+            START_NEW_REQUEST(parameters^.configptr^.iochannel);
+          INTSON (ints)
+        end
+      end; (*dskio*)
+
+    dskformat:
+      begin
+        if drive_cb[parameters^.configptr^.iochannel].disk_present =
+            nodisk then
+          TWIGIO := errbase + 4        (*diskette not present*)
+        else
+        begin
+          INTSOFF (twigints, ints);
+          NONIO_REQ (errnum, parameters^.configptr, req);(*build a request *)
+          if errnum = 0 then
+          begin
+            req^.operatn := 2; (*format*)
+            if cur_drive < 0 then
+              START_NEW_REQUEST (parameters^.configptr^.iochannel);
+            INTSON (ints);
+            with req^.list_chain do
+              begin
+                fwd_link := ord(@fwd_link) - b_sysglobal_ptr;
+                bkwd_link := fwd_link
+              end;
+            BLK_REQ (req, first_req_ptr);
+            STATUS_REQ (req, status);
+            if not status.reqsuccess_f then
+              errnum := errbase + 8;
+            CANCEL_REQ (req)
+          end
+          else
+            INTSON (ints);
+          TWIGIO := errnum
+        end
+      end; (*dskformat*)
+
+    dskunclamp:
+      begin
+        if drive_cb[parameters^.configptr^.iochannel].notconfigured then
+          TWIGIO := errbase + 4        (*disk not configured*)
+        else
+        begin
+          INTSOFF (twigints, ints);
+          NONIO_REQ (errnum, parameters^.configptr, req);  (*build a request *)
+          if errnum = 0 then
+          begin
+            req^.operatn := 3; (*unclamp*)
+            if cur_drive < 0 then
+              START_NEW_REQUEST (parameters^.configptr^.iochannel);
+            INTSON (ints);
+            with req^.list_chain do
+              begin
+                fwd_link := ord(@fwd_link) - b_sysglobal_ptr;
+                bkwd_link := fwd_link
+              end;
+            BLK_REQ (req, first_req_ptr);
+            STATUS_REQ (req, status);
+            if not status.reqsuccess_f then
+              errnum := errbase+8;
+            CANCEL_REQ (req)
+          end
+          else
+            INTSON (ints);
+          TWIGIO := errnum
+        end
+      end; (*dskunclamp*)
+
+      reqrestart: begin
+            TWIGIO := 0;
+            INTSOFF (twigints, ints);
+            START_NEW_REQUEST
+                  (parameters^.configptr^.iochannel );
+            INTSON (ints);
+       end; (*reqrestart*)
+
+       dcontrol:
+       WITH parameters^ do
+          begin
+            TWIGIO := 0;
+            dc_rec_ptr := pointer(parptr);
+            INTSOFF (twigints, ints);
+            WITH drive_cb[configptr^.iochannel], dc_rec_ptr^ do
+              if dversion <> 2 then
+                TWIGIO := errbase + 13 (*wrong application version*)
+              else
+              case dcode of
+              20: begin  (*get disk status*)
+                    ar10[0] := ord(disk_present); (*current disk status*)
+                    ar10[1] := ord(eject_pending);
+                    ar10[2] := 16 - remap_ptr^.numbad;(*# blocks avail to remap*)
+                    ar10[3] := ord(bbtabl1_bad); (*1: only 1 good bad blok directory*)
+                    ar10[4] := ord(oktospare); (*=1 iff sparing enabled*)
+                    ar10[5] := ord(rewriting); (*=1 iff rewrite soft read errs*)
+                    ar10[6] := ord(verifying_now) (*=1 iff verifying writes*)
+                  end;
+              21: begin (*enable/disable sparing*)
+                    oktospare := (ar10[0] <> 0);  (*set boolean "oktospare"*)
+                    newspares := ( oktospare and (disk_present = gooddisk) and
+                                  (remap_ptr^.numbad < 16) );
+                    rewriting := (ar10[1] <> 0);
+                    verifying_now := (ar10[2] <> 0)
+                  end;
+              otherwise TWIGIO := errbase + 13;
+              end;
+            INTSON (ints)
+          end;
+
+       otherwise
+        TWIGIO := errbase + 6; (*illegal function code, or not implemented yet*)
+
+    end (*case*)
+(*$ENDC*)
+  end; (*twigio*)
+
+(*$IFC TWIGGYBUILD *)
+  procedure TWIG_INT; (*var twigint_data: interrupt_data_type*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Twiggy read/write done interrupt handler.   *)
+       (*                                                           *)
+       (* Input Parameters:  Twigint_data is a copy of the 6505     *)
+       (*   shared memory values.                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  If the current request completes it is un- *)
+       (*   blocked and dequeued, and the next request started.     *)
+       (*   All unit global variables are used or modified.         *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Call with twiggy interrupts   *)
+       (*   off and IOMR activated.                                 *)
+       (*                                                           *)
+       (* Error Conditions:  Any errors are saved in the request.   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    i, dr, block_no: integer;
+    req_ptr: reqptr_type;
+    ext_ptr: extdptr_type;
+    hdr_read_err: boolean;
+    byteptr: ^int1;
+
+  begin
+    rwts_data.cmd := clristat;
+    byteptr := @twigint_data.int_stat;
+    rwts_data.rwts_cmd := byteptr^;
+    START_RWTS (rwts_data);  (*clear all current interrupts*)
+
+    (* handle interrupts for event manager *)
+
+    if twigint_data.int_stat.top_in then
+    WITH drive_cb[0] do
+    begin
+      bbtabl1_bad := false;
+      alt_rd_state := clamp1_st;
+      disk_present := somedisk;
+      remap_ptr^.numbad := 0;
+      KEYPUSHED (1)
+    end;
+
+    if twigint_data.int_stat.top_button then
+    WITH drive_cb[0] do
+    begin
+      if disk_present <> nodisk then
+        eject_pending := true;
+      KEYPUSHED (2)
+    end;
+
+    if twigint_data.int_stat.bot_in then
+    WITH drive_cb[1] do
+    begin
+      bbtabl1_bad := false;
+      alt_rd_state := clamp1_st;
+      disk_present := somedisk;
+      remap_ptr^.numbad := 0;
+      KEYPUSHED (3)
+    end;
+
+    if twigint_data.int_stat.bot_button then
+    WITH drive_cb[1] do
+    begin
+      if disk_present <> nodisk then
+        eject_pending := true;
+      KEYPUSHED (4)
+    end;
+
+    twigerr := twigint_data.err;
+    if twigerr = timtrkerr then (*warning on "timing trk missing" error. Bug #170*)
+    begin (*#170*)
+      twigerr := 0;  (*#170*)
+      twigint_data.err := 0;
+      if worstwarning = 0 then (*#170*)
+        worstwarning := -(romerrbase + timtrkerr) (*#170*)
+    end; (*#170*)
+    twigcserr := twigint_data.cs_er_cnt;
+
+    if twigint_data.err = not_issued then (*re-issue previous command*)
+    begin
+      START_RWTS (twigint_data);
+      if twigint_data.err <> 0 then (*error on prior "clristat" command*)
+        SYSTEM_ERROR (twigint_data.err + syromerrbase);
+      EXIT(TWIG_INT)
+    end;
+
+    if twigint_data.int_stat.top_done or twigint_data.int_stat.bot_done then
+    begin
+      if cur_drive <> ord(twigint_data.int_stat.bot_done) then
+        SYSTEM_ERROR (syserrbase+1+ord(twigint_data.int_stat.top_done))
+          (*spurious disk interrupt*)
+    end
+    else (*make sure interrupt-clearing operation is completed before exiting*)
+    begin
+      rwts_data.cmd := nulcmd; (*sending null TWICE makes sure last cmd completed*)
+      SEND_COMMAND;
+      SEND_COMMAND;
+      EXIT(TWIG_INT)
+    end;
+
+    WITH drive_cb[cur_drive] do
+    begin
+      if alt_rd_state <> nuthin then
+      begin
+        START_DISK;  (*special states for doing I/O to spare blocks*)
+        EXIT(TWIG_INT)
+      end;
+
+      case twigerr of  (*bug #170*)
+        0: if needs_verify then
+           begin
+             if num_sectors_left = 1 then
+               WITH cur_info_ptr^ do
+               begin (*re-read all that was written*)
+                 final_block := blkno;
+                 blkno := orig_block;
+                 misc1 := orig_index;
+                 NEW_TRACK (orig_index);
+                 misc2 := orig_block - sequential_addrs[orig_index]; (*sector*)
+                 read_flag := true;
+                 START_DISK; (*do the first read*)
+                 alt_rd_state := verify1_st;
+                 EXIT(TWIG_INT)
+               end
+           end
+           else
+             if twigcserr > mx_soft then
+               if needs_rewrite then
+               WITH cur_info_ptr^ do
+               begin (*rewrite sector with recoverable checksum errors*)
+                 rwts_data.cmd := nulcmd;
+                 FINISH_READ (raw_data_ptr+xfer_count, raw_header_ptr^, rwts_data);
+                 if rwts_data.err <> 0 then
+                   SYSTEM_ERROR (rwts_data.err + syromerrbase);
+                 orig_header := soft_header; (*save original state*)
+                 orig_hdr_ptr := raw_header_ptr; (*save original state*)
+                 alt_rd_state := rewrt1_st;
+                 START_DISK;
+                 EXIT (TWIG_INT)
+               end;
+        write_err:
+           if newspares then
+             if cur_info_ptr^.blkno >= fs_st_blk then
+             begin (*write failure outside boot area means spare it*)
+               alt_rd_state := writer1_st;
+               START_DISK;
+               EXIT(TWIG_INT)
+             end;
+      end  (*case*)
+    end; (*with*)
+
+    (*execute rest of code if got expected read/write interrupt*)
+
+      if twigerr <> 0 then (*bug #170*)
+        begin
+          success_flag := false;
+          same_req := false
+        end;
+
+      if success_flag then
+      begin
+        num_sectors_left := num_sectors_left - 1;
+        WITH cur_info_ptr^ do
+        if num_sectors_left > 0 then
+        begin
+          NEXT_SECTOR;
+          rwts_data.head := cur_head;
+          rwts_data.cyl := cur_trk
+        end
+        else
+        begin (*all data transfers completed for this request*)
+          same_req := false
+        end
+      end;
+
+      hdr_read_err := false;
+      repeat
+        dr := cur_drive;
+        rwts_data.cmd := seek; (*next command will be a seek or a null*)
+        if not same_req then
+        begin (*look for next request*)
+          if drive_cb[1-dr].cur_num_requests > 0 then
+            dr := 1-dr;
+
+          (*look for request on the selected drive*)
+
+          WITH drive_cb[dr] do
+          begin
+            req_ptr := req_hd_ptr;
+            if cur_num_requests > 1 then
+              if dr = cur_drive then
+              begin (*new request on same drive as current*)
+                req_ptr := CHAIN_FORWARD (cur_req_ptr^.dev_chain);
+                if req_ptr = dummy_req_ptr then (*skip dummy*)
+                  req_ptr := CHAIN_FORWARD (req_ptr^.dev_chain);
+              end;
+            if (dr <> cur_drive) or (cur_num_requests > 1) then
+            begin (*have some new req*)
+              ext_ptr := pointer(req_ptr^.req_extent);
+              if ext_ptr <> nil then
+                if ext_ptr^.misc1 <= 45 then
+                begin
+                  rwts_data.head := 0;
+                  rwts_data.cyl := req_ptr^.reqspec_info
+                end
+                else
+                begin (*bottom*)
+                  rwts_data.head := 1;
+                  if ext_ptr^.misc1 < 92 then
+                    rwts_data.cyl := 45 - req_ptr^.reqspec_info
+                  else (*=92*)
+                    rwts_data.cyl := 91 - spareindex (*going directly to spare trk*)
+                end
+              else (*no pre-seek when about do execute non-io request*)
+                rwts_data.cmd := nulcmd
+            end
+            else
+              dr := -1 (*no requests pending on any drives*)
+          end
+        end;
+
+        (*since we now have drive, head  and cyl for next request, we can pre-seek*)
+
+        rwts_data.drive := dr;
+        if (cur_info_ptr = nil) or not success_flag then
+        begin
+          hdr_read_err := false; (*don't execute repeat-loop again*)
+          if dr >= 0 then SEND_COMMAND
+        end
+        else
+        if not cur_info_ptr^.read_flag then
+        begin
+          if dr >= 0 then SEND_COMMAND
+        end
+        else
+        WITH cur_info_ptr^ do
+        begin (*last operation was read*)
+          FINISH_READ (raw_data_ptr+xfer_count, raw_header_ptr^, rwts_data);
+          raw_header_ptr^.abspage := blkno - fs_st_blk;
+                      (*abspage not saved on disk, and must be derived*)
+          if rwts_data.err <> 0 then
+            SYSTEM_ERROR (rwts_data.err + syromerrbase);
+          if io_mode = chained_headers then
+          begin
+
+            (*verify the header just read*)
+
+            WITH soft_hdr, cur_req_ptr^ do
+            if (version<>soft_header.version) or (fileid<>soft_header.fileid) or
+               (relpage<>soft_header.relpage) then
+            begin (*header read error*)
+              success_flag := false;
+              hard_error := vfyerr;
+              hdr_read_err := true;  (*flags "repeat" to select next request*)
+              same_req := false
+            end
+            else
+              if same_req then
+                if fwdlink = -1 then
+                begin (*premature end of chain*)
+                  success_flag := false;
+                  hard_error := premenderr;
+                  hdr_read_err := true;
+                  xfer_count := xfer_count + dataused;
+                  same_req := false
+                end
+          end;
+
+          if success_flag then
+          case raw_header_ptr^.datastat of
+            datamaybe:  if worstwarning <> -625 then (*bug #170*)
+                          worstwarning := -626;
+            databad:    worstwarning := -625;
+          end
+
+        end
+      until not hdr_read_err;  (*repeat when get header compare read error*)
+
+
+   (*next complete previous request if it's done, and start up next disk I/O,
+       if any*)
+
+      if same_req then
+      begin (*update current request*)
+        WITH cur_info_ptr^ do
+        begin
+          blkno := blkno + 1; (*remember current logical sector number*)
+          xfer_count := xfer_count + 512;
+          case io_mode of
+            raw_io:
+              raw_header_ptr := pointer(ord(raw_header_ptr) + 24);
+            with_header:
+              NEXT_HDR (cur_info_ptr^, num_sectors_left=1);
+            chained_hdrs:
+              WITH soft_header do relpage := relpage + 1;
+          end
+        end;
+        START_DISK
+      end
+      else (*request completed*)
+        FIN_REQUEST (dr)
+  end; (*TWIG_INT*)
+(*$ENDC*)
+
+
+  (*$S init*)
+
+  procedure INIT_TWIGGLOB; (*var err: integer; driv: integer;*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Initialize twiggy unit global data.         *)
+       (*                                                           *)
+       (* Input Parameters:  driv equals 0 or 1                     *)
+       (*                                                           *)
+       (* Output Parameters:  all unit global data                  *)
+       (*                                                           *)
+       (* Side Effects:  none                                       *)
+       (*                                                           *)
+       (* Special Conditions of Use:  execute once for each disk    *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+    VAR
+      i: integer;
+      d_ptr: absptr;
+
+    begin
+      err := 0;
+
+(*$IFC TWIGGYBUILD *)
+
+      if port_cb_ptrs.floppy = 0 then
+      begin  (*first time called do all appropriate initialization*)
+        if not GETSPACE (sizeof(interrupt_data_type), b_sysglobal_ptr,
+                         port_cb_ptrs.floppy) then
+          err := errbase + 0
+        else
+        begin
+          cur_drive := -1; (*none active*)
+
+          (*set disk interrupt latches in hardware*)
+
+          rwts_data.cmd := clristat;
+          rwts_data.rwts_cmd := -1;
+          START_RWTS (rwts_data);  (*clear all pending interrupts*)
+          rwts_data.cmd := enabstat;
+          rwts_data.rwts_cmd := -120; (*=$88*)
+          START_RWTS (rwts_data);  (*enable both drives*)
+
+          (*The sequential_addrs[*] table is constructed in such a
+            way that a disk address can be derived from a sequential block number.
+            This is done by finding the largest index which yields a table value
+            which is less than or equal to the desired sequential block number.
+            Track 23 on the bottom surface is normally reserved for handling
+            spare blocks, and is not included in the OS file system's address space
+            of 1684 disk blocks.  However, if you wish to access the sectors
+            on this track directly (for the purpose of using files created under
+            "other" file systems), they are located at block numbers 1684 through
+            1701, beyond the end of OS file system's access.
+            The disk address is computed as follows:
+
+            spareindex = 68  -- index of where spare trk would go if it weren't spare
+
+            side =  0, for 0 <= index <= 45
+                    1, for 45 < index < 93
+
+            track = index, for 0 <= index <= 45
+                    91-index, for 45 < index < 92
+                    91-spareindex, for index = 92
+
+            seek-cylinder = index, for 0 <= index <= 45
+                            index-46, for 45 < index < 92
+                            spareindex-46, for index = 92
+
+            sectors-per-track =
+                    22 - (index+1) DIV 6, for 0 <= index <= 45, except 4,41
+                    22 - (92-index) DIV 6, for 45 < index < 92, except 50,87
+                    21, for index = 4 or 87
+                    16, for index = 41 or 50
+                    18, for index = 92
+
+            sector = desired block number - table value at index
+          *)
+
+          sequential_addrs[0] := 0;
+          sequential_addrs[46] := 851;
+          sequential_addrs[92] := 1684; (*18 blks less than max,
+                                since track 23 on bottom is reserved for spares*)
+          sequential_addrs[93] := 1702; (*last 18 blks map to track 23 on bottom*)
+
+          for i := 1 to 45 do
+            case i of
+            5: begin
+               sequential_addrs[5] := sequential_addrs[4]+21; (*#sectors on trk 4*)
+               sequential_addrs[51] := sequential_addrs[50]+16 (*#sectors on trk 50*)
+            end;
+            42:begin
+               sequential_addrs[42] := sequential_addrs[41]+16; (*#sectors on trk 41*)
+               sequential_addrs[88] := sequential_addrs[87]+21 (*#sectors on trk 87*)
+            end;
+            otherwise begin
+              sequential_addrs[i] := sequential_addrs[i-1] +
+                                   22 - i DIV 6 (*#sectors on track i-1*);
+              if (i+45) = spareindex then (*skip track reserved for remapping*)
+                sequential_addrs[i+46] := sequential_addrs[i+45]
+              else
+                sequential_addrs[i+46] := sequential_addrs[i+45] +
+                                      22 - (47-i) DIV 6 (*#sectors on trk i+45*)
+            end
+          end;
+
+          (*reserve space for internal sector buffer*)
+
+          if not GETSPACE (512, b_sysglobal_ptr, internal_buffer) then
+            err := errbase + 0;
+
+          (*initialize some vars for both drives, whether or not configured*)
+
+          for i := 0 to 1 do
+            WITH drive_cb[i] do
+              begin
+                notconfigured := true;
+                cur_num_requests := 0;
+                lock_fails := 0;
+                rewriting := true; (*enable re-write on soft read errors*)
+                verifying_now := false; (*disable re-read on writes by default*)
+                oktospare := true; (*enable sparing by default*)
+                eject_pending := false;
+                alt_rd_state := nuthin;
+                disk_present := nodisk;
+                dummy_req_ptr := nil;
+                req_hd_ptr := dummy_req_ptr;
+                remap_ptr := nil;
+              end
+        end
+      end;
+
+      (*next initialize only the drive requested*)
+
+      if err = 0 then
+          WITH drive_cb[driv] do
+            begin
+              notconfigured := false;
+              if ISTWIGIN (driv) then
+              begin
+                alt_rd_state := rddir1_st;
+                disk_present := somedisk
+              end;
+
+              (*create a dummy request and link it to the drive control block*)
+
+              if GETSPACE (sizeof(reqblk), b_sysglobal_ptr, d_ptr) then
+              begin
+                dummy_req_ptr := pointer(d_ptr);
+                req_hd_ptr := dummy_req_ptr;
+                WITH dummy_req_ptr^ do
+                  begin
+                    dev_chain.fwd_link := d_ptr - b_sysglobal_ptr + sizeof(rb_headT);
+                    dev_chain.bkwd_link := dev_chain.fwd_link;
+                    reqspec_info := -1;  (*initialize dummy cylinder # *)
+                    reqstatus.reqsrv_f := active;
+                    reqstatus.reqabt_f := false;
+                  end
+              end
+              else
+                err := errbase + 0;
+
+              (*reserve space for bad block table*)
+
+              if GETSPACE (sizeof(remap_table), b_sysglobal_ptr, d_ptr) then
+              begin
+                remap_ptr := pointer(d_ptr);
+                remap_ptr^.numbad := 0
+              end
+              else
+                err := errbase + 0;
+            end
+
+(*$ENDC*)
+
+    end; (*init_twigglob*)
+
+
+end. (*twiggy unit*)
+
+
+ÿ

@@ -1,0 +1,490 @@
+        PAGE
+        .proc   mc%INT  ; 0,0
+        .def    mc%int_a,mc%int_b
+;
+;*************************************************************************
+;
+;       I N T E G E R   P A R T
+;
+;       Routines A and B
+;
+;***************************************************************************
+;
+;
+;       Find the integer part of a floating point register. (FPn)
+;
+;       On entry: d0-d2 contains the fp number
+;                 d3 contains zero
+;                 a3 points to the register block
+;
+;       On exit:  integer part in d0-d3
+;                 d4 - d6 are trashed
+;                 d7   is restored
+;                 a0 - a7 are restored
+;
+;       Revision:
+;       26.Mar.81       J.Boney         Performance improvements
+;        7.Jul.81       D.Cawthron      changed to EXORmacs structured
+;                                          asm syntax
+;       28.Jul.81       G.Walker        Correct renorm test
+;       28.Jul.81       D.Cawthron      moved INTRZ2 and INTRZ3 so that short
+;                                       branches are not out of range when
+;                                       path counters are added
+;
+;******************* w h o  c a l l s  w h o ************************
+;
+;  This procedure calls: no one
+;
+;  This procedure is called by: fix, dispat, bindec
+;
+;***********************  F L A G S   ******************************
+;
+;  Exception    Set by     Reason
+;
+;  rsvx         ---        Not affected by this routine
+;
+;  iovf         ---        Not affected by this routine
+;
+;  inex         int        Number too small to be an integer but
+;                               not zero.
+;               int        The number was not an exact integer
+;
+;  dz           ---        Not affected by this routine
+;
+;  unfl         ---        Not affected by this routine
+;
+;  ovfl         ---        Not affected by this routine
+;
+;  iop          ---        Not affected by this routine
+;
+;*********************************************************************
+;
+;
+;*************************************************************************
+;
+; A number to be rounded can be thought as being composed as follows:
+;
+;  +-+--------+----------------+-+------+-+
+;  |s|exponent| fraction ...  l|g|r....r|s|
+;  +-+--------+----------------+-+------+-+
+;
+;  where:
+;       l is the least significant bit of the fraction for the
+;         rounding precision in effect.
+;       g is the guard bit
+;       r is(are) the rounding bits
+;       s is the sticky bit (or bits) that is the logical or
+;         of all the result bits to the right of r.
+;
+;***********************************************************************
+;
+;       The trick to doing an integer part is to find the position
+;       in the significand that separates the true integer bits from the
+;       fraction bits.
+;       Once this position is known, then rounding can occur using
+;       this position as the point between the l and g bits. After
+;       rounding the bits to the right of l are cleared leaving
+;       the rounded integer representation of the number.
+;
+;       The algorithm used for rounding is given in Appendix II of
+;       the 68341 spec.
+;
+;*********************************************************************
+;
+;  Average execution time:
+;       64 usec
+;
+;
+      PAGE
+;
+;**********************************************************************
+;
+;
+;       c o m m o n   m a c r o s
+;
+;
+;
+;*************************************
+;
+; add1ld1 macro
+;
+; add 1 to l when l is in d1
+;       d7 contains a bit in l's position
+;
+;*************************************
+;
+        .macro  ADD1LD1
+  ADD.L  D7,D1
+  BCC    @65
+    ROXR.L  #1,D1     ; ANSWER ALWAYS IS $80000000,0
+    ADDQ    #1,D0
+@65
+ .endm
+;
+;**************************************
+;
+; add1ld2 macro
+;
+;
+; add 1 to l when l is in d2
+;       d7 contains a bit in l's position
+;
+;**************************************
+;
+        .macro  ADD1LD2
+  ADD.L D7,D2
+  BCC.S @66
+    ADDQ.L  #1,D1
+@66
+  BCC.S @67
+    ROXR.L  #1,D1     ; ANSWER ALWAYS IS $80000000,0
+    ADDQ    #1,D0
+@67
+ .endm
+;
+;*****************************************
+;
+;       int_den macro
+;
+;       Denormalize a number by 1 bit
+;
+;******************************************
+;
+        .macro  INT_DEN
+  ADDQ  #1,D4         ; ALLOW 1 MORE NORMALIZING SHIFT AT END
+  ADDQ  #1,D0         ; INCR EXPONENT
+  LSR.L #1,D1         ; SHIFT FRACTION RIGHT 1
+  ROXR.L #1,D2
+  BCC.S  @68
+    OR    #1,D2       ; OR IT BACK INTO LS BIT
+@68
+ .endm
+
+;
+        PAGE
+;*********************************************************************
+;
+; Table of the maximum size exponent that can be integerized for
+; the rounding precision in effect
+;
+PRECTAB EQU *
+        .word   64,24,53
+;
+;***********************************************************************
+;
+;       B  Routine Entry
+;               FPn is not normalized
+;
+;***********************************************************************
+;
+mc%int_b  EQU *
+        debugbegin
+        TST.L  D1  ; IF FPN IS UNNORMAL ZERO THEN ANSWER IS FPN
+        BNE.S   mc%int_a
+        TST.L  D2
+        BNE.S   mc%int_a
+        RTS
+        debugend 'MC%INT_B',0
+;
+;***********************************************************************
+;
+;       A  Routine Entry
+;               FPn is normalized or non zero unnormalized
+;
+;***********************************************************************
+;
+;
+mc%int_a  EQU     *
+        debugbegin
+  MOVE.L  D7,-(A7) ; SAVE CALLER'S D7
+;
+;***********************************************
+;
+; check for exponent too big to become an integer
+;
+;************************************************
+;
+  MOVE.B   MODE(A3),D5
+  LSR      #3,D5
+  AND      #6,D5      ; PRECISION INDEX * 2
+;
+;       if exponent too big return the input argument
+;
+    cmp     prectab(d5),d0
+    bge     lab3        ; {IF NOT TOO BIG}
+    MOVE.B  MODE(A3),D5 ; GET ROUNDING PRECISION INDEX IN D5
+    AND     #MDRND_B,D5
+    ADD     D5,D5       ; DOUBLE INDEX
+    cmp     #-1,d0
+    bge     jst_right
+;
+;*******************************************************************
+;
+;       exponent too small to be integerized
+;
+;********************************************************************
+;
+;       Since we know there are some round or sticky bits set because
+;       the input argument wasn't zero and since we also know that g=0,
+;       then return either a true zero or a + or - 1.0.
+;
+;       if (RM and minus) or (RP and plus) then
+;               return properly signed 1.0
+;       else
+;               return properly signed 0.0
+;       endif
+;
+      BSET   #STINEX_M,TEMPSTAT(A3) ; SET INEXACT STATUS BIT
+      CLR.L  D2       ; PRECLEAR FRACTION
+      CLR.L  D1
+      AND.L  #$80000000,D0 ; CLEAR EVERYTHING BUT SIGN AND ALSO SET CC'S
+;
+;     case rounding mode of:
+;
+      JMP    INTAB1(D5)
+INTAB1 EQU *
+      BRA.S  FILL0    ; RN - RESULT = 0
+      BRA.S  FILL0    ; RZ - RESULT = 0
+      BRA.S  INTRP1   ; RP
+;     RM
+      BMI.S  FILL1    ; IF NEGATIVE THEN RESULT = -1.0
+      BRA.S  FILL0
+;     RP
+INTRP1 EQU *
+      BPL.S  FILL1    ; IF POSITIVE THEN RESULT = 1.0
+;
+;     result = 0
+;
+FILL0 EQU *
+      OR.L  #$C000+ZERO_L,D0
+      BRA.S INTXIT1
+;
+;     result = 1.0
+;
+FILL1 EQU *
+      BSET  #NORM_R,D0
+      BSET  #31,D1     ; 1.0
+INTXIT1 EQU *
+      bra   lab3
+;
+;************************************************************************
+;
+;       JUST RIGHT !!!!!!!!!!!!!!!
+;
+;       Number can be made an integer
+;
+;       thruout the following calculations:
+;       d4  =  normalizing count
+;       d5  =  rounding mode index
+;
+;***********************************************************************
+;
+jst_right
+      CLR     D4     ; INITIALIZE NUMBER OF ALLOWABLE NORMALIZING SHIFTS = 0
+      MOVEQ   #63,D6      ; 63 - EXPONENT = BIT NUMBER
+      SUB     D0,D6
+;
+;   see if the l,g,r and s bits lie in d1 or d2. If they lie across
+;   the boundary they are handled as special cases.
+;
+      cmp     #31,d6
+      ble     rndd2           ; IF ROUNDING IN D1
+        SUB   #32,D6          ; MODULO 32
+;
+;************
+;
+;       do the special cases where the original exponent
+;       was  2**-1, 2**30, or 2**31.
+;
+;************
+;
+        bne      @1         ; {2**31 CASE}
+          MOVEQ  #31,D6     ; CHANGE TO 2**32 CASE
+;         denormalize by 1 bit
+          INT_DEN
+          BRA    RNDD2
+@1
+        cmp       #1,d6
+        bne       @2       ; {2**30 CASE}
+          MOVEQ   #31,D6   ; CHANGE INTO 2**32 CASE
+;         denormalize by two bits
+          INT_DEN
+          INT_DEN
+          BRA     RNDD2    ; NOW DO ROUNDING IN D2 INSTEAD
+@2
+        cmp      #32,d6
+        bne      @3        ; {2**-1 CASE}
+          MOVEQ  #31,D6    ; TURN INTO 2**0 CASE
+;         denormalize by 1 bit
+          INT_DEN
+@3
+;
+;***************************
+;
+;
+;       normal rounding in d1 cases
+;
+;       d1 contains the l,g,r and possibly some of the g bits
+;
+;       d4 = normalizing ct
+;       d5 = rounding mode index
+;       d6 = bit number on entry (later it is used for scratch)
+;       d7 = mask for l bit
+;
+;***************************
+;
+        MOVEQ     #0,D7 ; GET MASK BIT MASK FOR 'L' IN D7
+        BSET      D6,D7
+;
+;       if g=r=s=0 then answer is exact now
+;
+        MOVE.L    D7,D6 ; CREATE MASK TO TEST G,R,S
+        SUBQ.L    #1,D6
+        AND.L     D1,D6 ; OR IN ANY BITS FROM D2 TOO
+        OR.L      D2,D6
+        beq       br_renorm              ; IF NOT EXACT
+          BSET    #STINEX_M,TEMPSTAT(A3) ; SET INEXACT BIT
+          TST.L   D0                     ; SET CC'S BASED ON SIGN
+          JMP     INTAB2(D5)
+;
+;         case rounding mode of
+;
+INTAB2    EQU  *
+          BRA.S   INTRN2      ; RN
+          BRA.S   INTRZ2      ; RZ
+          BRA.S   INTRP2      ; RP
+;         RM
+          bpl     @4
+;           add 1 to l in d1
+            ADD1LD1
+@4
+;         RZ
+INTRZ2    EQU *        ; ROUND TOWARD ZERO IS A NOP
+          BRA.S  INT_E
+;         RP
+INTRP2    EQU *
+          bmi    @5
+;           add 1 to l in d1
+            ADD1LD1
+@5
+          BRA.S  INT_E
+;         RN
+INTRN2    EQU  *
+          MOVE.L  D7,D6       ; GET MASK FOR G
+          LSR.L   #1,D6
+          AND.L   D1,D6       ; IF G SET
+          beq     int_e
+;           add 1 to l in d1
+            ADD1LD1
+            MOVE.L  D7,D6
+            LSR.L   #1,D6
+            SUBQ.L  #1,D6       ; GET MASK TO TEST S BITS
+            AND.L   D1,D6       ; ANY S BITS SET IN D1?
+            OR.L    D2,D6       ; OR D2?
+            bne         int_e     ; IF R=S=0 THEN CLEAR L BIT
+              MOVE.L    D7,D6     ; CLEAR L BIT
+              NOT.L     D6
+              AND.L     D6,D1
+INT_E   EQU  *
+        SUBQ.L  #1,D7  ; CLEAR G,R AND S BITS
+        NOT.L   D7
+        AND.L   D7,D1
+        MOVEQ   #0,D2
+br_renorm
+        bra     renorm   ; {IF NOT EXACT}
+;
+;***********************************************
+;
+;       Rounding in d2
+;
+;       l,g,r and s bits are all in d2
+;
+;       d4 = normalizing ct
+;       d5 = rounding mode index
+;       d7 = mask for l bit
+;
+;***********************************************
+;
+RNDD2 EQU *
+      MOVEQ  #0,D7                   ; GET BIT MASK FOR L IN D7
+      BSET   D6,D7
+;
+;   if g=r=s=0 then answer is exact now
+;
+      MOVE.L  D7,D6
+      SUBQ.L  #1,D6
+      AND.L   D2,D6
+      beq     renorm                 ; {G=R=S <NE> 0}
+        BSET  #STINEX_M,TEMPSTAT(A3) ; SET INEXACT BIT
+        TST.L  D0                    ; SET CC'S FOR SIGN OF FRACTION
+        JMP    INTAB3(D5)
+;
+;       case rounding mode of:
+;
+INTAB3  EQU    *
+        BRA.S  INTRN3 ; RN
+        BRA.S  INTRZ3 ; RZ
+        BRA.S  INTRP3 ; RP
+;       RM
+        bpl    @6
+;         add 1 to l in d2
+          ADD1LD2
+@6
+;       RZ
+INTRZ3  EQU  *        ; ROUND TOWARD ZERO IS A NOP
+        BRA.S  INT_F
+;       RP
+INTRP3  EQU *
+        bmi    @7
+;         add 1 to l in d2
+          ADD1LD2
+@7
+        BRA.S  INT_F
+;       RN
+INTRN3  EQU  *
+        MOVE.L  D7,D6                ; GET MASK FOR G
+        LSR.L   #1,D6
+        AND.L   D2,D6
+        beq     int_f        ; IF G SET THEN
+;         add 1 to l in d2
+          ADD1LD2
+          MOVE.L  D7,D6
+          LSR.L   #1,D6
+          SUBQ.L  #1,D6      ; GET MASK TO TEST S BITS
+          AND.L   D2,D6      ; ANY S BITS SET?
+          bne       int_f      ; IF R=S=0 THEN CLEAR L BIT
+            MOVE.L  D7,D6      ; CLEAR L BIT
+            NOT.L   D6
+            AND.L   D6,D2      ; L = 0
+INT_F   EQU *
+        SUBQ.L #1,D7     ; CLEAR G, R AND S BITS
+        NOT.L  D7
+        AND.L  D7,D2
+;
+;                          {G,R,S <NE> #0}
+;
+;                          {ROUNDING IN D2}
+;
+; renormalize if necessary and permitted. Only up to d4 shifts
+; are permitted
+;
+renorm
+      TST.L  D1
+      BMI.S  LAB3
+      BRA.S  LAB1
+LAB2 EQU *
+      SUBQ   #1,D0 ; EXP - 1 --> EXP
+      LSL.L  #1,D2   ; LEFT SHIFT FRACTION
+      ROXL.L #1,D1
+LAB1 DBMI D4,LAB2 ; GO NORMALIZE IF NOT NORM AND D4 <NE> -1
+LAB3 EQU  *
+;
+;                        {EXPONENT IS NOT TOO SMALL TO NORMALIZE}
+;                        {EXPONENT IS NOT TOO BIG TO NORMALIZE}
+;
+  TZERO               ; TEST FOR ZERO AND MAKE TRUE ZERO IF NEEDED
+  MOVE.L  (A7)+,D7    ; RESTORE CALLER'S D7
+  RTS
+        debugend 'MC%INT_A',0 
+    
+ÿ

@@ -1,0 +1,850 @@
+(*
+$Exec
+P?
+-newdisk-intrinsic.lib
+NewPr/CIProcs
+{no listing}
+Temp
+GTemp
+NewPr/CIProcs
+$EndExec
+*)
+{               NOTE: The above compiles this program.                   }
+{ ---------------------------------------------------------------------- }
+{                Copyright 1983,1984 Apple Computer Inc.                 }
+UNIT CiProcs;
+
+{ ---------------------------------------------------------------------- }
+                              Interface
+{ ---------------------------------------------------------------------- }
+
+USES {$U LibOS/SysCall         }  SysCall,
+     {$U LibPM/PMDecl          }  PMDecl,
+     {$U LibSM/UnitStd         }  UnitStd,
+     {$U LibSM/UnitHz          }  UnitHz,
+     {$U LibQD/Storage         }  Storage,
+     {$U LibQD/QuickDraw       }  QuickDraw,
+     {$U LibFM/FontMgr         }  FontMgr,
+     {$U LibWM/Events          }  Events,
+     {$U LibWM/Menus           }  Menus,
+     {$U LibWM/Windows         }  Windows,
+     {$U LibWM/Folders         }  Folders,
+     {$U libSB/WmlStd          }  WmlStd,
+     {$U libSB/WmlCrs          }  WmlCrs,
+     {$U LibAM/AlertMgr        }  AlertMgr,
+     {$U LibPr/PrStdInfo       }  PrStdInfo,
+     {$U LibPr/PrStdProcs      }  PrStdProcs,
+     {$U LibPr/PrFileProcs     }  PrFileProcs,
+     {$U LibPr/PrBuf           }  PrBuf,
+     {$U LibPr/Queues          }  Queues,
+     {$U LibPr/PrEvents        }  PrEvents,
+     {$U LibPr/PrDlgMgr        }  PrDlgMgr,
+     {$U LibPr/PrMgr           }  PrMgr,
+     {$U LibPr/PrSpool         }  PrSpool,
+
+     {$U-}
+     {$U LibPr/CiGlobals       }  CiGlobals,
+     {$U LibPr/CiStdQDProcs    }  CiStdQDProcs,
+     {$U LibPr/CiDev           }  CiDev,
+     {$U LibPr/CiBuf           }  CiBuf;
+
+(* ----- Procedures and Functions listed in alphabetical Order. *)
+Function  CiAlert      ( AlertFile:TAlertFile;AlertNumber:Integer;AlertKind:TAlertKind):Integer;
+PROCEDURE CiCleanup    ( Var PrRec:TPrRec;Var DevRec:TDevRec);
+PROCEDURE CiClose      ( PrRec:TPrRec);
+PROCEDURE CiDfMetrics  ( Var PrRec:TPrRec;HiRes,DraftParm,Land:Boolean);
+Procedure CiDocBegin   ( FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec);
+PROCEDURE CiDocEnd     ( VAR error: Integer;Var PrRec:TPrRec;Var DevRec:TDevRec);
+PROCEDURE CiEjectPage;
+PROCEDURE CiEndPage    ( VAR error: Integer );
+Procedure CiGetPicProc ( DataPtr:QDPtr;ByteCount:Integer);
+PROCEDURE CiInitAlerts ( Var Error:Integer );
+PROCEDURE CiMetrics    ( Var PrRec:TPrRec;Var DevRec:TDevRec);
+PROCEDURE CiOpen       ( Var PrRec:TPrRec;DevRec:TDevRec);
+Procedure CiOpenFile   ( FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec);
+FUNCTION  CiPageOK     ( CiCfg:TCiCfg; fDMZDirty: TF ): TF;
+PROCEDURE CiPrintFile  ( FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec );
+Procedure CiPrintPict  ( Var error: Integer;PrRec:TPrRec;DevRec:TDevRec;hPicture:PicHandle;
+                         Frame:Rect);
+Procedure CiReadPicture( Var Error:Integer;Length:LongInt;RefNum:Integer);
+{ ---------------------------------------------------------------------- }
+                           Implementation
+{ ---------------------------------------------------------------------- }
+{$S Ci}
+
+{$IFC fSymOK} {$D+} {$ELSEC} {$D-} {$ENDC}
+{$IFC fdbgok} {$R+} {$ELSEC} {$R-} {$ENDC}
+
+{ ---------------------------------------------------------------------- }
+(*
+
+                        CiPicDataSeg ---- Opened in CiDocBegin
+
+ CiBandPtr---->+-----------------------------+
+               !  C.Itoh Imageing Band       !
+               !_____________________________!
+ PicBegPtr---->!  Streamed QuickDraw Picture !
+               !                             !
+ PrPicPtr------------->|                     !   PrPicPtr points to next N requested bytes from
+               !                             !   the streamed picture by QuickDraw.
+               +-----------------------------+
+
+*)
+{ ---------------------------------------------------------------------- }
+Const
+      PicDSName     = 'CiPicDATASEG';
+      PicDSSize     = $2000;
+      PicDSLDSN     = 6;
+
+
+Var DeltaVPic,DeltaHPic,DeltaVBand,DeltaHBand : Integer;  {Set in CiDocStart. Used in CiPrintPage.}
+    CiBandPtr  : QDPtr;    {Points to the printing band. It is allocated in CiPrint.}
+    Numbands   : Integer;
+    PicDSRec   : TPrDSRec  {.PrStdInfo};
+    PrPicPtr   : QDPtr     {.QuickDraw}; {Used to point to picture elements in Picture Data Seg.}
+    PicBegPtr  : QDPtr     {.QuickDraw};
+
+{ ---------------------------------------------------------------------- }
+{Directory of private procs }
+PROCEDURE CiClosePort(CiPort:Integer);                                  FORWARD;
+PROCEDURE CiDumpScanLine( scan: Integer );                              FORWARD;
+FUNCTION  CiEqualCfg(Var PgSize1: TPgSize;Var PgSize2:TPgSize;
+                     Var Feeder1: TFeeder;Var Feeder2:TFeeder):Boolean; FORWARD;
+{ ---------------------------------------------------------------------- }
+Function CiAlert {(AlertFile:TAlertFile;AlertNumber:Integer;AlertKind:TAlertKind):Integer};
+Var Result,Error :Integer;
+Begin
+  Result:=PrOtherAlert(AlertFile,AlertNumber,AlertKind,True);
+  (* ----- If this was a caution alert and the client decided to cancel printing, then cancel printing. *)
+  If ((Result=0) and (AlertKind=CautionProc)) then Begin
+    CiAbort:=True;
+    With CiPrinter^^.PrRec.PrInfo  do PrCall(error,lParentid,ePrintTerminate,0,1,PrinterID,port);
+  End;
+  CiAlert:=Result;
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiCleanup(* Var PrRec:TPrRec;Var DevRec:TDevRec*);
+Var Error:Integer;
+    AlertResult:Integer;
+    I:Integer;
+BEGIN
+  (* ----- If an abort has been hit, eject page. *)
+  IF fPgDirty THEN CiNewPage;
+  CiDmpBuf;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiClose{PrRec:TPrRec};
+Var Error:Integer;
+BEGIN
+   CiDevClose;
+   CiClosePort(PrRec.PrInfo.Port);   {!EZ 5/10/84}
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiClosePort{(CiPort:Integer)};
+VAR
+  Error       : TC;
+  devControl  : dcType;
+  devName     : E_Name;
+  path        : PathName;
+BEGIN
+  If ((CiPort=PortA) or (CiPort=PortB)) then Begin
+    (*-----Get the port name.*)
+    PsPortToDevName(CIPort,devName);
+    path:=CONCAT('-', devName, '-x');
+    WITH devControl DO BEGIN
+      dcversion:=2;
+      dccode:=25;                     {--code to disable/enable break on closing}
+      dcdata[0]:=0;                   {--disable (1 = enable)}
+    END;
+    DEVICE_CONTROL(Error,path,devControl);
+  End;
+  PsClosePort(Error,CiPort);
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiDFMetrics (* ( Var PrRec:TPrRec;HiRes,DraftParm,Land:Boolean) *);
+Var pDevRec:^TDevRec;
+    I:Integer;
+Begin
+  pDevRec:=Pointer(Ord(@PrRec.PrDevInfo));
+  (* ----- Default the PrRec and the DevRec to: Portrait, Hi Res, Fan Fold paper.                    *)
+  (* ----- CiMetrics needs ADEV and PgSize fields of the PrRec.PrInfo and the CiPrMode and           *)
+  (* ----- feeder fields of the DevRec.CiCfg records to fill in the rest of the PrRec and the DevRec *)
+  (* ----- Fill in the ADev and PgSize fields of the PrRec.*)
+  With PrRec,PrRec.PrInfo do Begin
+    PrVersion:=cPrPrfVersion;   {!DC 2/15/84}
+    PrJobInfo.Immediate:=False;
+    With PgSize do Begin
+      (* ----- Set up the correct paper and printing direction. *)
+      If Land then PrintDirect:=LandScape
+      Else         PrintDirect:=Portrait;
+      PaperDirect:=Portrait;
+      Height:=11*PrPgFrac{.PrStdInfo};  {Default 8.5x10 inch paper.}
+      Width := (17*PrPgFrac) DIV 2{.PrStdInfo}; {!DC 2/15/84}
+    End;
+    With PrRec do For I:=1 to 128 do PrDevInfo[I]:=0;
+  End;
+  (* ----- Fill in the Draft and feeder type fields of the DevRec. *)
+  pDevRec^.CiCfg .feeder  :=FeedFanFold{.CiGlobals};
+  With pDevRec^.CiCfg  do Begin
+    CiPrMode.Draft:=DraftParm;
+    If HiRes then CiPrMode.Resolution:=HighRes
+    Else          CiPrMode.Resolution:=LowRes;
+  End;
+  CiMetrics(PrRec,pDevRec^);
+End;
+{ ---------------------------------------------------------------------- }
+Procedure CiDocBegin{(FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec)};
+Var Error, Remainder:Integer;
+    AlertResult     :Integer;
+Begin
+  CiAbort   :=False;
+
+  (* ----- Open up file, read in PrRec and DevRec and assign them as globals.                           *)
+  CiOpenFile(FName,PrRec,DevRec);
+
+  If Not(CiAbort) then Begin
+
+    (* ----- Check if Alert needs to go up for a change in feeder or a change in paper size since last  *)
+    (* ----- job. *)
+    If Not(CiEqualCfg(LastJob.PgSize, PrRec.PrInfo.PgSize, LastJob.Feeder, DevRec.CiCfg.feeder)) then
+       AlertResult:=CiAlert(BgdAlertFile,CiNewConfig,NoteProc);
+
+    (* ----- Set the DevRec unit global in CiStdQDProcs. I wanted to keep the QD bottlenecks in a seperate *)
+    (* ----- unit. DevRec data is referenced in that unit, hence this call.  Eric Z.                       *)
+    SetUnitGlobals(DevRec);
+
+    (* ----- Make the data segment for the Picture. This is    *)
+    (* ----- where we reserve the space for the printing band. *)
+    With PicDSRec{.CiProcs} do Begin
+      SegName  :=PicDSName{.CiProcs};
+      InitSize :=PicDSSize{.CiProcs}+DevRec.CiInfo.lBandSize;
+      LDSN     :=PicDSLDSN{.CiProcs};
+    End;
+    With PicDSRec do Make_DataSeg(error,SegName,InitSize,InitSize,refnum,
+                                  PicDSRec.BegAddr{.CiProcs},ldsn,ds_private);
+
+    (* ----- Set up the pointers to the beginning of the printing Band and the picture. *)
+    CiBandPtr{.CiProcs}:=Pointer(Ord4(PicDSRec.BegAddr));
+    PicBegPtr:=Pointer(Ord4(CiBandPtr{.CiProcs})+DevRec.CiInfo.lBandSize);
+    PrPicPtr :=PicBegPtr;
+
+    PrPort.gport.patStretch := DevRec.CiInfo.cPatScale;
+    GrafDevice( PrRec.prInfo.ADev.Dev );
+
+    (* ----- Build portbits. *)
+    WITH PrPort.gport, portBits DO BEGIN
+      bounds  :=DevRec.CiInfo.rBounds;
+      rowBytes:=(bounds.right-bounds.left) DIV 8;
+      baseAddr:=CiBandPtr;
+
+      portRect:=DevRec.CiInfo.rBand;
+      RectRgn( visRgn, PrRec.prInfo.rPrintable{portRect} );
+    END;
+
+    (* ----- Compute the number of bands and the remainder for the last band. *)
+    With PrRec.prInfo.rPrintable do Begin
+      DeltaVPic:=Bottom-Top;
+      DeltaHPic:=Right-Left;
+    End;
+    With DevRec.CiInfo.rBand do Begin
+      DeltaVBand:=Bottom-Top;
+      DeltaHBand:=Right-Left;
+    End;
+    CASE DevRec.CiInfo.tyScan OF
+        tyscanTB: Begin
+                    NumBands :=DeltaVPic div DeltaVBand;
+                    Remainder:=DeltaVPic mod DeltaVBand;
+                  End;
+        tyscanLR: Begin
+                    NumBands :=DeltaHPic div DeltaHBand;
+                    Remainder:=DeltaHPic mod DeltaHBand;
+                  End;
+    END; {case}
+    If Remainder>0 then NumBands:=NumBands+1;
+    CiOpen( PrRec,DevRec );
+  End;{If not (CiAbort }
+
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiDocEnd(* VAR error: Integer;Var PrRec:TPrRec;Var DevRec:TDevRec *);
+Var Err:Integer;
+BEGIN
+  Error:=0;
+  (* ----- Update feeder and PgSize information. *)
+  LastJob.feeder:=DevRec.CiCfg.feeder;
+  LastJob.PgSize:=PrRec.PrInfo.PgSize;
+
+  (* ----- Close and delete the picture data segment.*)
+  Close_DataSeg(error,PicDSRec.RefNum);
+
+  CiClose(PrRec);
+
+  (* ----- Reduce memory usage because of fonts. *)
+  PsNonPreEmptive;
+    FMCacheSize(minCache,err);
+  PsPreEmptive;
+END;
+{ ---------------------------------------------------------------------- }
+Procedure CiDrawPicture(Pic_Handle : PicHandle;Pic_Rect : Rect);
+Begin
+    (* ----- Initialize the picture pointer to point to the begining of the picture. Add 8 bytes to *)
+    (* ----- point past the picture frame. *)
+    PsYieldCpu;
+    PrPicPtr :=Pointer(Ord(PicBegPtr)+8);
+    PsNonPreemptive;
+    DrawPicture(Pic_Handle,Pic_Rect);
+    PsPreemptive;
+    PsYieldCpu;
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiDumpBand(PrRec:TPrRec;DevRec:TDevRec);
+VAR DeltaV,DeltaH, v: Integer;
+    fBiDir: TF;
+BEGIN
+WITH ThePort^, PrRec.PrInfo.PgSize DO BEGIN
+   (* ----- For Draft printing, check to insure that the printing band is below roller (DMZ). *)
+   IF DevRec.CiCfg.CiPrMode.Draft THEN BEGIN
+      IF CiPageOK( DevRec.CiCfg,PortRect.Top < DevRec.CiInfo.rRoller.bottom ) THEN Begin
+        PbDumpBand;
+        {fPgDirty := TRUE;} {!EZ 4/5/84}
+      End;
+   END
+   ELSE BEGIN
+   (* ----- For 'normal' raster printing check if bits are turned on in the DMZ. *)
+      IF CiPageOK( DevRec.CiCfg, NOT fClrBitmap( portBits, DevRec.CiInfo.rRoller ) )
+      THEN BEGIN
+         IF NOT fClrBitmap( portBits, portRect ) THEN BEGIN
+            fPgDirty := TRUE;     {!EZ 4/5/84}
+            fBiDir := (tyspiBM=tyspi144);
+            IF (PrintDirect=Portrait)  THEN v:=portRect.top-PrRec.PrInfo.rPrintable.top
+                                       ELSE v:=PortRect.left-PrRec.PrInfo.rPrintable.left;
+
+            IF NOT fBiDir THEN v:=v*2;    {Conv. to 144ths.}
+            CiGotoV (v);
+            With PortRect do Begin
+              DeltaH:=Right-left;
+              DeltaV:=Bottom-Top;
+            End;
+            WITH portBits DO IF (PrintDirect=Portrait)
+               THEN CiPrBMVert ( baseAddr, DeltaH, DeltaV, rowBytes,
+                                 tybpiBM, tyspiBM, FALSE, fBiDir )
+               ELSE CiPrBMHoriz( baseAddr, DeltaH, DeltaV, rowBytes,
+                                 tybpiBM, tyspiBM, FALSE, fBiDir );
+         END;
+      END;
+   END;
+END;
+FirstBand:=False;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiDumpScanLine{ scan: TC };
+VAR
+    cError: TC;
+BEGIN
+   IF tyspiBM=tyspi72 THEN CiGotoV (scan*2)
+                      ELSE CiGotoV (scan);
+   PsYieldCpu;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiEjectPage;
+BEGIN
+  IF fPgDirty THEN CiNewPage;
+  fPgDirty := FALSE;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiEndPage{ VAR error: Integer };
+BEGIN
+  Error:=0;
+  FirstPage:=FALSE;
+  CiEjectPage;
+END;
+{ ---------------------------------------------------------------------- }
+Function CiEqualCfg{(Var PgSize1: TPgSize;Var PgSize2:TPgSize;
+                     Var Feeder1: TFeeder;Var Feeder2:TFeeder):Boolean};
+Begin
+  CiEqualCfg:= (PgSize1.PaperDirect = PgSize2.PaperDirect) and
+               (PgSize1.Width       = PgSize2.Width      ) and
+               (PgSize1.Height      = PgSize2.Height     ) and
+               (Feeder1             = Feeder2            );
+End;
+(* ----------------------------------------------------------------*)
+Procedure CiGetPicProc{( DataPtr:QDPtr;ByteCount:Integer)};
+Var MyPtr:QDPtr;
+    I    :Integer;
+Begin
+  MoveLeft(PrPicPtr^,DataPtr^,ByteCount);
+  PrPicPtr:=Pointer(Ord4(PrPicPtr)+ByteCount);
+End;
+{ ---------------------------------------------------------------------- }
+{$S   }
+PROCEDURE CiInitAlerts{(Var Error:Integer)};
+VAR
+  cAlerts   : TC;
+BEGIN
+  PsNonPreEmptive;
+    InitAlerts(CacheSize,CacheBytes,theHeap,nil,nil);
+    OpenPhraseFile(cAlerts,sAlerts);
+    Error:=AlertError;
+    IF (Error <= 0) THEN BgdAlertFile:=ReadAlerts(cAlerts,cAxVersion);
+  PsPreEmptive;
+END;
+{ ---------------------------------------------------------------------- }
+{$S CiDlg}
+PROCEDURE CiMetrics (* Var PrRec:TPrRec;Var DevRec:TDevRec *);
+VAR vPaperBits, hPaperBits, cPlaten, cGap: Integer;
+    hBytes, vBytes: Integer;
+    rTemp : Rect;
+BEGIN
+  (* ----- Set the proper version. *)
+  DevRec.Version:=$0001;
+
+  (* ----- Set up the rPrintable, rRoller rectangles and the scanning direction. *)
+  WITH PrRec.prInfo, DevRec.CiInfo, PrRec.PrInfo.PgSize DO BEGIN
+     NumColors:=1;
+
+     (* ----- Portrait Hi resolution and Low resolution. *)
+     IF (PrintDirect=Portrait) THEN BEGIN
+        PrRec.PrInfo.ADev.fPortrait:=True;
+        IF (DevRec.CiCfg.CiPrMode.Resolution=HighRes) THEN BEGIN
+           PrRec.PrInfo.ADev.EDev:=edevHDotMX;
+           PrRec.PrInfo.ADev.fHiRes:=True;
+           hRes:=160; vRes:=144;
+           cPlaten := c160Bits{.CiGlobals};
+           cGap:=cCiGap144ths {.CiGlobals};
+        END
+        ELSE BEGIN
+           PrRec.PrInfo.ADev.EDev  :=edevDotMX;
+           PrRec.PrInfo.ADev.fHiRes:=False;
+           hRes:=96; vRes:=72;
+           cPlaten := c96Bits{.CiGlobals};
+           cGap:=cCiGap144ths{.CiGlobals} DIV 2;
+        END;
+        tyScan:=tyscanTB;
+
+        (* ----- Returning DEVICE PAPER SIZE not DOCUMENTS *)
+        With PrRec.PrInfo.PgSize do Begin
+          vPaperBits:=Height * ORD4(vRes) DIV prPgFract{.PrStdInfo};
+          hPaperBits:=Width  * ORD4(hRes) DIV prPgFract{.PrStdInfo};
+        End;
+        SetRect ( rPaper, 0, 0, (hPaperBits Div 16) * 16, vPaperBits );
+
+        (* ----- Round down vPaperBits to nearest multiple of 16 in order for # scans to work. *)
+        SetRect ( rPrintable, 0, 0, cPlaten, (vPaperBits DIV 16) * 16 );
+        If SectRect(rPaper,rPrintable,rTemp) then rPrintable:=rTemp;
+        SetRect ( rRoller,    0, 0, cPlaten, cGap );
+     END
+     (* ----- Landscape Hi resolution and Low resolution. *)
+     ELSE BEGIN
+        PrRec.PrInfo.ADev.fPortrait:=False;
+        IF (DevRec.CiCfg.CiPrMode.Resolution=HighRes) THEN BEGIN
+           PrRec.PrInfo.ADev.EDev  :=edevHDotMX;
+           PrRec.PrInfo.ADev.fHiRes:=True;
+           hRes:=144; vRes:=144;
+           cPlaten := c144Bits{.CiGlobals};
+           cGap:=cCiGap144ths {.CiGlobals};
+        END
+        ELSE BEGIN
+           PrRec.PrInfo.ADev.EDev  :=edevDotMX;
+           PrRec.PrInfo.ADev.fHiRes:=False;
+           hRes:=144; vRes:=96;
+           cPlaten := c96Bits{.CiGlobals};
+           cGap:=cCiGap144ths{.CiGlobals};
+        END;
+        tyScan:=tyscanLR{.CiGlobals};
+
+        (* ----- Note switched height and width for rotated pages. *)
+        With PrRec.PrInfo.PgSize do Begin
+          hPaperBits := Height* ORD4(hRes) DIV prPgFract;
+          vPaperBits := Width * ORD4(vRes) DIV prPgFract;
+        End;
+        SetRect ( rPaper, 0, 0, (hPaperBits Div 16) * 16, vPaperBits );
+
+        (* ----- Round down hPaperBits to nearest multiple of 16 in order for # scans to work.*)
+        SetRect ( rPrintable, 0, 0, (hPaperBits DIV 16) * 16, cPlaten );
+        If SectRect(rPaper,rPrintable,rTemp) then rPrintable:=rTemp;
+        SetRect ( rRoller,    0, 0, cGap,                     cPlaten );
+
+        (* ----- HACK: Lie to user to get fonts & graphics to scale. hRes set to 96 to  *)
+        (* ----- insure text witdh match. vRes set square if zoom, std otherwise. Note: HRes and VRes*)
+        (* ----- must be set to the above computed values for determining rPrintable and rRoller. *)
+        IF NOT (DevRec.CiCfg.CiPrMode.Resolution=HighRes) THEN BEGIN
+           hRes:=96;
+           vRes:=64{96*(96/144)};
+        END;
+     END;
+
+     (* ----- Set underlining parameters based on resolution. *)
+     cULThick:=1;
+     IF (DevRec.CiCfg.CiPrMode.Resolution=HighRes) THEN BEGIN
+        cPatScale :=-2; cULOffset := 3; cULShadow := 3;
+     END
+     ELSE BEGIN
+        cPatScale := 1; cULOffset := 1; cULShadow := 1 {!PE115};
+     END;
+
+     (* ----- Get the rBand and rBounds rectangles and determine the band size. *)
+     WITH DevRec.CiInfo DO BEGIN
+        IF (PrRec.PrInfo.PgSize.PrintDirect=Portrait) THEN BEGIN
+           hBytes:=((rPrintable.right-rPrintable.left + 15) DIV 16) * 2;
+           vBytes:=(prMaxBand{.CiGlobals} DIV hBytes ) DIV 16 * 2;
+        END
+        ELSE BEGIN
+           vBytes:=(rPrintable.bottom-rPrintable.top + 15) DIV 16 * 2;
+           hBytes:=( prMaxBand{.CiGlobals} DIV vBytes + 15 ) DIV 16 * 2;
+        END;
+        If (DevRec.CiCfg.CiPrMode.Draft=True) then Begin
+          (* ----- If Draft then make rbounds to have zero size, make one band which is the size rPrintable *)
+          (* ----- CiDocBegin will set Numbands to 1. *)
+          lBandSize:=4;                     {A Small non-Zero number}
+          rBand    :=rPrintable;
+          SetRect ( rBounds, 0, 0, 0, 0 );
+        End
+        Else Begin
+          lBandSize:=hBytes*vBytes*8;                     {Bytes*bits(scans)}
+          SetRect ( rBand, 0, 0, hBytes*8, vBytes*8 );
+          rBounds:=rBand;
+        End;
+     END;
+  END; { With PrRec.PrInfo, DevRec.CiInfo...}
+END;
+{ ---------------------------------------------------------------------- }
+{$S Ci}
+PROCEDURE CiOpen (* Var PrRec:TPrRec; DevRec:TDevRec *);
+VAR pbInstall: TPbInstall;
+    fFastGraf, fPEStop: TF;
+    Error    :Integer;
+BEGIN
+  WITH DevRec.CiCfg, DevRec.CiInfo  DO BEGIN
+
+     With PrRec.PrInfo do fFastGraf := (port=PortA) OR (port=PortB);
+     fPEStop   := (feeder=feedFanfold);
+
+     (* ----- CLose the port, just in case the workshop or someone else left it open!  --- *)
+     CiCLosePort(PrRec.PrInfo.Port);                                            {!EZ 5/10/84}
+
+     PsOpenPort(Error,PrRec.PrInfo.Port);
+     CiDevOpen (fFastGraf, fPEStop);
+
+     fPgDirty := FALSE;
+
+    (* ----- Set the tyspi/tybpi.  This is needed even in draft mode.*)
+     IF (DevRec.CiCfg.CiPrMode.Resolution=HighRes) THEN BEGIN
+        IF (PrRec.PrInfo.PgSize.PrintDirect=Portrait) THEN BEGIN
+           tybpiBM:=tybpi160; tyspiBM:=tyspi144;
+        END
+        ELSE BEGIN
+           tybpiBM:=tybpi144; tyspiBM:=tyspi144;
+        END;
+     END
+     ELSE BEGIN
+        IF (PrRec.PrInfo.PgSize.PrintDirect=Portrait) THEN BEGIN
+           tybpiBM:=tybpi96; tyspiBM:=tyspi72;
+        END
+        ELSE BEGIN
+           tybpiBM:=tybpi96; tyspiBM:=tyspi144;
+        END;
+     END;
+
+     (* ----- PrMgr Note: DotMx's pgHt is independent of landscape (i.e. 11 or 14, never 81/2):*)
+     CiSetFormLng( PrRec.PrInfo.pgSize.Height * ORD4(144) DIV prPgFract );
+
+     (* ----- Stuff the 'normal' text proc into the bottleneck. It may get overridden if we are *)
+     (* ----- doing draft. This must be stuffed for each job, because draft printing overrides  *)
+     (* ----- the bottleneck and it will never get restored while the process is alive unless we *)
+     (* ----- do it here.                                                                       *)
+     ThePort^.grafprocs^.TextProc:=@PrStdText;
+
+     (* ----- Set the proc variables for Draft; otherwise inherit defaults.*)
+     IF CiPrMode.Draft THEN WITH pbInstall DO BEGIN
+        (* ----- Install ourselves into PrBuf*)
+        chkProcs[pbCmdHRule]  := @CiChkHRule;
+        chkProcs[pbCmdText]   := @CiChkText;
+        chkProcs[pbCmdVRule]  := @CiChkVRule;
+
+        dumpProcs[pbCmdHRule] := @CiDumpHRule;
+        dumpProcs[pbCmdText]  := @CiDumpText;
+        dumpProcs[pbCmdVRule] := @CiDumpVRule;
+
+        scanLine := @CiDumpScanLine;
+        PbOpen( pbInstall );
+
+        (* ----- Set Up PrBuf Unit globals for offseting by rPrintable for draft. *)
+        With PrRec.PrInfo.rPrintable do PbOffSet(Left,Top);
+
+        (* ----- Divert the std text proc to here; keep the std graphics but use the null*)
+        (* ----- graf port to keep track of the pen.*)
+        ThePort^.grafprocs^.TextProc:=@CiStdText;
+
+        (* ----- Init draft state.*)
+        CiDftFont (p12tile);    {Install a vanilla value for the font.}
+        CiDftFace ([]);
+        charSubs{.CiGlobals} := [$82, $83, $87, $89, $8B, $90..$92, $94, $95, $97, $99, $9B, $9C,
+                                 $9E, $A5, $AB, $AE, $AF, $B4, $BB, $BC, $BE, $BF, $C4, $C7, $C8,
+                                 $CA];  {DC 5/11/83, 6/15/83}
+     END;
+  END;
+END;
+{ ---------------------------------------------------------------------- }
+Procedure CiOpenFile{(FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec)};
+Var
+    Error       : Integer;
+    LocPrRec    : LongInt;           {Location of the PrRec in the spool file.}
+    LocPageDir  : LongInt;           {Location of the PageDir in the spool file.}
+    DirLength   : Integer;           {Number of bytes needed in the picture directory. This is the size
+                                    of the object pointed to by hPfPages.}
+    pDevRec     : ^TDevRec;
+    AlertResult : Integer;
+Begin
+  PrFileRec.FileName:=Fname;
+
+  (* ----- Open the print file. *)
+  OpenBlock(error,prfilerec,[DRead,Private]);
+  If Error<=0 then OpenFile:=True;
+
+  (* ----- Read the File Positions of the PrRec and the Page Directory.*)
+  ReadBlock(error,Pointer(Ord(@LocPrRec)),4,PrFileRec.RefNum);
+  ReadBlock(error,Pointer(Ord(@LocPageDir)),4,PrFileRec.RefNum);
+
+  (* ----- Position File Marker and read in the PrRec.*)
+  PfSetPos(error,LocPrRec,PrFileRec.RefNum);
+  ReadBlock  (error,Pointer(Ord(@PrRec)),Sizeof(TPrRec),PrFileRec.RefNum);
+
+  (* ----- Stuff the port designated by the father process. *)
+  PrRec.PrInfo.Port:=CiPrinter^^.PrRec.PrInfo.Port;
+
+  (* ----- Isolate the DevRec portion of the PrRec. *)
+  pDevRec:=@PrRec.PrDevInfo;
+  DevRec :=pDevRec^;
+
+  (* ----- Check if the PrRec and the CiRec are O.K.*)
+  If (DevRec.Version<>$0001) then Begin
+    CiAbort:=True;
+    AlertResult:=CiAlert(BgdAlertFile,CiBadSpoolFile,StopProc);
+  End;
+
+  If not(CiAbort) then Begin
+    (* ----- Position File Marker and read in the Page Directory. File marker is probably already     *)
+    (* ----- at the corret position, but we are keeping a pointer to it until file structure settles. *)
+    PfSetPos(error,LocPageDir,PrFileRec.RefNum);
+
+    NumPages:=PrRec.PrJobInfo.SpooledPages;
+
+    (* ----- Allocate the handle array in TheHeap. *)
+    DirLength:=NumPages*SizeOf(TPfPage);
+    hPfPages:=Pointer(Ord(NewHandle(DirLength)));
+
+    ReadBlock(error,Pointer(Ord(hPfPages^)),DirLength,PrFileRec.Refnum);
+  End;
+End;
+{ ---------------------------------------------------------------------- }
+FUNCTION  CiPageOK{ ( CiCfg:TCiCfg; fDMZDirty: TF ): TF };
+(* ----- This procedure is called to set the error to reflect that data exists in the *)
+(* ----- roller gap.*)
+Var AlertResult:Integer;
+BEGIN
+   IF FirstBand THEN WITH CiCfg DO BEGIN
+      (* ----- Assume page will be repeated.*)
+      CiPageOK:=FALSE;
+      {fPgDirty:=True;} {!EZ 4/5/84}
+      CASE feeder OF
+         feedFanFold: BEGIN
+            (* ----- Only raise the DMZ error if on the first page otherwise plow ahead.*)
+            IF (fDMZDirty AND FirstPage) then Begin
+              fPgDirty:=True;   {!EZ 4/10/84 - forces page eject}
+              CiEjectPage;
+            End;
+            CiPageOK:=True;
+         END;
+         feedCut: BEGIN
+            (* ----- If dmz is dirty call a sheet feed for top, otherwise plain sheet feed.*)
+
+            AlertResult:=CiAlert(BgdAlertFile,CiNextSheet,CautionProc);
+            (* ----- CiAbort can be set in CiAlert. *)
+            CiPageOK:=Not(CiAbort);
+         END;
+         feedMechCut: BEGIN
+            (* ----- Never raise the DMZ error if using a sheet feeder.*)
+            CiPageOK:=TRUE;
+         END;
+      END; {case...}
+   END
+   ELSE BEGIN
+      (* -----  Not the first band so always give go-ahead. *)
+      CiPageOK:=TRUE;
+   END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CiPrintFile {(FName:Str255;Var PrRec:TPrRec;Var DevRec:TDevRec)};
+VAR Error, PageNum: Integer;
+    hPic          : PicHandle;
+    rFrame        : Rect{.QuickDraw};
+    Delta,Ignore  : LongInt;
+    AlertResult   : Integer;
+BEGIN
+     If Not(OpenFile) then CiOpenFile (FName,PrRec,DevRec);
+     If Not(CiAbort) then Begin
+       PageNum:=1;
+       Repeat
+         (* -----Check if we need to increase the size of the data segment for large pictures. Pictures must *)
+         (* ----- be memory resident, so that we do not hit the disk for every band. *)
+         Delta:=hPfPages^^[PageNum].Length-(PicDSRec.InitSize{.CiProcs}-DevRec.CiInfo.lBandSize);
+         If  (Delta>0) then  Size_DataSeg(error,PicDSRec.RefNum {.CiProcs},Delta,Ignore,Delta,Ignore);
+
+         (* ----- If we cannot increase the size of the data seg then its time to Bail out Campers!! *)
+         (*!EZ 5/11/84 *)
+         If Error>0 then Begin
+            AlertResult:=CiAlert(BgdAlertFile,CiNoDiskSpace,StopProc);
+            CiAbort:=True;
+         End;
+
+         If Not(Ciabort) then Begin
+           (* ----- Set the file position and read the picture. *)
+           PfSetPos(error,hPfPages^^[PageNum].Start,PrFileRec.RefNum);
+           CiReadPicture(error,hPfPages^^[PageNum].Length,PrFileRec.Refnum);
+
+           (* ----- Read the Picture Frame rectangle before looking at the rest of the picture. QuickDraw does not *)
+           (* ----- write the picture size or frame when using put and get procs. *)
+           CiGetPicProc(Pointer(Ord(@rFrame)),8);
+
+           (* ----- Set up a picture header for using the correct frame rectangle*)
+           hPic:=OpenPicture(rFrame);
+           ClosePicture;
+
+           CiPrintPict(error,PrRec,DevRec,hPic,rFrame);
+           CiEndPage(error);
+
+           DisposeHandle( POINTER(ORD(hPic)) );
+
+           (* ----- Shrink down the data segment if we had a large picture. *)
+           If (Delta>0) then Begin
+              Size_DataSeg(error,PicDSRec.RefNum{.CiProcs},-Delta,Ignore,
+                           -Delta,Ignore);
+           End;
+
+           PageNum:=PageNum+1;
+         End; {If (Not(CiAbort)}
+       Until ( (PageNum>NumPages) or (CiAbort) );
+
+     End; {If not(CiAbort}
+
+     (* ----- Close print file. *)
+     Close_Object(error,PrFileRec .RefNum);
+     OpenFile:=False;
+END;
+{ ---------------------------------------------------------------------- }
+Procedure CiPrintPict {( Var error: Integer;PrRec:TPrRec;DevRec:TDevRec;hPicture:PicHandle;
+                         Frame:Rect)};
+Var BandNumber:Integer;
+    NextBand  : Rect{.QuickDraw};
+Begin
+  Error:=0;
+  FirstBand:=TRUE;
+  rPrBounds.Left:=-32000;  { This is used in PBLimit for draft.}
+
+
+  (* ----- Set up the first band. *)
+  With NextBand do Begin
+    Top   := PrRec.PrInfo.rPrintable.Top;
+    Bottom:= Top+DeltaVBand;
+    Left  := PrRec.PrInfo.rPrintable.Left;
+    Right := Left+DeltaHBand;
+  End;
+
+  BandNumber:=1;
+  If ((NumBands>=BandNumber) and Not(CiAbort)) then Begin
+    Repeat
+      (* ----- Initialize the picture pointer to the begining of the picture. Add 8 bytes to point
+      (* ----- past the picture frame.*)
+      PrPicPtr:=Pointer(Ord(PicBegPtr{.CiProcs})+8);
+
+      ThePort^.PortRect        := NextBand;
+      If Not(DevRec.CiCfg.CiPrMode.Draft) then ThePort^.PortBits.Bounds := NextBand;
+      ClrBitMap(Pointer(Ord(@ThePort^.PortBits)) );
+      CiDrawPicture(hPicture,Frame);
+      With NextBand do CiDumpBand(PrRec,DevRec);
+      (* ----- Increment the Band based on scanning direction. *)
+      CASE DevRec.CiInfo.tyScan OF
+          tyscanTB:  Begin
+                       With NextBand do Begin
+                         Top   :=Bottom;
+                         Bottom:=Bottom+DeltaVBand;
+                         If Bottom>PrRec.PrInfo.rPrintable.Bottom then Bottom:=PrRec.PrInfo.rPrintable.bottom;
+                       End;
+                     End;
+
+          tyscanLR: Begin
+                       With NextBand do Begin
+                         Left   :=Right;
+                         Right  :=Right+DeltaHBand;
+                         If Right>PrRec.PrInfo.rPrintable.Right then Right:=PrRec.PrInfo.rPrintable.right;
+                       End;
+                     End;
+      END; {case}
+      BandNumber:=BandNumber+1;
+    Until ( (BandNumber>Numbands) or (Error<>0) or (CiAbort) );
+  End; { If NumBands>=...}
+End;
+{ ---------------------------------------------------------------------- }
+Procedure CiReadPicture{(Var Error:Integer;Length:LongInt;RefNum:Integer)};
+Begin
+  (* ----- The reading of the picture is done in this unit because the Picture Data Segment *)
+  (* ----- is not visable outside of the CiProcs Unit.                                      *)
+  ReadBlock(error,Pointer(Ord4(PicBegPtr)),Length,Refnum);
+
+  (* ----- Initialize the picture pointer to the begining of the picture. First eight bytes of         *)
+  (* ----- the picture are the picture frame, which is artifically stuffed by the print spooler.       *)
+  (* ----- The frame is picked off by a call to CiGetPicProc in CiPrintFile. CiGetPicProc advances the *)
+  (* ----- the PrPicPtr to point past the frame, thus QuickDraw never knows about the picture frame.   *)
+  PrPicPtr:=Pointer(Ord(PicBegPtr{.CiProcs}));
+End;
+{ ---------------------------------------------------------------------- }
+END.
+{***************************SUMMARY OF CIPROCS CHANGES FOR INTERNATIONAL VERSION*******************
+
+ All these changes have to do with making draft printing handle non-USASCII characters.  CiDev
+ assumes that all characters to be draft-printed by CiDev are ones that can in fact be printed on
+ the C.Itoh; here we guarantee this.
+
+   0. fPrEnhanceDraft flag controls these changes.  Set equal to fPrInternational (from PrStd).
+   1. Set variable charSubs added; Codes of chars that cannot be printed on the C.Itoh, but can
+      be reasonably substituted.  Initialized in CiOpen.
+   2. CiSubs added to perform substitutions.  Note: 1-to-1 substitution, in the buffer.
+   3. CiChkText calls CiSubs if char code is in charSubs.
+   4. zCiInit added.
+
+***************************************************************************************************}
+
+{
+UNIT CiProcs CHANGE LOG:
+     10/25/83 EZ: TSeteface changed to Style in CiDftFace. CiOpen - bottleneck reference changed for
+                  new quickdraw format.
+      9/06/83 DC: zCiInit: new proc to call CiDevInit.
+      8/10/83 DC: CiSubs: Change handling of O and o slashed, AE and ae ligatures (back the way
+                  they were before, using umlauts!).
+      7/08/83 DC: Changed name of zCiSubs to CiSubs.
+      7/07/83 DC: Replaced charForeign with charEuropean (from CiDev).  No reusability problem.
+      6/15/83 DC: CiOpen: add "<<" and ">>" characters ($C7, $C8) to charSubs initialization.
+      6/15/83 DC: zCiSubs: add substitutions for "<<" and ">>" characters.
+      5/18/83 DC: Made draft printing of special chars depend on flag fPrEnhanceDraft (from CiDev)
+                  instead of fPrEurope.
+      5/11/83 DC: CiOpen: Add the "non-breaking space" to charSubs initialization.
+                  zCiSubs: Add substitution of space for "non-breaking space" ($CA).
+                  zCiSubs: Change handling of O and o slashed, AE and ae ligatures.
+      4/29/83 DC: The following mods are conditional, based on fPrEurope:
+                    Add charSubs & charForeign variables.
+                    Add zCiSubs function.
+                    CiChkText: add conditional code to call zCiSubs.
+                    CiOpen: add conditional code to initialize charSubs & charForeign.
+      4/13/83 EZ: CiOpen: Changed fPEStop to be true for feedFanfold instead of feedCut. PR Bug #008.
+      2/19/83 OD: CiMetrics: LoRes UL params = screen's.
+      2/ 9/83 OD: marker removed from draft.
+                  CiDftFont: tried for better fit.
+      2/ 2/83 OD: fPgDirty added to detect blank pages.
+      1/31/83 OD: vPaperBits-(vPaperBits-cGap) MOD 16 => (vPaperBits DIV 16)*16.
+                  rSafe added to CiMetrics.
+                  CiChkText: add marker font hack.
+      1/30/83 OD: Add CiClose to CiCleanup.
+      1/24/83 OD: remove cGap from page calcs in CiMetrics.
+}
+
+ÿ

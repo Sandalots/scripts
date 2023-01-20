@@ -1,0 +1,606 @@
+;Copyright 1983, 1984, Apple Computer Inc.
+
+;file source/ldprof (contents of the boot block)
+
+        .proc LDRLDR                    ;profile/widget loader loader
+        .NOLIST
+
+    ;**********
+    ;* Description:
+    ;*   This is the copy of the loader loader with a PROFILE/WIDGET device driver,
+    ;*     either from the builtin parallel port or from a port on the 2-port card.
+    ;*
+    ;* Input Parameters:
+    ;*   The boot prom tells the size and base address of physical memory, and
+    ;*   where we are booting from.  WBT deposits information into a small
+    ;*   data area at the front of this block, showing the amount of the loader's
+    ;*   global data and code, the offset to the loader's entrypoint, and the
+    ;*   block address of the first page of the filesystem, ie, the MDDF.
+    ;*
+    ;*   The slot prom passes two parameters in addition to what's available
+    ;*   when booting from the parallel port:
+    ;*       (SP) - the address of the slot prom's 'read a block' procedure,
+    ;*         A0 - a 'logic base address' pointer (a parameter to the 'read a
+    ;*             block' routine).
+    ;*
+    ;* Output Parameters:
+    ;*   The loader loader reports to the loader the block address of MDDF, the
+    ;*   logical volume number of the boot device (though that's only used for
+    ;*   twiggy, the type of device we are booting from, the block address
+    ;*   of the first usable page of the boot volume (exclusive of this block),
+    ;*   the address of the loader database and where the loader began execution.
+    ;*
+    ;**********
+
+        .INCLUDE        SOURCE/LDEQU.TEXT
+        .LIST
+
+retry           equ     10
+thresh          equ     3
+timeout         equ     $900000 ;about 100 seconds
+disk_header     equ     20      ;20 byte soft header with profile/widget
+cksum_on        equ     $8000   ;bit saying whether cksum present
+pport_id        equ     2       ;value denoting parallel port
+adr_scratch     equ     $800    ;scratch space  (at least a block+headers worth)
+disk_type       equ     $20e    ;byte offset from adr_scratch to report whether
+                                ; boot device is widget or profile.
+
+
+;**********
+;
+; Here begins the body of loader loader.
+;
+;**********
+ldr_base
+        jmp     over_ldr_data           ;dont execute loader data
+                                        ; written by boot track writer
+
+;---------
+;
+; reserve enough space for the 'write_boot_tracks' utility
+;  to store primitive config information here:
+        .word boot_id,ldr_version       ;note loader version and that it's bootable
+        .word 0,0,0,0                   ;save bytes for loader self-description space
+
+;allocate space for slot-boot ldrldr variables:
+drvr_base       ;pointer to boot device driver
+        .word 0,0
+
+drvr_ptr        ;logic ptr param, for use with boot device driver
+        .word 0,0
+
+
+over_ldr_data                           ; execution continues from here
+;
+;pick where to re-position the loader
+        move.l  prom_realsize,d0
+        lsr.l   #1,d0                   ;use midpoint
+        move.l  d0,ldbaseptr            ;remember our choice (both in D0 and in
+                                        ;     ldbaseptr)
+; Relocate the loader to ldbase
+        move.l  d0,a1                   ; a1 := destination ptr (D0 has ldbase)
+        move.l  #prom_assumes,a2        ; a2 := source ptr
+        lea     ldr_base,a3             ; a3 := end marker (accounting for extra
+        add.l   #preloaded,a3           ;   slot code that may be drug along}
+move_loop
+        cmpa.l  a3,a2
+        bgt.s   exit_loop
+        move.l  (a2)+,(a1)+
+        bra.s   move_loop
+exit_loop
+        lea     real_code,a4            ;get into code just copied to ldbase
+        add.l   d0,a4                   ; (D0 has ldbase)
+        sub.l   #prom_assumes,a4
+        jmp     (a4)                    ; (distance from where the prom has
+real_code                               ;  loaded the loader to where I've
+                                        ;  relocated it.)
+
+;----
+; here begins the REAL ldrldr functions:
+;----
+        lea     drvr_ptr,a1             ;store away drvr's logic ptr
+        move.l  a0,(a1)
+        lea     drvr_base,a1            ;store away (potential) driver base adr
+        move.l  (SP),(a1)
+        add.l   d0,(a1)                 ;correct for its relocation (D0 has ldbase)
+        sub.l   #prom_assumes,(a1)
+
+        move.l  d0,a7                   ;get a fresh stack
+        sub     #init_sp,a7
+
+;check whether boot device is profile or widget:
+        move.l  #$ffffff,d7             ;read 'status' block from hard disk
+        move.l  #adr_scratch,a6         ; to scratch buffer
+        move    #dev_prof,dev_type      ;assume boot is from profile (and tell 'read_it' so!)
+        bsr     read_it
+        move.b  disk_type(a6),d0
+        beq.s   is_prof
+        move    #dev_widget,dev_type    ;correct to widget
+is_prof
+
+;
+; Define (and initialize) some registers:
+;    a6 holds the pointer to the next byte to load the loader into
+;    d6 holds the amount of code still to be loaded
+;    d7 holds the where the next block is on disk
+        lea     ldr_base,a6     ; (one sector already loaded)
+        move.l  a6,a0
+        add.l   #preloaded,a6
+        adda    #codesize,a0
+        move    (a0),d6
+        sub     #preloaded,d6
+        move.l  #8,d7           ; (skip mount table, at block 7  )
+        move    d7,vol_starts   ; (and pass it along to loader,  )
+        addq    #1,d7           ; (but skip block 0, within vol  )
+        cmp     #dev_widget,dev_type ;widget has less data in block 0.
+        bne.s   @1
+        sub.l   #disk_header,a6 ;trash useless 'real' header
+@1
+
+;
+;MAIN LOOP STARTS HERE: (while codesize>0 do)
+main_loop:
+        move    d6,d6
+        bmi     start_pascal            ;exit once negative
+        bsr.s   ldr_read_block
+        add     #block_size,a6          ;increment destination ptr
+        sub     #block_size,d6          ;decrement bytes still to be read
+        add     #1,d7                   ;increment sector number
+        jmp     main_loop
+
+
+
+;*************************************************************)
+;*
+;*  procedure bootbomb;
+;*
+;* Description:
+;*    Display a crash diagnostic. (error number is in a3)
+;*
+;*************************************************************)
+bootbomb
+        move.l  d0,d6                   ;stash prom's io error number in bomb shelter
+        move.l  #disk_control,a2        ;await profile/widget not busy before proceeding
+busy_loop
+        btst    #1,(a2)
+        beq.s   busy_loop
+
+        move.l  prom_realsize,d0        ;tell prom where the main screen is,
+        sub.l   #screensize,d0          ;   (top of mem minus screensize)
+        move.l  d0,prom_screen          ; in unmapped terminology.
+
+        suba.l  a2,a2                   ;no icon
+        move.l  a3,d0                   ;error number, new format
+        move.l  d0,d1                   ;error number, old format
+        suba.l  a3,a3                   ;no textual messages, please.
+        jmp     prom_monitor            ;BYE-BYE time
+
+
+
+;****************************************************
+;
+; LDR_READ_BLOCK - reads one block into memory, assuming header is in FRONT
+;                       of the data block.
+;       A6 - the destination address.
+;       D7 - the sector to read
+;
+;****************************************************
+ldr_read_block:
+        bsr.s   read_it         ;read the data (also stashes header/data adr in A1/A2.
+
+;see whether cksum is present:
+        move.w  $206(a6),d0     ;d0 := version field of header (for profile)
+        cmp     #dev_widget,dev_type    ;dont use interleave on widget
+        bne.s   @1
+        move.w  $204(a6),d0     ;d0 := version field of header (for widget)
+@1      and     #cksum_on,d0
+        beq.s   cksum_done
+
+;verify checksum:
+        clr.l   d0              ;d0 to accumulate cksum
+        move.l  a6,a1           ;for a1 := a6 to a6+data_and_header do
+        move.w  #block_size+disk_header-1,d2
+        lsr     #2,d2           ;convert from byte length to 4-byte loop count
+                                ;(works since it's known to be multiple of 4-bytes)
+xor_loop                        ;    d0 := d0 'EOR-ed with' (a1);
+        move.l  (a1)+,d1
+        eor.l   d1,d0
+        dbra    d2,xor_loop
+
+        move    d0,d1           ;krunch/eor result down to a word
+        lsr.l   #8,d0
+        lsr.l   #8,d0
+        eor     d1,d0
+        move.b  d0,d1           ;krunch/eor result down to a byte
+        lsr.w   #8,d0
+        eor.b   d1,d0
+        beq.s   cksum_done
+        move.l  #bombed,a3              ;pass error number
+        moveq   #-1,d0                  ; (signal error NOT from prom)
+        bra.s  bootbomb                 ;that's all
+cksum_done
+        rts
+
+
+;****************************************************
+;
+;   Read_it : the heart of Ldr_Read_Block.
+;
+;   Parameters:
+;     d7 - sector to read.
+;     a6 - destination address of data, to be followed by header.
+;
+;  (the prom expects:
+;       A0 - Address of logic base for channel (required for slot boot ONLY)
+;       A1 - Destination adr of header
+;       A2 - Destination adr of data
+;       D1 - 32-bit sector number (upper byte must be zero)
+;       D2 - timeout ($900,000 translates to 100 seconds)
+;       D3 - retries
+;       D4 - threshold
+;
+;       D0    return error indications (0 means OK)  )
+;
+; Note:
+;   Two different drivers exists for the same device so that one can be small
+;   and simpleminded and fit in the first block (ldr_read_block), while the
+;   second (asm_read_block) can still do header handling.
+;
+;****************************************************
+read_it
+        move.l  d7,d1                   ;sector address goes in d1
+        move.l  a6,a2
+        move.l  a6,a1
+        cmp     #dev_widget,dev_type
+        bne.s   @1
+        add     #disk_header,a2         ;widget has header before data
+        bra.s   @2
+@1      add     #block_size,a1          ;profile has header after data
+@2      move    #retry,d3               ;
+        move    #thresh,d4
+        move.l  #timeout,d2
+        cmp.l   #$ffffff,d1             ;don't use interleave for device query
+        beq.s   no_interleave
+        cmp     #dev_widget,dev_type    ;dont use interleave for widget
+        beq.s   no_interleave
+        bsr.s   interleave              ;d1 := interleave block address,
+no_interleave                           ;   as function of original d1.
+        movem.l a1/a2/a6/d6-d7,-(SP)    ;save registers
+
+;get block from paraport or slot-based driver:
+        cmp.b   #pport_id,prom_bootdev   ;did we boot from parallel port?
+        bgt.s   read_from_slot
+        jsr     prof_entry              ;  if so, call prom's driver
+        bra.s   para_read_done
+read_from_slot                          ;  if not, read block from a slot
+        lea     drvr_base,a0            ;get drvr entrypoint
+        move.l  (a0),a3
+        lea     drvr_ptr,a0             ;get drvr logic ptr
+        move.l  (a0),a0
+        jsr     (a3)
+para_read_done
+        movem.l (SP)+,a1/a2/a6/d6-d7    ;restore registers
+
+        bcc.s   got_it                  ;carry set by prom if error
+        move.l  #bombed,a3              ;pass error number
+        bra.s   bootbomb                ;(never returns)
+got_it  rts
+
+
+       ;*************************************************************)
+       ;*  Description:
+       ;*    Modifies the lower 4-bits of the block number to account for
+       ;*    a software maintained interleave factor.
+       ;*
+       ;*  Input Parameter:
+       ;*    Register D1 gets the block number to be translated.
+       ;*
+       ;*************************************************************)
+interleave
+        move.l  d0,-(SP)        ;don't disturb any registers
+        move.l  d1,-(SP)        ;update block address WHILE ON STACK
+                                ;  (allows me to fiddle with reg-based copy)
+        moveq   #-$10,d0        ; = $F0
+        and.b   d1,d0           ;mask high 4 bits
+        and     #$000f,d1       ;mask low 4 bits
+        add.b   intertabl(d1),d0 ;add in PROFILE'S remapped low 4 bits
+        move.b  d0,3(SP)        ;  (replace low nibble ON STACK)
+        move.l  (SP)+,d1        ;return final block address to orig register
+        move.l  (SP)+,d0        ;restore d0
+        rts
+      ;table of interleave remappings for low 4 bits of block number
+intertabl
+;       .BYTE     0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15   ;no remapping
+        .byte     0, 5,10,15, 4, 9,14, 3, 8,13, 2, 7,12, 1, 6,11   ;9:1 leaved
+
+
+
+;*************************************************************)
+;
+; Here is the boundary of the stuff that has to fit in the first block.
+;  along with everything else that won't fit there.
+;
+;*************************************************************)
+
+
+; ENTER EXECUTION OF THE LOADER
+start_pascal
+
+; FOR PEPSI ONLY: CHANGE BOOT DEVICE FROM '0' TO '2'.
+        move.l  #prom_bootdev,a0        ;address of boot device selector
+        move.l  #adr_machinfo,a1        ;address of machine identification byte
+        move.b  (a1),d0                 ;if negative, machine is a PEPSI
+        bpl.s   not_pepsi
+;overrule pepsi boot dev 0 to 2:
+        move.b  (a0),d0
+        bne.s   not_zero
+        move.b  #2,(a0)
+not_zero
+not_pepsi
+
+;pass MDDF location to loader
+        lea     ldr_base,a0
+        adda    #fs_block0,a0
+        move    (a0),ld_fs_block0
+
+        clr.l   -(SP)                   ;clear 'C'
+        clr.l   -(SP)                   ;clear 'V'
+        clr.l   -(SP)                   ;clear 'os/mon flag'
+
+        lea     ldr_base,a0
+        adda    #globalsize,a0
+        move    (a0),a1                 ;tell pascal how much global data
+        move.l  a1,-(SP)
+
+        clr.l   -(SP)                   ;init output buffer addresses
+        clr.l   -(SP)                   ;init input buffer addresses
+
+        clr.l   -(SP)                   ;enter nil return address
+
+        lea     ldr_base,a0             ;find entrypoint
+        move.l  a0,a1
+        adda    #pc_offset,a1
+        move    (a1),a1
+        adda.l  a0,a1
+        jmp     (a1)                    ;enter pascal execution of the loader
+
+
+
+;****************
+;*
+;*   Swap around 'disk_header' bytes of the header onto the front of the
+;*     corresponding data, overcoming widget driver.  Unfortunately, this
+;*     also entails moving the data down to make room!
+;*
+;*     (a1/a2 are pointers to header/data, before AND after swap)
+;*     (destroys a3, but that's ok within asm_read_block)
+;*
+;****************
+some    equ     disk_header/4           ;constant, for use in swappo.
+swappo                                  ; (what a mess)
+        add.l   #block_size,a2          ;position data pointers to end of data
+        move.l  a2,a3
+
+        moveq   #some-1,d0              ;stash the header on the stack
+@1      move.l  (a1)+,-(SP)
+        dbra    d0,@1
+
+        moveq   #some-1,d0              ;copy last part of data into header
+@2      move.l  -(a3),-(a1)
+        dbra    d0,@2
+
+        move.w  #block_size/4-1-some,d0 ;move data down (in place)
+@3      move.l  -(a3),-(a2)
+        dbra    d0,@3
+
+        moveq   #some-1,d0              ;pop header into front of data
+@4      move.l  (SP)+,-(a2)
+        dbra    d0,@4
+
+        rts
+
+
+
+        .def    asm_read_block
+;****************************************************
+;
+;       procedure read_block(var err: integer;
+;                                drive: integer;
+;                                block: longint;
+;                            var buffer,header : integer;
+;
+; ASM_READ_BLOCK - reads one block into memory and unpacks the header.
+;
+;  (the prom expects:
+;       A0 - Address of logic base for channel (required for slot boot ONLY)
+;       A1 - Destination adr of header
+;       A2 - Destination adr of data
+;       D1 - 32-bit sector number (upper byte must be zero)
+;       D2 - timeout ($900,000 translates to 100 seconds)
+;       D3 - retries
+;       D4 - threshold
+;
+;       D0 return error indication (0 means OK)  )
+;
+; Note:
+;   Two different drivers exists for the same device so that one can be small
+;   and simpleminded and fit in the first block (ldr_read_block), while the
+;   second (asm_read_block) can still do header handling.
+;
+;****************************************************
+asm_read_block:
+        move.l  (SP)+,a1        ;transfer return address around parms
+
+        move.l  (SP)+,d2        ;d2 (temporarily) := header destination adr
+        move.l  (SP)+,a0        ;a0 := data destination adr
+        move.l  (SP)+,d0        ;d0 := block number
+        move    (SP)+,d1        ;discard drive number
+
+     ; (leave error address, return address on stack)
+        move.l  (SP)+,a2        ;get error var address
+        move.l  a1,-(SP)        ;push return address back
+        move.l  a2,-(SP)        ; UNDER re-pushed error var address
+
+        movem.l d4-d7/a3-a6,-(SP) ;save away registers used by language
+
+        clr.l   d1                      ;zero upper part of register
+        move    d0,d1                   ;pass sector address
+        move.l  d2,a1                   ;hdr destination address in a1
+        move.l  a0,a2                   ;data adr in a2
+
+        move.l  #timeout,d2
+        move    #retry,d3
+        move    #thresh,d4
+
+        cmp     #dev_widget,dev_type    ;dont use interleave on widget
+        beq.s   not_interleaved
+        bsr.s   interleave              ;d1 := interleave block address,
+                                        ;   as function of original d1.
+not_interleaved
+        movem.l a1-a2,-(SP)             ; (old proms clobber these registers)
+
+;get block from paraport or slot-based driver:
+        cmp.b   #pport_id,prom_bootdev   ;did we boot from parallel port?
+        bgt.s   xread_from_slot
+        jsr     prof_entry              ;  if so, call prom's driver
+        bra.s   xpara_read_done
+xread_from_slot                         ;  if not, read block from a slot
+        lea     drvr_base,a0            ;get drvr entrypoint
+        move.l  (a0),a3
+        lea     drvr_ptr,a0             ;get drvr logic ptr
+        move.l  (a0),a0
+        jsr     (a3)
+xpara_read_done
+
+        movem.l (SP)+,a1-a2             ; (old proms clobber these registers)
+        bcc.s   gotit                   ;prom sets carry if error
+
+err_path
+        move    #-1,d0                  ;signal error (general case)
+        bra     exitter
+gotit
+
+;detect/handle widget (has the header moved around to the other side of the data):
+        cmp     #dev_widget,dev_type
+        bne.s   @1
+        bsr.s   swappo
+@1
+
+;see whether cksum is present, if so, test it:
+        move.w  $6(a1),d0       ;d0 := version field of header (assuming profile)
+        cmp     #dev_widget,dev_type
+        bne.s   @2
+        move.w  $4(a1),d0       ;d0 := version field of header (assuming widget)
+@2      and     #cksum_on,d0
+        beq.s   checksum_done
+
+;verify checksum for the data AND header:
+        clr.l   d0              ;d0 accumulates cksum:
+
+        move.l  a2,a6
+        move.w  #127,d2         ; (127 := 512/4 - 1; which is 4-byte EOR count)
+eor1_loop
+        move.l  (a6)+,d1        ;  d0 := d0 EOR Data[0..511] of byte
+        eor.l   d1,d0
+        dbra    d2,eor1_loop
+
+        move.l  a1,a6
+        move.w  #4,d2           ; (4 := disk_header/4 - 1; which is 4-byte EOR count)
+eor2_loop
+        move.l  (a6)+,d1        ;  d0 := d0 EOR Header[0..19] of byte
+        eor.l   d1,d0
+        dbra    d2,eor2_loop
+
+        move    d0,d1           ;krunch/eor result down to a word
+        lsr.l   #8,d0
+        lsr.l   #8,d0
+        eor     d1,d0
+        move.b  d0,d1           ;krunch/eor result down to a byte
+        lsr.w   #8,d0
+        eor.b   d1,d0
+        beq.s   checksum_done
+        add.l   #1,$680         ;keep informal tally/flag of load error
+        bra.s   err_path
+checksum_done
+
+
+;UN-COMPACTIZE 20 byte header into the 24 byte format:
+;  (a1 - is a ptr the 20-byte copy)
+
+vers            equ     $0      ;integer
+vol             equ     $2      ;integer (rightmost 8-bits are significant)
+fileid          equ     $4      ;integer
+dataused        equ     $6      ;integer (rightmost 15-bits are signficant)
+abspage         equ     $8      ;leftmost 3-bytes of a 4-byte field
+relpage         equ     $c      ;integer
+fwdlink         equ     $e      ;leftmost 3-bytes of a 4-byte field
+bkwdlink        equ     $10     ;rightmost 3-bytes of a 4-byte field
+
+abspage_actual  equ     $8     ;offset from start of hdr to spot
+                                ;where the 24-byte format begins
+                                ;the real abspage field.
+
+        and     #$ff,vol(a1)    ;clear upper bits of volume field
+        and     #$7fff,dataused(a1) ;clear upper bit of dataused
+
+        move.l  abspage(a1),d0  ;d0 := abspage
+        move.w  relpage(a1),d1  ;d1 := relpage
+        move.l  fwdlink(a1),d2  ;d2 := fwdlink
+        move.l  bkwdlink(a1),d3 ;d3 := bkwdlink
+
+        add     #abspage_actual,a1 ;position to abspage position
+
+        move.l  #$ff000000,d4   ;d4 := sign-extend mask
+
+        lsr.l   #8,d0           ;re-write abspage
+        btst    #23,d0          ;after sign-extend of value
+        beq.s   d0zero
+        or.l    d4,d0
+d0zero  move.l  d0,(a1)+
+
+        ext.l   d1              ;re-write relpage
+        move.l  d1,(a1)+
+
+        lsr.l   #8,d2           ;re-write fwdlink
+        btst    #23,d2          ;after sign-extend of value
+        beq.s   d2zero
+        or.l    d4,d2
+d2zero  move.l  d2,(a1)+
+
+        and.l   #$ffffff,d3     ;re-write bkwdlink
+        btst    #23,d3          ;after sign-extend of value
+        beq.s   d3zero
+        or.l    d4,d3
+d3zero  move.l  d3,(a1)+
+
+;the job's complete, all's right with the world (signaled by setting d0 to 0)
+        clr     d0
+exitter
+        movem.l (SP)+,d4-d7/a3-a6 ;restore registers used by language
+
+        move.l  (SP)+,a0        ;return error code
+        move    d0,(a0)
+
+        rts
+
+
+        .def    shutdown
+;****************************************************
+;
+;       procedure shutdown(device:integer);
+;
+;       General case boot device shutdown sometimes needs
+;       an opportunity to eject the media.  For profile/widget,
+;       this is a no-op.
+;
+;****************************************************
+shutdown:
+        move.l  (SP)+,a0        ;get return address
+        move.w  (sp)+,a1        ;dump parameter
+        jmp     (a0)            ;return
+
+
+
+        .END
+
+ÿ

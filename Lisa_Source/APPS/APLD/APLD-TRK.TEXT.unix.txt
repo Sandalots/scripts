@@ -1,0 +1,1383 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE Tracking Routines *)
+
+(* ********************************************************************* *)
+
+UNIT Trk;
+
+(* Segment SCR *)
+INTERFACE
+USES
+    (*$U UNITSTD*)     UnitStd,     (* interface dependency  *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/syscall *)   Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)    Hdr,
+
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+                                    (* implementation units  *)
+    (*$U WM.EVENTS*)   Events,
+    (*$U WM.MENUS*)    Menus,
+    (*$U WMLSTD*)      WMLStd,
+    (*$U WMLSB*)       WMLSB,
+    (*$U WMLCRS*)      WMLCrs,
+    (*$U ApLd/DMGR*)   DMgr,
+    (*$U ApLd/UTL*)    Utl,
+    (*$U ApLd/DAT*)    Dat,
+    (*$U ALERTMGR*)    AlertMgr,
+    (*$U ApLd/DBX*)    Dbx,
+    (*$U ApLd/SEL*)    Sel,
+    (*$U ApLd/UOP*)    UOp,
+    (*$U ApLd/DRW*)    Drw,
+    (*$U ApLd/SCR*)    Scr,
+    (*$U ApLd/TXT*)    Txt;
+
+VAR trackObj:   TObjRec;
+    pasteState:   Boolean;
+    pastePt:      Point;
+    noDblVrtFlag: Boolean;
+
+    (* Drawing    Routines *)
+    procedure TrkPoly;
+    procedure MakeObjCmd;
+    (* Editing Routines *)
+    procedure EditArcCmd (thisKnob: Integer);
+    procedure EditCLstCmd(thisKnob: Integer);
+    (* Stretching Routines *)
+    procedure StrSelCmd(thisObj: TObjPtr; thisKnob: Integer);
+    (* Moving Routines *)
+    procedure MoveSelCmd(thisObj: TObjPtr);
+    (* Selecting Routines *)
+    procedure MakeSelCmd(shFlag,objFlag: Boolean;Var noVrtSelected: Boolean);
+    (* misc *)
+    procedure InitTrk;
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+
+
+(* ********************************************************************* *)
+
+const
+    (* zone dimensions for fixing rLin to horizontal OR vertical *)
+    hTrkFix = 30;
+    vTrkFix = 20;
+    (* zone dimensions for fixing adding new crd to fHnd  *)
+    fHndTolh =  6;
+    fHndTolv =  4;
+
+var (* drawing and moving vars *)
+    trkFixed:  Boolean;
+    (* declared in SCR so TrkDist can use it:
+    trkHoriz:  Boolean;
+    *)
+    trkFxBox:  Rect;
+    (* poly pt *)
+    poly2D:     Point2D;
+    polySRect:  Rect;
+    polyERect:  Rect;
+    (* arc quadrant *)
+    arcQuad:    packed Array[Boolean,Boolean,Boolean] of Integer;
+    (* distance tracking *)
+    tlSz2D,brSz2D:  Point2D;
+
+(* ********************************************************************* *)
+
+(* Misc Routines *)
+
+(* ********************************************************************* *)
+
+    Function  ExpMiscMem(op,hSiz,pSiz: Integer): Boolean;
+    EXTERNAL;  (* in CMD *)
+
+    Function  ExpTrfoMem(op: Integer): Boolean;
+    EXTERNAL;  (* in CMD *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    function  PeekPt: Boolean;
+    var thisEvent: EventRec;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        PeekPt := FALSE;
+        if PeekEvent(thisEvent) AND (thisEvent.what=buttonUp)
+        AND NOT EqualPt(thisEvent.where,msePt) then begin
+            SetWrkMse(thisEvent.where);
+            PeekPt := TRUE;
+        end;
+    end; (* PeekPt *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    function  StartTrk: Boolean;
+    (* loop until mouse moves more than dKnob OR buttonUp *)
+    var thisPt: Point;
+        thisR: Rect;
+        thisEvent: EventRec;
+        haveMoved: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        thisPt := msePt;
+        SetRect(thisR,thisPt.h-dhKnob,thisPt.v-dvKnob,
+                      thisPt.h+dhKnob,thisPt.v+dvKnob);
+        repeat
+            if StillDown then
+                GetMouse(thisPt)
+            else if PeekEvent(thisEvent) then
+                if thisEvent.what=buttonUp then
+                    thisPt := thisEvent.where;
+            haveMoved := NOT PtInRect(thisPt,thisR);
+        until NOT StillDown OR haveMoved;
+        StartTrk := haveMoved;
+    end; (* StartTrk *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure ReDrwSel;
+    (* Redraw all objects, displaying only frames of sel ones, so that   *)
+    (* fill patterns of objects below will show.*)
+    var i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        EraseSel;
+        PenMode(patXor);
+        {penPats[iPenWhite] := black;}   {done in DrwObj}
+        for i := 1 to curDoc.sLst^^.sCnt do
+            DrwObj(CkObjTrfo(CurSelObj(i)));
+        {penPats[iPenWhite] := white;}
+    end; (* ReDrwSel *)
+
+(* ********************************************************************* *)
+
+(* Drawing Routines *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure DrwPolyLine(thisPt: Point; okToAutoScroll: Boolean);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if NOT EqualPt(lastPolyPt,thisPt) then begin
+            (* erase old *)
+            DrwPLine(polyPt,lastPolyPt);
+            if okToAutoScroll then
+                if StillDown then
+                    AutoScroll(TRUE);
+            (* draw new *)
+            lastPolyPt := thisPt;
+            DrwPLine(polyPt,lastPolyPt);
+        end;
+    end; (* DrwPolyLine *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure TrkPoly;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if curDoc.proto=iObjPoly then
+            if NOT polyStart then begin
+                GridMse(wrkPt,wrk2D);
+                DrwPolyLine(gridPt,TRUE);
+            end;
+    end; (* TrkPoly *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure DragObj;
+    var lastPt: Point;
+        dx,dy: Real;
+        minSize: Point2D;
+
+    (* objects get drawn to minimum size constraints, OR zero dimensions *)
+    (* drawing to zero dimensions allows user to change mind after starting *)
+    (* to draw without having to undo OR cut.  Min size is grid unless off, *)
+    (* then it is the size of a knob *)
+
+    (* ***************************************************************** *)
+
+        procedure MkDragObj;
+        var dx,dy: Real;
+
+        (* ************************************************************* *)
+
+            procedure MkRLin;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                with trackObj.oDat do
+                if trkHoriz then begin
+                    SetPt2D(p2,grid2D.x,p1.y);
+                    (* min size constraints *)
+                    if NOT curDoc.atr.grdOn then
+                        if (Abs(p1.x-grid2D.x)<minSize.x) then
+                            p2.x := p1.x;
+                end else begin
+                    SetPt2D(p2,p1.x,grid2D.y);
+                    (* min size constraints *)
+                    if NOT curDoc.atr.grdOn then
+                        if (Abs(p1.y-grid2D.y)<minSize.y) then
+                            p2.y := p1.y;
+                end;
+            end; (* MkRLin *)
+
+        (* ************************************************************* *)
+
+            procedure MkSLin;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                with trackObj.oDat do begin
+                    p2 := grid2D;
+                    (* min size constraints *)
+                    if NOT curDoc.atr.grdOn then
+                        if (Abs(p1.x-grid2D.x)<minSize.x) AND
+                           (Abs(p1.y-grid2D.y)<minSize.y) then
+                            p2.y := p1.y;
+                end;
+            end; (* MkSLin *)
+
+        (* ************************************************************* *)
+
+            procedure MkRect(var r2D: Rect2D);
+            var dx,dy: Real;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                R2DFmP2D(grid2D,anchor2D,r2D);
+                (* min size constraints *)
+                if NOT curDoc.atr.grdOn then
+                    if (Abs(r2D.xR-r2D.xL)<minSize.x)
+                    AND (Abs(r2D.yB-r2D.yT)<minSize.y) then
+                        r2D.topLeft := r2D.botRight;
+            end; (* MkRect *)
+
+        (* ************************************************************* *)
+
+            procedure MkArc;
+            var thisR2D: Rect2D;
+                d2D:     Point2D;
+                dPt:     Point;
+                quad:    Integer;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                with trackObj.oDat.arc^^ do begin
+                    (* get the normalized arc rect *)
+                    MkRect(thisR2D);
+                    aR2D.xR := thisR2D.xR-thisR2D.xL;
+                    aR2D.yB := thisR2D.yB-thisR2D.yT;
+                    aR2D.xL := -aR2D.xR;
+                    aR2D.yT := -aR2D.yB;
+                    (* put arc in appropriate quadrant *)
+                    aAngle :=  90;
+                    dPt := wrkPt;
+                    SubPt(anchorPt,dPt);
+                    quad := arcQuad[trkHoriz,dPt.h>0,dPt.v>0];
+                    aStart := quad*90;
+                    case quad of
+                        0: SetPt2D(d2D,thisR2D.xL,thisR2D.yB);
+                        1: SetPt2D(d2D,thisR2D.xL,thisR2D.yT);
+                        2: SetPt2D(d2D,thisR2D.xR,thisR2D.yT);
+                        3: SetPt2D(d2D,thisR2D.xR,thisR2D.yB);
+                    end; (* case *)
+                    (* offset the normalized arc rect appropriately *)
+                    AddPt2D(d2D,aR2D.topLeft);
+                    AddPt2D(d2D,aR2D.botRight);
+                    (* min size constraints are handled in MkRect *)
+                end;
+            end; (* MkArc *)
+
+        (* ************************************************************* *)
+
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC} (* MkDragObj *)
+            (* check tracking direction *)
+            if NOT trkFixed then begin
+                dx := Abs(anchor2D.x-grid2D.x);
+                dy := Abs(anchor2D.y-grid2D.y);
+                trkHoriz := dx>=dy/aspRatio;
+                trkFixed := (dx>hTrkFix) OR (dy>vTrkFix);
+            end;
+
+            (* erase old trackObj *)
+            DrwObj(@trackObj);
+            AutoScroll(TRUE);
+            (* get new trackObj *)
+            with trackObj.oDat do
+            case kind of
+                iObjRLin: MkRLin;
+                iObjSLin: MkSLin;
+                iObjArc:  MkArc;
+                iObjRect,
+                iObjRndR,
+                iObjOval: MkRect(r2D);
+            end; (* case *)
+            (* Draw new trackObj *)
+            DrwObj(@trackObj);
+        end; (* MkDragObj *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC} (* DragObj *)
+        {
+        if traceTrk then
+            writeln('DragObj');
+        }
+
+        (* initialize trackObj *)
+        with trackObj.oDat do
+        if kind=iObjArc then begin
+            arc := NewArc;
+            with arc^^ do begin
+                aStart := 0;
+                aAngle := 0;
+                SetRect2D(aR2D,0,0,0,0);
+            end;
+        end else begin
+            p1 := anchor2D;
+            p2 := anchor2D;
+        end;
+        DrwObj(@trackObj);
+        trkFixed := FALSE;
+        GetDKnobRect(anchorPt,trkFxBox);
+
+        (* set up min size constraints *)
+        minSize := curDoc.atr.grdSz2D;
+        if NOT curDoc.atr.grdOn then
+            SetPt2D(minSize,1,1);
+
+        (* drag trackObj *)
+        while StillDown do begin
+            lastPt := gridPt;
+            GetWrkMse;
+            TrkDist(grid2D);
+            if PtInRect(wrkPt,trkFxBox) then
+                trkFixed := FALSE;
+            if NOT EqualPt(lastPt,gridPt) OR NeedScroll then
+                MkDragObj;
+        end;
+        if PeekPt then
+            MkDragObj;
+
+        (* erase obj *)
+        DrwObj(@trackObj);
+    end; (* DragObj *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure SetTrkSBox(r: Rect);
+    var thisRect: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        thisRect := r;
+        with curDoc.sLst^^ do
+        if sCnt>1 then begin
+            thisRect := sBBox;
+            CkBBox(r.topLeft,1,thisRect);
+            CkBBox(r.botRight,1,thisRect);
+        end;
+        curDoc.sLst^^.sBBox  := thisRect;
+        lastOp.nBox          := thisRect;
+    end; (* SetTrkSBox *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure DragFHnd;
+    var lastPt: Point;
+        begR:   Rect;
+        thisObj: TObjPtr;
+
+    (* ***************************************************************** *)
+
+        procedure TrkFHnd;
+        var dh,dv,ch,cv: Integer;
+
+        (* ************************************************************* *)
+
+            procedure GetCVal(VAR d,c: Integer);
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                c := d;
+                if ABS(c)>127 then begin
+                    c := 127;
+                    if d<0 then
+                        c := -127;
+                end;
+                d := d-c;
+            end; (* GetCVal *)
+
+        (* ************************************************************* *)
+
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            {
+            if traceTrk then
+                writeln('    TrkFHnd wrk:  ',wrkPt.h:2,',',wrkPt.v:2,
+                                  ', poly: ',polyPt.h:2,',',polyPt.v:2);
+            }
+            with thisObj^,oDat do
+            if cLst^^.crdCnt<maxCrdCnt then begin
+                DrwPolyLine(wrkPt,FALSE);
+                (* add gridPt to list *)
+                dh := wrkPt.h-polyPt.h;
+                dv := wrkPt.v-polyPt.v;
+                if ((ABS(dh)>fHndTolh) OR (ABS(dv)>fHndTolv))
+                OR (cLst^^.crdCnt=0) then begin
+                    PenMode(patOr);
+                    DrwPLine(polyPt,wrkPt);
+                    PenMode(patXor);
+                    (* dh,dv may be greater than 127: break them up *)
+                    while (dh<>0) OR (dv<>0) do begin
+                        GetCVal(dh,ch);
+                        GetCVal(dv,cv);
+                        PutNode(cLst,ch,cv);
+                    end;
+                    polyPt := wrkPt;
+                    CkBBox(wrkPt,inf.pnSiz,bBox)
+                end;
+            end;
+        end; (* TrkFHnd *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC} (* DragFHnd *)
+        {
+        if traceTrk then with polyPt do
+            Writeln('DragFHnd');
+        }
+        (* initialize *)
+        OpenCLst(curDoc.hHz,trackObj.oDat.cLst,maxCrdCnt,iObjFHnd);
+        trackObj.oDat.cLst^^.beg2D := anchor2D;
+
+        polyPt     := anchorPt;
+        lastPolyPt := polyPt;
+        polyOSet.h := penSizes[curDoc.pnSiz].h Div 2;
+        polyOSet.v := penSizes[curDoc.pnSiz].v Div 2;
+
+        (* draw start so don't get dots laying around *)
+        DrwPLine(polyPt,lastPolyPt);
+
+        (* put obj in nObjOLst now so that if autoscroll, will draw all segments *)
+        {CommitLastOp;}  {Already done once in calling procedure MakeObjCmd}
+        (* add to data base *)
+        thisObj  := NewObj(iObjFhnd);
+        thisObj^ := trackObj;
+        thisObj^.cSel := iSelNml;
+        GetBBox(thisObj);
+        AddToOEnd(curDoc.oLst,thisObj);
+        (* remember lastOp *)
+        AddToSEnd(curDoc.sLst,thisObj);
+
+        SetLastOp(iOpDrw);  {This makes the newly draw obj have pSel=iSelNml}
+
+        mkObjFlag := TRUE;
+
+        (* drag the fHnd curve *)
+        while StillDown do begin
+            GetWrkMse;
+            TrkFHnd;
+        end;
+        if PeekPt then
+            TrkFHnd;
+
+        (* node didn't get added, erase last line *)
+        if NOT EqualPt(polyPt,wrkPt) then
+            DrwPLine(polyPt,lastPolyPt);
+        CloseCLst(thisObj^.oDat.cLst);
+        (* see if user closed curve *)
+        GetDKnobRect(anchorPt,begR);
+        if PtInRect(wrkPt,begR) then
+            thisObj^.oDat.cLst^^.cClose := iCLstUsr;
+        (* erase the tracking lines *)
+        if thisObj^.oDat.cLst^^.crdCnt>0 then
+            DrwObj(thisObj);
+        (* finish the object *)
+        with thisObj^,oDat do
+        if cLst^^.crdCnt=1 then begin
+            (* if only one crd, then make it into sLin *)
+            FreeCLst(cLst);
+            kind := iObjSLin;
+            p1 := anchor2D;
+            ScrnToWld(polyPt,p2);
+        end;
+        (* get the final bBox *)
+        GetBBox(thisObj);
+        (* we already SetLastOp, so update sLst *)
+        SetTrkSBox(thisObj^.bBox);
+        MarkCSel(curDoc.sLst,iSelNil);
+        ShowRFrom(thisObj^.bBox,thisObj);
+        MarkCSel(curDoc.sLst,iSelNml);
+    end; (* DragFHnd *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure SetPolyPt;
+    var thisRect: Rect;
+        cCnt: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if polyStart then begin
+            polyStart := FALSE;
+            polyObj   := NIL;
+            polyOSet.h := penSizes[curDoc.pnSiz].h Div 2;
+            polyOSet.v := penSizes[curDoc.pnSiz].v Div 2;
+            GetDKnobRect(gridPt,polySRect);
+            polyERect := polySRect;
+            OpenCLst(curDoc.hHz,polyCLst,maxC2DCnt+2,iObjPoly);
+            polyCLst^^.beg2D := grid2D;
+            polyCLst^^.c2DLst[0] := grid2D;
+            poly2D := grid2D;
+            polyPt := gridPt;
+            lastPolyPt := polyPt;
+            DrwPLine(polyPt,lastPolyPt);
+            TurnOnDist(iObjPoly,grid2D,grid2D);
+        end else begin
+            cCnt := polyCLst^^.crdCnt;
+            if (PtInRect(gridPt,polySRect)AND noDblVrtFlag)
+            OR (PtInRect(gridPt,polyERect) AND noDblVrtFlag)
+            OR (cCnt=maxC2DCnt-1) then begin
+                if cCnt=0 then begin
+                    (* haven't added any nodes, so don't finish *)
+                    (* erase the pLine *)
+                    DrwPLine(polyPt,lastPolyPt);
+                end else begin
+                    (* finish the poly *)
+                    TurnOffDist;
+                    with polyCLst^^ do
+                    if PtInRect(gridPt,polySRect) then begin
+                        cClose := iCLstUsr;
+                        grid2D := beg2D;
+                        WldToScrn(grid2D,gridPt);
+                        (*$R-*)
+                        c2DLst[crdCnt+1]  :=  c2DLst[0];
+                        c2DLst[crdCnt+2]  :=  c2DLst[1];
+                        (*$IfC rangeOn *) (*$R+*) (*$EndC*)
+                    end else if PtInRect(gridPt,polyERect) then begin
+                        gridPt := polyPt;
+                        grid2D := poly2D;
+                    end else
+                        PutPNode(polyCLst,grid2D);
+                    ResetPoly;
+                    mkObjFlag := TRUE;
+                    (* remember new pt *)
+                    poly2D := grid2D;
+                    polyPt := gridPt;
+                end;
+            end else begin
+                HideDist;
+                (* draw the line in OR mode *)
+                DrwPolyLine(gridPt,TRUE);
+                PenMode(patOr);
+                DrwPLine(polyPt,gridPt);
+                PenMode(patXor);
+                (* if first node, create new obj *)
+                if cCnt=0 then begin
+                    CommitLastOp;  {I think that this is redundant}
+                    polyObj := NewObj(iObjPoly);
+                    GetProto(iObjPoly,polyObj);
+                    polyObj^.oDat.cLst := polyCLst;
+                    GetBBox(polyObj);
+                    polyObj^.cSel := iSelNml;
+                    AddToOEnd(curDoc.oLst,polyObj);
+                    (* remember lastOp *)
+                    AddToSEnd(curDoc.sLst,polyObj);
+
+                    SetLastOp(iOpDrw);
+                                  {This makes the newly draw obj have pSel=iSelNml}
+                end;
+                (* add node to cLst *)
+                PutPNode(polyCLst,grid2D);
+                GetDKnobRect(gridPt,polyERect);
+                TurnOnDist(iObjPoly,grid2D,grid2D);
+                (* remember new pt *)
+                poly2D := grid2D;
+                polyPt := gridPt;
+            end;
+            if polyObj<>NIL then with polyObj^,oDat do begin
+                (* update poly bBox *)
+                CkBBox(polyPt,inf.pnSiz,bBox);
+                (* make sure curSLst and lastOp.nSel sBBoxes get updated *)
+                SetTrkSBox(polyObj^.bBox);
+            end;
+        end;
+        (* reset pen *)
+        PenMode(patXor);
+    end; (* SetPolyPt *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure DragPoly;
+    var dh,dv: Integer;
+        cLstPt: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        {
+        if traceTrk then with polyPt do
+            Writeln('DragPoly(',h:2,',',v:2,')');
+        }
+        (* initialize *)
+        if polyStart then
+            SetPolyPt;
+
+        (* drag the poly line *)
+        while StillDown do begin
+            GetWrkMse;
+            TrkDist(grid2D);
+            DrwPolyLine(gridPt,TRUE);
+        end;
+        if PeekPt then
+            DrwPolyLine(gridPt,TRUE);
+
+        (* add lastPolyPt to poly cLst *)
+        SetPolyPt;
+    end; (* DragPoly *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure MakeObjCmd;
+    var thisObj: TObjPtr;
+        gBox: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then with gridPt do
+            Writeln('MakeObjCmd(',curDoc.proto:2,',',h:2,',',v:2,')');
+
+        (* set up drag *)
+        mkObjFlag := FALSE;
+        thisObj := @trackObj;
+        GetProto(curDoc.proto,thisObj);
+        SetPenToObj(@trackObj);
+        GetPenState(polyPen);
+
+        (* drag out new obj *)
+        if StartTrk then begin
+            CommitLastOp;
+            (* check to see if there is room to create another object *)
+            if ExpMiscMem(iCItmDrw,512,40) then begin
+                if curDoc.proto=iObjFHnd then
+                    DragFHnd
+                else begin
+                    penPats[iPenWhite] := black;
+                    (* doesn't make sense to measure fHnd *)
+                    TurnOnDist(curDoc.proto,grid2D,grid2D);
+                    if curDoc.proto=iObjPoly then
+                        DragPoly
+                    else
+                        DragObj;
+                    penPats[iPenWhite] := white;
+                end;
+
+                (* finish the object *)
+                if curDoc.proto<>iObjPoly then
+                    TurnOffDist;
+                (* enforce minimum size constraint, add to data base, and show *)
+                with trackObj,oDat do
+                if NOT (kind in [iObjPoly,iObjFHnd]) then begin {Can't be
+                                                                 iObjSPoly here}
+                    GetGBox(@trackObj,gBox);
+                    with gBox do
+                    if (right-left>hKnob) OR (bottom-top>vKnob) then begin
+                        (* validObj, add to data base *)
+                        GetBBox(@trackObj);
+                        thisObj  := NewObj(trackObj.oDat.kind);
+                        thisObj^ := trackObj;
+                        thisObj^.cSel := iSelNml;
+                        AddToOEnd(curDoc.oLst,thisObj);
+                        (* remember lastOp *)
+                        AddToSEnd(curDoc.sLst,thisObj);
+                        SetLastOp(iOpDrw);
+                                  {This makes the newly draw obj have pSel=iSelNml}
+                        mkObjFlag := TRUE;
+                        (* show new object *)
+                        MarkCSel(curDoc.sLst,iSelNil);       {Devise for getting the
+                                                         highlighting of thisObj
+                                                         in sink with the other
+                                                         selected objests}
+                        ShowRFrom(thisObj^.bBox,thisObj);
+                        MarkCSel(curDoc.sLst,iSelNml);
+                    end else begin
+                        (* we started tracking, but ended up with invalid object *)
+                        SetLastOp(iOpNOP);
+                        (* free up auxiliary arc storage *)
+                        if kind=iObjArc then
+                            FreeArc(arc)
+                    end;
+                end;
+            end;
+        end else begin
+            if curDoc.proto=iObjPoly then
+                SetPolyPt
+            else begin
+                pasteState := TRUE;
+                pastePt    := anchorPt;
+            end;
+        end;
+    end; (* MakeObjCmd *)
+
+
+(* ********************************************************************* *)
+
+(* Editing Routines *)
+
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure EditArcCmd(* thisKnob: Integer *);
+    var lastPt: Point;
+        start,angle,totAngle: Integer;
+        aRect: Rect;
+        tObj: TObjPtr;
+        knobs: TKnobs;
+
+    (* ***************************************************************** *)
+
+        procedure MkArcEdt;
+        var oldAngle,dAngle: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* save old state *)
+            oldAngle := angle;
+
+            (* get new state *)
+            PtToAngle(aRect,gridPt,angle);
+            dAngle := angle-oldAngle;
+            (* handle the 0 to 360 crossover *)
+            if (angle<90) AND (oldAngle>270) then
+                dAngle := dAngle+360
+            else if (angle>270) AND (oldAngle<90) then
+                dAngle := dAngle-360;
+            (* min size constraint *)
+            totAngle := totAngle+dAngle;
+            if (totAngle=0) OR (ABS(totAngle)=360) then begin
+                {
+                if traceTrk then
+                    writeln('    MkArcEdt min size, totAngle=',totAngle:4);
+                }
+                angle := angle+2;
+                dAngle := dAngle+2;
+                totAngle := totAngle+2;
+            end;
+            (* keep totAngle < 360 *)
+            if totAngle>360 then
+                totAngle := totAngle-720
+            else if totAngle<-360 then
+                totAngle := totAngle+720;
+
+            (* update display *)
+            FrameArc(aRect,oldAngle,dAngle);
+            {
+            if traceTrk then
+                writeln('    MkArcEdt, start=',start:4,
+                                     ',angle=',angle:4,
+                                       ',tot=',totAngle:4,
+                                    ',dAngle=',dAngle:4);
+            }
+            (* update bBox *)
+            with curDoc.edtObj^,oDat do
+            CkBBox(gridPt,inf.pnSiz,bBox);
+        end; (* MkArcEdt *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC} (* EditArcCmd *)
+        if traceCmd then
+            writeln('EditArcCmd(',thisKnob:2,')');
+
+        (* check to see if there is room to handle trfo object *)
+        if ExpTrfoMem(iCItmEdt) then begin
+            (* erase knob *)
+            XorKnob(wrkPt);
+
+            (* edit arc *)
+            if StartTrk then begin
+                CommitLastOp;
+                (* set up edit *)
+                DupObj(curDoc.edtObj,tObj);
+                with tObj^.oDat,arc^^ do begin
+                    if thisKnob=1 then begin
+                        aStart := aStart+aAngle;
+                        aAngle := -aAngle;
+                    end;
+                    start := aStart;
+                    angle := (aAngle+aStart) MOD 360;
+                    totAngle := aAngle;
+                    GetDrwRect(aR2D,inf.pnSiz,aRect);
+                    {
+                    if traceTrk then
+                        writeln('    SetUpEdt, start=',start:4,
+                                             ',angle=',angle:4,
+                                               ',tot=',totAngle:4);
+                    }
+                end;
+                SetPenToObj(tObj);
+
+                if NOT curDoc.edtStart then begin
+                    ReDrwSel;
+                    curDoc.edtStart:= TRUE;
+                    HiLiteObj(tObj,ON);
+                    XorKnob(wrkPt);
+                end;
+
+                (* track the mouse *)
+                penPats[iPenWhite] := black;
+                while StillDown do begin
+                    lastPt := gridPt;
+                    GetWrkMse;
+                    if NOT EqualPt(lastPt,gridPt) OR NeedScroll then
+                        MkArcEdt;
+                end;
+                if PeekPt then
+                    MkArcEdt;
+                penPats[iPenWhite] := white;
+
+                (* finish Edit *)
+                FreeObj(tObj);
+                (* hiLite the knob *)
+                AngleToPt(aRect,start+totAngle,lastPt);
+                XorKnob(lastPt);
+                if NOT EqualPt(anchorPt,gridPt) then begin
+                    (* make sure angles are positive, <360 *)
+                    GetAngles(start,totAngle,start,totAngle);
+                    totAngle := totAngle-start;
+                    With lastOp do begin
+                        iDat1 := start;
+                        iDat2 := totAngle;
+                    end;
+                    SetLastOp(iOpEdt);
+                end else
+                    SetLastOp(iOpNOP);
+                {
+                if traceTrk then
+                    writeln('EdtArc:',start:2,',',totAngle:2);
+                }
+            end else
+                (* never started tracking, turn knob back on *)
+                XorKnob(wrkPt);
+        end;
+    end; (* EditArcCmd *)
+
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure Wait(time: Integer);
+    Var i,j,dummy: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        For i := 0 to time do
+            For j := 1 to 100 do
+                dummy := 2*2;
+    end;
+(* ********************************************************************* *)
+(*$S Reshape*)
+    function EqualPt2D(firstPt2D,secondPt2D: Point2D): Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        EqualPt2D := (firstPt2D.x=secondPt2D.x) AND (firstPt2D.y=secondPt2D.y);
+    end;{EqualPt2D}
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure EditCLstCmd(* thisKnob: Integer *);
+    var crdPt,lastPt: Point;
+        xEdit,yEdit: Real;
+        i: Integer;
+        lmtRect,tRect: Rect;
+        tObj,thisObj: TObjPtr;
+        (* edit vars *)
+        begPt:  Point;
+        endPt:  Point;
+        thisPt,thatPt,tempPt: Point;
+        tempCLst: TCLstHnd;
+        drwVrtLst: TVertexLst;
+        thisPoly: PolyHandle;
+        angleObj: TObjPtr;
+        lastTime: LongInt;
+
+    (* ***************************************************************** *)
+
+        procedure GetFHLmt(cLst: TCLstHnd; knob,del: Integer; var r: Rect);
+        var crdPt,knobPt: Point;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if (knob<0) OR (knob>cLst^^.crdCnt) then
+                r := sizeLBox
+            else begin
+                (* get knob *)
+                if knob=0 then begin
+                    (* there is no crd before begPt, so always set del=1 *)
+                    knobPt := begPt;
+                    del := 1;
+                end else if knob=cLst^^.crdCnt then begin
+                    (* there is no crd after endPt, so always set del=0 *)
+                    knobPt := endPt;
+                    del := 0;
+                end else
+                    knobPt := thisPt;
+
+                (* get distance to adjacent knob *)
+                SetPt(crdPt,0,0);
+                GetNode(cLst,knob+del,crdPt);
+                if del=0 then   (* prev knob *)
+                    SubPt(crdPt,knobPt)
+                else            (* next knob *)
+                    AddPt(crdPt,knobPt);
+
+                (* limit to byte offset from adjacent knob *)
+                SetRect(r,-127,-127,127,127);
+                OffsetRect(r,knobPt.h,knobPt.v);
+            end;
+        end; (* GetFHLmt *)
+
+    (* ***************************************************************** *)
+
+        procedure InitAngObj;
+        Var size: Integer;
+        begin
+            {Allocate room for angleObj and its cLst}
+            angleObj := Pointer(Ord(PAllocate(curDoc.pHz,SizeOf(TObjRec))));
+            With angleObj^,oDat do begin
+                bBox := nilRect;
+                size := SizeOf(Point2D);
+                size := SizeOf(TCLstRec)+size+size;
+                cLst := Pointer(Ord(HAllocate(curDoc.pHz,size)));
+                cLst^^.cClose := iCLstNil;
+            end;
+        end;{InitAngObj}
+
+    (* ***************************************************************** *)
+
+        procedure SmoothAngle(pt2D0,pt2D1,pt2D2: Point2D;
+                               Var smoothPoly: PolyHandle);
+        begin
+            With angleObj^.oDat.cLst^^ do begin
+                {$R-}
+                c2DLst[0] := pt2D0;
+                c2DLst[1] := pt2D1;
+                c2DLst[2] := pt2D2;
+                {$IfC rangeOn} {$R+} {$EndC}
+                crdCnt := 2;
+            end;
+            Smooth(angleObj,smoothPoly,TRUE,FALSE);{FALSE mean do
+                                                         not needPrep}
+        end;{SmoothAngle}
+
+
+
+
+        (* ***************************************************************** *)
+
+        procedure ShowPEdit(cLst:TCLstHnd);
+        Var count,i: Integer;
+        pt: Point;
+        halfPnSize: Point;
+        begin
+            {$IFC sampcalls} ALogCall; {$ENDC}
+            SetPt(halfPnSize,thePort^.pnSize.h Div 2,thePort^.pnSize.v Div 2);
+            With cLst^^,curVrtLst^^ do begin
+                If cClose=iCLstUsr then begin
+                    vertex[vCnt+1] := vertex[0];
+                    vertex[vCnt+2] := vertex[1];
+                    count := vCnt+1
+                end else
+                    count := vCnt;
+                For i := 1 to count do begin
+                    {$R-}
+                    If (vertex[i-1]=1) OR (vertex[i]=1) then begin
+                        WldToScr(c2DLst[i-1],pt);
+                        SubPt(halfPnSize,pt);
+                        GEMoveTo(pt);
+
+                        {Line(0,0);}
+
+                        WldToScr(c2DLst[i],pt);
+                        SubPt(halfPnSize,pt);
+                        GELineTo(pt);
+                        Line(0,0);
+                    end;
+                    {$IfC rangeOn} {$R+} {$EndC}
+                end;
+                If NOT(cClose=iCLstUsr) AND ((vertex[vCnt]=1)
+                        OR (vertex[vCnt-1]=1)) then Line(0,0);
+            end;
+        end;{ShowPEdit}
+
+        (* ***************************************************************** *)
+
+        procedure ShowCLEdt(xEdt,yEdt: Real);
+        var crdPt,edtPt,tempPt: Point;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            With tObj^.oDat do begin
+                with penSizes[inf.pnSiz] do
+                SetPt(tempPt,h Div 2,v Div 2);
+                crdPt := thisPt;
+                SubPt(tempPt,crdPt);
+                GEMoveTo(crdPt);
+                if locked=0 then begin
+                    SetPt(edtPt,Round(xEdt),Round(yEdt));
+                    (* show segment before thisKnob *)
+                    if thisKnob>0 then begin
+                        SetPt(crdPt,0,0);
+                        GetNode(cLst,thisKnob,crdPt);
+                        SetPt(tempPt,-crdPt.h,-crdPt.v);
+                        GEMove(tempPt);
+                        AddPt(edtPt,crdPt);
+                        GELine(crdPt);
+                        (* draw crd so doesn't get canceled *)
+                        Line(0,0);
+                    end else if cLst^^.cClose=iCLstUsr then begin
+                        GEMoveTo(endPt);
+                        tempPt := begPt;
+                        AddPt(edtPt,tempPt);
+                        GELineTo(tempPt);
+                        (* draw crd so doesn't get canceled *)
+                        Line(0,0);
+                    end else
+                        GEMove(edtPt);
+                    (* show segment after thisKnob *)
+                    if thisKnob<cLst^^.crdCnt then begin
+                        SetPt(crdPt,-edtPt.h,-edtPt.v);
+                        GetNode(cLst,thisKnob+1,crdPt);
+                        GELine(crdPt);
+                    end else if cLst^^.cClose=iCLstUsr then
+                        GELineTo(begPt)
+                    else
+                        (* draw crd so doesn't get canceled *)
+                        Line(0,0);
+                end;
+            end;
+        end; (* ShowCLEdt *)
+
+    (* ***************************************************************** *)
+
+        procedure CopyCLst(srcCLst,dstCLst:TCLstHnd);
+        Var i: Integer;
+        begin
+            {$R-}
+            With srcCLst^^ do begin
+                dstCLst^^.crdCnt := crdCnt;
+                For i := 0 to crdCnt+2 do begin
+                    dstCLst^^.c2DLst[i] := c2DLst[i];
+                end;
+            end;
+            {$IfC rangeOn} {$R+} {$EndC}
+        end;{CopyCLst}
+
+    (* ***************************************************************** *)
+
+        procedure MakeDrawList(cLst: TCLstHnd);
+
+        {This procedures makes a list or vertices whoes angles must be redrawn from
+        the list of verticies which have been moved.}
+        Var i: Integer;
+        begin
+
+            With curVrtLst^^ do begin
+                For i := 0 to vCnt do
+                    drwVrtLst.vertex[i] := -1;
+                If cLst^^.cClose=iCLstUsr then begin
+                    If (vertex[vCnt]=1) OR (vertex[0]=1) OR (vertex[1]=1) then
+                        drwVrtLst.vertex[0] := 1;
+                    drwVrtLst.vCnt := vCnt + 1;
+                    vertex[vCnt+1] := vertex[0];
+                    vertex[vCnt+2] := vertex[1];
+                end else
+                    drwVrtLst.vCnt := vCnt-1;
+
+                For i := 1 to drwVrtLst.vCnt do begin
+                    If (vertex[i-1]=1) OR (vertex[i]=1) OR (vertex[i+1]=1) then
+                        drwVrtLst.vertex[i] := 1;
+                end;
+            end;
+        end;{MakeDrawList}
+
+(* ***************************************************************** *)
+
+        procedure ShowSPEdit(cLst:TCLstHnd;showAll:Boolean);
+
+        Var
+           closed: Boolean;
+           save0Delta,save1Delta: Point2D;
+           i,j: Integer;
+
+        begin
+            If showAll then
+                EraseSel;
+            {$IFC sampcalls} ALogCall; {$ENDC}
+            With cLst^^ do begin
+                closed := cClose=iCLstUsr;
+                {For open polygons temporily change beginning and end}
+                {$R-}
+                With drwVrtLst do begin
+                    If NOT closed then begin
+                        save0Delta := c2DLst[1];
+                        SubPt2D(c2DLst[0],save0Delta);
+                        SubPt2D(save0Delta,c2DLst[0]);
+                        save1Delta := c2DLst[vCnt];
+                        SubPt2D(c2DLst[vCnt+1],save1Delta);
+                        SubPt2D(save1Delta,c2DLst[vCnt+1]);
+                    end;
+
+                    For i := 1 to vCnt do begin
+                        If (vertex[i]=1) OR showAll then begin
+                            SmoothAngle(c2DLst[i-1],c2DLst[i],c2DLst[i+1],thisPoly);
+                            {FramePoly(thisPoly);}
+                            With thisPoly^^ do begin
+                                MoveTo(polyPoints[0].h,polyPoints[0].v);
+                                For j := 1 to 17 do begin
+                                    LineTo(polyPoints[j].h,polyPoints[j].v);
+                                    Line(0,0);
+                                end;
+                            end;
+                        end;
+                    end;
+                    {Restore changed values}
+                    If NOT closed then begin
+                        AddPt2D(save0Delta,c2DLst[0]);
+                        AddPt2D(save1Delta,c2DLst[vCnt+1]);
+                    end;
+                end;
+            end;
+            {$IfC rangeOn} {$R+} {$EndC}
+        end;{ShowSPEdit}
+
+
+       (* **************************************************************** *)
+
+        procedure MkCLstEdt(cPt: Point);
+        var oldEx,oldEy: Real;
+            thisR: Rect;
+            delta: Point2D;
+
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* save old state *)
+            oldEx := xEdit;
+            oldEy := yEdit;
+
+            (* get new state *)
+            xEdit := cPt.h-anchorPt.h;
+            yEdit := cPt.v-anchorPt.v;
+
+            delta.x := xEdit - oldEx;
+            delta.y := yEdit - oldEy;
+
+            (* erase old state, draw new state *)
+
+            With tObj^,oDat do begin
+                If kind=iObjPoly then begin
+                    UpdateCLst(cLst,tempCLst,delta,curVrtLst);
+                    ShowPEdit(cLst);
+                    ShowPEdit(tempCLst);
+                    CopyCLst(tempCLst,cLst);
+                end else if kind=iObjSPoly then begin
+                    MakeDrawList(cLst);
+                    UpdateCLst(cLst,tempCLst,delta,curVrtLst);
+                    ShowSPEdit(cLst,FALSE);
+                    ShowSPEdit(tempCLst,FALSE);
+                    CopyCLst(tempCLst,cLst);
+                end else begin
+                    ShowCLEdt(oldEx,oldEy);
+                    ShowCLEdt(xEdit,yEdit);
+                end;
+                (* update bBox *)
+
+                If kind=iObjFHnd then begin
+                    CkBBox(cPt,inf.pnSiz,bBox);
+                end else begin
+                    GetBBox(tObj);
+                end;
+            end;
+        end; (* MkCLstEdt *)
+
+    (* ***************************************************************** *)
+
+    begin (* EditCLstCmd *)
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('EditCLstCmd(',thisKnob:2,')');
+
+        penPats[iPenWhite] := black; {changed back at the end of this procedure}
+
+        (* check to see if there is room to handle trfo object *)
+        if ExpTrfoMem(iCItmEdt) then begin
+            (* remember where we started *)
+            thisPt := wrkPt;
+
+            {Reset curVrtLst}
+            If curDoc.edtObj^.oDat.kind=iObjFHnd then begin
+                XorKnob(thisPt);
+            end else begin
+                With curVrtLst^^ do begin
+                    If vertex[thisKnob]=-1 then begin
+                        HiliteVrtSel(FALSE,TRUE);
+                        For i := 0 to vCnt do
+                            vertex[i] := -1;
+                        vertex[thisKnob] := 1;
+                        If thisKnob<vCnt then begin
+                            thisObj := CkObjTrfo(curDoc.edtObj);
+                            With thisObj^.oDat.cLst^^ do begin
+                                {$R-}
+                                If EqualPt2D(c2DLst[thisKnob],c2DLst[thisKnob+1]) then begin
+                                    If noDblVrtFlag then begin
+                                        vertex[thisKnob+1] := 1;
+                                    end else begin
+                                        WldToScrn(c2DLst[thisKnob],tempPt);
+                                        XorKnob(tempPt);
+                                    end;
+                                end;
+                                {$IfC rangeOn} {$R+} {$EndC}
+                            end;
+                        end;
+                        HiliteVrtSel(FALSE,TRUE);
+                    end;
+                end;
+
+                (* erase knob *)
+                HiliteVrtSel(FALSE,FALSE);
+            end;
+
+            (* stretch CLst *)
+            if StartTrk then begin
+
+                CommitLastOp;
+                OpenCLst(geHHz,tempCLst,maxCrdCnt,iObjPoly);
+                {Allocate room for thisPoly}
+                thisPoly := Pointer(ord(HAllocate(curDoc.hHz,sPolySize)));
+                InitAngObj;
+
+                (* set up edit *)
+                xEdit := 0;
+                yEdit := 0;
+
+                (* work with a copy of thisObj *)
+                DupObj(curDoc.edtObj,tObj);
+                SetPenToObj(tObj);
+                (* drw object ghost *)
+                if NOT curDoc.edtStart then begin
+                    With tObj^.oDat do begin
+                        If kind=iObjSPoly then begin
+                            MakeDrawList(cLst);
+                            ShowSPEdit(cLst,TRUE);
+                            HiliteVrtSel(TRUE,FALSE);
+                            HiliteVrtSel(FALSE,FALSE);
+                        end else if kind=iObjPoly then begin
+                            ReDrwSel;
+                            HiliteVrtSel(TRUE,FALSE);
+                            HiliteVrtSel(FALSE,FALSE);
+                        end else begin
+                            XorKnob(wrkPt);
+                            ReDrwSel;
+                            HiLiteObj(tObj,ON);
+                            XorKnob(wrkPt);
+                        end;
+                    end;
+                    curDoc.edtStart:= TRUE;
+                end;
+
+                (* get begPt,endPt *)
+                with tObj^.oDat,cLst^^ do begin
+                    WldToScrn(beg2D,begPt);
+                    begPt.h := begPt.h-penSizes[inf.pnSiz].h Div 2;
+                    begPt.v := begPt.v-penSizes[inf.pnSiz].v Div 2;
+                    endPt := begPt;
+                    for i := 1 to crdCnt do
+                        GetNode(cLst,i,endPt);
+                end;
+
+                (* get limits of edit *)
+                if curDoc.edtState=iObjFHnd then with tObj^.oDat do begin
+                    GetFHLmt(cLst,thisKnob,0,tRect);
+                    GetFHLmt(cLst,thisKnob,1,lmtRect);
+                    if NOT SectRect(tRect,lmtRect,lmtRect) then begin
+                        lmtRect.topLeft  := thisPt;
+                        lmtRect.botRight := thisPt;
+                    end;
+                end else
+                    lmtRect := sizeLBox;
+                SetMseLmt(lmtRect);
+
+                if curDoc.edtState=iObjFHnd then
+                    anchorPt := wrkPt;
+                crdPt := anchorPt;
+
+                (* track the mouse *)
+                {penPats[iPenWhite] := black; already done}
+                lastTime := Time;
+                while StillDown do begin
+                    lastPt := crdPt;
+                    GetWrkMse;
+                    if curDoc.edtState=iObjFHnd then
+                        crdPt := wrkPt
+                    else
+                        crdPt := gridPt;
+                    if NOT EqualPt(lastPt,crdPt) OR NeedScroll then begin
+                        If Time>lastTime+5 then Wait(400);
+                        GetWrkMse;
+                        If curDoc.edtState=iObjFHnd then
+                            crdPt := wrkPt
+                        else
+                            crdPt := gridPt;
+                        MkCLstEdt(crdPt);
+                        lastTime := Time;
+                    end;
+                end;
+                if PeekPt then begin
+                    if curDoc.edtState=iObjFHnd then
+                        crdPt := wrkPt
+                    else
+                        crdPt := gridPt;
+                    MkCLstEdt(crdPt);
+                end;
+                {penPats[iPenWhite] := white; done at the very end}
+
+                (* finish edit *)
+                FreeObj(tObj);
+                if NOT EqualPt(anchorPt,crdPt) then begin
+                    With lastOp do begin
+                        iDat1 := thisKnob;
+                        rDat1 := xEdit;
+                        rDat2 := yEdit;
+                        rDat3 := crdPt.h;
+                        rDat4 := crdPt.v;
+                    end;
+                    SetLastOp(iOpEdt);
+                end else
+                    SetLastOp(iOpNOP);
+                (* hiLite the knob *)
+                thisPt.h := thisPt.h+Round(xEdit);
+                thisPt.v := thisPt.v+Round(yEdit);
+                If curDoc.edtObj^.oDat.kind=iObjFHnd then begin
+                    XorKnob(thisPt);
+                end else begin
+                    HiliteVrtSel(FALSE,FALSE);
+                end;
+                (* restore mouse *)
+                SetMseLmt(sizeLBox);
+                FreeH(curDoc.pHz,Pointer(Ord(angleObj^.oDat.cLst)));
+                FreeP(curDoc.pHz,Pointer(Ord(angleObj)));
+                FreeCLst(tempCLst);
+                FreeH(curDoc.hHz,Pointer(Ord(thisPoly)));
+            end else
+                (* never started tracking, turn knob back on *)
+                If curDoc.edtObj^.oDat.kind=iObjFHnd then begin
+                    XorKnob(thisPt);
+                end else begin
+                    HiliteVrtSel(FALSE,FALSE);
+                end;
+        end;
+        penPats[iPenWhite] := white;
+    end; (* EditCLstCmd *)
+
+
+(*$I ApLd/TR1.text *)
+
+END. (* unit *)
+
+
+ÿ

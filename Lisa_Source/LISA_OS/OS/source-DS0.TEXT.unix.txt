@@ -1,0 +1,826 @@
+(* DS0 *)
+
+(*$G+*)
+(*$R-*)
+
+UNIT DATASEGS; (* unit for data segment calls *)
+
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+
+INTERFACE
+
+USES
+(*$U object/DRIVERDEFS.OBJ*)
+     driverdefs,
+(*$U object/HWINT.OBJ*)
+     hwint,
+(*$U object/SYSGLOBAL.OBJ*)
+     globaldata,
+(*$U object/PROCPRIMS.OBJ*)
+     proc_prims,
+(*$U object/MMPRIM.OBJ*)
+     mmprimitives,
+(*$U object/ASYNCTR.OBJ*)
+     asynctr,
+(*$U object/GENIO.OBJ*)
+     genio,
+(*$U object/TWIGGY.OBJ*)
+     twiggy,
+(*$U object/VMSTUFF.OBJ*)
+     vmstuff,
+(*$U object/SFILEIO.OBJ*)
+     sfileio,
+(*$U object/FSPRIM.OBJ*)
+     fs_primitives,
+(*$U object/OBJIO.OBJ *)
+     ObjIO,
+(*$U object/MM0.OBJ*)
+     memorymanager,
+(*$U object/FSUI.OBJ*)
+     fs_interface;
+
+
+CONST
+  e_dsbase     = 300;   (* base for data segmentation errors *)
+  { e_badrefnum = 1;    (* defined in globaldata-- invalid refnum *) }
+  e_badldsn    = 2;     (* ldsn invalid                      *)
+  e_ldsnfree   = 3;     (* no ds bound to ldsn when there should be *)
+  e_ldsnused   = 4;     (* ds bound to ldsn when there shouldn't be *)
+  e_alreadybound = 5;   (* ds already bound                  *)
+  e_dstoobig   = 6;     (* ds too large                      *)
+  e_badpathname= 7;     (* invalid pathname                  *)
+  e_dupds      = 8;     (* ds named "pathname" already exists*)
+  e_nodiscspace= 9;     (* insufficient disc space for segment *)
+  e_invalidsize= 10;    (* memory or disc size is invalid on make_dataseg *)
+  e_nosysresources=11;  (* insufficient system resources *)
+  e_filesyserr = 12;    (* unexpected file system error*)
+  e_nods       = 13;    (* no data seg found *)
+  e_addrnoldsn = 14;    (* invalid addr to Info_Address (not in range of ldsn) *)
+  e_datalockout= 15;    (* bind of data segment could cause a data lockout for *)
+                        (* the process.                                        *)
+  e_badstatcall= 16;    (* Sys_Stat called with an invalid function or parmaddr*)
+  e_discerror  = 17;    (* Disc I/O error during swap in of segment *)
+
+  e_subsize    = 20;    (* warning- leof = 0 on a data seg open - a size for *)
+                        (* the data seg was calculated based upon peof *)
+  e_baddata    = 21;    (* warning- data seg open when system crashed - *)
+                        (* data possibly corrupt                        *)
+
+  s_maxDsSize = 131072; (* max size of shared data segment in bytes *)
+  p_maxDssize = 917504; (* max size of private data segment in bytes *)
+
+TYPE
+
+  Tdstype = (ds_shared, ds_private); (* types of data segments *)
+
+  dsinfoRec = record
+                mem_size: longint;  (* length of data seg (bytes) in memory *)
+                disc_size: longint; (* length of data seg (bytes) on disc *)
+                numb_open: integer; (* current open count          *)
+                ldsn: integer;      (* ldsn for segment binding    *)
+                boundF: boolean;    (* true if segment is bound to *)
+                                    (* ldsn                        *)
+                presentF: boolean;  (* true if segment is present  *)
+                                    (* in memory                   *)
+                creatorF: boolean;  (* true if calling process is  *)
+                                    (* the creator of the segment  *)
+                rwaccess: boolean;  (* true if calling process has *)
+                                    (* read/wrrite access to seg.  *)
+                segptr: longint;    (* base address of segment     *)
+                volname: e_name;    (* volume containing data seg  *)
+              end;
+
+procedure UNBIND_DATASEG(var errnum: integer; refnum: integer);
+
+procedure BIND_DATASEG(var errnum: integer; refnum: integer);
+
+procedure SETACCESS_DATASEG(var errnum: integer; refnum: integer;
+                                                 readonly: boolean);
+
+procedure INFO_DATASEG(var errnum: integer; refnum: integer;
+                                                 var ds_info: dsinfoRec);
+
+procedure INFO_LDSN(var errnum: integer; ldsn: integer; var refnum: integer);
+
+procedure MAKE_DATASEG(var errnum: integer; var segname: pathname;
+                       mem_size, disc_size: longint; var refnum: integer;
+                       var segptr: longint; ldsn: integer; dstype: Tdstype);
+
+procedure OPEN_DATASEG(var errnum: integer; var segname: pathname;
+                 var refnum: integer; var segptr: longint; ldsn: integer);
+
+procedure OPEN_NR_DATASEG(var errnum: integer; var segname: pathname;
+                 var refnum: integer; var segptr: longint; ldsn: integer);
+
+procedure MAKE_SYSDATASEG(var errnum: int2; var progname: pathname; memsize,
+                         discsize: int4; var refnum: int2; var segptr: absptr;
+                         ldsn: int2);
+
+procedure CLOSE_DATASEG(var errnum: integer; refnum: integer);
+
+procedure KILL_DATASEG(var errnum: integer; var segname: pathname);
+
+procedure SIZE_DATASEG(var errnum: integer; refnum: integer;
+                       deltamemsize: longint; var newmemsize: longint;
+                       deltadiscsize: longint; var newdiscsize: longint);
+
+procedure FLUSH_DATASEG(var errnum: integer; refnum: integer);
+
+function DSVERSION: integer;
+
+procedure DS_CLEANUP;
+
+procedure MEM_INFO(var errnum: integer;
+                   var swapspace, dataspace,
+                       cur_codesize, max_codesize: longint);
+
+procedure INFO_ADDRESS(var errnum: int2; address: int4; var refnum: int2);
+
+procedure INIT_DRIVER_SPACE;
+
+function GET_DRIVER_SPACE(var error: integer; codesize: int4): absptr;
+
+procedure REL_DRIVER_SPACE(var error: integer; ordaddr: absptr);
+
+procedure PRO_DRIVER_SPACE;
+
+IMPLEMENTATION
+
+CONST
+  version = 90;         (* version number of this unit *)
+  maxcdrvr = 32;        (* max # config drivers *)
+
+TYPE
+
+Tdsopen = (dsmake, dsmake_nf, dsopen, dsopen_nr); (* types of calls to DS_OPEN*)
+
+(********************************************)
+(*                                          *)
+(*SHARED DATA SEGMENT CONTROL BLOCK (SDSCB) *)
+(*                                          *)
+(********************************************)
+
+sdscb_ptr = ^sdscb;
+sdscb = record
+          chain: linkage;       (* to next sdscb entry *)
+          ptr_e_name: ^e_name;  (* name of this entry *)
+          open_needed: boolean; (* true if file open required before data *)
+                                (* segment can be used.                   *)
+          sdb_addr: sdb_ptr;    (* sdb for this segment *)
+          f_refnum: int2;       (* file refnum for this segment *)
+          sfileid: int2;        (* sfile number for this segment *)
+          unitid: int2;         (* device # containing this segment *)
+        end;
+
+
+
+
+(********************************************)
+(*                                          *)
+(*Free pool for Dynamic Device Driver Code  *)
+(*                                          *)
+(********************************************)
+jumprec = record
+            jumpinst: integer; (* jump instruction opcode *)
+            drvraddr: longint; (* jump address            *)
+            drvrsize: int2;    (* page size of driver code*)
+          end;
+freerec = record
+            freeaddr: longint; (* free address            *)
+            freesize: int2;    (* page size of free area  *)
+          end;
+
+DrvrCRec = record
+             header: longint;                        (*segment header*)
+             curpos: longint;                        (*physical addr driverspace*)
+             jumptab: array[1..maxcdrvr] of jumprec; (*jumps to the driver code *)
+             freeslot:array[1..maxcdrvr] of freerec; (*free areas in segment    *)
+           end;
+
+
+(*$S dsegs*)
+
+function SEG_OF_CALLER: int2; external;
+
+function LOGGING: boolean; external;
+
+procedure LOG(var errnum: integer; ptr_arr: absptr); external;
+
+function DSVERSION;
+(* return the version of this unit *)
+begin
+  dsversion:=version;
+end; (* DSVERSION *)
+
+
+
+function BAD_LDSN(ldsn: integer): boolean;
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    return TRUE if the ldsn value is invalid            *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    ldsn is the value to be validated                   *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    BAD_LDSN = TRUE if ldsn is invalid                  *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+begin
+  if (ldsn < min_ldsn) or
+     (ldsn > max_ldsn)
+    then bad_ldsn:=true
+    else bad_ldsn:=false;
+end;
+
+procedure CHK_LDSN_FREE(var errnum: int2; ldsn, numb_ldsn: int2);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Check the validity of the ldsn value supplied.      *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    ldsn is the value to be validated.                  *)
+       (*    numb_ldsn = the number of ldsn which will be used by*)
+       (*                the segment                             *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum gives the result of the validity check.      *)
+       (*    errnum = e_badldsn  -- ldsn is invalid              *)
+       (*           = e_ldsnused -- ldsn has seg bound to it     *)
+       (*           = e_ldsnfree -- ldsn is valid and unbound    *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  c_syslocal_ptr: slocal_ptr;
+  c_lbt_ptr: lbt_ptr;
+  limit: int2;
+
+begin
+  c_syslocal_ptr:=pointer(b_syslocal_ptr);
+  c_lbt_ptr:=pointer(c_syslocal_ptr^.lbt_addr);
+
+ (* check if required ldsn[s] are free *)
+  errnum:=e_ldsnfree;
+  limit:=ldsn + numb_ldsn - 1;
+  while (errnum = e_ldsnfree) and (ldsn <= limit) do
+    begin
+      if BAD_LDSN(ldsn)
+        then errnum:=e_badldsn
+        else if c_lbt_ptr^[ldsn] = 0
+               then ldsn:=ldsn+1 (* free - go on to next ldsn *)
+               else errnum:=e_ldsnused;
+    end;(*while*)
+end; (* CHK_LDSN_FREE *)
+
+procedure INFO_LDSN(* var errnum: integer; ldsn: integer; var refnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Return info about the input ldsn                    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    ldsn is the logical mapping register                *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum is the status of the operation.              *)
+       (*    errnum = 0 --a segment is bound to the ldsn and its *)
+       (*                 refnum is returned in refnum           *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badldsn -- ldsn is invalid              *)
+       (*              e_ldsnfree -- no seg is bound to ldsn     *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_syslocal_ptr: slocal_ptr;
+    c_lbt_ptr: lbt_ptr;
+    c_ptr_ds_refdb: ptr_ds_refdb;
+    (*$IFC DEBUG2*)
+    parmarr: parmcheck;
+    (*$ENDC*)
+
+  begin
+    (*$IFC DEBUG3*)
+    if TRACE(mm,99) then writeln(' info_ldsn called');
+    (*$ENDC*)
+    (*$IFC DEBUG2*)
+    with parmarr do
+      begin
+        numcheck:=1;
+        parms[1].addr:=ord(@refnum);
+        parms[1].readwrite:=true;
+      end;
+    if not VALID_ADDR(errnum,parmarr) then exit (Info_LDSN);
+    (*$ENDC*)
+
+    refnum := -1;
+    if BAD_LDSN(ldsn) or (not SYS_CALLED and (ldsn <= 0)) then
+      begin
+        errnum:=e_dsbase + e_badldsn;
+        exit (Info_LDSN)
+      end;
+
+    { ldsn is valid }
+    c_syslocal_ptr:=pointer(b_syslocal_ptr);
+    c_lbt_ptr:=pointer(c_syslocal_ptr^.lbt_addr);
+
+    if c_lbt_ptr^[ldsn] = 0 then
+      errnum:=e_dsbase + e_ldsnfree
+    else
+      begin (* a segment bound to ldsn *)
+        c_ptr_ds_refdb:=pointer(c_lbt_ptr^[ldsn]+b_syslocal_ptr);
+        refnum:=c_ptr_ds_refdb^.ds_refnum;
+        errnum:=0;
+      end
+  end;(*INFO_LDSN*)
+
+
+
+procedure UPD_MRBT(c_sdb: sdb_ptr; ldsn: int2; c_access: int1);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Update the mrbt entry for c_mmu and map the segment *)
+       (*    accordingly.                                        *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb - the segment to be mapped                    *)
+       (*    ldsn  - the ldsn to be used to map the segment      *)
+       (*    c_access - the access restrictions for the segment  *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_pcb: ptr_pcb;
+    c_syslocal_ptr: slocal_ptr;
+    c_mrbt_ptr: mrbt_ptr;
+    c_smrbt_ptr: smrbt_ptr;
+    l_sdb: sdb_ptr;
+    c_mmu: int2;
+
+  begin
+    c_mmu:=LDSN_TO_MMU(ldsn);
+    c_syslocal_ptr:=pointer(b_syslocal_ptr);
+    c_mrbt_ptr:=pointer(c_syslocal_ptr^.mrbt_addr);
+    c_smrbt_ptr:=pointer(c_syslocal_ptr^.smrbt_addr);
+    c_pcb:=pointer(c_pcb_ptr);
+
+    if (ldsn <= 0) and (c_sdb = nil) (* ending use of a system ldsn *)
+     then c_mrbt_ptr^[c_mmu]:=c_smrbt_ptr^[c_mmu]  (* restore old mrbt entry *)
+     else
+      begin
+        if (ldsn <= 0) and (c_mrbt_ptr^[c_mmu].sdbRP <> 0) then
+          begin (* some seg defined in mrbt *)
+            l_sdb:=pointer(c_mrbt_ptr^[c_mmu].sdbRP + b_sysglobal_ptr);
+            if l_sdb^.sdbtype = code (* save curr entry in secondary mrbt *)
+              then c_smrbt_ptr^[c_mmu]:=c_mrbt_ptr^[c_mmu];
+          end;
+        with c_mrbt_ptr^[c_mmu] do
+          begin
+            access:=c_access;
+            if c_sdb = nil
+              then sdbRP:=0
+              else sdbRP:= ord(c_sdb) - b_sysglobal_ptr;
+          end;
+      end;
+
+    (* map the segment in domain 0 *)
+    MAP_SEGMENT(c_sdb,c_mmu,0,c_access);
+
+    (* If the user process is still mapped by a domain then the mapping of *)
+    (* the data segment must be established in that domain.  If not mapped *)
+    (* then the data segment will be mapped by the scheduler when a domain *)
+    (* is selected.                                                        *)
+    if ldsn > 0  (* map only normal ldsn in user's domain *)
+      then if dct[c_syslocal_ptr^.scb.domvalue].owner = c_pcb^.glob_id
+             then MAP_SEGMENT(c_sdb,c_mmu,c_syslocal_ptr^.scb.domvalue,c_access);
+  end;(*UPD_MRBT*)
+
+
+
+procedure UNBIND_DATASEG(* var errnum: integer; refnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Free the mapping register corresponding to ldsn by  *)
+       (*    unbinding the currently bound segment.              *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum specifies the data segment to be unbound     *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum is the status of the operation.              *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum=0 Successful Unbind.                         *)
+       (*          = e_dsbase +                                  *)
+       (*             e_bad_ldsn -- invalid ldsn                 *)
+       (*             e_ldsnfree -- no seg bound to ldsn         *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+(*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 23 }
+             ev_bind: int1;             { Bind_dataseg = 1 }
+                                        { Unbind_dataseg=2 }
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_ldsn: int2;             { ldsn }
+             ev_pcb: absptr;            { c_pcb_ptr }
+           end;
+(*$ENDC*)
+
+var
+  i: int2;
+  c_mmu: int2;
+  c_ptr_ds_refdb: ptr_ds_refdb;
+  c_lbt_ptr: lbt_ptr;
+  c_syslocal_ptr: slocal_ptr;
+  c_pcb: ptr_pcb;
+  ordrefdbpr: absptr;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+  (*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' free_ldsn called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  parmarr.numcheck:=0;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10; (* take error exit *)
+
+  c_ptr_ds_refdb:=pointer(ordrefdbptr);
+  with c_ptr_ds_refdb^ do
+    begin
+      if not boundF then
+        begin
+          errnum:=e_dsbase+e_ldsnfree;
+          goto 10;
+        end;
+
+      (*$IFC DEBUG1*)
+      if TRACE(spare2,10) then
+        begin
+          if LOGGING then
+            begin
+              with c_event do
+                begin
+                  ev_type:=23;
+                  ev_bind:=2;
+                  ev_sdb:=a_sdb_ptr;
+                  ev_ldsn:=ldsn;
+                  ev_pcb:=c_pcb_ptr;
+                  LOG(errnum,ord(@c_event));
+                  errnum:=0;
+                end;
+            end;
+        end;
+      (*$ENDC*)
+
+      boundF:=false;
+      c_syslocal_ptr:=pointer(b_syslocal_ptr);
+      c_lbt_ptr:=pointer(c_syslocal_ptr^.lbt_addr);
+
+      (* remove the SRB for this process from the segment's chain*)
+      DEL_SRB(a_sdb_ptr,c_pcb_ptr);
+
+      (* clear lbt entry and free the mapping of the segment *)
+      for i:=ldsn to ldsn + no_ldsn -1 do
+        begin
+          c_lbt_ptr^[i]:=0;
+          UPD_MRBT(nil,i,mmuabsent);
+        end;(*for*)
+    end;(*with*)
+
+10: (* error exit *)
+
+end;(*UNBIND_DATASEG*)
+
+
+procedure BIND_DATASEG(* var errnum: integer; refnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The data segment known by refnum will be bound to   *)
+       (*    the MMU register associated with the data segment   *)
+       (*    when the segment was created or opened.             *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum specifies the data segment to be bound.      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the bind.*)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*    The corresponding MMU will be changed to map the    *)
+       (*    data segment.                                       *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful operation                     *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badrefnum -- invalid refnum             *)
+       (*              e_alreadybound -- already bound to ldsn   *)
+       (*              e_ldsnused -- another ds bound to ldsn    *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+(*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 23 }
+             ev_bind: int1;             { Bind_dataseg = 1 }
+                                        { Unbind_dataseg=2 }
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_ldsn: int2;             { ldsn }
+             ev_pcb: absptr;            { c_pcb_ptr }
+           end;
+(*$ENDC*)
+
+var
+  c_ptr_ds_refdb: ptr_ds_refdb;
+  c_syslocal_ptr: slocal_ptr;
+  ordrefdbptr: absptr;
+  c_lbt_ptr: lbt_ptr;
+  i: int2;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+  (*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' bind_ldsn called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  parmarr.numcheck:=0;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10; (* take error exit *)
+
+  c_ptr_ds_refdb:=pointer(ordrefdbptr);
+  with c_ptr_ds_refdb^ do
+    begin
+      CHK_LDSN_FREE(errnum,ldsn,no_ldsn);
+      if errnum <> e_ldsnfree then
+        begin (* ldsn invalid or not free *)
+          errnum:=e_dsbase + errnum;
+          goto 10; (* take error exit *)
+        end;
+      errnum:=0;
+
+      (* make sure bind of data segment will not open process to possible data *)
+      (* lockout.                                                              *)
+      if DATA_LOCKOUT(a_sdb_ptr,false)
+        then errnum:=e_dsbase+e_datalockout
+        else
+         begin
+           (* insure data segment is in memory *)
+           CHECK_DS(a_sdb_ptr);
+           if a_sdb_ptr^.sdbstate.swaperrF
+             then errnum:=e_dsbase + e_discerror
+             else
+              begin
+                (*$IFC DEBUG1*)
+                if TRACE(spare2,10) then
+                  begin
+                    if LOGGING then
+                      begin
+                        with c_event do
+                          begin
+                            ev_type:=23;
+                            ev_bind:=1;
+                            ev_sdb:=a_sdb_ptr;
+                            ev_ldsn:=ldsn;
+                            ev_pcb:=c_pcb_ptr;
+                            LOG(errnum,ord(@c_event));
+                            errnum:=0;
+                          end;
+                      end;
+                  end;
+                (*$ENDC*)
+
+                (* adjust refnum descriptor *)
+                boundF:=true;
+
+                (* set lbt entry and map the segment*)
+                c_syslocal_ptr:=pointer(b_syslocal_ptr);
+                c_lbt_ptr:=pointer(c_syslocal_ptr^.lbt_addr);
+                for i:=ldsn to ldsn + no_ldsn-1 do
+                  begin
+                    c_lbt_ptr^[i]:=ordrefdbptr - b_syslocal_ptr;
+                  end;(*for*)
+
+                UPD_MRBT(a_sdb_ptr,ldsn,access);
+              end;
+         end;
+    end;(*with*)
+
+10: (* error exit *)
+
+end; (* BIND_DATASEG *)
+
+
+procedure SETACCESS_DATASEG(* var errnum: integer; refnum: integer;
+                                                 readonly: boolean *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Set the access rights to the specified data segment *)
+       (*    to read only or to read/write.                      *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    Refnum defines the data segment whose rights are    *)
+       (*    to be changed.                                      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    Errnum defines the success or failure of the        *)
+       (*    operation.                                          *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*    If the specified segment is currently bound then    *)
+       (*    the MMU register will be changed.                   *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Operation successful                     *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badrefnum -- invalid refnum             *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  c_access: int1;
+  c_ptr_ds_refdb: ptr_ds_refdb;
+  ordrefdbptr: absptr;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' setaccess_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  parmarr.numcheck:=0;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10; (* take error exit *)
+
+  c_ptr_ds_refdb:=pointer(ordrefdbptr);
+  if readonly
+    then c_access:=mmureadonly
+    else c_access:=mmureadwrite;
+  with c_ptr_ds_refdb^ do
+    begin
+      if access <> c_access then
+        begin (* access value is changing *)
+          access:=c_access;
+          if boundF then UPD_MRBT(a_sdb_ptr,ldsn,c_access);
+        end;
+    end; (* with *)
+
+10: (* error exit *)
+
+end; (* SETACCESS_DATASEG *)
+
+
+
+procedure INFO_DATASEG(* var errnum: integer; refnum: integer;
+                              var ds_info: dsinfoRec *);
+
+       (**********************************************************)
+       (* Description:                                           *)
+       (*    Returns status information about the specified data *)
+       (*    segment.                                            *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum defines the specific data segment.           *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the result of the operation.       *)
+       (*    errnum = 0 -- successful operation                  *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badrefnum -- invalid refnum             *)
+       (*                                                        *)
+       (*    ds_info is a record for the return information.     *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  c_sdb_ptr: sdb_ptr;
+  c_ptr_ds_refdb: ptr_ds_refdb;
+  ordrefdbptr: absptr;
+  fcbptr: sfcb_ptr;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' info_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  with parmarr do
+    begin
+      numcheck:=1;
+      parms[1].addr:=ord(@ds_info);
+      parms[1].readwrite:=true;
+    end;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10; (* take error exit *)
+
+  c_ptr_ds_refdb:=pointer(ordrefdbptr);
+  c_sdb_ptr:=c_ptr_ds_refdb^.a_sdb_ptr;
+  (* return status information *)
+  with ds_info do
+    begin
+      with c_sdb_ptr^ do
+        begin
+          if newlength <> 0
+            then mem_size:=newlength*mempgsize
+            else mem_size:=length;
+          disc_size:=disclength;
+          numb_open:=numbopen;
+          presentF:=sdbstate.memoryF;
+          if discaddr.fid <> 0
+            then fcbptr:=pointer(discaddr.fid + b_sysglobal_ptr)
+            else fcbptr:=nil;
+        end;
+      ldsn:=c_ptr_ds_refdb^.ldsn;
+      boundF:=c_ptr_ds_refdb^.boundF;
+      creatorF:=c_ptr_ds_refdb^.creatorF;
+      if c_ptr_ds_refdb^.access = mmureadwrite
+        then rwaccess:=true
+        else rwaccess:=false;
+      segptr:=MMU_BASE(LDSN_TO_MMU(ldsn));
+      if fcbptr <> nil
+        then volname:=mounttable[fcbptr^.curdev]^.name
+        else volname:='';
+    end;
+
+10: (* error exit *)
+
+end; (* INFO_DATASEG *)
+
+
+
+(*$Isource/DS2.TEXT*)
+(*$Isource/DS3.TEXT*)
+
+end.
+
+ÿ

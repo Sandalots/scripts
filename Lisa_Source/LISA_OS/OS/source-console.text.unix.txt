@@ -1,0 +1,495 @@
+
+  UNIT CONSOLE;           (* SCREEN AND ALTERNATE SCREEN driver *)
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+  INTERFACE
+
+    USES
+      (*$Uobject/driverdefs.obj*)
+        driverdefs,
+      (*$Uobject/driversubs.obj*)
+        driversubs;
+
+      function DRIVER (parameters: param_ptr): integer;
+
+  IMPLEMENTATION
+    (*$R-*) (*rangecheck off *)
+
+    CONST
+      errbase = 670; (*use >670, since profile reserves errnum = 670*)
+      syserrbase = 10670;
+
+    TYPE
+      evrecord = record (*also defined in assembly language*)
+                   evcode: int1;
+                   evshift: integer;
+                   evmouse: longint;
+                   evtimer: longint;
+                   padding: longint  (*to make it 16 bytes long*)
+                 end;
+
+      pdrec = record (*also defined in assembly language*)
+                  crtrow: int1;
+                  crtcol: int1;
+                  crtstate: int1;
+                  ctlsflag: int1;
+                  autolf: boolean;
+                  ev: evrecord
+                end;
+
+      portrec_ptr = ^portrec;
+      portrec = record
+                  cur_req_ptr: reqptr_type;
+                  cur_info_ptr: seqextptr_type;
+                  nullink: linkage;  (* points to head of queue *)
+                  xmit_ref: integer;
+                  iochan: int1;
+                  no_block: boolean;
+                  portdata: pdrec;
+                  eventqueue: array [0..7] of evrecord;
+                  que_get, que_put: integer;
+                  input_timeout: longint; (*number of microseconds before T/O*)
+                  last_intime: longint; (*time of last input*)
+                end;
+
+      procedure SCREAD (bufferptr: longint; mainscr: integer; scrdatabase: pdrec);
+                external;
+
+      procedure SCWRITE (bufferptr: longint; count: integer; mainscr: integer;
+                 scrdatabase: pdrec); external;
+
+      procedure FINISH_REQ (port: portrec_ptr); forward;
+
+      procedure SAVE_EVENT (port: portrec_ptr; event: evrecord);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Save a disk/mouse event                     *)
+       (*                                                           *)
+       (* Input Parameters:  the event to be saved                  *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        temp: integer;
+
+      begin
+        WITH port^ do
+        begin
+          temp := que_put + 1;  (*increment put-index with wrap-around*)
+          if temp = 8 then
+            temp := 0;
+          if temp <> que_get then
+          begin (*put into queue if queue is not full*)
+            eventque[que_put] := event;
+            que_put := temp;
+          end
+        end
+      end;
+
+      function GRAB_EVENT (port: portrec_ptr; var event: evrecord): boolean;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  get a disk/mouse event                      *)
+       (*                                                           *)
+       (* Input Parameters:  Where the event is to be saved         *)
+       (*                                                           *)
+       (* Output Parameters: true if event returned from queue      *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      begin
+        WITH port^ do
+        begin
+          if que_get <> que_put then
+          begin (*get next queued event*)
+            event := eventque[que_get];
+            que_get := que_get + 1;  (*increment get-index with wrap-around*)
+            if que_get = 8 then
+              que_get := 0;
+            GRAB_EVENT := true
+          end
+          else
+            GRAB_EVENT := false  (*no events*)
+        end
+      end;
+
+      procedure LOWPRI (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Low priority console input handler.         *)
+       (*                                                           *)
+       (* Input Parameters: none                                    *)
+       (*                                                           *)
+       (* Output Parameters:                                        *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  called only by TMR_ALT/MAIN   *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        errnum: integer;
+        intptr: ^int1;
+        actual_addr: longint;
+        wakeup: boolean;
+
+      begin
+        if port^.cur_req_ptr = nil then
+          SYSTEM_ERROR (syserrbase+5)
+        else
+        WITH port^, cur_info_ptr^ do
+        begin
+          FREEZE_SEG (errnum, buff_rdb_ptr, buff_offset, ord(cur_req_ptr),
+                    actual_addr);
+          if errnum = 0 then
+          begin
+            wakeup := false;
+            SCREAD (actual_addr, iochan, portdata);
+            while portdata.ev.evcode <> 0 do
+            begin (*got some disk/mouse event*)
+              SAVE_EVENT (port, portdata.ev);
+              SCREAD (actual_addr, iochan, portdata);
+              wakeup := true
+            end;
+            intptr := pointer (actual_addr);
+            if intptr^ <> 0 then
+            begin
+              xfer_count := xfer_count +1;
+              wakeup := true
+            end;
+            UNFREEZE_SEG (buff_rdb_ptr); (*allow buffer to move*)
+            if no_block or wakeup then
+              FINISH_REQ (port)  (*done with this request*)
+            else
+            begin  (*no character yet*)
+              if input_timeout > 0 then
+                if MICROTIMER > (last_intime + input_timeout) then
+                begin
+                  cur_req_ptr^.hard_error := 644;
+                  FINISH_REQ (port);  (*done with this request*)
+                  EXIT (LOWPRI)
+                end;
+              ALARMRELATIVE (xmit_ref, 1) (*executes again at next alarm*)
+            end
+          end
+        end
+      end; (*lowpri*)
+
+      procedure START_NEW_REQUEST (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start a new read or write from the queue.   *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current port        *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  only clock interrupts  off.   *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        prevints: intson_type;
+        errnum: integer;
+        chan: integer;
+        actual_addr: longint;
+
+      begin
+        WITH port^ do
+          begin
+            cur_req_ptr := CHAIN_FORWARD (nullink);
+            cur_req_ptr^.reqstatus.reqsrv_f := in_service;
+            cur_info_ptr := pointer (cur_req_ptr^.req_extent);
+            WITH cur_info_ptr^ do
+              if read_flag then
+              begin
+                if not no_block then
+                  if input_timeout > 0 then
+                    last_intime := MICROTIMER;
+                LOWPRI (port)
+              end
+              else
+              begin
+                FREEZE_SEG (errnum, buff_rdb_ptr, buff_offset, ord(cur_req_ptr),
+                          actual_addr);
+                if errnum = 0 then
+                begin
+                  INTSON (clkonints);  (*interrupts back on for actual write*)
+                  SCWRITE (actual_addr, num_bytes, iochan, portdata);
+                  while portdata.ev.evcode <> 0 do
+                  begin
+                    SAVE_EVENT (port, portdata.ev);
+                    SCWRITE (actual_addr, 0 , iochan, portdata);(*in case still in
+                                                                 ctrl-s routine*)
+                  end;
+                  xfer_count := xfer_count + num_bytes;
+                  UNFREEZE_SEG (buff_rdb_ptr); (*allow buffer to move*)
+                  INTSOFF (clokints, prevints);  (*ints back off for finish*)
+                  FINISH_REQ (port)
+                end
+              end
+          end
+      end;  (*start_new_request*)
+
+       procedure FINISH_REQ (*port: portrec_ptr*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Complete the current request                *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current printer port*)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Modem control signals are affected.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Cur_req_ptr must be valid.    *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        ptrsysg: ^longint;
+
+      begin
+          ptrsysg := pointer(bsysglob);   (*set up pointer to b_sysglobal_ptr*)
+          WITH port^, cur_info_ptr^ do
+          begin
+            ADJ_IO_CNT (false, buff_rdb_ptr);  (*allow swapout*)
+            UNBLK_REQ (cur_req_ptr, (cur_req_ptr^.hard_error = 0) );
+            DEQUEUE (cur_req_ptr^.dev_chain, ptrsysg^);
+            if (nullink.fwd_link + ptrsysg^) <> ord(@nullink) then
+              START_NEW_REQUEST (port)
+            else
+              cur_req_ptr := nil
+          end
+      end; (*finish_req*)
+
+
+      function DRIVER(*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Parallel printer external interface via     *)
+       (*               DRIVERCALL                                  *)
+       (*                                                           *)
+       (* Input Parameters:  Parameters depend on function code     *)
+       (*                                                           *)
+       (* Output Parameters:  Function returns integer errnum.      *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        prevints: intson_type;
+        port_ptr: portrec_ptr;
+        ptrsysg: ^longint;
+
+      procedure CINITIT;
+
+      (****************************************************************)
+      (*  Internal subroutine to initialize main or alt screen        *)
+      (****************************************************************)
+
+      VAR
+        errnum: integer;
+        ptrsysg: ^longint;
+
+      begin
+        errnum := 0;
+        ptrsysg:=pointer(bsysglob);
+        INTSOFF (clokints, prevints);
+          WITH parameters^.configptr^ do
+          if not GETSPACE(sizeof(portrec),ptrsysg^,cb_addr)
+            then errnum := 610
+            else
+             begin
+               port_ptr := pointer (cb_addr);
+               WITH port_ptr^ do
+                 begin
+                   iochan:=iochannel;
+                   ALARM_ASSIGN (xmit_ref, parameters^.configptr, clokints);
+                   if xmit_ref = 0 then
+                   begin
+                     RELSPACE (cb_addr, ptrsysg^);
+                     errnum := 602 (*no more alarms available*)
+                   end
+                   else
+                   begin (*initialize the port control block*)
+                     cur_req_ptr := nil;
+                     input_timeout := 0;
+                     nullink.fwd_link := ord(@nullink) - ptrsysg^;
+                     nullink.bkwd_link := nullink.fwd_link;
+                     no_block := false;
+                     que_get := 0;
+                     que_put := 0;
+                     portdata.crtrow := 32;
+                     portdata.crtcol := 1;
+                     portdata.crtstate := 0;
+                     portdata.ctlsflag := 0;
+                     portdata.autolf := false;
+                   end
+                 end;(*with*)
+             end;
+             INTSON (prevints);
+             DRIVER := errnum
+        end; (*cinitit*)
+
+      procedure CCONTROL;
+
+      (****************************************************************)
+      (*  Internal subroutine to do device control                    *)
+      (****************************************************************)
+
+      VAR
+        event: evrecord;
+        dc_rec_ptr: ^dc_rec;
+
+      begin (*device control*)
+        DRIVER:=0;
+        with parameters^ do
+          begin
+            dc_rec_ptr := pointer(parptr);
+            INTSOFF (clokints, prevints);
+            WITH port_ptr^, dc_rec_ptr^ do
+              if dversion <> 2 then
+                DRIVER := 623 (*wrong application version*)
+              else
+              case dcode of
+              6:  (*set input blocking/not-blocking mode*)
+                 no_block := (ar10[0] <> 0);
+
+              14: (*set input timeout in seconds.. 0 is infinite*)
+                 input_timeout := ar10[0] * 1000000; (*convert to microseconds*)
+
+              16: (*return an event, or nothing*)
+                if GRAB_EVENT (port_ptr, event) then
+                begin
+                  ar10[0] := event.evcode;
+                  ar10[1] := event.evshift;
+                  ar10[2] := event.evmouse;
+                  ar10[3] := event.evtimer
+                end
+                else
+                  ar10[0] := 0;
+
+              17: portdata.autolf := (ar10[0] <> 0);  (*enable/disable auto LF*)
+
+              otherwise
+                DRIVER := 623;
+              end;  (*case*)
+
+            INTSON (prevints)
+          end
+        end; (*ccontrol*)
+
+      procedure CSEQIO;
+
+      (****************************************************************)
+      (*  Internal subroutine to start screen I/O                     *)
+      (****************************************************************)
+
+      VAR
+        ptrsysg: ^longint;
+        leftlink: link_ptr;
+        ext_ptr: seqextptr_type;
+
+        begin
+          begin
+            ext_ptr := pointer (parameters^.req^.req_extent);
+            WITH ext_ptr^ do
+            if (num_bytes <= 0) or (read_flag and (num_bytes <> 1)) then
+              DRIVER := errbase + 1  (*illegal parameters *)
+            else
+            begin
+              WITH port_ptr^ do
+              begin (* add request to the device queue *)
+                DRIVER := 0;  (*no errors*)
+                ptrsysg := pointer(bsysglob);   (*set pointer to b_sysglobal_ptr*)
+                INTSOFF (clokints, prevints);
+                leftlink := pointer (nullink.bkwd_link + ptrsysg^);
+                ENQUEUE (parameters^.req^.dev_chain, leftlink^, ptrsysg^);
+                if leftlink = @nullink then
+                  START_NEW_REQUEST (port_ptr);  (*no other requests present*)
+                INTSON (prevints)
+              end
+            end
+          end
+        end; (*cseqio*)
+
+     (****************************************************************)
+
+      begin (*DRIVER*)
+        with parameters^ do
+             begin
+               port_ptr:=pointer(configptr^.cb_addr);
+               case fnctn_code of
+               seqio:  CSEQIO;
+
+               reqrestart:
+                 begin
+                   DRIVER := 0;
+                   INTSOFF (clokints, prevints);
+                   START_NEW_REQUEST (port_ptr);  (*no other requests present*)
+                   INTSON (prevints);
+                  end; (*reqrestart*)
+
+               dinit: CINITIT;
+
+               dalarms: LOWPRI(port_ptr);
+
+               dcontrol: CCONTROL;
+
+               ddown: begin
+                 DRIVER := 0;
+                 WITH port_ptr^ do
+                 begin
+                   INTSOFF(clokints, prevints);
+                   if cur_req_ptr <> nil then
+                     DRIVER := 607
+                   else
+                   begin
+                     ptrsysg := pointer(bsysglob);
+                     ALARMRETURN (xmit_ref);
+                     configptr^.cb_addr := ord(nil);
+                     RELSPACE (ord(port_ptr), ptrsysg^);
+                   end;
+                   INTSON (prevints);
+                 end
+               end; (*ddown*)
+
+
+               otherwise
+                 DRIVER := 656;   (*currently unimplemented w/ error*)
+               end;  (*case*)
+             end;
+      end; (*DRIVER*)
+
+   end.
+ÿ

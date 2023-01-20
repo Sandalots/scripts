@@ -1,0 +1,480 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983  Apple Computer Inc.                                      *)
+(*                                                                               *)
+(*********************************************************************************)
+program masterdup;
+
+{$U-}
+
+uses
+
+{$U libos/syscall.obj } syscall,
+{$U libos/psyscall.obj } psyscall;
+
+{$SETC PROMPT := TRUE }
+{$SETC EUROPE := FALSE }
+
+Label
+{$IFC PROMPT }
+10,
+{$ENDC}
+20,1;
+
+Const
+        CBuffSize = 65536;
+        CopyLdsn = 3;
+        maxstring = 127;   (* max string length *)
+        tmddfoffset = 41;  (* boot area size on twiggy  *)
+        pmddfoffset = 30;  (* boot area size on profile *)
+        plsize = 24;       (* bytes in a page label *)
+        oldfsversion = 14;  (* file system versions this should work with *)
+        thisfsversion = 15;
+        blessmark = -1;    (* value of blessed field on master diskette *)
+{$IFC EUROPE }
+        fuzz = 'sqemzy';
+        osv = 554;
+        relname = 'A31';
+{$ELSEC }
+        fuzz = 'nqemzy';
+{$ENDC }
+
+type    rec_param_mem = record
+                        updateF: boolean;
+                        parm_mem: array[1..32] of integer
+                        end;
+        mountstate = (mountundefined,
+                      defmounted,
+                      realmounted,
+                      fsmounted,
+                      unmounted,
+                      temp_mounted,
+                      temp_unmounted,
+                      mountpending,
+                      unmountpending,
+                      diagnostic,
+                      mounterror);
+
+        MDDFt = record
+                fsversion    : integer;
+                volid        : UID;
+                volnum       : integer;
+                volname      : string [max_ename];
+                password     : string [max_ename];
+                init_machine_id : longint;     (* machine initialized on *)
+                master_machine_id : longint;   (* for theft protection *)
+                DT_created   : longint;        (* original creation date *)
+                DT_copy_created : longint;     (* date THIS copy made *)
+                DT_copied    : longint;        (* date this vol was backed up *)
+                DT_scavenged : longint;
+                copy_thread : longint; (* incremented each time on a new copy *)
+                geography : record
+                  firstblock : longint;    (* abs block number of first block *)
+                  lastblock  : longint;    (* abs block number of last  block *)
+                  lastfspage : longint;    (* abs page number of last fs page *)
+                end;
+                blockcount: longint;     (* number of blocks on disk   *)
+                blocksize : integer;     (* bytes per block, often 512 *)
+                datasize  : integer; (* data bytes per block *)
+                cluster_size:integer;(* # of blocks per cluster on disk *)
+                MDDFaddr  : longint; (* page where MDDF starts *)
+                MDDFsize  : integer; (* size in bytes of MDDF *)
+                bitmap_addr:longint; (* page where bit map starts *)
+                bitmap_size:longint;(* size in bits of allocation bit map *)
+                bitmap_bytes:integer; (* size in bytes of alloc. bit map *)
+                bitmap_pages:integer; (* number of data pages for bitmap bytes *)
+                slist_addr : longint; (* page where s-file list begins *)
+                slist_packing:integer;(* number of s_entries per block in slist *)
+                slist_block_count:integer; (* number of data blocks in slist file *)
+                first_file: integer;  (* fid of minimum non-initial s-file *)
+                empty_file: integer;  (* minimum fid of all unused s-file ids *)
+                maxfiles  : integer;(* max s-file index on this device *)
+                hintsize  : integer;      (* number of pages in s-file hints *)
+                leader_offset : integer;  (* page offset of leader in file hints *)
+                leader_pages  : integer;  (* number of pages in file leader *)
+                flabel_offset  : integer;  (* byte offset of file label in first hint page *)
+                unusedi1  : integer;  (* spare field *)
+                map_offset    : integer;  (* page offset of first file map page *)
+                map_size      : integer;  (* number of file map entries per page *)
+                filecount : integer;  (* current number of s-files allocated *)
+                freestart : longint; (* start of free page search in bit map *)
+                unusedl1 : longint;   (* spare field *)
+                freecount : longint; (* number of free pages in list *)
+                rootsnum  : integer; (* s-file number of root catalog file *)
+                rootmaxentries : integer; (* maximum number of centry in root cat *)
+                mountinfo : mountstate;   (* info about mount state of volume *)
+                overmount_stamp : UID; (* UID of temp overmount op *)
+                pmem_id : longint;     (* machine ID for this copy of param mem *)
+                pmem : rec_param_mem; (* temp parameter memory *)
+                vol_scavenged : boolean;  (* volume modified by scavenger *)
+                tbt_copied : boolean;     (* set on newly tbt copied disk vol *)
+
+                smallmap_offset : integer;  (* byte offset of fmap in hint page *)
+                hentry_offset : integer;  (* byte offset of hentry in hint page *)
+                backup_volid : UID;   (* volume that this volume backs-up *)
+                flabel_size : integer;  (* byte size of file label *)
+                fs_overhead : integer;  (* per-volume file system space overhead *)
+                result_scavenge : integer;  (* result of last scavenge *)
+                boot_code : integer;  (* reserved for future use *)
+                boot_environ : integer;  (* reserved for future use *)
+              end;
+
+     MDDFptrt = ^MDDFt;
+
+var
+        SrcDev,
+        DestDev,
+        vname,
+        chkvname  : e_name;
+
+        enp : ^e_name;
+
+        SName : pathname;
+
+        fsParams : Ut_Parmt;
+
+        answer : string[maxstring];
+        cover_up : string[3];
+
+        CBuffAddr,
+        actual : longint;
+
+        i,
+        error,
+        RefNo,
+        MDDFoffset,
+        srcdevnum,
+        destdevnum : integer;
+
+        MDDFp : MDDFptrt;
+
+        rawbuffer : array [1..268] of integer;
+
+        c : string [1];
+
+        ejectsrc : boolean;
+
+{$IFC EUROPE }
+        vinfo : vers_info;
+{$ENDC }
+
+
+begin
+
+(*
+ *  Version 3.1 modifications:
+ *       Allow copying of FS version 14 and 15 volumes.
+ *)
+
+writeln;
+writeln ('Master Disk Duplication Utility     V3.1        07/15/83');
+writeln;
+
+cover_up := '...';
+cover_up[1] := chr(8);
+cover_up[2] := ' ';
+cover_up[3] := chr(8);
+i := 1;
+vname := '';
+
+write ('What is the password?  ');
+
+read(c);
+
+while not eoln do
+begin
+  if i <= max_ename then
+  begin
+    vname := concat (vname, c);
+    i := i + 1;
+  end;
+
+  write (cover_up);
+  read (c);
+end;
+
+readln;  (* clear eoln *)
+
+for i := 1 to length (vname) do vname [i] := chr (ord (vname [i]) + i);
+if vname <> fuzz then
+begin
+  writeln ('Sorry, that is not the password.  See you later.');
+  goto 1;
+end;
+
+
+
+{$IFC EUROPE }
+
+list_versions (vinfo);
+if vinfo.OSVers <> osv then
+begin
+  writeln (chr(7), chr(7), 'Program is obsolete and will not run correctly.');
+  goto 1;
+end;
+
+{$ENDC }
+
+
+
+SName := 'bufseg';
+make_dataseg(error,SName,CBuffSize,0,RefNo,CBuffAddr,CopyLdsn,ds_private);
+if error <> 0 then
+    begin
+    writeln(chr(7),'Couldn''t make data segment ',error);
+    goto 1;
+    end;
+
+writeln(chr(7),'Reminder to user:');
+writeln;
+writeln(       'Twiggy master goes in UPPER, blank diskette in LOWER.');
+writeln(       'Profile master is on PARAPORT, destination is on SLOT2CHAN2.');
+writeln(       'Your destination disk should be dedicated as an OS disk,');
+writeln(       'that is, it should not have any Monitor volumes on it,');
+writeln(       'and should use all available blocks for an OS volume.');
+write(         'Is this the case?  (Type Y<CR> if so, otherwise type <CR>)  ');
+readln(answer);
+writeln;
+if (answer <> 'Y') and (answer <> 'y') then
+    begin
+    writeln('OK, the copy will not be performed then.  So long for now.');
+    GOTO 1;
+    end;
+
+MDDFp := pointer (ord(@rawbuffer) + plsize);
+
+repeat
+
+    ejectsrc := false;
+
+
+    {$IFC PROMPT }
+    repeat
+        write('Source Device: T(wiggy) or P(rofile):  ');readln(answer);
+        if (answer = 'T') or (answer = 't') then
+            begin
+            SrcDev := 'upper';
+            DestDev := 'lower';
+            MDDFoffset := tmddfoffset;
+            srcdevnum := 1;
+            destdevnum := 2;
+            ejectsrc := true;
+            goto 10;
+            end
+        else if (answer = 'P') or (answer = 'p') then
+            begin
+            SrcDev := 'paraport';
+            DestDev := 'slot2chan2';
+            MDDFoffset := pmddfoffset;
+            srcdevnum := 0;
+            with fsParams do    (* convert destdev name to device number *)
+            begin
+              command := gp;
+              funct := 3;    (* special call to convert *)
+              enp := @parm_array;
+              enp^ := DestDev;
+              parm1 := 0;  (* initialize *)
+            end;
+            Fs_Utilities (error, fsParams);
+            if fsParams.parm1 > 0 then
+            begin
+              destdevnum := fsParams.parm1;
+            end
+            else
+            begin
+              writeln ('Error converting slot2chan2 to device ', fsParams.parm1);
+              goto 20;
+            end;
+            goto 10;
+            end
+        else writeln(chr(7));
+    until false;
+    10: { break }
+
+
+    {$ELSEC }
+
+    SrcDev := 'paraport';
+    DestDev := 'slot2chan2';
+    MDDFoffset := pmddfoffset;
+    srcdevnum := 0;
+    with fsParams do    (* convert destdev name to device number *)
+    begin
+      command := gp;
+      funct := 1982;    (* special call to convert *)
+      enp := @parm_array;
+      enp^ := DestDev;
+      parm1 := 0;  (* initialize *)
+    end;
+    Fs_Utilities (error, fsParams);
+    if fsParams.parm1 > 0 then
+    begin
+      destdevnum := fsParams.parm1;
+    end
+    else
+    begin
+      writeln ('Error converting slot2chan2 to device ', fsParams.parm1);
+      goto 20;
+    end;
+
+    {$ENDC}
+
+    if vname <> fuzz then goto 1;
+                        (* in case of tricky attempt to subvert password check *)
+
+    unitio (error, srcdevnum, ord (@rawbuffer), 1 {block}, MDDFoffset {blocknum},
+            actual, raw_io, readop);
+    if error <> 0 then
+    begin
+      writeln ('Error reading source master = ', error);
+      goto 20;
+    end;
+
+    if vname <> fuzz then goto 1;
+                        (* in case of tricky attempt to subvert password check *)
+
+    if ( (MDDFp^.fsversion <> -thisfsversion) AND  (* both versions are OK *)
+         (MDDFp^.fsversion <> -oldfsversion) )
+        OR (MDDFp^.MDDFaddr <> 0)
+        OR (MDDFp^.blocksize <> 536)
+        OR (MDDFp^.flabel_size <> max_label_size)
+   {$IFC EUROPE}
+        OR (MDDFp^.volname <> relname)
+   {$ENDC}
+    then
+    begin
+      writeln (SrcDev, ' volume is not a copyable OS reproduction master, ');
+      writeln ('and will not be copied.');
+      goto 20;
+    end;
+
+    if vname <> fuzz then goto 1;
+                        (* in case of tricky attempt to subvert password check *)
+
+    writeln;
+    writeln('The copy operation about to be performed will do the following:');
+    writeln;
+    writeln('Device ',SrcDev:length(SrcDev),' will be copied in toto to Device ',
+             DestDev:length(DestDev),'; if this is your');
+    write  ('desire type Y<CR>.  If it is not, type <CR>  ');readln(answer);
+    writeln;
+    if (answer <> 'Y') and (answer <> 'y') then
+        begin
+        writeln('OK, the copy operation will not be performed.');
+        GOTO 20;
+        end;
+
+    if vname <> fuzz then goto 1;
+                        (* in case of tricky attempt to subvert password check *)
+
+    if DestDev = 'lower' then
+        begin
+        unmount (error, SrcDev);  (* in case Paslib mounted it on last readln!!! *)
+        unmount (error, DestDev);
+        writeln('Formatting lower');
+        with fsParams do
+            begin
+            command := format;
+            dev_name := DestDev;
+            end;
+        Fs_Utilities(error,fsParams);
+        if error = 0 then writeln(chr(7),'Formatting accomplished!')
+        else
+            begin
+            writeln(chr(7),'Error in formatting, is ',error);
+            goto 20;
+            end;
+        end;
+
+    writeln('Copying ',SrcDev:length(SrcDev),' to ',DestDev:length(DestDev));
+
+    with fsParams do
+        begin
+        command := copy_volume;
+        from_dev := SrcDev;
+        to_dev := DestDev;
+        buffAddr := CBuffAddr;
+        buffSize := CBuffSize;
+        end;
+
+    if vname <> fuzz then goto 1;
+                        (* in case of tricky attempt to subvert password check *)
+
+    Fs_Utilities(error,fsParams);
+
+    if (DestDev <> 'lower') and (error = 0) then
+        begin
+        WRITELN('writing boot tracks again');
+        with fsParams do
+            begin
+            command := writeBT;
+            dev_name := DestDev;
+            end;
+        Fs_Utilities(error,fsParams);
+        end;
+
+    if error = 0 then writeln
+                (chr(7),'Your disk copy operation has completed successfully.')
+    else writeln(chr(7),'Had a problem making the copy; error code was ',error);
+
+    unitio (error, destdevnum, ord (@rawbuffer), 1 {block}, MDDFoffset {blocknum},
+            actual, raw_io, readop);
+    if error <> 0 then
+    begin
+      writeln ('Error on read for final destination fixup = ', error);
+      goto 20;
+    end;
+
+    MDDFp^.tbt_copied := false;
+    MDDFp^.fsversion := -MDDFp^.fsversion;   (* unzap the volume *)
+    MDDFp^.unusedi1 := 0;                    (* curse the volume *)
+
+    unitio (error, destdevnum, ord (@rawbuffer), 1 {block}, MDDFoffset {blocknum},
+            actual, raw_io, writeop);
+    if error <> 0 then
+    begin
+      writeln ('Error on write for final destination fixup = ', error);
+      goto 20;
+    end;
+
+20: if DestDev = 'lower' then
+        begin
+        with fsParams do
+            begin
+            command := eject;
+            dev_name := DestDev;
+            end;
+        Fs_Utilities(error,fsParams);
+        if ejectsrc then
+        begin
+            fsParams.dev_name := SrcDev;
+            Fs_Utilities(error,fsParams);
+        end;
+        end
+    else
+        begin
+        writeln
+    (chr(7),'Please be careful about changing profiles by following these steps:');
+        WRITELN;
+        WRITELN(       'Profile Disconnection and Re-connection Steps:');
+        writeln;
+        WRITELN(       '1) Disconnect ribbon cable from Profile on SLOT2CHAN2');
+        WRITELN(       '2) Turn off power switch on this Profile');
+        WRITELN(       '3) Unplug power cord from this Profile');
+        WRITELN(       '4) Plug power cord into next destination Profile');
+        WRITELN
+        (       '5) Turn on power switch on Profile, WAIT for STEADY RED LIGHT');
+        writeln(       '   Note:  may take about two minutes or so');
+        WRITELN(       '6) Connect ribbon cable (from step 1) to this Profile.');
+        WRITELN(       '7) Proceed');
+        WRITELN;
+        end;
+
+    write('Would you like to make another copy?  (Y/N)  ');readln(answer)
+
+until (answer <> 'Y') and (answer <> 'y');
+
+1:
+end.
+
+ÿ

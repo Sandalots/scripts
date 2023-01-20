@@ -1,0 +1,868 @@
+unit Sched;     { Process Scheduler }
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+interface
+uses
+  (*$U object/driverdefs.obj *)  DriverDefs,
+  (*$U object/hwint.obj *)       HWInt,
+  (*$U object/sysglobal.obj *)   GLOBALDATA,
+  (*$U object/procprims.obj *)   Proc_Prims,
+  (*$U object/mmprim.obj *)      MMPRIMITIVES;
+
+
+  (*$IFC debug1 *)
+  procedure StartTime;
+    { procedure to start the millisecond timer for timings }
+
+
+  procedure AddTime (counter : int2);
+    { procedure to accumulate times in counters }
+  (*$ENDC *)
+
+  procedure Set_Address_Space (prev_domain : domainRange);
+    { procedure to establish the address space mapping for a process }
+
+
+  procedure Scheduler;
+    { low level process scheduler }
+
+
+  procedure SchedDisable;
+    { procedure to disable process switching by the Scheduler }
+
+
+  procedure SchedEnable;
+    { procedure to enable normal process switching by the Scheduler }
+
+
+  procedure SimpleScheduler;
+    { simple scheduler to manage a single process when boot volume is unmounted }
+
+
+
+implementation
+
+(*$IFC debug1 *)
+const
+  { counters in measTable for recording user vs. system vs. idle times }
+  userTime  = 47;
+  sysTime   = 48;
+  idleTime  = 49;
+  spareTime = 50;
+
+
+  function Logging : boolean;  external;
+
+  procedure Log (var errnum : integer;  ptr_arr : absptr);  external;
+(*$ENDC *)
+
+
+
+(*$S kr_prims *)
+
+  procedure ExitSys;  external;
+    { assembly language procedure for leaving system code }
+
+
+  procedure Recv_SoftInt;  external;
+    { procedure in ProcMgmt for receiving soft interrupts }
+
+
+  procedure excep_prolog;  external;
+    { procedure in ExcepMgmt for setting up exceptions }
+
+
+  (*$IFC debug1 *)
+  procedure StartTime;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to start the millisecond counter for          *)
+        (*   recording various times in the system.                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine should only be called from special places  *)
+        (*   in Process Management code.                             *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      measTable.misc[spareTime] := Timer
+    end { StartTime };
+
+
+  procedure AddTime (* counter : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Measurement procedure to accumulate times spent in      *)
+        (*   user code, system code, and idle.  The time elpased     *)
+        (*   since the last call to Timer is added to the specified  *)
+        (*   accumulator.                                            *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   counter : the index into the counters in the            *)
+        (*             measurement table for the particular counter  *)
+        (*             to be used for accumulating the time.         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine should only be called from special places  *)
+        (*   in Process Management code.                             *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      with measTable do
+        misc[counter] := (Timer - misc[spareTime]) + misc[counter]
+    end { AddTime };
+  (*$ENDC *)
+
+
+  procedure Setup_Exception;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure used by Scheduler to set up the candidate     *)
+        (*   process to be launched into the soft interrupt          *)
+        (*   procedure or the exception prolog procedure.  The       *)
+        (*   set up consists of placing the process in 'system       *)
+        (*   mode' and pushing the PC from the environment save      *)
+        (*   area onto the stack.                                    *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be used only by Scheduler.  *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      sysloc_ptr : ^syslocal;                 { local syslocal ptr }
+      pcb_ptr : ptr_PCB;                      { local ptr to candidate PCB }
+      stk_ptr : ^int4;                        { ptr to a longint on user stack }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+      sysloc_ptr := pointer(b_syslocal_ptr);
+
+      with sysloc_ptr^ do
+        begin
+          with SCB, env_save_area do
+            begin
+              A5value := A5;
+              PCvalue := PC;
+              domvalue := pcb_ptr^.domain
+            end;
+
+          Map_DataSpace;
+
+          with env_save_area do
+            begin
+              A7 := A7 - 4;   { for PC being pushed }
+              stk_ptr := pointer(A7);
+              if pcb_ptr^.softints <> [] then
+                begin
+                  stk_ptr^ := ord(@ExitSys);
+                  PC := ord(@Recv_SoftInt)   { launch into Recv_SoftInt }
+                end
+              else
+                begin
+                  stk_ptr^ := PC;
+                  PC := ord(@excep_prolog)   { launch into excep_prolog }
+                end;
+              A5 := sysA5
+            end { with env_save_area }
+        end { with sysloc_ptr^ };
+
+      pcb_ptr^.domain := 0;
+      DCT[0].owner := pcb_ptr^.glob_id;
+      if anyBPs then Set_BP (pcb_ptr^.glob_id)   { not needed? }
+    end { Setup_Exception };
+
+
+  procedure Pause;   external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to place the CPU in the     *)
+        (*   STOPped state while Scheduler is waiting for a process  *)
+        (*   to come ready.  An interrupt will force the processor   *)
+        (*   out of this state and, after the appropriate interrupt  *)
+        (*   handler has executed, the Scheduler will continue       *)
+        (*   execution from the start of its Ready queue scan        *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be used only by the         *)
+        (*   Scheduler.                                              *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  procedure Launch;   external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to launch a process into    *)
+        (*   execution.  The processor registers are restored to     *)
+        (*   the values that were in effect when the process last    *)
+        (*   gave up the CPU and the process continues execution     *)
+        (*   from where it left off.  The process to be launched is  *)
+        (*   pointed to by c_pcb_ptr.                                *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be used only by the         *)
+        (*   Scheduler.  Note that execution never returns to this   *)
+        (*   procedure but rather continues with the launched        *)
+        (*   process.                                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+{  procedure Shift_Counters (var inc_counter : int2);  external;}
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to shift the reference      *)
+        (*   counters for domains 1-3 and increment (reference) the  *)
+        (*   specified reference counter.  These shift counters are  *)
+        (*   used to implement a simple LRU replacement policy for   *)
+        (*   use when a process must execute and no domain is        *)
+        (*   available for it.  The shift counters themselves are    *)
+        (*   16-bit integers with the sign bit ignored.  They are    *)
+        (*   shifted using the LSR instruction and incremented by    *)
+        (*   setting bit 14 of the integer.                          *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   inc_counter : the reference counter that is to be       *)
+        (*                 incremented after all the counters have   *)
+        (*                 been shifted.                             *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None, other than inc_counter.                           *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  function SelectDomain : domainRange;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Function to select a domain for a process in user mode  *)
+        (*   to be mapped into.  If a free domain is available, it   *)
+        (*   will be used.  Otherwise, a replacement is chosen       *)
+        (*   based on an LRU policy using the reference counters in  *)
+        (*   the DCT.                                                *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   SelectDomain : the domain selected for use by a         *)
+        (*                  process in user mode.                    *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      i : 1..sentDomain;                      { loop index }
+
+    begin
+      { first look for a free domain }
+      i := 1;
+      while DCT[i].owner > 0 do i := i + 1;
+
+      if i < sentDomain then SelectDomain := i
+      else
+        { must choose a replacement }
+        SelectDomain := domainLRU[maxDomain]
+    end { SelectDomain };
+
+
+  procedure ShiftLRU (new_head : domainRange);  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    (*var
+      scan : 1..sentDomain;                   { loop index for scanning }
+      shift : 1..sentDomain;                  { loop index for shifting }
+
+    begin
+      domainLRU[sentDomain] := new_head;   scan := 1;
+      while domainLRU[scan] <> new_head do
+        scan := scan + 1;
+
+      {MoveRight (domainLRU[scan-1], domainLRU[scan], scan - 1);}
+      for shift := scan downto 2 do
+        domainLRU[shift] := domainLRU[shift-1];
+
+      domainLRU[1] := new_head
+    end { ShiftLRU };*)
+
+
+  procedure Set_Address_Space (* prev_domain : domainRange *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to establish the address space of the         *)
+        (*   process pointed to by c_pcb_ptr.  The DCT is checked    *)
+        (*   to determine whether a domain is already being used     *)
+        (*   for the process.  If so, that domain is used.  If not,  *)
+        (*   a domain is selected for the process to be re-mapped    *)
+        (*   into.  If a domain was selected, the process's address  *)
+        (*   space is mapped into that domain and the hardware set   *)
+        (*   to reflect that fact.  The DCT is updated               *)
+        (*   appropriately.                                          *)
+        (*                                                           *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   prev_domain : the domain that the process about to be   *)
+        (*                 launched was last executing in.           *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be used only by the         *)
+        (*   Scheduler when launching a process or by ReturnUser     *)
+        (*   when returning a process that was in system code to     *)
+        (*   user code.                                              *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                      { ptr to current PCB }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+
+      if DCT[prev_domain].owner = pcb_ptr^.glob_id then
+        begin  { domain is still intact }
+          Set_Domain (prev_domain);
+          if prev_domain > 0 then ShiftLRU (prev_domain);
+          pcb_ptr^.domain := prev_domain   { extra for Scheduler }
+        end
+      else
+        begin  { must do some re-mapping }
+          if prev_domain = 0 then   { extra for ReturnUser }
+            begin  { process is still in system }
+              Map_DataSpace;
+              DCT[0].owner := pcb_ptr^.glob_id
+            end
+          else
+            begin  { must choose a new user domain }
+              with pcb_ptr^ do
+                begin
+                  domain := SelectDomain;
+                  Map_Domain (domain);
+                  DCT[domain].owner := glob_id;
+                  ShiftLRU (domain)
+                end
+            end { choose a new domain }
+        end { re-map a domain };
+
+      if anyBPs then Set_BP (pcb_ptr^.glob_id)   { not needed for domain 0? }
+    end { Set_Address_Space };
+
+
+  procedure Scheduler;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to implement low level process scheduling in  *)
+        (*   the Lisa Operating System.  Process scheduling in the   *)
+        (*   Lisa environment is non-preemptive, generally with the  *)
+        (*   highest priority process holding the CPU.               *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   Execution on a process in the Ready queue is begun      *)
+        (*   (i.e. control is transferred to the code that process   *)
+        (*   is executing).  If no process can be executed, the      *)
+        (*   Scheduler executes the STOP instruction.                *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   The Scheduler should only be entered by calling         *)
+        (*   Enter_Scheduler, which does a TRAP(2) if the system is  *)
+        (*   running in user state or a JMP if the system is         *)
+        (*   running in Supervisor state.  Note that Scheduler       *)
+        (*   enables all interrupts before beginning its work.       *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    (*$IFC debug1 *)
+    type
+      sw_logEvent = record   { process switch log }
+                      sw_type   : int1;     { type = 22 }
+                      sw_res    : int1;     { reserved }
+                      sw_res2   : int2;     { reserved }
+                      sw_pcbPtr : absptr;   { ptr to PCB of new process }
+                      sw_id     : int4      { global id of new process }
+                    end;
+    (*$ENDC *)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+      candidate : ptr_PCB;                    { ptr to candidate process }
+      status : launch_status;                 { action for launching }
+      (*$IFC debug1 *)
+      SW_event : sw_logEvent;                 { for logging the process switches }
+      errnum : int2;                          { error return from Log }
+      (*$ENDC *)
+
+    procedure SelectProcess;
+      { procedure used by Scheduler to select a process from the Ready queue to
+        be launched into execution }
+
+      begin
+        if nonPreempt <> ord(nil) then
+          begin  { a non-preemptive process is active }
+            candidate := pointer(nonPreempt);
+
+            if candidate^.blk_state = [] { active } then
+              begin  { process is ready }
+                if not candidate^.need_mem then
+                  exit (SelectProcess);
+
+                Prepare_Process (candidate, status);
+                if status = ok_launch then
+                  exit (SelectProcess)
+                else if status = mm_launch then
+                  begin
+                    { launch memory mgr process to do memory scheduling }
+                    candidate := pointer(mm_pcb_ptr);
+                    exit (SelectProcess)
+                  end
+              end { process ready };
+
+            { choose only a preemptive process }
+            if sched_attn <> ord(nil) then
+              begin  { a special attention process }
+                candidate := pointer(sched_attn);
+                sched_attn := ord(nil);
+                if candidate^.np_count <= 0 then
+                  begin  { process is preemptive }
+                    if not candidate^.need_mem then
+                      exit (SelectProcess);
+
+                    Prepare_Process (candidate, status);
+                    if status = ok_launch then
+                      exit (SelectProcess)
+                    else if status = mm_launch then
+                      begin
+                        { launch memory mgr process to do memory scheduling }
+                        candidate := pointer(mm_pcb_ptr);
+                        exit (SelectProcess)
+                      end
+                  end { process is preemptive }
+              end { special attention };
+
+            Intsoff (allints, int_level);
+            candidate := pointer(fwd_ReadyQ);
+            Intson (int_level);
+
+            while candidate^.priority > 0 do
+              begin  { Ready queue scan }
+                if candidate^.np_count <= 0 then
+                  begin  { preemptive process }
+                    if not candidate^.need_mem then
+                      exit (SelectProcess);
+
+                    Prepare_Process (candidate, status);
+                    if status = ok_launch then
+                      exit (SelectProcess)
+                    else if status = mm_launch then
+                      begin
+                        { launch memory mgr process to do memory scheduling }
+                        candidate := pointer(mm_pcb_ptr);
+                        exit (SelectProcess)
+                      end
+                  end { preemptive process };
+
+                { candidate can't be launched - get next process }
+                Intsoff (allints, int_level);
+                candidate := candidate^.next_schedPtr;
+                Intson (int_level)
+              end { Ready queue scan }
+          end { non-preemptive process active }
+
+        else
+          begin  { normal scheduling - choose any available process }
+            if sched_attn <> ord(nil) then
+              begin  { a special attention process }
+                candidate := pointer(sched_attn);
+                sched_attn := ord(nil);
+                if not candidate^.need_mem then
+                  exit (SelectProcess);
+
+                Prepare_Process (candidate, status);
+                if status = ok_launch then
+                  exit (SelectProcess)
+                else if status = mm_launch then
+                  begin
+                    { launch memory mgr process to do memory scheduling }
+                    candidate := pointer(mm_pcb_ptr);
+                    exit (SelectProcess)
+                  end
+              end { special attention };
+
+            Intsoff (allints, int_level);
+            candidate := pointer(fwd_ReadyQ);
+            Intson (int_level);
+
+            while candidate^.priority > 0 do
+              begin  { Ready queue scan }
+                if not candidate^.need_mem then
+                  exit (SelectProcess);
+
+                Prepare_Process (candidate, status);
+                if status = ok_launch then
+                  exit (SelectProcess)
+                else if status = mm_launch then
+                  begin
+                    { launch memory mgr process to do memory scheduling }
+                    candidate := pointer(mm_pcb_ptr);
+                    exit (SelectProcess)
+                  end
+                else
+                  begin  { candidate can't be launched - get next process }
+                    Intsoff (allints, int_level);
+                    candidate := candidate^.next_schedPtr;
+                    Intson (int_level)
+                  end
+              end { Ready queue scan }
+          end { normal scheduling };
+
+        candidate := nil   { no one to run right now }
+      end { SelectProcess };
+
+
+    begin  { Scheduler }
+      Intson (0);   { make sure all interrupts are enabled }
+      (*$IFC debug1 *)
+      candidate := pointer(c_pcb_ptr);
+      if candidate^.domain = 0 then AddTime (sysTime)
+      else
+        AddTime (userTime);
+      (*$ENDC *)
+
+      { quiesce the currently running process }
+      if anyBPs then
+        begin
+          candidate := pointer(c_pcb_ptr);
+          Clr_BP (candidate^.glob_id)
+        end;
+      c_pcb_ptr := ord(nil);
+
+      { select a new process for execution }
+      while true do  { forever - until a process is launched }
+        begin
+          Invoke_sched := false;
+
+          SelectProcess;
+          if candidate <> nil then
+            begin  { launch selected process }
+              c_pcb_ptr := ord(candidate);
+
+              Map_Syslocal (candidate);
+              with candidate^ do
+                begin
+                  if np_count > 0 then nonPreempt := c_pcb_ptr;
+
+                  if ((softints <> []) or (excep_pending > 0)) and
+                       (domain <> 0) then
+                    Setup_Exception
+                  else
+                    Set_Address_Space (domain)
+                end;
+
+              (*$IFC debug1 *)
+              if Trace (spare2, 5) then
+                if Logging then
+                  begin  { must log the process switch }
+                    with SW_event do
+                      begin
+                        sw_type := 22;
+                        sw_pcbPtr := c_pcb_ptr;
+                        sw_id:= candidate^.glob_id
+                      end;
+                    Log (errnum, ord(@SW_event))
+                  end;
+              (*$ENDC *)
+
+              {if anyBPs then Set_BP (candidate^.glob_id); - in Set_Addr & SetEx }
+
+              { Invoke_sched := false; - could miss higher process coming ready }
+              (*$IFC debug1 *)
+              StartTime;
+              (*$ENDC *)
+
+              Launch   { never returns }
+            end { launch process };
+
+          { nothing to do so wait around for something }
+          if not Invoke_sched then
+            begin
+              (*$IFC debug1 *)
+              StartTime;
+              (*$ENDC *)
+
+              Pause;   { enables interrupts }
+
+              (*$IFC debug1 *)
+              AddTime (idleTime);
+              (*$ENDC *)
+            end
+        end { loop forever }
+    end { Scheduler };
+
+
+  procedure SchedDisable;  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to disable normal process switching by the    *)
+        (*   Scheduler.  The current (calling) process will be the   *)
+        (*   only process in the system that will continue to be     *)
+        (*   scheduled.                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended only to be called as part of   *)
+        (*   the code to unmount the boot volume.                    *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  procedure SchedEnable;  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to enable normal process switching by the     *)
+        (*   Scheduler.                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  procedure SimpleScheduler;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to perform scheduling of a single process     *)
+        (*   when the boot volume is unmounted.  Assumes that the    *)
+        (*   current process is the only one to be allowed to        *)
+        (*   execute.  This mode of operation is established by      *)
+        (*   calling SchedDisable.  Normal scheduling is             *)
+        (*   re-established by calling SchedEnable.                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This scheduler is only to be used in the special case   *)
+        (*   of unmounting the boot volume.                          *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   If the process being scheduled requires any memory      *)
+        (*   scheduling, a system error occurs.                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+      candidate : ptr_PCB;                    { ptr to candidate process }
+      status : launch_status;                 { action for launching }
+
+    procedure Fail (error : int2);
+      { procedure to display error message before system error occurs }
+
+      begin
+        (*$IFC debug2 *)
+        writeln ('   *** Failing PCB ptr = ', ord(candidate):1);
+        (*$ENDC *)
+        System_Error (error)
+      end;
+
+    begin  { SimpleScheduler }
+      c_pcb_ptr := ord(nil);
+      Intson (0);   { make sure all interrupts are enabled }
+
+      while true do { forever }
+        begin
+          candidate := pointer(ubd_pcb_ptr);
+          if candidate^.need_mem then
+            begin
+              Prepare_Process (candidate, status);
+              if (status <> ok_launch) then candidate := pointer(mm_pcb_ptr)
+            end;
+          with candidate^ do
+            if blk_state = [i_o] then Pause   { enables interrupts }
+            else if blk_state <> [] then Fail (10198)
+            else
+              begin
+                c_pcb_ptr := ord(candidate);
+                Map_Syslocal (candidate);
+                if ((softints <> []) or (excep_pending > 0)) and
+                    (domain <> 0) then
+                  Setup_Exception
+                else
+                  Set_Address_Space (domain);
+                Launch   { never returns }
+              end
+        end { while }
+    end { SimpleScheduler };
+
+
+end.
+
+
+ÿ

@@ -1,0 +1,1126 @@
+
+  UNIT RS232;           (* built-in RS-232 driver *)
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+  INTERFACE
+
+    USES
+      (*$Uobject/driverdefs.obj*)
+        driverdefs,
+      (*$Uobject/driversubs.obj*)
+        driversubs;
+
+      function RS_232 (parameters: param_ptr): integer;
+
+      procedure COPYBYTES (port_ptr: absptr);
+
+  IMPLEMENTATION
+
+    (*$R-*)
+
+    CONST
+      errbase = 640;
+      axmit = 0;
+      amodem = 1;
+      arecv = 2;
+      aerr = 3;
+
+    TYPE
+  (**)send_hs = (hw_hs, xmt_xon, xmit_delay);  (*transmit handshake type*)
+  (**)recv_hs = (hwhs, rec_xon);  (*receive handshake type*)
+
+  (**)int1ptr = ^int1;
+
+  (**)int1recptr = ^int1rec;
+  (**)int1rec = record
+  (**)            controlreg: int1;
+  (**)          end;
+
+
+      portrec_ptr = ^portrec;
+      portrec = record
+  (**)            frozen_addr: absptr; (*holds result of freeze_seg*)
+  (**)            flags: packed record
+  (**)               junk: -16..15; (*5 garbage bits*)
+  (**)               no_cur_req: boolean;
+  (**)               cur_read_flag: boolean;
+  (**)               xmit_wait: boolean; (*waiting for XON, modem signal or timeout*)
+  (**)            end;
+  (**)            restrt_out: boolean;
+  (**)            prev_char: int1;
+  (**)            autolf: boolean;
+  (**)            lastwr1: int1; (*for use by ALLOW_OTHER and RESTORE *)
+  (**)            hwcontrol: int1recptr;  (* actual I/O address *)
+  (**)            cur_req_ptr: reqptr_type;
+  (**)            sdb_ptr: absptr; (*copy of buff_rdb_ptr in req extent*)
+  (**)            offset: absptr; (*copy of buff offset in req extent*)
+  (**)            xfercnt: longint; (*copy of xfer_count in req extent*)
+  (**)            numbytes: longint; (*coyp of num_bytes in req extent*)
+  (**)            hi_speed: boolean; (*true when >= 4800 baud*)
+
+
+                  (*RS-232 output variables*)
+
+  (**)            xmt_hs: send_hs;  (*handshake for transmitting*)
+  (**)            xmit_ref: integer;  (*timer refnum*)
+
+                    (*xmt_hs = hw_hs or xmt_xon. (modem or xoff/xon handshake): *)
+  (**)              xmit_timeout: longint;  (*hardware handshake timeout*)
+
+                      (*xmt_hs = hw_hs. (no handshake, or modem handshake): *)
+  (**)                xmtrr0: int1; (*modem controls required *)
+  (**)                xmtzrr0: int1; (*modem required to = 0 *)
+
+                    (*xmt_hs = xmit_delay. (delay after CR, LF): *)
+  (**)              crlfdelay: longint; (*timer count *)
+  (**)              waitb4next: boolean; (*cr or lf was xmitted *)
+
+                  (*RS-232 input variables*)
+
+                    (*rec_hs = rec_xon. (send xoff/xon when threshhold reached): *)
+  (**)              hschar_pending: (no_char, xoff_char, xon_char);
+
+  (**)            strip_parity: boolean; (*TRUE when 8th bit gets zero'd*)
+  (**)            size_typeah: 34..1024; (*size of type-ahead input buffer*)
+  (**)            start_typeah, get_typeah, put_typeah: int1ptr; (*type ahead ptrs*)
+  (**)            start_errbuf: absptr; (*equals start_typeah+size_typeah*)
+  (**)            er_framing,er_parity,er_overrun,er_ovflow: longint; (*err counters*)
+  (**)            rec_hs: recv_hs;  (*handshake for receiving*)
+  (**)            last_stopped: boolean; (*DTR off or XOFF last sent*)
+  (**)            num_typeah: integer;  (*number of chars currently in buffer*)
+  (**)            full_thresh: integer; (*threshhold for sending "buffer-full"*)
+  (**)            wr5: record
+  (**)                   case integer of
+  (**)                   0: (byte: int1);
+  (**)                   1: (bits: packed record
+  (**)                               dtr: boolean;
+  (**)                               fill1: -2..1; (*2-bit fill*)
+  (**)                               break: boolean;
+  (**)                               fill2: -8..7  (*4-bit fill*)
+  (**)                             end)
+  (**)                 end;
+  (**)            wr15: record (*needed by RESTORE*)
+  (**)                   case integer of
+  (**)                   0: (byte: int1);
+  (**)                   1: (bits: packed record
+  (**)                               fill1: -128..127; (*8-bit fill for now*)
+  (**)                             end)
+  (**)                 end;
+  (**)            prior_rr0: int1;
+  (**)            rr0_changes: int1;
+  (**)            await_tx: int1; (*for use by RESTORE*)
+  (**)            allow_status: integer; (*int prio for ALLOW_OTHER, w/super bit set*)
+                  empty_thresh: integer;(*threshhold for sending "buffer-empty"*)
+                  input_ref: integer;   (*refnum for input timeout*)
+                  input_timeout: longint; (* = 0 if no timeout*)
+                  discon_detect: boolean;
+                  restrt_in: boolean;
+                  no_block: boolean; (*blocking/non-blocking read mode*)
+
+                  in_copybytes: boolean;
+                  need_copy: boolean; (*true when requesting copybytes execution*)
+                  cur_info_ptr: seqextptr_type;
+                  nullink: linkage;  (* points to head of queue *)
+                  openwr14: int1;
+                  dobreak: boolean; (*enable break on close?*)
+                  channel: integer;
+
+                  (*configuration state vars needed only for devcontrol #19*)
+                  grp_a: integer;
+                  grp_b: integer;
+                  grp_c: longint;
+               end;
+
+
+      procedure RSOUT (port: portrec_ptr); external; (*replaces byteo*)
+
+      procedure FINISH_REQ (port: portrec_ptr; ok_flag: boolean); forward;
+
+      procedure WR_SCC (regno: int1; val: int1; port_ptr: portrec_ptr); external;
+
+      procedure FINDBIT(var newlen: integer; base: absptr; start: integer;
+                             len: integer; size: integer); external;
+
+      procedure ALLOW_OTHER (port_ptr: portrec_ptr; var prevstatus: intson_type);
+                                                                        external;
+      procedure RESTORE (port_ptr: portrec_ptr; prevstatus: intson_type); external;
+
+      procedure COPYBYTES (*port_ptr: absptr*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Copy bytes from typeahead buffer to user buffer*)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current port in the *)
+       (*         RS-232 device control block.                      *)
+       (*                                                           *)
+       (* Output Parameters:                                        *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  RS-232 interrupts must be off.*)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        i, errnum, cnt, orig_num: integer;
+        data_ptr: int1ptr;
+        real_addr: longint;
+        port: portrec_ptr;
+
+      begin
+        port := pointer (port_ptr);
+        WITH port^ do
+        if in_copybytes then (*use in_copybytes as semaphore on entry to this code*)
+          need_copy := true
+        else
+        repeat
+          need_copy := false;
+          in_copybytes := true;
+          lastwr1 := $17;
+          WR_SCC (1, lastwr1, port); (*allow interrupts on this channel!*)
+          orig_num := num_typeah; (*while in interrupt contin., num_typeah might change*)
+          i := numbytes - xfercnt;
+          if i > orig_num then
+            i := orig_num + 1; (*look for error @ end if reading past end*)
+          FINDBIT(cnt, start_errbuf, ord(get_typeah)-ord(start_typeah),
+                  i, size_typeah); (*see if there are any errors for this data*)
+          if i <> cnt then
+            cur_req_ptr^.hard_error := errbase+3;
+
+          if cnt > orig_num then
+            cnt := orig_num; (*re-adjust for read-past-end case*)
+
+          if cnt <= 0 then
+          begin
+            WR_SCC (1, 0, port); (*end of intson window*)
+            lastwr1 := 0;
+            in_copybytes := false;
+          end
+          else
+          begin (*cnt > 0*)
+              FREEZE_SEG (errnum, sdb_ptr, offset, ord(cur_req_ptr), real_addr);
+              if errnum <> 0 then
+              begin
+                restrt_in := true;
+                WR_SCC (1, 0, port); (*end of intson window*)
+                lastwr1 := 0;
+                in_copybytes := false;
+              end
+              else
+              begin (*transfer typed-ahead characters to user buffer*)
+                data_ptr := pointer(real_addr + xfercnt);
+                i := ord(get_typeah) + cnt - start_errbuf; (*# wraparound chars*)
+                if i < 0 then (*transfer all chars in single move of length "cnt"*)
+                  i := cnt
+                else
+                begin (*transfer requires two moves*)
+                  moveleft (get_typeah^, data_ptr^, cnt - i);
+                  data_ptr := pointer (ord(data_ptr) + cnt - i);
+                  get_typeah := start_typeah
+                end;
+                moveleft (get_typeah^, data_ptr^, i);
+                get_typeah := pointer (ord(get_typeah) + i);
+
+                UNFREEZE_SEG (sdb_ptr); (*allow buffer to move*)
+
+                WR_SCC (1, 0, port); (*end of intson window*)
+                lastwr1 := 0;
+                in_copybytes := false;
+                num_typeah := num_typeah - cnt;
+                if last_stopped then
+                  if num_typeah <= empty_thresh then (*allow input*)
+                  begin
+                    last_stopped := false;
+                    if rec_hs = hwhs then
+                    begin (*toggle modem signals*)
+                      wr5.bits.dtr := true;
+                      WR_SCC (5, wr5.byte, port)
+                    end
+                    else
+                    begin (*send xon*)
+                      hschar_pending := xon_char;
+                      RSOUT (port);
+                    end
+                  end;
+                xfercnt := xfercnt + cnt
+              end;
+            end;
+
+            if cur_req_ptr^.hard_error <> 0 then
+            begin
+              need_copy := false;
+              FINISH_REQ (port, false)
+            end
+            else
+              if (xfercnt = numbytes) or no_block then (*read complete*)
+              begin
+                need_copy := false;
+                FINISH_REQ (port, true)
+              end
+              else
+                if input_timeout > 0 then
+                  ALARMRELATIVE (input_ref, input_timeout);
+        until not need_copy
+    end; (*copybytes*)
+
+
+      procedure START_NEW_REQUEST (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start a new read or write from the queue.   *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current port in the *)
+       (*         RS-232 device control block.                      *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Modem control signals are affected.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  RS-232 interrupts must be off.*)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      begin
+        WITH port^ do
+          begin
+            cur_req_ptr := CHAIN_FORWARD (nullink);
+            flags.no_cur_req := false;
+            cur_req_ptr^.reqstatus.reqsrv_f := in_service;
+            cur_info_ptr := pointer (cur_req_ptr^.req_extent);
+            WITH cur_info_ptr^ do
+            begin
+              sdb_ptr := buff_rdb_ptr;
+              offset := buff_offset;
+              numbytes := num_bytes;
+              if read_flag then
+                flags.cur_read_flag := true
+              else
+                flags.cur_read_flag := false;
+              xfercnt := 0;
+              if discon_detect and (hwcontrol^.controlreg < 0) then
+              begin  (*assume disconnected cable on input framing error*)
+                flags.xmit_wait := false;  (*fixes bug*)
+                cur_req_ptr^.hard_error := errbase + 8;
+                FINISH_REQ (port, false)
+              end
+              else (*start up i/o for new request*)
+                if flags.cur_read_flag then
+                  COPYBYTES (ord(port))
+                else (*write*)
+                begin
+                  waitb4next := false;
+                  if (xmt_hs = xmt_xon) and flags.xmit_wait then (*last received xoff*)
+                  begin
+                    if xmit_timeout > 0 then
+                      ALARMRELATIVE (xmit_ref, xmit_timeout)
+                  end
+                  else
+                    RSOUT (port)
+                end
+            end
+          end
+      end;  (*start_new_request*)
+
+       procedure FINISH_REQ (*port: portrec_ptr; ok_flag: boolean*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Complete the current request                *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current port in the *)
+       (*         RS-232 device control block. Ok-flag is param to  *)
+       (*         UNBLK_REQ.                                        *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Modem control signals are affected.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Cur_req_ptr must be valid.    *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        err: integer;
+        ptrsysg: ^longint;
+
+      begin
+          ptrsysg := pointer(bsysglob);   (*set up pointer to b_sysglobal_ptr*)
+          WITH port^ do
+          begin
+            if in_copybytes then
+              EXIT (finish_req);
+            ADJ_IO_CNT (false, sdb_ptr);  (*allow swapout*)
+            UNBLK_REQ (cur_req_ptr, ok_flag);
+            DEQUEUE (cur_req_ptr^.dev_chain, ptrsysg^);
+            cur_info_ptr^.xfer_count := xfercnt;
+            if flags.xmit_wait then
+              ALARMOFF (xmit_ref);
+            if flags.cur_read_flag then
+            begin
+              if input_timeout > 0 then
+                ALARMOFF (input_ref);
+              restrt_in := false (*prevent reqrestart after completion. fixes bug*)
+            end
+            else (*write*)
+            begin
+              if hschar_pending = no_char then
+                restrt_out := false; (*fixes bug*)
+                if frozen_addr <> ord(nil) then
+                begin
+                  UNFREEZE_SEG (sdb_ptr);
+                  frozen_addr := ord(nil);
+                end
+            end;
+            if (nullink.fwd_link + ptrsysg^) <> ord(@nullink) then
+              START_NEW_REQUEST (port)
+            else (*queue empty*)
+              flags.no_cur_req := true
+          end
+      end; (*finish_req*)
+
+
+       procedure XMT_TO_HNDL (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Timeout handler when waited too long for    *)
+       (*     resuming output to RS-232 channel A or B, or Delaying *)
+       (*     after transmitting CR or LF.                          *)
+       (*                                                           *)
+       (* Input Parameters:  pointer to data for Port A or B        *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  completes the request with an error        *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                        Called with all ints off.          *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+       VAR
+         ptrsysg: ^longint;
+
+       begin
+         WITH port^ do
+           if wr5.bits.break then
+           begin (*remove from break state*)
+             wr5.bits.break := false;
+             if (rec_hs = hwhs) and last_stopped then
+               wr5.bits.dtr := false
+             else
+               wr5.bits.dtr := true;
+             WR_SCC (5, wr5.byte, port);
+             ptrsysg := pointer (bsysglob);
+             if (nullink.fwd_link + ptrsysg^) <> ord(@nullink) then
+               START_NEW_REQUEST (port) (*start next pending request*)
+           end
+           else
+             if flags.xmit_wait then
+               if not flags.no_cur_req then
+               begin
+                 if xmt_hs <> xmt_xon then
+                   flags.xmit_wait := false;
+                 if xmt_hs = xmit_delay then  (*time up after CR or LF*)
+                   if xfercnt < numbytes then
+                     RSOUT (port)  (*send next byte out*)
+                   else  (*complete previous request*)
+                     FINISH_REQ (port, true)
+                 else
+                 begin  (*handshake has been delayed too long*)
+                   cur_req_ptr^.hard_error := errbase + 7;
+                   FINISH_REQ (port, false)
+                 end
+               end
+       end; (*xmt_to_hndl*)
+
+
+      function RS_232(*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  RS-232 external interface via DRIVERCALL    *)
+       (*                                                           *)
+       (* Input Parameters:  Parameters depend on function code     *)
+       (*                                                           *)
+       (* Output Parameters:  Function returns integer errnum.      *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        prevstat: intson_type;
+        port_ptr: portrec_ptr;
+        i,char_in: int1;
+        ptrsysg: ^longint;
+        p: params;
+        dcrec: dc_rec;
+
+
+      procedure INITIT;
+       (*************************************************************)
+       (*  internal procedure to handle initialize "case" and reduce*)
+       (*    code size of main RS_232 procedure                     *)
+       (*************************************************************)
+
+      VAR
+        ptrsysg: ^longint;
+        err,i: integer;
+        temp : longint;
+        portacontrol,portbcontrol : int1recptr;
+        p: params;
+        dcrec: dc_rec;
+
+      begin
+            err := 0;
+            ptrsysg := pointer(bsysglob);   (*set up pointer to b_sysglobal_ptr*)
+            if not GETSPACE (sizeof(portrec), ptrsysg^, temp) then
+              err := errbase + 6
+            else
+            begin
+              parameters^.configptr^.cb_addr := temp;
+              port_ptr := pointer(temp)
+            end;
+
+            (* initialize either port A or B *)
+
+            if err = 0 then
+            WITH parameters^, port_ptr^ do
+              begin
+                case configptr^.slot_no of
+                0: begin (*slot 1 at int prio 5*)
+                     channel := ord(configptr^.iochannel=0); (*reversed*)
+                     portacontrol := pointer (iospacemmu*$20000 + $2003);
+                     allow_status := $2400 (*set one lower than priority*)
+                   end;
+                1: begin (*slot 2 at int prio 4*)
+                     channel := ord(configptr^.iochannel=0); (*reversed*)
+                     portacontrol := pointer (iospacemmu*$20000 + $6003);
+                     allow_status := $2300
+                   end;
+                2: begin (*slot 3 at int prio 3*)
+                     channel := ord(configptr^.iochannel=0); (*reversed*)
+                     portacontrol := pointer (iospacemmu*$20000 + $0A003);
+                     allow_status := $2200
+                   end;
+                otherwise begin (*built-in at int prio 6*)
+                     channel := configptr^.iochannel;
+                     portacontrol := pointer (iospacemmu*$20000 + $0D203);
+                     allow_status := $2500
+                   end;
+                end; (*case*)
+
+                portbcontrol := pointer (ord(portacontrol) - 2);
+                lastwr1 := 0; (*causes next ALLOW_OTHER to not enable ints in WR1*)
+                flags.no_cur_req := true;
+
+                if channel = 0 then
+                begin (*chan A initializations*)
+                  xmtrr0 := $10; (* bit position for DSR signal*)
+                  xmtzrr0 := 0;
+                  openwr14 := 3; (*port A uses baud rate generator*)
+                  wr5.byte := -22;
+                  hwcontrol := portacontrol;
+                  i := hwcontrol^.controlreg; (*make sure initially writes to reg 0*)
+                  WR_SCC (9, -118, port_ptr)  (* = $8a, reset chan A*)
+                end
+                else
+                begin (*chan B initializations*)
+                  xmtrr0 := 0;
+                  xmtzrr0 := $20; (* bit position for DSR' *)
+                  openwr14 := 1;
+                  wr5.byte := -24;
+                  hwcontrol := portbcontrol;
+                  i := hwcontrol^.controlreg; (*make sure initially writes to reg 0*)
+                  WR_SCC (9, $4A, port_ptr)  (* reset chan B*)
+                end;
+
+                WR_SCC (4, $44, port_ptr);  (*set operating mode*)
+
+                if channel = 0 then
+                  WR_SCC (11, $50, port_ptr) (*Port A uses baud rate generator*)
+                else
+                begin
+                  WR_SCC (11, -48, port_ptr); (* = $D0 for oscillator source on Port B*)
+                  for i := 1 to 1000 do ;  (*kill time while oscillator starts*)
+                end;
+
+                (*set baud rate*)
+
+                p.configptr := configptr;
+                p.fnctn_code := dcontrol;
+                dcrec.dversion := 2;
+                dcrec.dcode := 5;
+                dcrec.ar10[0] := 1200; (*baud rate*)
+                p.parptr := ord(@dcrec);
+                i := RS_232 (@p);  (*call internal device control routine*)
+
+                WR_SCC (10, 0, port_ptr);
+
+                WR_SCC (3, -63, port_ptr);  (*set receiver state to $C1*)
+
+                WR_SCC (5, wr5.byte, port_ptr);  (*set to standard modem signals*)
+
+                if channel = 0 then
+                  wr15.byte := -112 (*=$90 enable ints on  BRK & SYNC A modem change*)
+                else
+                  wr15.byte := -96; (*=$A0 or enable ints on BRK & CTS B modem change*)
+                WR_SCC (15, wr15.byte, port_ptr);
+
+                hwcontrol^.controlreg := $10; (*reset modem latch*)
+
+                er_framing := 0;
+                er_parity := 0;
+                er_overrun := 0;
+                er_ovflow := 0;
+                in_copybytes := false;
+                need_copy := false;
+                prior_rr0 := 0;
+                await_tx := 0;
+                grp_a := 0;
+                grp_b := 2;
+                dobreak := true;
+                discon_detect := false;
+                restrt_in := false;
+                restrt_out := false;
+                prev_char := 0;
+                frozen_addr := ord(nil);
+                autolf := false;
+                nullink.fwd_link := ord(@nullink) - ptrsysg^;
+                nullink.bkwd_link := nullink.fwd_link;
+                flags.junk := 0;
+                flags.xmit_wait := false;
+                xmt_hs := hw_hs;
+
+                (*receiver initializations*)
+
+                no_block := true;
+                rec_hs := hwhs;
+                strip_parity:= false;
+                last_stopped := false;
+                input_timeout := 0;
+                xmit_timeout := 20000;  (*20 seconds*)
+                ALARM_ASSIGN(xmit_ref, configptr, rsints);
+                if xmit_ref = 0 then
+                begin
+                  err := 602; (*timer table full*)
+                  RELSPACE (ord(port_ptr), ptrsysg^)
+                end
+                else
+                begin  (*initialize type-ahead buffer*)
+                    size_typeah := 0; (*temporary value*)
+                    p.configptr := configptr;
+                    p.fnctn_code := dcontrol;
+                    dcrec.dversion := 2;
+                    dcrec.dcode := 9;
+                    dcrec.ar10[0] := 64; (*size of typeahead buffer*)
+                    dcrec.ar10[1] := 16; (*low threshhold*)
+                    dcrec.ar10[2] := 32; (*high threshhold*)
+                    p.parptr := ord(@dcrec);
+                    if RS_232 (@p) > 0 then (*calls internal device control routine*)
+                    begin (*device control error*)
+                      ALARMRETURN (xmit_ref);
+                      RELSPACE (ord(port_ptr), ptrsysg^);
+                      err := errbase + 6
+                    end
+                end
+              end;
+
+          if err <= 0 then
+          begin
+            INTSOFF (rsints, prevstat);
+            RESTORE (port_ptr, prevstat+$17) (*enable device interrupts in WR1*)
+          end;
+          RS_232 := err
+      end; (*initit*)
+
+
+
+      procedure CONTROLIT;
+       (*************************************************************)
+       (*  internal procedure to handle DCONTROL "case" and reduce  *)
+       (*    code size of main RS_232 procedure                     *)
+       (*************************************************************)
+
+      VAR
+        i: int1;
+        speed: integer;
+        ptrsysg,longptr: ^longint;
+        temp : longint;
+        dc_rec_ptr: ^dc_rec;
+
+      begin
+        WITH parameters^ do
+          begin
+            RS_232 := 0;
+
+            dc_rec_ptr := pointer(parptr);
+            ALLOW_OTHER (port_ptr, prevstat);
+            WITH port_ptr^, dc_rec_ptr^ do
+              if dversion <> 2 then
+                RS_232 := errbase + 0 (*wrong application version*)
+              else
+              case dcode of
+              1: begin  (*set parity and leave break-state*)
+                   strip_parity := true;
+                   if channel = 0 then
+                     wr5.byte := -86 (*=$AA, for port A*)
+                   else
+                     wr5.byte := -88;  (*=$A8, port B always has RTS off*)
+                   if rec_hs = hwhs then
+                     if last_stopped then
+                       wr5.bits.dtr := false;
+
+                   grp_a := ar10[0];
+                   case grp_a of
+                   0,5: begin (*no parity(0) or odd parity(5),
+                                8 data, 1 stop, leave input bit 7*)
+                        if grp_a=0 then
+                          WR_SCC (4, $44, port_ptr)
+                        else
+                          WR_SCC (4, $45, port_ptr);
+                        WR_SCC (3, -63, port_ptr); (* =$C1 *)
+                        wr5.byte := wr5.byte + $40;
+                        strip_parity := false
+                      end;
+                   1,2: begin (*odd parity, 7 data, 1 stop, strip input bit 7*)
+                        WR_SCC (4, $45, port_ptr);
+                        WR_SCC (3, $41, port_ptr);
+                      end;
+                   3,4: begin (*even parity, 7 data, 1 stop, strip input bit 7*)
+                        WR_SCC (4, $47, port_ptr);
+                        WR_SCC (3, $41, port_ptr);
+                      end;
+                   6: begin (*no parity, strip input bit 7, 8 data 1 stop*)
+                        WR_SCC (4, $44, port_ptr);
+                        WR_SCC (3, -63, port_ptr); (* =$C1 *)
+                        wr5.byte := wr5.byte + $40;
+                      end;
+                   end; (*case*)
+
+                   WR_SCC (5, wr5.byte, port_ptr);
+                 end;
+
+              2: begin (*set up for DSR handshake on output*)
+                   grp_b := 2;
+                   xmt_hs := hw_hs;
+                   if channel = 0 then
+                     xmtrr0 := $10
+                   else
+                     xmtzrr0 := $20; (*port B*)
+                   flags.xmit_wait := false  (*clear xoff state. fixes bug*)
+                 end;
+
+              3:  if not flags.no_cur_req then
+                    RS_232 := errbase + 9 (*don't change xmt_hs during I/O*)
+                  else
+                  begin (*set up for xon xoff handshake on output*)
+                   grp_b := 3;
+                   xmt_hs := xmt_xon;
+                   flags.xmit_wait := false  (*put in xon state. fixes bug*)
+                 end;
+
+              4: begin  (*set up for delay on cr lf *)
+                   xmt_hs := xmit_delay;
+                   crlfdelay := ar10[0];
+                   grp_b := -crlfdelay;
+                   flags.xmit_wait := false  (*clear xoff state. fixes bug*)
+                 end;
+
+              5: begin  (*set baud rate *)
+                   grp_c := ar10[0];
+                   hi_speed := (grp_c >= 4800);
+                   if channel = 0 then
+                     temp := 125000 (*constant for baud rate computation*)
+                   else
+                     temp := 115200;
+                   speed := ( temp DIV grp_c ) - 2;
+                   WR_SCC (14, 0, port_ptr); (*turn off baud rate generator*)
+                   WR_SCC (12, speed, port_ptr); (*lsb*)
+                   WR_SCC (13, speed DIV 256, port_ptr); (*msb*)
+                   WR_SCC (14, openwr14, port_ptr)
+                 end;
+
+              6: no_block := (ar10[0] <> 0); (*set input blocking/not-blocking mode*)
+
+              7: begin  (*set input mode to hardware handshake*)
+                   if num_typeah >= full_thresh then
+                   begin
+                     wr5.bits.dtr := false;  (*no DTR*)
+                     last_stopped := true;
+                   end
+                   else
+                   begin
+                     wr5.bits.dtr := true; (*enable receive handshake signals*)
+                     last_stopped := false;
+                   end;
+                   WR_SCC (5, wr5.byte, port_ptr);
+                   rec_hs := hwhs;
+                 end;
+              8: begin  (*set input mode to xon/xoff*)
+                   rec_hs := rec_xon;
+                   if num_typeah >= full_thresh then
+                   begin
+                     last_stopped := true;
+                     hschar_pending := xoff_char;
+                     RSOUT (port_ptr);
+                   end
+                   else
+                   begin
+                     last_stopped := false;
+                     hschar_pending := xon_char;
+                     RSOUT (port_ptr);
+                   end;
+                 end;
+              9: begin (*flush and redefine typeahead buffer*)
+                   num_typeah := 0;
+                   get_typeah := put_typeah;
+                   hschar_pending := no_char;
+                   if last_stopped then
+                      begin
+                        last_stopped := false;
+                        if rec_hs = hwhs then
+                        begin (*toggle modem signals*)
+                          wr5.bits.dtr := true;
+                          WR_SCC (5, wr5.byte, port_ptr) (*enable receive handshake signals*)
+                        end
+                        else
+                        begin (*send xon*)
+                          hschar_pending := xon_char;
+                          RSOUT (port_ptr);
+                        end
+                      end;
+                   ptrsysg := pointer (bsysglob);
+                   if ar10[0] >= 0 then
+                   begin (*allocate new buffer*)
+                     if size_typeah > 0 then
+                       RELSPACE (ord(start_typeah), ptrsysg^);
+
+                     size_typeah := ar10[0];
+                     if size_typeah < 34 then
+                       size_typeah := 34 (*min size required by FINDBIT*)
+                     else
+                       if odd(size_typeah) then (*forces start_errbuf to even addr*)
+                         size_typeah := size_typeah+1;
+
+                     (*next allocate input byte buffer and corresponding
+                       bit array of error flags -- one bit for each input byte.
+                       The bit array begins at the end of the input byte buffer*)
+
+                     if not GETSPACE (size_typeah + ((size_typeah+31) DIV 8),
+                                                              ptrsysg^, temp) then
+                       begin
+                         RS_232 := errbase + 6;
+                         size_typeah := 0
+                       end
+                     else
+                     begin
+                         start_typeah := pointer (temp);
+                         get_typeah := start_typeah;
+                         put_typeah := get_typeah;
+                         start_errbuf := temp + size_typeah;
+                     end
+                   end;
+
+                   (*zero out error buffer that follows typeahead buffer*)
+
+                   longptr := pointer(start_errbuf);
+                   longptr^ := 0;
+                   ptrsysg := pointer(start_errbuf+4);
+                   moveleft (longptr^, ptrsysg^, (size_typeah-1) DIV 8 );
+
+                   if ar10[1] >= -1 then (*-2 means don't change, -1 means disable*)
+                     empty_thresh := ar10[1];
+                   if ar10[2] >= -1 then (*-2 means don't change, too big means disable*)
+                     full_thresh := ar10[2]
+                 end;
+
+              10: discon_detect := (ar10[1] <> 0);(*enable framing err as discon?*)
+
+              11: begin (*set up for no handshake on output*)
+                   grp_b := 11;
+                   xmt_hs := hw_hs;
+                   xmtrr0 := 0;
+                   xmtzrr0 := 0;
+                   flags.xmit_wait := false  (*clear xoff state. fixes bug*)
+                  end;
+
+              12: xmit_timeout := ar10[0] * 1000;
+                  (*set transmit-handshake timeout in seconds. =0 is infinite*)
+
+              13:  (*put into break state for specified period of time*)
+                  if not flags.no_cur_req then
+                    RS_232 := errbase + 9 (*don't start break during I/O*)
+                  else
+                  begin
+                    ALARMRELATIVE (xmit_ref, ar10[0]); (*remain in break state until
+                                                        alarm or dcontrol 1*)
+                    if not wr5.bits.break then
+                    begin
+                      wr5.bits.break := true; (*enable break*)
+                      if ar10[1] <> 0 then
+                        wr5.bits.dtr := false; (*no DTR*)
+                      WR_SCC (5, wr5.byte, port_ptr) (*enable receive handshake signals*)
+                    end
+                  end;
+
+              14: begin  (*set input timeout in seconds. =0 is infinite*)
+                    if input_timeout > 0 then
+                      ALARMRETURN (input_ref);
+                    input_timeout := ar10[0] * 1000;
+                    if input_timeout > 0 then
+                    begin
+                      ALARM_ASSIGN(input_ref, configptr, rsints);
+                      if input_ref = 0 then
+                      begin
+                        input_timeout := 0;
+                        RS_232 := 602
+                      end
+                    end
+                  end;
+
+              17: autolf := (ar10[0] <> 0);  (*enable/disable auto LF*)
+
+              18: begin (*read and clear error buckets*)
+                    ar10[0] := er_framing;
+                    ar10[1] := er_parity;
+                    ar10[2] := er_overrun;
+                    ar10[3] := er_ovflow;
+                    er_framing := 0;
+                    er_parity := 0;
+                    er_overrun := 0;
+                    er_ovflow := 0;
+                  end;
+
+              19: begin (*return configured state*)
+                    ar10[0] := grp_a;
+                    ar10[1] := grp_b;
+                    ar10[2] := grp_c;
+                    temp := ord(rec_hs)+7;
+                    if no_block then
+                      temp := temp + $10000;
+                    ar10[3] := temp;
+                    ar10[4] := size_typeah;
+                    ar10[5] := $10000*empty_thresh + full_thresh;
+                    ar10[6] := xmit_timeout DIV 1000;
+                    temp := ord(autolf);
+                    if discon_detect then
+                      temp := temp + $10000;
+                    ar10[7] := temp;
+                    ar10[8] := input_timeout DIV 1000;
+                    ar10[9] := num_typeah;
+              end;
+
+              25: dobreak := (ar10[0] <> 0); (*enable/disable break on close*)
+
+              otherwise
+                RS_232 := errbase + 9;
+            end;  (*case*)
+
+          RESTORE (port_ptr, prevstat);
+        end
+    end; (*controlit*)
+
+      procedure STARTIT;
+       (*************************************************************)
+       (*  internal procedure to handle SEQIO "case"                *)
+       (*************************************************************)
+
+      VAR
+        ptrsysg: ^longint;
+        leftlink: link_ptr;
+        ext_ptr: seqextptr_type;
+        cnt: integer;
+
+      begin
+        WITH parameters^, req^ do
+          begin
+            ext_ptr := pointer (req_extent);
+            WITH ext_ptr^ do
+            if num_bytes <= 0 then
+              RS_232 := errbase + 1  (*illegal parameters *)
+            else
+            begin
+              WITH port_ptr^ do
+              begin (* add request to the device queue or finish the request now*)
+                RS_232 := 0;  (*no errors*)
+                ptrsysg := pointer(bsysglob);   (*set pointer to b_sysglobal_ptr*)
+                ALLOW_OTHER (port_ptr, prevstat);
+                leftlink := pointer (nullink.bkwd_link + ptrsysg^);
+                if read_flag and no_block and
+                   ((num_typeah = 0) or (leftlink <> @nullink)) then
+                begin (*ok to complete request since non-blocking read w/o char*)
+                  ADJ_IO_CNT (false, buff_rdb_ptr);
+                  if discon_detect and (hwcontrol^.controlreg < 0) then
+                  begin  (*assume disconnected cable on input framing error*)
+                    flags.xmit_wait := false;
+                    hard_error := errbase + 8;
+                  end
+                  else
+                    if num_typeah = 0 then
+                    begin (*about to unblock with no data..see if rec'd error*)
+                      FINDBIT(cnt, start_errbuf, ord(get_typeah)-ord(start_typeah),
+                        1, size_typeah);
+                      if cnt = 0 then (*yes, have input error*)
+                        hard_error := errbase+3
+                    end;
+                  UNBLK_REQ (req, (hard_error = 0) )
+                end
+                else
+                begin
+                  ENQUEUE (dev_chain, leftlink^, ptrsysg^);
+                  if flags.no_cur_req then
+                    if not wr5.bits.break then
+                     START_NEW_REQUEST (port_ptr);
+                end;
+                RESTORE (port_ptr, prevstat);
+              end
+            end
+          end
+      end; (*startit*)
+
+      begin (*RS_232*)
+        port_ptr := pointer(parameters^.configptr^.cb_addr);
+
+        WITH parameters^ do
+        case fnctn_code of
+        seqio:  STARTIT;
+
+        dinit:  INITIT;  (*call subroutine to reduce size of RS_232*)
+
+        dcontrol:  CONTROLIT; (*call subroutine to reduce size *)
+
+        dalarms:
+        WITH port_ptr^ do
+        begin
+          ALLOW_OTHER (port_ptr, prevstat);
+          if intpar = xmit_ref then
+            XMT_TO_HNDL (port_ptr) (*output alarm routine*)
+          else
+            if intpar = input_ref then
+            begin
+              if not flags.no_cur_req then
+                if flags.cur_read_flag then
+                begin
+                  cur_req_ptr^.hard_error := errbase + 4;
+                  FINISH_REQ (port_ptr, false)
+                end;
+            end;
+          RESTORE (port_ptr, prevstat);
+        end; (*dalarms*)
+
+        dinterrupt: (*ignore returned function value for ints*)
+         WITH port_ptr^, hwcontrol^ do
+         begin
+          case intpar of
+
+          axmit:  (*assembly language intercepts this and executes a bunch of
+                    stuff before ever getting here! *)
+                  FINISH_REQ (port_ptr, true);
+
+          amodem: begin
+              if not flags.no_cur_req then
+                if discon_detect and (prior_rr0 < 0) then
+                begin  (*assume disconnected cable on input framing error*)
+                  if flags.xmit_wait then (*fixes bug*)
+                  begin
+                    ALARMOFF (xmit_ref);
+                    flags.xmit_wait := false
+                  end;
+                  cur_req_ptr^.hard_error := errbase + 8;
+                  FINISH_REQ (port_ptr, false)
+                end
+                else
+                  if flags.xmit_wait then
+                    if xmt_hs = hw_hs then
+                    begin  (*we've been waiting for modem handshake to change*)
+                      flags.xmit_wait := false;
+                      ALARMOFF (xmit_ref);
+                      RSOUT (port_ptr)
+                    end
+          end; (*amodem*)
+
+          (*aerr and arecv cases are handled in assembly language*)
+
+          end;  (*case*)
+
+          RESTORE(port_ptr, $0617) (*for interrupts, restore ints to 6, WR1 to 17*)
+        end;  (*dinterrupt*)
+
+        reqrestart:
+          begin
+            RS_232 := 0;
+            WITH port_ptr^ do
+            begin
+              ALLOW_OTHER (port_ptr, prevstat);
+              if restrt_in then
+              begin
+                COPYBYTES (ord(port_ptr));
+                restrt_in := false
+              end;
+              if restrt_out then
+              begin
+                RSOUT (port_ptr);
+                restrt_out := false
+              end;
+              RESTORE (port_ptr, prevstat);
+            end
+          end; (*reqrestart*)
+
+        ddown: begin
+          RS_232 := 0;
+          WITH port_ptr^ do
+          begin
+            if not flags.no_cur_req then
+              RS_232 := 607
+            else
+            begin
+              ALLOW_OTHER (port_ptr, prevstat);
+              ptrsysg := pointer(bsysglob);   (*set up pointer to b_sysglobal_ptr*)
+              if size_typeah > 0 then
+                RELSPACE (ord(start_typeah), ptrsysg^);
+              ALARMRETURN (xmit_ref);
+              if input_timeout > 0 then
+                ALARMRETURN (input_ref);
+              if channel = 0 then (*reset channel*)
+                WR_SCC (9, -118, port_ptr) (*=$8A*)
+              else
+                WR_SCC (9, $4A, port_ptr);
+              configptr^.cb_addr := ord(nil);
+              RELSPACE (ord(port_ptr), ptrsysg^);
+              INTSON (prevstat)
+            end
+          end;
+        end;
+
+        ddiscon:  (*called during close*)
+        if port_ptr^.dobreak then
+        begin
+          p.configptr := configptr;
+          p.fnctn_code := dcontrol;
+          dcrec.dversion := 2;
+          dcrec.dcode := 13;
+          dcrec.ar10[0] := 500; (*lower dtr for 1/2 sec*)
+          dcrec.ar10[1] := 1;
+          p.parptr := ord(@dcrec);
+          i := RS_232 (@p);  (*call internal device control routine*)
+        end;
+
+        otherwise
+          RS_232 := errbase + 2;   (*currently unimplemented w/ error*)
+        end;  (*case*)
+      end; (*RS_232*)
+
+   end.
+
+ÿ

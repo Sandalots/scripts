@@ -1,0 +1,565 @@
+{$S sortseg }
+{^T 20}
+{******************************************************************************
+
+                             mergepass
+
+        mergeruns passes to us a file of runs and a file in which to put
+        the runs computed by merging the file of runs, as best we can.  we
+        leave a set of run end addresses in prunend^ and set newruns to
+        the number of runs we produced.  the merge algorithm is trivial,
+        since we do no asynchronous io (ain't none in OS).
+
+        input parameters
+
+        poutbuff           ptr to output buffer
+        pagesize           # bytes in pages
+        nsflds             # fields in sort key
+        pkey               ptr to sort key descriptor
+        prundesc           for each of the 1..kmerge runs there is a
+                           descriptor that contains
+
+                           toprec - ptr to top record of input buffer
+                           lastrec - ptr to last record of input buffer
+                           pbuff - ptr to start of input buffer for this run
+                           po - pegged at rec offset array
+                           pd - pegged at pagedesc in page
+                           pnextrun - ptr to next open rundesc (we unlink
+                               desc when the run exhausts)
+                           priorrun - ptr to prior open rundesc
+                           endrun - file address of first byte after end of
+                               run
+                           readaddr - file address of next block to be read
+
+        runfile            refno of runfile
+        mergefile          refno of mergefile
+        maxruns            maximum order of merge
+        runs               current number of runs
+        prunend            ptr to array of runend file marks
+        keepduplicates     if true, retain records w/ dupl. keys
+
+        output parameters
+
+        mresult            status code, noerr if ok
+        nrecords           if newruns = 1, set to #records in dest file
+        newruns            number of runs we produce
+        prunend            at exit, contains new runend file marks
+
+******************************************************************************}
+procedure mergepass(var mresult : integer;
+                    var nrecords,
+                        lastpage: fileptr;
+                        firstpage : fileptr;
+                        pagesize,
+                        nsflds : integer;
+                        pkey: ptrrecptr;
+                        prunend : ptrrunend;
+                        poutbuff : ptrdata;
+                        prundesc : ptrrunarray;
+                    var newruns  : integer;
+                        runfile,
+                        mergefile : integer;
+                        maxruns,
+                        runs : integer;
+                        keepduplicates : boolean);
+label
+        2,3,4;
+
+var
+        actual,
+        prevpage,               { previous btree page written }
+        fmark : fileptr;        { file marker for output file }
+        oldsize,                { scratch }
+        bytes_left,             { bytes left in output page }
+        offoff,                 { offset of record offsets array in page }
+        winsize,                { size of winning record }
+        currecord,              { next output record in buffer }
+        currun,                 { index of current first run of merge }
+        kmerge,                 { current order of merge }
+        temp : integer;
+        pdob : ptrpagedesc;     { pts to pagedesc in output buffer }
+        poob : ptroffsets;      { pts to record offsets array in out.buff. }
+        pooob : ^ integer;      { pts to rec. offset for current record }
+        tempptr,
+        poutrec,                { pts to next record in output buffer }
+        plastrec,               { pts to last record output }
+        pwinner : ptrdata;      { pts to winning record }
+        pwinningrun,            { pts to winning rundesc }
+        prun,
+        pfirstrun : ptrrundesc;
+
+(*
+procedure windump;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        writeln(dumpfile,'winsize,winner:',winsize);
+        printkey(pkey,nsflds,pwinner);
+end;
+*)
+
+{^T 20}
+{****************************************************************************
+
+                                mergeinit
+
+        sets up rundescs for another k-way merge of the runfile into
+        the mergefile.
+
+        -  establishes order of merge (kmerge) as min(maxruns,runs left)
+        -  links together the first kmerge rundescriptors and sets
+           pfirstrun to point the the first of them
+        -  reads in the first block of each run and sets up the buffer
+           pointers
+        -  computes the first winner and writes him to the runfile
+
+****************************************************************************}
+
+procedure mergeinit;
+label
+        2;
+var
+        tempptr : ptrdata;
+        prun : ptrrundesc;
+        actual : fileptr;
+        offset,
+        run,
+        i : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        kmerge := runs - currun + 1;
+        if kmerge > maxruns then kmerge := maxruns;
+        pfirstrun := @prundesc^;
+        prun := pfirstrun;
+        for i := 1 to kmerge do
+            begin
+            if i = 1 then prun^.ppriorrun := nil
+            else prun^.ppriorrun := @prundesc^[i-1];
+            if i = kmerge then prun^.pnextrun := nil
+            else prun^.pnextrun := @prundesc^[i+1];
+
+            run := currun + i - 1;
+            if run = 1 then prun^.readaddr := 0
+            else prun^.readaddr := prunend^[run-1];
+            prun^.endrun := prunend^[run];
+
+            read_data(mresult,runfile,ord(prun^.pbuff),pagesize,
+                      actual,absolute,prun^.readaddr);
+            prun^.readaddr := prun^.readaddr + pagesize;
+            if mresult <> noerr then
+                begin
+                mresult := ioerr;
+                goto 2;
+                end;
+            tempptr := @prun^.pbuff^[prun^.po^[-(prun^.pd^.nkeys-1)]];
+            prun^.lastrec := tempptr;
+            prun^.toprec := prun^.pbuff;
+            prun^.poo := @prun^.po^;
+            prun := pointer(ord(prun)+sizeof(rundesc));
+            end; { with }
+
+
+{al     see below, a candidate for assembler }
+
+        pwinningrun := pfirstrun;
+        prun := pwinningrun^.pnextrun;
+        while prun <> nil do
+            with prun^ do
+                begin
+                if lt = compare(pkey,pkey,nsflds,toprec,
+                                pwinningrun^.toprec)
+                then pwinningrun := prun;
+                prun := prun^.pnextrun;
+                end;
+        with pwinningrun^ do
+            begin
+            pwinner := toprec;
+            winsize := poo^;
+            poo := pointer(ord(poo)-sizeof(integer));
+            winsize := poo^ - winsize;
+            end;
+
+        (*windump;*)
+
+        plastrec := poutbuff;
+        movelf(pwinner,plastrec,winsize);
+        poutrec := @plastrec^[winsize];
+        pooob := @poob^[-1];
+        pooob^ := winsize;
+        bytes_left := offoff-winsize-sizeof(integer);
+        currecord := 1;
+        nrecords := 1;
+        mresult := noerr;
+2 :
+end;
+
+{****************************************************************************
+
+                                finisharun
+
+        finishes off the current run. writes out the last page of the run
+        bumps the filemark and increments newruns.
+
+****************************************************************************}
+procedure finisharun;
+label
+        2;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        currun := currun + kmerge;
+        newruns := newruns + 1;
+        if currun > runs then
+
+        with pdob^ do
+            begin
+            nkeys := currecord;
+            next := nilptr;
+            prior := prevpage;
+            end;
+
+        (*printpage(pkey,nsflds,pagesize,poutbuff);*)
+
+        write_data(mresult,mergefile,ord(poutbuff),pagesize,
+                   actual,absolute,fmark);
+        fmark := fmark + pagesize;
+        if mresult <> noerr then
+            begin
+            if no_room(mresult) then mresult := noroom
+            else mresult := ioerr;
+            goto 2;
+            end;
+
+        mresult := noerr;
+        prunend^[newruns] := fmark;
+2:
+end;  { finisharun }
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        offoff := pagesize-(sizeof(pagedesc)+sizeof(integer));
+        poob := @poutbuff^[offoff];
+        poob^[0] := 0;
+        pdob := pointer(ord(poob)+sizeof(integer));
+        pdob^.ptype := leaftype;
+        prevpage := nilptr;
+
+        currun := 1;
+        newruns := 0;
+        prevpage := nilptr;
+        fmark := firstpage;
+
+        while currun <= runs do {  merge the runfile into a new one }
+            begin
+
+        {   initialize the run descriptor for the input runs.
+            find the first winner and write it to the runfile }
+
+            mergeinit;
+            if mresult <> noerr then goto 2;
+
+            repeat   {   merge a run   }
+
+             {  get next record of the winning run
+                - if the current page is exhausted read the next page first
+                - if the run is exhausted then unlink the descriptor so we wont
+                  look at it again in this merge phase  }
+
+                with pwinningrun^ do
+                    begin
+                    if toprec = lastrec then
+                        begin
+                        if readaddr = endrun then
+                            begin
+                            if ppriorrun = nil then
+                                begin
+                                pfirstrun := pnextrun;
+                                if pfirstrun = nil then goto 3; { break }
+                                end
+                            else ppriorrun^.pnextrun := pnextrun;
+                            if pnextrun <> nil then
+                                pnextrun^.ppriorrun := ppriorrun;
+                            end
+                        else
+                            begin
+                            read_data(mresult,runfile,ord(pbuff),pagesize,
+                                      actual,absolute,readaddr);
+                            readaddr := readaddr + pagesize;
+                            if mresult <> noerr then begin
+                                mresult := ioerr;
+                                goto 2;
+                            end;
+                            tempptr := @pbuff^[po^[-(pd^.nkeys-1)]];
+                            lastrec := tempptr;
+                            toprec := pbuff;
+                            poo := @po^;
+                            end;
+                        end
+                    else toprec := @toprec^[winsize];
+                    end;
+
+            {al    another candidate for assembly language   }
+
+            {   compute the new winner }
+
+                pwinningrun := pfirstrun;
+                prun := pwinningrun^.pnextrun;
+                while prun <> nil do
+                    with prun^ do
+                        begin
+                        if lt = compare(pkey,pkey,nsflds,toprec,
+                                        pwinningrun^.toprec)
+                        then pwinningrun := prun;
+                        prun := prun^.pnextrun;
+                        end;
+
+                with pwinningrun^ do
+                    begin
+                    pwinner := toprec;
+                    winsize := poo^;
+                    poo := pointer(ord(poo)-sizeof(integer));
+                    winsize := poo^ - winsize;
+                    end;
+
+                (*windump;*)
+
+             {  unless this a duplicate record and we are eliminating
+                duplicates - write out the winner }
+
+                if keepduplicates then goto 4;  {  short circuit boolean:
+                                                   if keepduplicates or ... }
+                if compare(pkey,pkey,nsflds,pwinner,plastrec) <> eq then
+                    begin
+                4 : { short circuit boolean }
+                    bytes_left := bytes_left-winsize-sizeof(integer);
+                    if bytes_left < 0 then
+                        begin
+                        with pdob^ do
+                            begin
+                            nkeys := currecord;
+                            next := fmark + pagesize;
+                            prior := prevpage;
+                            prevpage := fmark;
+                            end;
+
+                        (*printpage(pkey,nsflds,pagesize,poutbuff);*)
+
+                        write_data(mresult,mergefile,ord(poutbuff),pagesize,
+                                   actual,absolute,fmark);
+                        fmark := fmark + pagesize;
+                        if mresult <> noerr then
+                            begin
+                            if no_room(mresult) then mresult := noroom
+                            else mresult := ioerr;
+                            goto 2; { exit }
+                            end;
+                        currecord := 0;
+                        poutrec := poutbuff;
+                        pooob := @poob^;
+                        bytes_left := offoff-winsize-sizeof(integer);
+                        end;
+
+                    nrecords := nrecords + 1;
+                    movelf(pwinner,poutrec,winsize);
+                    oldsize := pooob^;
+                    pooob := pointer(ord(pooob)-sizeof(integer));
+                    pooob^ := oldsize + winsize;
+                    plastrec := poutrec;
+                    poutrec := @poutrec^[winsize];
+                    currecord := currecord + 1;
+                    end;
+
+             until false;
+
+        3: { break }
+
+             finisharun;
+             if mresult <> noerr then goto 2;
+             end; { while }
+
+2: { exit }
+        lastpage := fmark;
+end;  { mergepass }
+{^T20}
+{******************************************************************************
+
+                                mergeruns
+
+        receives an initial runfile from genruns and loops to merge
+        successive run sets until the number of runs can be merged into
+        one run on the next pass.  at this time the destination file
+        is created.
+
+        input parameters
+
+        pagesize           # bytes in file pages
+        nsflds             # fields in sort key
+        pkey               ptr to sort key descriptor
+        tempfiles          names of tempfiles for runfile and mergefile
+        temprefnos         refnos of tempfiles
+        runs               number of runs
+        prunend            ptr to array of runend file marks
+        destfile           name of destination file
+        destdir            name of destination directory
+        keepduplicates     if true, retain records w/ dupl. keys
+
+        output parameters
+
+        mresult            status code, noerr if ok
+        nrecords           on successful exit, nrecords = # records in file
+        frefno             on successful exit, refno of destination file
+
+******************************************************************************}
+procedure mergeruns(var mresult : integer;
+                    var nrecords,
+                        lastpage  : fileptr;
+                        firstpage : fileptr;
+                        pagesize,
+                        nsflds  : integer;
+                        pkey : ptrrecptr;
+                    var tempfiles : lisaobjs;
+                        temprefnos : lisarefs;
+                        runs : integer;
+                        segsize : longint;
+                        prunend : ptrrunend;
+                        destfile : integer;
+                        keepduplicates : boolean);
+label
+        2;
+
+type
+        flags = array[0..1] of boolean;
+var
+        multipass : boolean;            {  > 1 merge pass required }
+        pinbuffs,                       {  pts to input buffers for runs }
+        poutbuff : ptrdata;             {  pts to output buffer for new run }
+        prundesc : ptrrunarray;         {  pts to array of maxrun rundesc's }
+        runfile,                        {  index into tempfiles and temprefnos
+                                           for the current runfile, toggles
+                                           between 0 and 1 }
+        trash,                          {  scratch }
+        mergefile,                      {  ditto for the merge file }
+        maxruns,                        {  maximum order of the merge }
+        newruns,                        {  # of runs returned by mergepass }
+        i     : integer;
+        result : integer;
+        toclose : flags;                {  indicates if tempfiles 0 & 1 need
+                                           to be closed }
+        pheap : ptrdata;
+        locfirstpage : fileptr;
+
+ begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*writeln(dumpfile,'mruns');
+        writeln(dumpfile,'r,ps,rs:',runs,',',pagesize);
+        for i := 1 to runs do write(dumpfile,prunend^[i]:14);
+        writeln;*)
+
+        toclose[0]   := true;  { the initial runfile exists }
+        toclose[1]   := false;
+
+        segsize := segsize - mult424(runs,sizeof(fileptr));
+        maxruns := div424(segsize-pagesize,pagesize+sizeof(rundesc),trash);
+        if maxruns < 2 then
+            begin
+            mresult := nomem;
+            goto 2; { exit }
+            end;
+
+        if runs > maxruns then
+            begin
+            mresult := temperror;
+            createuniquefile(result,tempfiles[1],temprefnos[1]);
+            if result <> noerr then goto 2; { exit }
+            toclose[1] := true;
+            multipass := true;
+            end
+        else
+            begin
+            maxruns := runs;
+            multipass := false;
+            end;
+
+        (*writeln(dumpfile,'mxr:',maxruns);*)
+
+        pheap := pointer(ord(prunend)+mult424(runs,sizeof(fileptr)));
+        prundesc := @pheap^;
+        poutbuff := pointer(ord(prundesc)+sizeof(rundesc)*maxruns);
+        pinbuffs := @poutbuff^[pagesize];
+
+        (*writeln(dumpfile,'pre,prd,pob,pib:',ord(prunend):14,ord(prundesc):14,
+                         ord(poutbuff):14,ord(pinbuffs):14);*)
+
+        for i := 1 to maxruns do
+            with prundesc^[i] do
+                begin
+                pbuff := pinbuffs;
+                pd := @pbuff^[pagesize-sizeof(pagedesc)];
+                po := pointer(ord(pd)-sizeof(integer));
+                pinbuffs := @pinbuffs^[pagesize];
+                end;
+
+        runfile := 0;
+        mergefile := 1;
+        locfirstpage := 0;
+
+        repeat
+
+            (*writeln(dumpfile,'mf,rf:',mergefile,',',runfile);
+            writeln(dumpfile,'r:',runs);
+            for i := 1 to runs do write(prunend^[i]:14);
+            writeln;*)
+
+            if runs <= maxruns then
+                begin
+                mresult := temperror;
+                if multipass then
+                    begin
+                    close_object(result,temprefnos[mergefile]);
+                    toclose[mergefile]  := false;
+                    if (result <> noerr) then goto 2; { exit }
+                    end;
+
+                locfirstpage := firstpage;
+                temprefnos[mergefile] := destfile;
+                end;
+
+            mergepass(mresult,nrecords,lastpage,locfirstpage,pagesize,nsflds,
+                      pkey,prunend,poutbuff,prundesc,
+                      newruns,temprefnos[runfile],temprefnos[mergefile],
+                      maxruns,runs,keepduplicates);
+
+            (*writeln(dumpfile,'newr:',newruns);*)
+
+            if mresult <> noerr then goto 2; { exit }
+
+            if newruns = 1 then
+                begin
+                mresult := temperror;
+                close_object(result,temprefnos[runfile]);
+                toclose[runfile] := false;
+                if result <> noerr then goto 2; { exit }
+                end
+            else
+                begin
+                mergefile := 1 - mergefile;
+                runfile := 1 - runfile;
+                end;
+
+            runs := newruns;
+
+        until runs = 1;
+
+        mresult := noerr;
+
+2:    { exit }
+
+        if mresult <> noerr then
+            begin
+            if toclose[0] then close_object(result,temprefnos[0]);
+            if toclose[1] then close_object(result,temprefnos[1]);
+            end;
+
+end;  { mergeruns}
+
+ÿ

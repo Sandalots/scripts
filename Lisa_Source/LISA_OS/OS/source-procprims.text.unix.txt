@@ -1,0 +1,1283 @@
+unit Proc_Prims;     { Process Management Primitives }
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+interface
+uses
+  (*$U object/driverdefs.obj *)  DriverDefs,
+  (*$U object/hwint.obj *)       HWInt,
+  (*$U object/sysglobal.obj *)   GLOBALDATA;
+
+const
+  semPriority = 226;                        { min priority for semaphore users }
+
+  { global process management errors }
+  e_noprocess     = 100;                    { error - no such process }
+  e_invprocess    = 101;                    { error - user attempt on sys proc }
+
+type
+  launch_status = (ok_launch, mm_launch, busy_thisPCB, busy_otherPCB,
+                   skip_process);
+
+  q_type = (Ready, Blocked);
+
+  proc_types = (user, sys);
+
+  wait_types = (i_o, ostimer, pipe_io, sem, act_call);
+
+  blk_type = set of wait_types;
+
+  ptrblk_type = ^blk_type;   { for use in asynctrl unit }
+
+  sftint_types = (die, susp);
+
+  si_type = set of sftint_types;
+
+  term_types = (call_Term, ended, self_Killed, Killed, fthr_term, bad_syscall,
+                bad_errnum, swap_error, stk_overflow, data_overflow, parity_err);
+
+  ptr_PCB = ^PCB;
+
+  sem_options = (readonly, fast);
+
+  sem_control = set of sem_options;
+
+  semaphore = record
+                sem_count  : int2;        { semaphore counter }
+                owner      : relptr;      { relptr to process owning this sem }
+                wait_queue : ptr_PCB;     { processes waiting for it }
+              end;
+
+
+
+  PCB = record  { Process Control Block }
+          { linkages for various queues }
+          next_schedPtr   : ptr_PCB;          { forward scheduling queue ptr }
+          prev_schedPtr   : ptr_PCB;          { backward scheduling queue ptr }
+          semwait_queue   : ptr_PCB;          { queue of semaphore waiters }
+
+          { scheduling information - state, etc. }
+          priority        : 0..255;           { current executing priority }
+          norm_pri        : 0..255;           { normal executing priority }
+          blk_state       : blk_type;         { empty set => active }
+          domain          : domainRange;      { domain process is currently in }
+          sems_owned      : int2;             { # of semaphores currently owned }
+
+          { process handling information }
+          glob_id         : int4;             { unique global id }
+          proctype        : proc_types;       { process type identification }
+          np_count        : int1;             { # calls into non-preemptive class }
+          gplist_ptr      : ptr_PCB;          { global process list pointer }
+          softints        : si_type;          { soft interrupts for control }
+          fatherptr       : relptr;           { hierarchy ptrs }
+          sonptr          : relptr;
+          brotherptr      : relptr;
+          fam_sem         : semaphore;        { family semaphore for coordination }
+          terming         : boolean;          { true if process is terminating }
+          termcause       : term_types;       { cause of process's termination }
+
+          { memory mgmt information }
+          slocal_sdbRP    : relptr;           { relptr to syslocal SDB }
+          plcbRP          : relptr;           { relptr to PLCB for program }
+          need_mem        : boolean;          { true if process needs memory }
+
+          { exception mgmt & asynch. control information }
+          excep_pending   : int2;             { exception pending count }
+          pcbfreqptr      : absptr            { 1st completed req ptr }
+        end;
+
+
+  glist_head = record   { global process list head }
+                 gplist_head_ptr : ptr_PCB;
+                 gplist_sem      : semaphore
+               end;
+
+  ptr_gplisthead = ^glist_head;
+
+
+  ptr_prcedure = ^int4;
+
+
+  namestring = string[20];
+
+
+  function PPrim_Version : int2;
+    { function to return the version number of this version of Proc_Prims }
+
+
+  procedure Queue_Process (pcb_ptr : ptr_PCB;  queue : q_type);
+    { procedure to move PCBs between scheduling queues }
+
+
+  procedure Enter_Scheduler;
+    { assembly language procedure to enter the Scheduler }
+
+
+  procedure Block_Process (pcb_ptr : ptr_PCB;  blk_reasons : blk_type);
+    { procedure to place a process in the Blocked queue }
+
+
+  procedure Unblock_Process (pcb_ptr : ptr_PCB;  unblk_reasons : blk_type);
+    { procedure to place a process on the Ready queue }
+
+
+  procedure Find_PCB (var error : int2;  insysflag : boolean;  proc_id : int4;
+                      var pcb_ptr : ptr_PCB);
+    { procedure to find the PCB of a process given its global id }
+
+
+  procedure Rel_PCBglist (pcb_ptr : ptr_PCB);
+    { procedure to remove a process from the global process list }
+
+
+  procedure Init_sem (var this_sem : semaphore;  initial : int2);
+    { procedure to initialize a semaphore variable }
+
+
+  procedure Signal_sem (var this_sem : semaphore);
+    { procedure to perform a V operation on a semaphore }
+
+
+  procedure Wait_sem (var this_sem : semaphore;  control : sem_control);
+    { procedure to perform a P operation on a semaphore }
+
+
+  procedure Send_SoftInt (pcb_ptr : ptr_PCB;  sft_int : sftint_types);
+    { procedure to send a soft interrupt to a process }
+
+
+  procedure Clear_SoftInt (pcb_ptr : ptr_PCB;  sft_int : sftint_types);
+    { procedure to clear a pending soft interrupt for a process }
+
+
+  procedure AbortProcess (pcb_ptr : ptr_PCB;  allowTH : boolean;
+                          why : term_types);
+    { procedure to abort a process for a specific reason }
+
+
+  procedure MakeSGSpace (var no_space : boolean);
+    { procedure to allow a pending sysglobal expansion to occur }
+
+
+  procedure UserBreak;
+    { procedure to cause a break point to be set in user code on exit from sys }
+
+
+  procedure ProcDisplay;
+    { procedure to display current process environment for debugging }
+
+
+  procedure RemoveProcess (pcb_ptr : ptr_PCB);
+    { procedure to remove a process from the system whose stack and/or syslocal
+      is no longer available }
+
+
+implementation
+
+
+const
+  vercode = 90;
+
+
+(*$S ProcStart *)
+
+  function PPrim_Version (* : int2 *);
+    { function to return the version number of this version of Proc_Prims }
+    begin
+      PPrim_Version := vercode
+    end { PPrim_Version };
+
+
+(*$S kr_prims *)
+
+  procedure Queue_Process (* pcb_ptr : ptr_PCB;  queue : q_type *);  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to place a PCB in the specified scheduling    *)
+        (*   queue.  If the PCB is being placed in the Blocked       *)
+        (*   queue, it is placed at the end.  If the PCB is being    *)
+        (*   placed in the Ready queue, it is placed at the end of   *)
+        (*   the subqueue of PCBs of the same priority.              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB to be linked into the    *)
+        (*             queue.                                        *)
+        (*                                                           *)
+        (*   queue : the name of the queue into which the PCB is to  *)
+        (*           be linked.                                      *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   Invoke_sched is set if a process with higher priority   *)
+        (*   than the current one is linked into the Ready queue.    *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Queue_Process assumes that interrupts have been         *)
+        (*   disabled.  The usual callers of Queue_Process (i.e.     *)
+        (*   Block_Process and Unblock_Process) disable interrupts.  *)
+        (*   If this procedure proves to be too slow, it will either *)
+        (*   be recoded to use true PCB pointers rather than         *)
+        (*   linkages or it will be recoded in assembly language.    *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*    None.  This is a low level kernel function that does   *)
+        (*    no error checking.                                     *)
+        (*                                                           *)
+        (*************************************************************)
+
+  (*begin
+    bkwd_BlockQ := ord(nil);
+    fwd_ReadyQ := ord(nil);
+    Invoke_sched :=true
+  end;*)
+  (*var
+      insert_ptr : ^linkage;           { place where PCB will be linked }
+      scanptr : ptr_PCB;               { for scanning down Ready queue }
+      priority : int2;                 { priority of calling process }
+
+    begin
+      Dequeue (pcb_ptr^.schedptrs, b_sysglobal_ptr);
+
+      if queue = Blocked then
+        begin
+          insert_ptr := pointer(block_queue.bkwd_link + b_sysglobal_ptr);
+          Enqueue (pcb_ptr^.schedptrs, insert_ptr^, b_sysglobal_ptr)
+        end
+      else
+        begin  { going to Ready queue }
+          scanptr := pointer(ready_queue.fwd_link + b_sysglobal_ptr);
+          priority := pcb_ptr^.priority;
+          while scanptr^.priority >= priority do
+            scanptr := pointer(scanptr^.schedptrs.fwd_link + b_sysglobal_ptr);
+
+          insert_ptr := pointer(scanptr^.schedptrs.bkwd_link + b_sysglobal_ptr);
+
+          Enqueue (pcb_ptr^.schedptrs, insert_ptr^, b_sysglobal_ptr);
+
+          { set Invoke_sched if there's no current process or if there's
+            now a process ahead of the current one. }
+          if c_pcb_ptr <> ready_queue.fwd_link + b_sysglobal_ptr then
+            Invoke_sched := true
+        end { going to Ready queue }
+    end { Queue_Process };*)
+
+
+  procedure Enter_Scheduler;  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to cause the Scheduler to   *)
+        (*   start executing.  If Enter_Scheduler is called from     *)
+        (*   the current process, the Scheduler is entered by doing  *)
+        (*   a TRAP(2).  This causes the processor to execute on     *)
+        (*   the Supervisor's stack.  If Enter_Scheduler is called   *)
+        (*   from an interrupt routine executing on the              *)
+        (*   Supervisor's stack, the PC laid down by the             *)
+        (*   JSR Enter_Scheduler is popped and the Scheduler is      *)
+        (*   entered by doing a JMP.  In either case, if there is a  *)
+        (*   current process (c_pcb_ptr <> nil), the Scheduler       *)
+        (*   expects the PC and SR of the process to be on top of    *)
+        (*   the Supervisor's stack.  The previous process is        *)
+        (*   quiesced (PC, SR, and other registers saved in the      *)
+        (*   environment save area) and the Scheduler then begins    *)
+        (*   its execution.                                          *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.  The current context (process or interrupt        *)
+        (*   routine) is left and the Scheduler is started.          *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine can be called anywhere in the operating    *)
+        (*   system.  Note that if a process switch is required in   *)
+        (*   the operating system, this routine MUST be called.      *)
+        (*   Calling SetPriority_Process or Yield_CPU from within    *)
+        (*   the system is not sufficient since these routines may   *)
+        (*   only re-order the Ready queue and won't effect a        *)
+        (*   process switch until they return to the user (via       *)
+        (*   ExitSys).  Thus, if a process switch is required while  *)
+        (*   in the system, Enter_Scheduler must be called after     *)
+        (*   the Ready queue has been arranged appropriately.        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  procedure Unblock_Process (* pcb_ptr : ptr_PCB;  unblk_reasons : blk_type *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to unblock a process.  If the process is, in  *)
+        (*   fact, blocked for a subset of the specified reasons,    *)
+        (*   it is placed in the active state and linked into the    *)
+        (*   Ready queue at its current priority.                    *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process to be     *)
+        (*             unblocked.                                    *)
+        (*                                                           *)
+        (*   unblk_reasons : the set of things the process is to be  *)
+        (*                   unblocked on.                           *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel function so no error  *)
+        (*   checking is done.                                       *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+
+    begin
+      Intsoff (clokints, int_level);
+
+      { unblock the process only if it's expecting to be unblocked for 1 of
+        the reasons specified by the caller }
+
+      if pcb_ptr^.blk_state * unblk_reasons <> [] then
+        begin  { the process should be unblocked }
+          pcb_ptr^.blk_state := [];     { now active }
+          Queue_Process (pcb_ptr, Ready)
+        end;
+
+      Intson (int_level)
+    end { Unblock_Process };
+
+
+  procedure Block_Process (* pcb_ptr : ptr_PCB;  blk_reasons : blk_type *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to block a process.  Process is placed in the *)
+        (*   specified block state and linked into the Blocked       *)
+        (*   queue.                                                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process to be     *)
+        (*             blocked.                                      *)
+        (*                                                           *)
+        (*   blk_reasons : the set of things that the process is to  *)
+        (*                 be blocked on.                            *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   If pcb_ptr is the current process, the Scheduler will   *)
+        (*   be entered; otherwise, the calling process will         *)
+        (*   continue execution.                                     *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel function so no error  *)
+        (*   checking is performed.                                  *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+      giveUp_waits : blk_type;                { the set of 'give-up' waits }
+
+    begin
+      Intsoff (clokints, int_level);
+      pcb_ptr^.blk_state := blk_reasons;
+      Queue_Process (pcb_ptr, Blocked);
+      Intson (int_level);
+
+      if pcb_ptr = pointer(c_pcb_ptr) then
+        begin  { blocking self }
+          if c_pcb_ptr = nonPreempt then
+            begin
+              giveUp_waits := [act_call, ostimer, pipe_io];
+              if blk_reasons - giveUp_waits = [] then
+                nonPreempt := ord(nil)
+            end;
+          Enter_Scheduler
+        end { block self }
+    end { Block_Process };
+
+
+  procedure Find_PCB (* var error : int2;  insysflag : boolean;  proc_id : int4;
+                        var pcb_ptr : ptr_PCB *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to find the PCB of a process given its        *)
+        (*   global process ID.  The global process list is scanned  *)
+        (*   for the PCB with the matching global ID.                *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   insysflag : a flag indicating whether the caller of     *)
+        (*               the routine which called Find_PCB was in    *)
+        (*               system code.  If so, then process handling  *)
+        (*               calls on system processes will be allowed   *)
+        (*               and the ptr to the PCB returned.            *)
+        (*                                                           *)
+        (*   proc_id : the global process ID of the process whose    *)
+        (*             PCB is to be found.                           *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   pcb_ptr : a pointer to the PCB of the process whose     *)
+        (*             global ID was specified.                      *)
+        (*                                                           *)
+        (*   error : an error return (see values below).             *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   error = 0              process found                    *)
+        (*         = e_noprocess    no such process                  *)
+        (*         = e_invprocess   invalid process (system)         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      glob_list_head : ptr_gplisthead;    { ptr to global list head }
+      scan_ptr : ptr_PCB;                 { ptr to scan through PCB list }
+
+    begin
+      error := 0;
+      glob_list_head := pointer(glob_pcb_list);
+
+      with glob_list_head^ do
+        begin
+          {Wait_sem (gplist_sem, []);}
+
+          scan_ptr := gplist_head_ptr;
+          while (scan_ptr <> nil) and (scan_ptr^.glob_id > proc_id) do
+            scan_ptr := scan_ptr^.gplist_ptr;
+
+          if scan_ptr^.glob_id <> proc_id then
+            error := e_noprocess
+          else if (scan_ptr^.proctype = sys) and not insysflag then
+            error := e_invprocess
+          else
+            pcb_ptr := scan_ptr;
+
+          {Signal_sem (gplist_sem)}
+        end
+    end { Find_PCB };
+
+
+  procedure Rel_PCBglist (* pcb_ptr : ptr_PCB *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to remove a process from the global process   *)
+        (*   list.                                                   *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process to be     *)
+        (*             removed from the list.                        *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      glob_list_head : ptr_gplisthead;    { ptr to global list head }
+      scan_ptr : ptr_PCB;                 { ptr to scan through PCB list }
+      prev_ptr : ptr_PCB;                 { ptr to previous PCB in scan }
+
+    begin
+      glob_list_head := pointer(glob_pcb_list);
+
+      with glob_list_head^ do
+        begin
+          Wait_sem (gplist_sem, []);
+
+          if gplist_head_ptr = pcb_ptr then
+            gplist_head_ptr := pcb_ptr^.gplist_ptr   { remove head PCB }
+          else
+            begin  { remove non-head PCB }
+              scan_ptr := gplist_head_ptr;
+
+              while (scan_ptr <> pcb_ptr) and (scan_ptr <> nil) do
+                begin
+                  prev_ptr := scan_ptr;
+                  scan_ptr := scan_ptr^.gplist_ptr
+                end;
+
+              prev_ptr^.gplist_ptr := pcb_ptr^.gplist_ptr
+            end;
+
+          Signal_sem (gplist_sem)
+        end
+    end { Rel_PCBglist };
+
+
+  { Semaphore usage notes:
+      1. Semaphores are generally associated with some data structure.  If a
+         data structure requires some sort of semaphore control, part of the
+         record defining the data structure should declare 1 of the fields to
+         be of type semaphore.  Semaphores may also be used without being
+         associated with a particular data structure.  Note, however, that all
+         semaphores must be in sysglobal.
+
+      2. Semaphores may be initialized to allow any number of processes to 'own'
+         the semaphore at a time.  For mutual exclusion, initialize the semaphore
+         to 1.  Note, however, that for speed and efficiency, this implementation
+         of semaphores requires that the count be initialized to a value <= 1.
+         This restriction will be removed later.  Thus, semaphores may currently
+         be used only for mutual exclusion (count = 1) and synchronization
+         (count = 0).
+
+      3. Wait_sem decrements the semaphore count and if it's < 0, blocks the
+         calling process on the semaphore.  Signal_sem increments the count and
+         if it's <= 0, unblocks 1 of the processes waiting for the semaphore.
+
+      4. Note that these are low level kernel service routines that are meant
+         to be as fast as possible (currently in Pascal).  No error checking is
+         done.  Currently, however, there is a check to insure that semaphores
+         are initialized to a value <= 1.
+  }
+
+
+  procedure Init_sem (* var this_sem : semaphore;  initial : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to initialize a semaphore variable.  The      *)
+        (*   initial value of the counter is set and the associated  *)
+        (*   queue is initialized.                                   *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   this_sem : the semaphore to be initialized.             *)
+        (*                                                           *)
+        (*   initial : the initial value of the semaphore counter.   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel function that does    *)
+        (*   no error checking.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      with this_sem do
+        begin
+          { temporary check until the more general mechanism is defined }
+          if initial > 1 then System_Error (10103);
+
+          sem_count := initial;
+          owner := 0;
+          wait_queue := nil
+        end
+    end { Init_sem };
+
+
+  procedure Signal_sem (* var this_sem : semaphore *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to perform V type operation on a semaphore.   *)
+        (*   The counter is incremented and if there are any         *)
+        (*   processes waiting for the semaphore, 1 is taken from    *)
+        (*   the waiting queue, granted the semaphore, and           *)
+        (*   unblocked.                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   this_sem : the semaphore on which the Signal (V)        *)
+        (*              operation is to be performed.                *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel routine that does     *)
+        (*   no error checking.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+      old_owner : relptr;                     { relptr to previous owner of sem }
+      pcb_ptr : ptr_PCB;                      { ptr to process doing V }
+
+    begin
+      with this_sem do
+        begin
+          Intsoff (clokints, int_level);
+
+          sem_count := sem_count + 1;
+          old_owner := owner;
+
+          {   --- traps, if needed ---
+          if (sem_count = 1) and (owner = 0) then
+            Macsbug;
+          if (sem_count > 1) then Macsbug;
+          }
+
+          if sem_count > 0 then
+            { no one waiting for semaphore }
+            owner := 0
+          else
+            begin  { give semaphore to a waiting process }
+              pcb_ptr := wait_queue^.semwait_queue;
+
+              with pcb_ptr^ do
+                begin
+                  { remove waiter from semaphore's waiters' queue }
+                  if semwait_queue = pcb_ptr then
+                    wait_queue := nil
+                  else
+                    wait_queue^.semwait_queue := semwait_queue;
+
+                  if owner <> 0 then
+                    begin  { mutual exclusion semaphore }
+                      owner := ord(pcb_ptr) - b_sysglobal_ptr;
+                      sems_owned := sems_owned + 1;
+                      { Pri_Up }
+                      if priority < semPriority then
+                        priority := semPriority;
+                    end
+                end { with pcb_ptr^ };
+
+              Unblock_Process (pcb_ptr, [sem])
+            end { give semaphore to waiter };
+
+          Intson (int_level)
+        end { with this_sem };
+
+      { check priority if caller was a process.  An interrupt routine might,
+        for example, have called Signal_sem. }
+      if old_owner = c_pcb_ptr - b_sysglobal_ptr then
+        begin  { caller owned semaphore (i.e. was a process)}
+          pcb_ptr := pointer(c_pcb_ptr);
+          with pcb_ptr^ do
+            begin
+              sems_owned := sems_owned - 1;
+              { Pri_Down }
+              if sems_owned = 0 then
+                begin
+                  Intsoff (clokints, int_level);
+                  priority := norm_pri;
+                  Queue_Process (pcb_ptr, Ready);
+                  Intson (int_level)
+                end
+            end
+        end { caller was a process }
+    end { Signal_sem };
+
+
+  procedure Wait_sem (* var this_sem : semaphore;  control : sem_control *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to perform P type operation on a semaphore.   *)
+        (*   The counter is decremented and if it falls below 0, the *)
+        (*   calling process is placed in the queue of processes     *)
+        (*   waiting for the semaphore and blocked.                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   this_sem : the semaphore on which the wait (P)          *)
+        (*              operation is to be performed.                *)
+        (*                                                           *)
+        (*   control : the set of special control options to be      *)
+        (*             used in performing the wait operation (e.g.   *)
+        (*             read only, fast, etc.).  Currently, no        *)
+        (*             special options are implemented.              *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel function that does    *)
+        (*   no error checking.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                { current interrupt level }
+      pcb_ptr : ptr_PCB;                      { ptr to process doing P }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+
+      with this_sem, pcb_ptr^ do
+        begin
+          Intsoff (clokints, int_level);
+
+          sem_count := sem_count - 1;
+
+          if sem_count < 0 then
+            begin  { will have to wait }
+              { put process in waiters' queue }
+              if wait_queue = nil then
+                begin
+                  wait_queue := pcb_ptr;
+                  semwait_queue := pcb_ptr
+                end
+              else
+                begin
+                  semwait_queue := wait_queue^.semwait_queue;
+                  wait_queue^.semwait_queue := pcb_ptr;
+                  wait_queue := pcb_ptr
+                end;
+
+              Block_Process (pcb_ptr, [sem])
+              { when process is unblocked, it will have the semaphore }
+            end
+          else
+            begin  { make an owner right now - a mutual exclusion semaphore }
+              owner := ord(pcb_ptr) - b_sysglobal_ptr;
+              sems_owned := sems_owned + 1;
+              { Pri_Up }
+              if priority < semPriority then
+                begin
+                  priority := semPriority;
+                  Queue_Process (pcb_ptr, Ready);
+                end
+            end;
+
+          Intson (int_level)
+        end { with this_sem, pcb_ptr^ }
+    end { Wait_sem };
+
+
+  procedure Send_SoftInt (* pcb_ptr : ptr_PCB;  sft_int : sftint_types *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to send a soft interrupt to a particular      *)
+        (*   process to effect some process control action on it.    *)
+        (*   These soft interrupts are handled by the process as     *)
+        (*   soon as it is not 'in system code' (i.e. domain 0).     *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process which is  *)
+        (*             to receive the soft interrupt.                *)
+        (*                                                           *)
+        (*   sft_int : the soft interrupt type that is to be sent    *)
+        (*             to the process.                               *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from within  *)
+        (*   the kernel of the operating system to effect certain    *)
+        (*   types of process control.                               *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel routine which does    *)
+        (*   no error checking.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      abort_waits : blk_type;             { the set of 'abortable' waits }
+
+    begin
+      (*$IFC debug3 *)
+      if Trace (pm, 20) then
+        begin
+          write ('      sending a ');
+          case sft_int of
+            die  : write ('die ');
+            susp : write ('suspend ')
+          end;
+          writeln ('soft interrupt to PCB ', ord(pcb_ptr))
+        end;
+      (*$ENDC *)
+
+      with pcb_ptr^ do
+        softints := softints + [sft_int];
+
+      if (sft_int = die) and (pcb_ptr^.blk_state <> []) then
+        begin  { see if process can be woken }
+          abort_waits := [act_call, ostimer, pipe_io];
+          if pcb_ptr^.blk_state - abort_waits = [] then
+            Unblock_Process (pcb_ptr, abort_waits)
+        end
+    end { Send_SoftInt };
+
+
+  procedure Clear_SoftInt (* pcb_ptr : ptr_PCB;  sft_int : sftint_types *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to clear a pending soft interrupt against a   *)
+        (*   process.  The soft interrupt would still be pending     *)
+        (*   because the process is 'in system code'.                *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process which is  *)
+        (*             to have the soft interrupt cleared.           *)
+        (*                                                           *)
+        (*   sft_int : the soft interrupt type that is to be         *)
+        (*             cleared.                                      *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from within  *)
+        (*   the kernel of the operating system.                     *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  This is a low level kernel routine that does no  *)
+        (*   error checking.                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      with pcb_ptr^ do
+        softints := softints - [sft_int]
+    end { Clear_SoftInt };
+
+
+  procedure AbortProcess (* pcb_ptr : ptr_PCB;  allowTH : boolean;
+                            why : term_types *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to cause the specified process to be          *)
+        (*   aborted.  The process will be marked so that it will    *)
+        (*   begin terminating as soon as it is not in system code.  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process which is  *)
+        (*             to be aborted.                                *)
+        (*                                                           *)
+        (*   allowTH : true of the process should be allowed to      *)
+        (*             execute its terminate exception handler       *)
+        (*             before being aborted.                         *)
+        (*                                                           *)
+        (*   why : the reason for the process's termination to be    *)
+        (*         passed in the information block with the          *)
+        (*         terminate exception.                              *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      if not allowTH then
+        pcb_ptr^.terming := true;    { abort immediately }
+
+      pcb_ptr^.termcause := why;
+      Send_SoftInt (pcb_ptr, die)
+    end { AbortProcess };
+
+
+  procedure MakeSGSpace (* var no_space : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to allow any pending sysglobal expansions to  *)
+        (*   complete before returning to the calling process so     *)
+        (*   that subsequent sysglobal space requests have a chance  *)
+        (*   to succeed.                                             *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   no_space : true if no additional sysglobal space could  *)
+        (*              be produced after expansion attempts.        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.  But note that the calling process could lose     *)
+        (*   the CPU while a sysglobal expansion is being            *)
+        (*   performed.                                              *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine must be called in the context of a         *)
+        (*   process (i.e.  not from the Supervisor's stack).        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    type
+      { free pool space definitions from Sysglobal implementation }
+      hdr_pool_ptr = ^hdr_freepool;
+      hdr_freepool = record
+                        pool_size: int2; (* integer size of pool array *)
+                        firstfree: int4; (* offset into pool for first free *)
+                        freecount: int2; (* cumulative amount of free space *)
+                      end;
+
+    var
+      sgFree_ptr : hdr_pool_ptr;            { ptr to sysglobal free pool header }
+      old_sgSize : int2;                    { size of sysglobal before expansion }
+      pcb_ptr : ptr_PCB;                    { ptr to PCB of current process }
+
+    begin
+      sgFree_ptr := pointer(sg_free_pool_addr);
+      old_sgSize := sgFree_ptr^.freecount;
+      pcb_ptr := pointer(c_pcb_ptr);
+
+      if c_pcb_ptr <> mm_pcb_ptr then
+        while grow_sysglobal do
+          begin
+            pcb_ptr^.need_mem := true;   { for non-preemptive current process }
+            Enter_Scheduler
+          end;
+
+      if sgFree_ptr^.freecount <= old_sgSize then no_space := true
+        else no_space := false
+    end { MakeSGSpace };
+
+
+(*$S debugRes *)
+
+  procedure UserBreak;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to set a break point at the 1st instruction   *)
+        (*   in user code to be executed by a process when it        *)
+        (*   leaves the Operating System.  Checks are made to        *)
+        (*   ensure that there is a current process and that it      *)
+        (*   is executing in system code.  If the conditions are     *)
+        (*   met, the break point is created and set using the       *)
+        (*   user's return PC in the SCB and the appropriate         *)
+        (*   lisaBug procedures.                                     *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from the     *)
+        (*   procedure UBR in ProcAsm.  UBR is only intended to be   *)
+        (*   invoked from lisaBug.                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   If any errors occur trying to set the break point via   *)
+        (*   lisaBug (e.g. break point table overflow), an error     *)
+        (*   message is displayed and execution continues.           *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                      { ptr to PCB of current process }
+      sysloc_ptr : slocal_ptr;                { ptr to syslocal of current proc }
+      error : int2;                           { error return from Create_BP }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+      if pcb_ptr = nil then exit (UserBreak);
+      with pcb_ptr^ do
+        if (proctype = sys) or (domain <> 0) then exit (UserBreak);
+
+      { can set a break point in user code }
+      sysloc_ptr := pointer(b_syslocal_ptr);
+      Create_BP (pcb_ptr^.glob_id, sysloc_ptr^.SCB.PCvalue, error);
+      if error <> 0 then
+        begin
+          (*$IFC debug *)
+          writeln ('   Can''t set break point in user code.');
+          (*$ENDC *)
+          exit (UserBreak)
+        end;
+
+      Set_BP (pcb_ptr^.glob_id)
+    end { UserBreak };
+
+
+  procedure Get_PName (var errnum : int2;  proc_id : int4;  fullName : boolean;
+                       var progname : pathname);  external;
+
+  procedure ProcDisplay;
+    { debugging procedure to display all processes currently in the system }
+    type
+      string15 = string[15];
+      string27 = string[27];
+
+    var
+      blank6 : string[6];
+      i : domainRange;                        { for scanning DCT }
+
+    procedure ScanPCBQueue (head : ptr_PCB;  qName : string15);
+      { debugging procedure to display a process }
+      var
+        pcb_ptr : ptr_PCB;                    { process to be displayed }
+        num : int2;                           { # blanks for title lines }
+        lenOutLine : ^int1;                   { ptr to length byte of outLine }
+        bs_ptr : ^int1;                       { ptr to blk_state as a byte }
+        outLine : string[79];                 { for writing text }
+        header : string[79];                  { header 'constant' }
+        blank1 : char;                        { a blank character }
+        error : int2;                         { for calling Get_PName }
+        progName : pathname;                  { program file name of process }
+
+      begin
+        blank1 := ' ';   lenOutLine := @outLine;
+        (*blank6 := '      ';   { 12 bytes }*)
+        header := ' Id   Domain   Priority   BlkState   needMem   Program';
+
+        num := 21;   lenOutLine^ := num;
+        repeat
+          outLine[num] := blank1;
+          num := num - 1
+        until num = 0;
+        writeln (outLine, qName);
+        writeln (header);
+        pcb_ptr := head^.next_schedPtr;
+        while pcb_ptr <> head do
+          begin
+            with pcb_ptr^ do
+              begin
+                if priority > 0 then
+                  begin
+                    write (glob_id:3, domain:6, priority:11, '      ');
+                    outLine := '       ';
+                    bs_ptr := @blk_state;
+                    case bs_ptr^ of
+                      1: { [i_o] = blk_state }      outLine := 'i_o    ';
+                      2: { [ostimer] = blk_state }  outLine := 'timer  ';
+                      4: { [pipe_io] = blk_state }  outLine := 'pipe/EC';
+                      8: { [sem] = blk_state }      outLine := 'sem    ';
+                     16: { [act_call] = blk_state } outLine := 'suspend';
+                    end;
+
+                    write (outLine, '      ');
+
+                    outLine := '        ';
+                    if need_mem then outLine := 'NM      ';
+
+                    Get_PName (error, glob_id, false, progName);
+                    writeln (outLine, progName)
+                  end { priority > 0 }
+              end { with };
+
+          pcb_ptr := pcb_ptr^.next_schedPtr
+        end { while };
+
+        writeln
+      end { ScanPCBQueue };
+
+    begin  { ProcDisplay }
+      writeln;
+
+      ScanPCBQueue (@fwd_ReadyQ, 'Ready Queue');
+
+      ScanPCBQueue (@fwd_BlockQ, 'Blocked Queue');
+
+      (*writeln ('Domain Control Table');
+      for i := 0 to maxDomain do
+        writeln (i:2, ': ', 'Process ', DCT[i].owner:1);
+      writeln;
+      writeln ('nonPreempt = ', nonPreempt:1, '   sched_attn = ', sched_attn:1);
+
+      writeln*)
+    end { ProcDisplay };
+
+
+(*$S kr_prims *)
+
+  procedure RemoveProcess (* pcb_ptr : ptr_PCB *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to 'remove' a process from the system whose   *)
+        (*   stack and/or syslocal can't be swapped in due to some   *)
+        (*   error condition.  The process is removed from the       *)
+        (*   scheduling queue (Ready or Blocked), the global         *)
+        (*   process list, and the process hierarchy.  Its PCB is    *)
+        (*   returned to the free pool since that is the only        *)
+        (*   structure belonging to the process that can be          *)
+        (*   determined without its syslocal.  Since this is a       *)
+        (*   severe situation, the entire user process hierarchy     *)
+        (*   (Shell and all its descendants) is started terminating  *)
+        (*   in the hope that user data will make it back to disk    *)
+        (*   consistently.                                           *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process which is  *)
+        (*             to be removed.                                *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is intended to be used only by the       *)
+        (*   kernel of the system when it determines that some       *)
+        (*   fatal error (usually in swapping) has occurred.         *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;            { current interrupt level }
+      fatherpcb_ptr : ptr_PCB;            { ptr to process's father's PCB }
+      sonpcb_ptr : ptr_PCB;               { ptr to son processes of the father }
+      prevpcb_ptr : ptr_PCB;              { ptr to process's left brother }
+      rootpcb_ptr : ptr_PCB;              { ptr to Root's PCB }
+      shellpcb_ptr : ptr_PCB;             { ptr to Shell's PCB }
+      scanpcb_RP : relptr;                { relptr for scanning through sons }
+
+    begin
+      { remove process from scheduling queues and global list }
+      with pcb_ptr^ do
+        begin
+          Intsoff (allints, int_level);
+          prev_schedPtr^.next_schedPtr := next_schedPtr;
+          next_schedPtr^.prev_schedPtr := prev_schedPtr;
+          Intson (int_level)
+        end;
+      Rel_PCBglist (pcb_ptr);
+
+      { force the entire hierarchy to begin terminating }
+      rootpcb_ptr := pointer(root_pcb_ptr);
+      { this assumes Shell is the most recently created son of Root }
+      shellpcb_ptr := pointer(rootpcb_ptr^.sonptr + b_sysglobal_ptr);
+      if pcb_ptr <> shellpcb_ptr then
+        AbortProcess (shellpcb_ptr, true, fthr_term)
+      else
+        begin  { must abort Shell's sons }
+          scanpcb_RP := shellpcb_ptr^.sonptr;
+          while scanpcb_RP <> 0 do
+            begin
+              sonpcb_ptr := pointer(scanpcb_RP + b_sysglobal_ptr);
+              AbortProcess (sonpcb_ptr, true, fthr_term);
+              scanpcb_RP := sonpcb_ptr^.brotherptr
+            end
+        end { abort Shell's sons };
+
+      if ord(pcb_ptr) <> root_pcb_ptr then
+        begin  { remove process from hierarchy }
+          fatherpcb_ptr := pointer(pcb_ptr^.fatherptr + b_sysglobal_ptr);
+          sonpcb_ptr := pointer(fatherpcb_ptr^.sonptr + b_sysglobal_ptr);
+
+          if sonpcb_ptr = pcb_ptr then
+            begin  { process is the 1st son }
+              fatherpcb_ptr^.sonptr := pcb_ptr^.brotherptr;
+              if fatherpcb_ptr^.terming and (pcb_ptr^.brotherptr = 0) then
+                { also the last son }
+                Signal_sem (fatherpcb_ptr^.fam_sem)
+            end
+          else
+            begin  { process is not the 1st son }
+              while sonpcb_ptr <> pcb_ptr do
+                begin  { find the right PCB }
+                  prevpcb_ptr := sonpcb_ptr;
+                  sonpcb_ptr := pointer(sonpcb_ptr^.brotherptr + b_sysglobal_ptr)
+                end;
+
+              prevpcb_ptr^.brotherptr := sonpcb_ptr^.brotherptr
+            end
+        end { remove process from hierarchy };
+
+      { adjust hierarchy if process had any sons }
+      if (pcb_ptr^.sonptr <> 0) and (pcb_ptr^.proctype = user) then
+        begin  { move sons up 1 level }
+          scanpcb_RP := pcb_ptr^.sonptr;
+          while scanpcb_RP <> 0 do
+            begin
+              sonpcb_ptr := pointer(scanpcb_RP + b_sysglobal_ptr);
+              scanpcb_RP := sonpcb_ptr^.brotherptr
+            end;
+          sonpcb_ptr^.brotherptr := fatherpcb_ptr^.sonptr;
+          fatherpcb_ptr^.sonptr := pcb_ptr^.sonptr
+        end { move sons };
+
+      { release the process's PCB, since that's all we know about now }
+      RelSpace (ord(pcb_ptr), b_sysglobal_ptr)
+    end { RemoveProcess };
+
+
+  end.
+
+ÿ

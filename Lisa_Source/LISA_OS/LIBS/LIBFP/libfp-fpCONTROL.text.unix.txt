@@ -1,0 +1,430 @@
+;-----------------------------------------------------------
+; 04JUL82: WRITTEN BY JEROME COONEN
+; 29AUG82: ACCESS TO STATE MADE EXPLICIT HERE. (JTC)
+; 12OCT82: CLEAR D0.W TO GET QUO IN REM; RND-UP BIT. (JTC)
+; 12DEC82: DON'T CLEAR D0.W HERE -- LET REM DO IT ALL (JTC)
+; 28DEC82: ADD LOGBX AND SCALBX (JTC).
+; 13APR83: ADD COMMENT ABOUT LABEL POP3 (JTC).
+; 29APR83: ADD CLASS (JTC).
+; 09MAY83: MAJOR CHANGES: SEE FPDRIVER. (JTC)
+; 25AUG83: Change to Lisa Sane_Environ (JTC).
+; 01NOV83: MOVE PRECISION CONTROL TO MODES (JTC).
+;
+;-----------------------------------------------------------
+
+        .if     formac+fordeb           ; This stuff louses up Lisabug.
+        
+        BRA.S   FPBEGIN
+
+        .WORD   $00                             ; MAC SPECIFIC STUFF
+        .ASCII  'PACK'
+        .WORD   $4
+        .WORD   $0001
+
+        .endc
+        
+;-----------------------------------------------------------
+; FOR TESTING, DEFINE STATEADRS RIGHT HERE
+;-----------------------------------------------------------
+        .IF     FORDEB
+STATEADRS:
+        .WORD   0
+        .WORD   0
+        .WORD   0
+        .ENDC
+
+;-----------------------------------------------------------
+; THIS IS THE SOLE ENTRY POINT OF THE PACKAGE.
+; THE STACK HAS THE FORM:
+;       <RET> <OPWORD> <ADRS1> <ADRS2> <ADRS3>
+; WHERE THE NUMBER OF ADDRESSES DEPENDS ON THE OPERATION.
+; MOST USE 2, SOME 1, ONLY BIN->DEC USES 3.
+;
+; FIRST GROW THE STACK TO HOLD: <TRAP VECTOR> <BYTE COUNT>
+; BELOW <RET> IN CASE A TRAP IS TAKEN.
+;
+; THEN SAVE REGISTERS D0-D7, A0-A4.
+;-----------------------------------------------------------
+FPBEGIN:
+        LINK    A6,#-2                  ; RESERVE CNT WORD
+        MOVEM.L D0-D7/A0-A4,-(SP)
+
+;-----------------------------------------------------------
+;
+; GET POINTER TO STATE AREA IN A0, USING SYSTEM CONVENTION.
+; SAMPLE USES ARE:
+;
+;       (DEBUGGING)
+;               LEA     STATEADRS,A0
+;
+;       (LISA)
+;               Get state address from library routine.
+;
+;       (MACINTOSH)
+;               MOVEA.W #FPState,A0
+;                       ...WHERE FPState IS DEFINED IN
+;                       TOOLEQU.TEXT, TO BE INCLUDED AT THE
+;                       TOP OF THE PROGRAM IN FPDRIVER.TEXT
+;
+;
+;-----------------------------------------------------------
+               .IF      FORMAC
+               MOVEA.W  #FPState,A0
+               .ENDC
+
+               .IF      FORDEB
+               LEA      STATEADRS,A0
+               .ENDC
+
+               .IF      FORLISA
+               SUBQ.L   #4,SP           ; MAKE WAY FOR PTR
+               .REF     Sane_Environ
+               JSR      Sane_Environ    ; COMPUTE STATE ADRS
+               MOVEA.L  (SP)+,A0
+               .ENDC
+
+               BRA.S    FPCOM           ; NOW DO IT
+        
+;-----------------------------------------------------------
+; THIS IS A TABLE OF INFORMATION BITS FOR THE VARIOUS
+; OPERATIONS.  SEE COMMENT BELOW FOR EXPLANATION
+;-----------------------------------------------------------
+OPMASKS:
+        .WORD   $0E1    ; ADD
+        .WORD   $0E1    ; SUB
+        .WORD   $0E1    ; MUL
+        .WORD   $0E1    ; DIV
+        .WORD   $0C1    ; CMP
+        .WORD   $0C1    ; CMPX
+        .WORD   $0E1    ; REM
+        .WORD   $061    ; 2EXT
+        .WORD   $161    ; EXT2
+        .WORD   $0A0    ; SQRT
+        .WORD   $0A0    ; RINT
+        .WORD   $0A0    ; TINT
+        .WORD   $0A1    ; SCALB -- LIKE SQRT, LEAVE INT
+        .WORD   $0A0    ; LOGB -- LIKE SQRT
+        .WORD   $041    ; CLASS -- SRC IN, INT PTR IS DST
+
+        .if     forlisa
+        debugend        'FP68K   '
+        .endc
+
+;-----------------------------------------------------------
+; ALTERNATIVE ENTRY POINT TO BYPASS RECALC OF STATE PTR.
+;-----------------------------------------------------------
+REFP68K:
+        LINK    A6,#-2                  ; RESERVE CNT WORD
+        MOVEM.L D0-D7/A0-A4,-(SP)
+
+FPCOM:
+
+;-----------------------------------------------------------
+; GET OPWORD INTO D6.LO; AFTER DECODING, WILL GO TO D6.HI.
+;-----------------------------------------------------------
+        MOVE.W  LKOP(A6),D6
+
+;-----------------------------------------------------------
+; HANDLE ODD INSTRUCTIONS (STATE AND BIN-DEC) ELSEWHERE.
+;-----------------------------------------------------------
+        MOVEQ   #OPAMASK,D7     ; ISOLATE OP INDEX
+        AND.W   D6,D7
+
+        BCLR    #0,D6           ; TEST AND CLEAR ODD BIT
+        BNE     ODDBALL
+
+;-----------------------------------------------------------
+; FOR ARITHMETIC OPERATIONS, CLEAR ROUND INCREMENT BIT IN
+; LOW BYTE OF STATE WORD.
+;-----------------------------------------------------------
+        BCLR    #RNDINC,1(A0)
+
+;-----------------------------------------------------------
+; SAVE INDEX IN D7.LO FOR LATER JUMP.
+; PICK UP USEFUL INFO BITS FROM TABLE, AFTER WHICH HAVE:
+;       8000 - IF SINGLE OP
+;       4000 - IF DOUBLE OP
+;       3800 - "NONEXTENDED" OPERAND -- WILL BE SRC FORMAT
+;       0100 - IF "NONEXTENDED" IS DST
+;       0700 - WILL BE DST FORMAT
+;       0080 - IF DST IS INPUT
+;       0040 - IF SRC IS INPUT
+;       0020 - IF DST IS OUTPUT (IDENTIFIES COMPARISONS)
+;       001E - OP CODE
+;       0001 - IF 2 ADDRESSES ON STACK
+;-----------------------------------------------------------
+        .IF PCOK
+        OR.W    OPMASKS(PC,D7),D6
+        .ELSE
+        OR.W    OPMASKS(D7),D6
+        .ENDC
+
+;-----------------------------------------------------------
+; TWO CASES MUST BE DISTINGUISHED:
+;       DST = EXTENDED, SRC = ANY          (USUAL)
+;       DST = ANY       SRC = EXTENDED     (CONVERSIONS)
+; THE "ANY" FORMAT IS IN BITS 3800 (SRC).  BIT 0100
+; DETERMINES WHETHER IT SHOULD BE DST IN BITS 0700.
+; AFTER TEST ABOVE HAVE FORMAT BITS ISOLATED IN D0.
+;
+; IF FORMAT GOVERNS DST OPERAND, IT OVERRIDES 2 LEADING
+; CONTROL BITS.  NOTE THAT EVEN EXTRANEOUS INTEGER BITS
+; OVERRIDE CONTROL BITS, BUT THEY HAVE NO EFFECT.
+;
+; IN ANY CASE, MOVE PRECISION CONTROL BITS TO HIGH BITS OF
+; D6.
+;-----------------------------------------------------------
+        MOVEQ   #PRECMSK,D0     ; GET ONLY PRECISION CONTROL
+        AND.B   1(A0),D0
+        ROR.W   #7,D0           ; ALIGN $0060 AS $C000
+        OR.W    D0,D6
+
+        BTST    #8,D6
+        BEQ.S   @2
+
+        MOVE.W  D6,D0           ; SAVE FORMAT BITS
+        ANDI.W  #$00FF,D6       ; KILL ALL FORMAT BITS
+
+        ANDI.W  #$3800,D0       ; ISOLATE FORMAT BITS
+        MOVE.W  D0,D1           ; COPY FOR CONTROL BITS
+        LSL.W   #3,D1           ; ALIGN 2 TRAILING BITS
+        ROR.W   #3,D0           ; SRC -> DST POSITION
+        OR.W    D0,D6
+        OR.W    D1,D6
+@2:
+
+;-----------------------------------------------------------
+; PLACE OPWORD IN D6.HI WHERE IT WILL STAY.
+; INIT TO ZERO D2,3 = INDEXES FOR CASES,
+; D6.LO = FLAGS & SIGNS.
+; BY NOW, D7.HI = JUNK, D7.LO = OPERATION INDEX.
+;-----------------------------------------------------------
+        SWAP    D6
+        CLR.L   D2
+        MOVE.L  D2,D3
+        MOVE.W  D2,D6
+
+;-----------------------------------------------------------
+; POST-DECODE MILESTONE ++++++++++++++++++++++++++++++++++ .
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; NOW UNPACK OPERANDS, AS NEEDED.  DST, THEN SRC.
+; LAST OPERAND IS IN D4,5/A4/D6.B.#7
+; FIRST OPERAND, IF 2, IS IN A1,2/A3/D6.B.#6
+; UNPACK ROUTINE EXPECTS (FORMAT*2) IN DO AND ADRS IN A3.
+;-----------------------------------------------------------
+        BTST    #DSTIN+16,D6
+        BEQ.S   @3
+
+        MOVE.L  D6,D0           ; GET OPWORD AND ALIGN DST
+        SWAP    D0
+        ROR.W   #7,D0
+        MOVEA.L LKADR1(A6),A3   ; DST ADDRESS
+        BSR     UNPACK
+@3:
+
+;-----------------------------------------------------------
+; IF SOURCE IN, MOVE DST OP OVER (EVEN IF NONE INPUT)
+; ALSO, BUMP INDEXES IN D2,D3.
+; IN ORDER TO USE A3 TO CALL UNPACK, MUST SAVE DST EXP (IN
+; A4) ACCROSS CALL, THEN RESTORE TO A3.
+;-----------------------------------------------------------
+        BTST    #SRCIN+16,D6
+        BEQ.S   @4
+
+        MOVEA.L D4,A1           ; HI BITS
+        MOVEA.L D5,A2           ; LO BITS
+        MOVE.L  A4,-(SP)        ; SAVE EXP ON STACK FOR CALL
+        ROR.B   #1,D6           ; SIGN
+
+        ADD.W   D2,D2           ; NAN INDEX (NEG, 2, 4, 6)
+        MOVE.W  D3,D0           ; NUM INDEX (0 - 16)
+        ADD.W   D3,D3
+        ADD.W   D0,D3
+
+        MOVE.L  D6,D0
+        SWAP    D0
+        ROL.W   #6,D0
+        MOVEA.L LKADR2(A6),A3   ; SRC ADDRESS
+        BSR     UNPACK
+        MOVEA.L (SP)+,A3        ; RESTORE DST EXP
+@4:
+
+;-----------------------------------------------------------
+; CONVENIENT HERE TO PUT XOR OF SIGNS IN D6(#5).
+;-----------------------------------------------------------
+        ASL.B   #1,D6           ; V = XOR OR SIGNS
+        BVC.S   @6
+        BSET    #6,D6
+@6:
+        ROXR.B  #1,D6
+
+;-----------------------------------------------------------
+; POST-UNPACK MILESTONE +++++++++++++++++++++++++++++++++++.
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; NOW PUSH A RETURN ADDRESS AND JUMP TO 3 CASES.
+; REMEMBER OPERATION INDEX IN D7, WHICH MUST BE ZEROED.
+;-----------------------------------------------------------
+        MOVE.W  D7,D0           ; FREE D7 FOR INIT
+        CLR.L   D7
+
+        .IF PCOK
+        PEA     PREPACK(PC)     ; WHERE TO COME BACK TO
+        .ELSE
+        PEA     PREPACK
+        .ENDC
+
+        TST.W   D2              ; NANS DISCOVERED?
+        BNE     NANS
+
+;-----------------------------------------------------------
+; DO-ARITHMETIC MILESTONE ++++++++++++++++++++++++++++++++ .
+;-----------------------------------------------------------
+
+ARITHOP:
+        .IF PCOK
+        MOVE.W  ARITHTAB(PC,D0),D0      ; GET INDEX
+        JMP     ARITHOP(PC,D0)
+        .ELSE
+        MOVE.W  ARITHTAB(D0),D0
+        JMP     ARITHOP(D0)
+        .ENDC
+
+;-----------------------------------------------------------
+; JUMP TO ARITHMETIC ROUTINE BASED ON INDEX SAVED IN D7.
+;-----------------------------------------------------------
+ARITHTAB:
+        .WORD   ADDTOP-ARITHOP
+        .WORD   SUBTOP-ARITHOP
+        .WORD   MULTOP-ARITHOP
+        .WORD   DIVTOP-ARITHOP
+        .WORD   CMPTOP-ARITHOP
+        .WORD   CMPTOP-ARITHOP       ; CMPX NOT SPECIAL
+        .WORD   REMTOP-ARITHOP
+        .WORD   CVT2E-ARITHOP
+        .WORD   CVTE2-ARITHOP
+        .WORD   SQRTTOP-ARITHOP
+        .WORD   RINT-ARITHOP
+        .WORD   TINT-ARITHOP
+        .WORD   SCALBTOP-ARITHOP
+        .WORD   LOGBTOP-ARITHOP
+        .WORD   CLASSTOP-ARITHOP
+
+
+;-----------------------------------------------------------
+; PRE-PACK MILESTONE +++++++++++++++++++++++++++++++++++++ .
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; PACK AND DELIVER IF OUTPUT OPERAND (SKIP COMPARES)
+;-----------------------------------------------------------
+PREPACK:
+        BTST    #DSTOUT+16,D6
+        BEQ.S   CHKERR
+
+        MOVE.L  D6,D0           ; GET OPWORD AND ALIGN DST
+        SWAP    D0
+        ROR.W   #7,D0
+        BSR     PACK
+
+;-----------------------------------------------------------
+; ALIGN CCR BITS FROM D7.HI TO D7.LO.
+; OR ERROR FLAGS INTO STATE WORD, STUFF STATE WORD, AND
+; CHECK FOR A TRAP.
+;-----------------------------------------------------------
+CHKERR:
+        SWAP    D7              ; RIGHT ALIGN CCR BITS
+
+        MOVE.W  (A0),D0         ; GET STATE WORD
+        CLR.B   D6              ; KILL SIGNS
+        OR.W    D6,D0
+        MOVE.W  D0,(A0)+        ; BUMP ADRS TO VECTOR
+
+        ROR.W   #8,D6           ; ALIGN BYTES
+        AND.W   D6,D0
+        BEQ.S   PASTHALT  ; ZERO IF NO TRAP
+
+;-----------------------------------------------------------
+; TO SET UP FOR TRAP:
+;       HAVE D0 ON TOP OF STACK.
+;       PUSH CCR TO HAVE 3-WORD STRUCTURE
+;       PUSH ADDRESS OF 3-WORD STRUCTURE
+;       BLOCK MOVE  OPCODE < ADR1 < ADR2 < ADR3 < REGADR
+;         TO STACK
+;       CALL HALT PROCEDURE, EXPECTING PASCAL CONVENTIONS TO
+;               BE HONORED.
+; THE BLOCK MOVE CAN BE DONE WITH A PAIR OF MOVEM'S SO LONG
+; AS AN EXTRA WORD IS COPIED (TO HAVE A WHOLE NUMBER OF
+; LONGS).
+;-----------------------------------------------------------
+
+
+        MOVE.W  D7,-(SP)        ; SAVE CCR BELOW D0
+        move.w  d0,-(sp)
+        PEA     (SP)            ; ADDRESS OF CCR/D0
+
+        MOVEM.L LKRET+2(A6),D0-D3
+        MOVEM.L D0-D3,-(SP)
+        ADDQ.L  #2,SP           ; KILL EXTRA WORD
+
+;-----------------------------------------------------------
+; IN MAC ENVIRONMENT, MUST LOCK MATH PACKAGE BEFORE CALLING
+; EXTERNAL PROCEDURE THAT WILL EXPECT TO RETURN.
+;-----------------------------------------------------------
+        .IF FORMAC
+
+        MOVE.L  AppPacks+16,A4  ; GET FP68K HANDLE
+        MOVE.W  (A4),D7         ; SAVE STATE OF LOCK BIT
+        BSET    #Lock,(A4)      ; FORCE LOCKING
+        MOVEA.L (A0),A0         ; GET VECTOR ADRS
+        JSR     (A0)
+        MOVE.W  D7,(A4)         ; RESTORE LOCK BIT STATE
+
+        .ELSE
+
+        MOVEA.L (A0),A0
+        JSR     (A0)
+
+        .ENDC
+
+        MOVE.l  (SP)+,D7        ; RESTORE CCR BITS
+
+;-----------------------------------------------------------
+; AFTER TRAP JUST RESTORE REGISTERS, KILL STACK STUFF, AND
+; RETURN.  TRICK: LOAD INCREMENT TO STACK JUST BELOW REGS,
+; SO ACCESSIBLE AFTER MOVEM.L.
+;-----------------------------------------------------------
+PASTHALT:
+        BTST    #TWOADRS+16,D6
+        BEQ.S   POP1
+POP2:
+        MOVEQ   #STKREM2,D0
+        MOVEQ   #LKADR2,D1
+        BRA.S   POPIT
+POP1:
+        MOVEQ   #STKREM1,D0
+        MOVEQ   #LKADR1,D1
+POPIT:
+        MOVE.W  D0,LKCNT(A6)            ; KILL COUNT
+        MOVE.L  LKRET(A6),0(A6,D1)      ; MOVE RETURN DOWN
+        MOVEA.L (A6),A6                 ; UNLINK MANUALLY
+        MOVE    D7,CCR
+        MOVEM.L (SP)+,D0-D7/A0-A4
+        ADDA.W  (SP),SP
+        RTS
+
+;-----------------------------------------------------------
+; THE ONLY THREE-ADDRESS OPERATION IS BINARY TO DECIMAL
+; CONVERSION.  POP3 IS JUMPED TO FROM THE END OF THAT OP.
+; NOTE THAT BIN2DEC CANNOT ITSELF TRAP, SO THE CODE AFTER
+; @1 ABOVE IS IRRELEVANT.
+;-----------------------------------------------------------
+POP3:
+        MOVEQ   #STKREM3,D0
+        MOVEQ   #LKADR3,D1
+        BRA.S   POPIT
+
+ÿ

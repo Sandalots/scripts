@@ -1,0 +1,925 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+(*  MM1  *)
+
+
+procedure SEG_IO(var error: int2; func: ioop; discaddr: addrdisc;
+                 c_memaddr: int4; length: int4);                              (*P*)
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Transfer data to/from the disc from/to an allocated *)
+       (*    region of physical memory.                          *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    func = read if a read of data from disc to memory   *)
+       (*         = write if a write from memory to disc         *)
+       (*                                                        *)
+       (*    discaddr = the disc address                         *)
+       (*                                                        *)
+       (*    c_memaddr = the physical memory byte address        *)
+       (*                                                        *)
+       (*    length = the number of bytes of data to transfer    *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    error - indicates the success or failure of the data*)
+       (*            transfer.                                   *)
+       (*            = 0 Successful transfer.                    *)
+       (*            <>0 Data transfer error.                    *)
+       (*                                                        *)           (*P*)
+       (**********************************************************)
+
+var
+  c_offset, actual: int4;
+  fcbptr: sfcb_ptr;
+  try: integer;
+  myMMRB : mmrb_ptr;
+  resSize : int2;
+
+begin
+  myMMRB := pointer(mmrb_addr);
+  with discaddr do                                                            (*P*)
+    begin                                                                     (*P*)
+      fcbptr:=pointer(fid + b_sysglobal_ptr);                                 (*P*)
+      c_offset:=offset;                                                       (*P*)
+    end;                                                                      (*P*)
+
+  (*$IFC DEBUG2*)
+  if TRACE(mm,0) then
+    begin
+      writeln(' SEG_IO xfer - length = ',length,' c_offset = ',c_offset);     (*P*)
+      writeln('               memaddr= ',c_memaddr,' fcbptr = ',ord(fcbptr)); (*P*)
+    end;
+  (*$ENDC*)
+
+  (* transfer the data - do not try to transfer 0 bytes *)
+  error:=0;
+  if length <> 0 then
+    begin
+      try:=0;
+      repeat
+        DIRECT_IO(error,fcbptr,c_memaddr,c_offset,length,actual,func);        (*P*)
+        (*$IFC DEBUG1*)
+        if error > 0 then
+          begin
+            beep(3822,1000);
+            writeln('Swap I/O Error = ',error);
+          end;
+        (*$ENDC*)
+
+        if error = 610 then
+          { no sysglobal space for i/o request }
+          with myMMRB^ do
+            if resReqBlks <> ord(nil) then
+              begin  { released reserved space }
+                RelSpace (resReqBlks, b_sysglobal_ptr);
+                resReqBlks := ord(nil)
+              end;
+
+        try:=try+1;
+      until (error <= 0) or (try >= 3);
+    end;
+
+  with myMMRB^ do
+    if resReqBlks = ord(nil) then
+      begin
+        resSize := 2 * (Sizeof (reqblk) + Sizeof (disk_extend));
+        if not GetSpace (resSize, b_sysglobal_ptr, resReqBlks) then
+          resReqBlks := ord(nil)
+      end
+end; (* SEG_IO *)
+
+
+procedure SWAP_SEG(var error: int2; c_sdb_ptr: sdb_ptr; func: ioop);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Swap the segment defined by c_sdb_ptr to/from disc. *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    func defines the direction of the swap.             *)
+       (*    c_sdb_ptr defines the segment to be swapped         *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    error indicates the results of the operation        *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+type
+  BlkUnpackTab = record (* unpacking table *)
+                 btype: int1;  (* block type *)
+                 res1: int1;   (* reserved *)
+                 bsize: int2;  (* block size *)
+                 packversion: int4; (* packtable version *)
+                 unpackbytes: array[1..2] of int1; (* unpack bytes *)
+               end;
+
+var
+  actual, seg_addr, seg_length: int4;
+  bufaddr: absptr;
+  checkByte: ^int1;
+  checkLeng: ^int4;
+  p_unpackTab: ^BlkUnpackTab;
+  error2: int2;
+  c_discaddr: addrdisc;                                                       (*P*)
+  l, l2, x: int4;                                                             (*P*)
+  c_mmrb: mmrb_ptr;                                                           (*P*)
+
+begin
+  error:=0;
+  with c_sdb_ptr^ do
+    begin
+
+      (*$IFC DEBUG2*)
+      if TRACE(mm,17) then
+        begin
+          if func = writeop
+            then writeln(' SWAPOUT sdb= ',ord(c_sdb_ptr),
+                         ' memaddr = ',memaddr)
+            else writeln(' SWAPIN  sdb= ',ord(c_sdb_ptr),
+                         ' memaddr = ',memaddr);
+        end;
+      (*$ENDC*)
+
+      (*$IFC DEBUG1*)
+      if func = writeop
+        then if sdbtype = code
+               then measTable.misc[cntCsout]:=measTable.misc[cntCsout]+1
+               else measTable.misc[cntDsout]:=measTable.misc[cntDsout]+1
+        else if sdbtype = code
+               then measTable.misc[cntCsin]:=measTable.misc[cntCsin]+1
+               else measTable.misc[cntDsin]:=measTable.misc[cntDsin]+1;
+      (*$ENDC*)
+
+      if func = writeop then
+        begin
+          sdbstate.memoryF:=false;
+          sdbstate.overlayF:=false;
+        end;
+
+      { determine address in memory for segment i/o }
+      seg_addr := ord4(memaddr) * hmempgsize*2 + logrealmem;
+      if sdbtype = stack then
+        if newlength <> 0 then
+          if func = readop then (* adjust for the stack expansion *)
+            seg_addr:=seg_addr + ord4(newlength)*hmempgsize*2 - length;
+
+      bufaddr:=seg_addr;                                                      (*P*)
+
+      { Determine length of i/o                                 }
+      { Writeop - Use length of segment                         }
+      { Readop - Code Segment                                   }
+      {          o Packed - Use Packed Size                     }
+      {          o Unpacked-Use length of Segment               }
+      {          Data Segment                                   }
+      {          o Use smaller of length, newlength, disclength }
+      seg_length:=length;
+      if func = readop then
+        if sdbtype = code then
+          begin
+            if packedLen <> 0 then seg_length:=packedLen;
+          end
+         else
+          begin (* data seg *)
+            if disclength < seg_length then seg_length:=disclength;
+            if newlength <> 0 then
+              if ord4(newlength)*hmempgsize*2 < seg_length
+                then seg_length:=ord4(newlength)*hmempgsize*2;
+          end;
+
+      if sdbtype = code then                                                  (*P*)
+        begin  (*transferring code seg*)                                      (*P*)
+          if func = readop then                                               (*P*)
+            begin
+              (* This code assumes there is 1 extra block of memory *)        (*P*)
+              (* available for reading the code segment in 1 I/O    *)        (*P*)
+              c_discaddr.fid:=discaddr.fid;                                   (*P*)
+              c_discaddr.offset:=(discaddr.offset div 512) * 512;             (*P*)
+              x:=discaddr.offset-c_discaddr.offset;                           (*P*)
+              l2:=(((discaddr.offset + seg_length + 511) div 512) * 512) -    (*P*)
+                     c_discaddr.offset;                                       (*P*)
+              SEG_IO(error,func,c_discaddr,seg_addr,l2);                      (*P*)
+              if error > 0 then goto 10; (*take error exit*)                  (*P*)
+              if x > 0 then MOVER(seg_addr+x,seg_addr,seg_length);            (*P*)
+            end;                                                              (*P*)
+        end                                                                   (*P*)
+       else                                                                   (*P*)
+        begin (*transfering data seg*)                                        (*P*)
+          SEG_IO(error,func,discaddr,seg_addr,seg_length);                    (*P*)
+          if error > 0 then goto 10; (* take error exit *)                    (*P*)
+        end;                                                                  (*P*)
+
+
+      { if necessary unpack the segment }
+      if (func = readop) and
+         (packedLen <> 0) then
+        begin (* the segment must be unpacked *)
+          error:=e_mmbase+e_unpackerr; (* assume failure *)
+          checkByte:=pointer(bufaddr);
+          checkLeng:=pointer(bufaddr);
+          if checkByte^ <> -96 {$A0}
+            then goto 10 (* invalid format - take error exit *)
+            else
+             begin (* valid code segment *)
+               p_unpacktab:=pointer(unpacktabaddr);
+               if p_unpacktab^.btype = -95 {$A1} then
+                 begin (* valid unpacking table *)
+                   error2:=UNPACKCODE(p_unpackTab^.packversion,bufaddr+12,
+                                     bufaddr+8,ord(@p_unpackTab^.unpackbytes),
+                                     packedLen-12,length-8);
+                   if error2 <> 0
+                     then goto 10 (* unpacking failed - take error exit*)
+                     else
+                      begin
+                        checkLeng^:=length;(* store first then check byte *)
+                        checkByte^:=-123; {$85}   (* seg now looks ordinary *)
+                      end;
+                 end;
+             end;
+        end;
+      error:=0;
+      if func = readop then sdbstate.memoryF:=true;
+    end; (*with*)
+
+10: (* error exit *)
+
+end;(* SWAP_SEG *)
+
+procedure TSTCLKPTR(c_sdb: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Backup the clock pointer if it is currently pointing*)
+       (*    to c_sdb                                            *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb - the segment which should not be the current *)
+       (*            clock pointer target                        *)
+       (*                                                        *)
+       (**********************************************************)
+var
+  c_mmrb: mmrb_ptr;
+
+begin
+  c_mmrb:=pointer(mmrb_addr);
+  with c_mmrb^ do
+    begin
+      if (clock_ptr = c_sdb) then
+        begin (* clock pointer must be adjusted *)
+          repeat clock_ptr:=pointer(ord(clock_ptr^.memchain.bkwd_link))
+          until (clock_ptr^.sdbtype <> free);
+        end;
+    end;
+end;(*TSTCLKPTR*)
+
+
+procedure DEALLOC_MEM(c_sdb: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Deallocate the memory assigned to segment c_sdb     *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb - the segment which is relinquishing memory   *)
+       (*                                                        *)
+       (**********************************************************)
+begin
+  (* check if clock ptr is pointing to this seg - if so adjust *)
+  TSTCLKPTR(c_sdb);
+
+  with c_sdb^ do
+    begin
+      (* delete sdb from chain of sdb's with allocated memory  *)
+      REMOVESDB(c_sdb);
+
+      (* make a free sdb in the free space *)
+      MAKE_FREE(memaddr,memsize);
+
+      (* clear the allocation fields in the sdb *)
+      memaddr:=0;
+      memsize:=0;
+    end;
+end;(*DEALLOC_MEM*)
+
+
+procedure TOSS_SEG(var error: int2; c_sdb_ptr: sdb_ptr; write_out: boolean);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The sdb will be swapped to disc if necessary and    *)
+       (*    the region of memory allocated to c_sdb_ptr will    *)
+       (*    be made a free region.                              *)
+       (*                                                        *)
+       (**********************************************************)
+
+(*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 14 }
+             ev_segT: int1;             { seg type 1=private code }
+                                        {          2=data }
+                                        {          3=stack}
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_maddr: int2;            { memory address }
+             ev_res2: int4;             { reserved }
+           end;
+
+(*$ENDC*)
+
+var
+  old_memaddr, old_memsize: int2;
+
+  (*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+begin
+  with c_sdb_ptr^ do
+    begin
+      {
+      RECORDIT(52,ord(sdbtype),memaddr,memsize,ord(c_sdb_ptr));               (*P*)
+      }
+      (*$IFC DEBUG2*)
+      if TRACE(mm,0) then
+        begin
+          if sdbtype = code
+          then writeln(' toss code seg - sdb = ',ord(c_sdb_ptr),' memaddr = ',memaddr)
+          else writeln(' toss data seg - sdb = ',ord(c_sdb_ptr),' memaddr = ',memaddr);
+          writeln(' hit RETURN for the system to continue');
+          readln;
+        end;
+      (*$ENDC*)
+      (*$IFC DEBUG1*)
+      if TRACE(spare2,9) then
+        begin
+          if LOGGING then
+            begin
+              with c_event do
+                begin
+                  ev_type:=14;
+                  ev_segT:=ord(sdbtype);
+                  ev_sdb:=c_sdb_ptr;
+                  ev_maddr:=memaddr;
+                  ev_res2:=0;
+                  LOG(error,ord(@c_event));
+                end;
+            end;
+        end;
+      (*$ENDC*)
+
+      (* make sure all processes are off the srb chain *)
+      if sdbtype <> code then CLEAR_SRB(c_sdb_ptr);
+
+      (* swap seg out of memory *)
+      error:=0;
+      if write_out then SWAP_SEG(error,c_sdb_ptr,writeop);
+      if error <= 0 then
+        begin
+          old_memaddr:=memaddr;
+          old_memsize:=memsize;
+
+          (* deallocate memory allocated to segment *)
+          DEALLOC_MEM(c_sdb_ptr);
+
+          (* change mapping in all domains *)
+          REMAP_SEGMENT(c_sdb_ptr,old_memaddr,old_memsize);
+        end;
+    end; (*with*)
+end; (* TOSS_SEG *)
+
+
+procedure RELSRBLIST(c_sdb_ptr: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The mmlist entries linked with the sdb which form   *)
+       (*    the SRB list will be released.                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_mmlist, s_mmlist, n_mmlist: ptr_mmlist;
+
+  begin
+    (* release any queued mmlist entries *)
+    with c_sdb_ptr^ do
+      if srbRP <> 0 then
+        begin
+          s_mmlist:=pointer(srbRP+b_sysglobal_ptr);
+          n_mmlist:=s_mmlist;
+          repeat
+            c_mmlist:=n_mmlist;
+            n_mmlist:=pointer(c_mmlist^.chain.fwd_link + b_sysglobal_ptr);(* next entry*)
+            RELSPACE(ord(c_mmlist),b_sysglobal_ptr);
+          until n_mmlist = s_mmlist;
+
+          srbRP := 0   { so no more RelSRBList calls will be done }
+        end;
+  end;(*RELSRBLIST*)
+
+
+(*$S dsegs*)  { force to segment where used}
+procedure REL_SEG(* c_sdb_ptr: sdb_ptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The memory allocated to the segment is freed and the*)
+       (*    sdb is returned to the global free pool.            *)
+       (*                                                        *)
+       (**********************************************************)
+(*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 14 }
+             ev_segT: int1;             { seg type 1=private code }
+                                        {          2=data }
+                                        {          3=stack}
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_res1: int2;             { reserved }
+             ev_res2: int4;             { reserved }
+           end;
+(*$ENDC*)
+
+var
+  error: int2;
+  oldmemaddr, oldmemsize: int2;
+  c_mmrb: mmrb_ptr;
+
+(*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+(*$ENDC*)
+
+begin
+
+  (*$IFC DEBUG2*)
+  if TRACE(mm,30) then
+    begin
+      if c_sdb_ptr^.sdbtype = code
+        then writeln('REL_SEG of code segment sdb_ptr = ',ord(c_sdb_ptr))
+        else writeln('REL_SEG of data segment sdb_ptr = ',ord(c_sdb_ptr));
+    end;
+  (*$ENDC*)
+  (*$IFC DEBUG1*)
+  if TRACE(spare2,10) then
+    begin
+      if LOGGING then
+        begin
+          with c_event do
+            begin
+              ev_type:=17;
+              ev_segT:=ord(c_sdb_ptr^.sdbtype);
+              ev_sdb:=c_sdb_ptr;
+              ev_res1:=0;
+              ev_res2:=0;
+              LOG(error,ord(@c_event));
+            end;
+        end;
+    end;
+
+  (*$ENDC*)
+
+  with c_sdb_ptr^ do
+    if sdbstate.memoryF then
+      begin (* seg in memory *)
+        if sdbtype <> code then
+          begin
+            CLEAR_SRB(c_sdb_ptr);
+            RELSRBLIST(c_sdb_ptr);
+          end;
+        (*unmap segment*)
+        oldmemaddr:=memaddr;
+        oldmemsize:=memsize;
+        memaddr:=0;
+        memsize:=0;
+        REMAP_SEGMENT(c_sdb_ptr,oldmemaddr,oldmemsize);
+        memaddr:=oldmemaddr;
+        memsize:=oldmemsize;
+        (*flag so memmgr will release memory and sdb *)
+        c_mmrb:=pointer(mmrb_addr);
+        with c_mmrb^ do numbRelSegs:=numbRelSegs+1;
+        sdbstate.releaseF:=true;
+        lockcount := 1   { so MemMgr won't swap it out before releasing }
+      end
+     else
+      begin (* seg not in memory *)
+        if sdbtype <> code then RELSRBLIST(c_sdb_ptr);
+        RELSPACE(ord(c_sdb_ptr),b_sysglobal_ptr);
+      end;
+end;(* REL_SEG *)
+
+
+
+(*$S dsegs*)  { force to segment where used}
+procedure BLD_SEG(* kind: Tsdbtype; csize: int4; newsize: int2; disca: addrdisc;
+                    discspace: int4; pkedLen: int4; var c_sdb_ptr: sdb_ptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Build a new segment by allocating an sdb entry.  The*)
+       (*    segment will not be brought into memory.            *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    kind = the type of segment (code,data)              *)
+       (*    csize= the current number of valid bytes of data on *)
+       (*           the disc                                     *)
+       (*    newsize= the size of the segment when fetched into  *)
+       (*             memory (valid for data segment only)       *)
+       (*    disca= the disc address of the segment              *)
+       (*    discspace= the number of bytes allocated on disc for*)
+       (*               the segment (valid for data segment only)*)
+       (*    pkedLen = if packed then size of seg on disk        *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    c_sdb_ptr = the pointer to the sdb entry defining   *)
+       (*                the new segment.                        *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+ label 10;
+
+ (*$IFC DEBUG1*)
+ type
+   ev_log = record
+              ev_type: int1;             { type = 11 }
+              ev_segT: int1;             { seg type 0 = secondary info }
+              ev_sdb: sdb_ptr;           { seg sdb ptr }
+              ev_newlen: int2;           { seg newlength }
+              ev_len: int4;              { seg length }
+            end;
+ (*$ENDC*)
+
+
+ var
+   ordsdbptr, ordmmlistptr: absptr;
+   c_mmlist: ptr_mmlist;
+   c1_mmlist: ptr_1mmlist;
+
+   (*$IFC DEBUG1*)
+   c_event: ev_log;                      { logging event }
+   errnum: int2;
+   (*$ENDC*)
+
+ begin
+   c_sdb_ptr:=nil;
+   if kind = code then
+     begin (* need space for code segment *)
+       if not GETSPACE(sizeof(codesdb),b_sysglobal_ptr,ordsdbptr) then goto 10;
+     end
+    else
+     begin (* need space for data segment *)
+       if not GETSPACE(sizeof(sdb),b_sysglobal_ptr,ordsdbptr) then goto 10;
+       if not GETSPACE(sizeof(mmlist1),b_sysglobal_ptr,ordmmlistptr) then
+         begin (* not enough space - release sdb space already obtained *)
+           RELSPACE(ordsdbptr,b_sysglobal_ptr);
+           goto 10;
+         end;
+     end;
+
+   c_sdb_ptr:=pointer(ordsdbptr);
+   with c_sdb_ptr^ do
+     begin
+
+       (*$IFC DEBUG2*)
+       if TRACE(mm,30) then
+         begin
+           if kind = code
+             then writeln('BLD_SEG of code segment sdb_ptr = ',ordsdbptr)
+             else writeln('BLD_SEG of data segment sdb_ptr = ',ordsdbptr);
+         end;
+       (*$ENDC*)
+
+       (*init fields common to both types of sdb *)
+       memaddr:=0;
+       memsize:=0;
+       sdbtype:=kind;
+       with c_sdb_ptr^.sdbstate do
+         begin
+           memoryF:=false;
+           motionF:=false;
+           deleteF:=false;
+           pcb_wF:=false;
+           overlayF:=false;
+           swaperrF:=false;
+           releaseF:=false;
+         end;
+       length:=csize;
+       discaddr:=disca;
+       numbopen:=1;
+       lockcount:=0;
+       packedLen:=pkedLen;
+
+       if kind <> code then
+         begin (* init all remaining fields *)
+           newlength:=newsize;
+           disclength:=discspace;
+           io_count:=0;
+           freeze_count:=0;
+           srbRP:= ordmmlistptr-b_sysglobal_ptr;
+           c_mmlist:=pointer(ordmmlistptr);
+           INIT_MMLIST(c_mmlist,1);
+           c1_mmlist:=pointer(ordmmlistptr);
+           c1_mmlist^.sdscb_addr:=ord(nil);
+         end;
+
+       (*$IFC DEBUG1*)
+       if TRACE(spare2,10) then
+         begin
+           if LOGGING then
+             begin
+               with c_event do
+                 begin
+                   ev_type:=11;
+                   ev_segT:=0;
+                   ev_sdb:=c_sdb_ptr;
+                   ev_newlen:=newsize;
+                   ev_len:=csize;
+                   LOG(errnum,ord(@c_event));
+                 end;
+             end;
+         end;
+       (*$ENDC*)
+       {
+       RECORDIT(59,ord(sdbtype),0,0,ord(c_sdb_ptr));                          (*P*)
+       }
+     end; (*with*)
+
+10: (*error exit*)
+ end;(*BLD_SEG*)
+
+
+(*$S dsegs*)  { force to segment where used}
+procedure Close_SysSegs;
+
+  (*$IFC DEBUG1*)
+  type
+    ev_log = record
+               ev_type: int1;             { type = 14 }
+               ev_segT: int1;             { seg type 1=private code }
+                                          {          2=data }
+                                          {          3=stack}
+               ev_sdb: sdb_ptr;           { seg sdb ptr }
+               ev_res1: int2;             { reserved }
+               ev_res2: int4;             { reserved }
+             end;
+  (*$ENDC*)
+
+  var
+    mysysloc_ptr : slocal_ptr;            { ptr to syslocal of current process }
+    mymrbt_ptr : MRBT_ptr;                { ptr to MRBT of current process }
+    mypcb_ptr : ptr_PCB;                  { ptr to PCB of current process }
+    stk_sdb : sdb_ptr;                    { ptr to SDB for stack segment }
+    sloc_sdb : sdb_ptr;                   { ptr to SDB for syslocal segment }
+  (*$IFC DEBUG1*)
+    error: int2;
+    c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+  procedure Close_Seg (sysSeg_sdb : sdb_ptr);
+    { procedure used by Close_SysSegs to mark a system segment so that it
+      can't be swapped and close the disk file behind the segment. }
+
+    var
+      disk_addr : addrdisc;               { disk address for system segment }
+      seg_fcbptr : sfcb_ptr;              { ptr to FCB for sys seg s-file }
+      errnum : int2;                      { error return from Close_SFile }
+
+    begin
+      sysSeg_sdb^.disclength := 0;   { so segment won't be swapped }
+
+      disk_addr := sysSeg_sdb^.discaddr;
+      if disk_addr.fid <> 0 then
+        begin
+          { there is disk space associated with the segment }
+          seg_fcbptr := pointer(disk_addr.fid + b_sysglobal_ptr);
+          Close_Temp (errnum, seg_fcbptr);
+          (*$IFC debug2 *)
+          if errnum <> 0 then
+            writeln ('   *** error closing sys seg s-file = ', errnum:1);
+          (*$ENDC *)
+        end
+    end { Close_Seg };
+
+
+  begin
+    mysysloc_ptr := pointer(b_syslocal_ptr);
+    mymrbt_ptr := pointer(mysysloc_ptr^.mrbt_addr);
+    stk_sdb := pointer(mymrbt_ptr^[stackmmu].sdbRP + b_sysglobal_ptr);
+
+    mypcb_ptr := pointer(c_pcb_ptr);
+    sloc_sdb := pointer(mypcb_ptr^.slocal_sdbRP + b_sysglobal_ptr);
+
+    (*$IFC DEBUG1*)
+    if TRACE(spare2,10) then
+      begin
+        if LOGGING then
+          begin
+            with c_event do
+              begin
+                ev_type:=17;
+                ev_res1:=0;
+                ev_res2:=0;
+                ev_sdb:=stk_sdb;
+                ev_segT:=ord(stk_sdb^.sdbtype);
+                LOG(error,ord(@c_event));
+                ev_sdb:=sloc_sdb;
+                ev_segT:=ord(sloc_sdb^.sdbtype);
+                LOG(error,ord(@c_event));
+              end;
+          end;
+      end;
+    (*$ENDC*)
+
+    Close_Seg (stk_sdb);
+    Close_Seg (sloc_sdb)
+  end { Close_SysSegs };
+
+
+(*$S kr_mmgr*)  {Restore normal segmentation}
+procedure Evap_SysSegs;
+
+  var
+    mysysloc_ptr : slocal_ptr;            { ptr to syslocal of current process }
+    mymrbt_ptr : MRBT_ptr;                { ptr to MRBT of current process }
+    mypcb_ptr : ptr_PCB;                  { ptr to PCB of current process }
+    stk_sdb : sdb_ptr;                    { ptr to SDB for stack segment }
+    sloc_sdb : sdb_ptr;                   { ptr to SDB for syslocal segment }
+    c_mmrb: mmrb_ptr;                     { ptr to mmrb of memory manager }
+
+  procedure Evap_Seg (sysSeg_sdb : sdb_ptr);
+    { procedure used by Evap_SysSegs to release the data structures associated
+      with a system data segment. }
+
+    begin
+      RelSRBList (sysSeg_sdb);
+      (*flag so memmgr will release memory and sdb*)
+      sysSeg_sdb^.sdbstate.releaseF:=true;
+      with c_mmrb^ do numbRelSegs:=numbRelSegs+1;
+    end { Evap_Seg };
+
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    mysysloc_ptr := pointer(b_syslocal_ptr);
+    mymrbt_ptr := pointer(mysysloc_ptr^.mrbt_addr);
+    stk_sdb := pointer(mymrbt_ptr^[stackmmu].sdbRP + b_sysglobal_ptr);
+    Evap_Seg (stk_sdb);
+
+    mypcb_ptr := pointer(c_pcb_ptr);
+    sloc_sdb := pointer(mypcb_ptr^.slocal_sdbRP + b_sysglobal_ptr);
+    Evap_Seg (sloc_sdb);
+  end { Evap_SysSegs };
+
+
+
+procedure PE_EVENT(* pe_access: int1; pe_type: int2; pe_addr: int4;
+                     pe_onsupvstk: boolean *);
+
+  (**********************************************************)
+  (*                                                        *)
+  (* Handles a parity error that has been diagnosed         *)
+  (* by the low level NMI handler.                          *)
+  (*                                                        *)
+  (* Input Parameters:                                      *)
+  (*   pe_access - indicates the type of access at the time *)
+  (*               of the parity error                      *)
+  (*               =1 video access                          *)
+  (*               =2 normal access                         *)
+  (*                                                        *)
+  (*   pe_type   - indicates the type of parity error       *)
+  (*               =1 hardware corrected soft error         *)
+  (*               =2 correctable hard error                *)
+  (*               =3 uncorrectable hard error              *)
+  (*               =4 unlocatable hard error                *)
+  (*                                                        *)
+  (*   pe_addr   - the physical address of the parity error *)
+  (*                                                        *)
+  (*   pe_onsupvstk- true if pe ocurred while on supv stack *)
+  (*                                                        *)
+  (* Side Effects:                                          *)
+  (*   If the pe was in a user code or data segment then the*)
+  (*   current process will be aborted.  If in a data seg   *)
+  (*   then all processes sharing the data seg will be      *)
+  (*   aborted.                                             *)
+  (*                                                        *)
+  (* Error Conditions:                                      *)
+  (*   SF 10590 if the parity error cannot be recovered:    *)
+  (*      o pe is hard (write to location will not clear it)*)
+  (*      o pe while on supervisor stack                    *)
+  (*      o pe while in system code                         *)
+  (*      o pe in locked code or data segment               *)
+  (*                                                        *)
+  (**********************************************************)
+
+  type
+    pe_log_event = record
+                     ev_type: int1;
+                     ev_pe_type: int1;
+                     ev_pe_access: int1;
+                     ev_pe_addr: int4;
+                     ev_reserved: int4;
+                   end;
+
+  var
+    badpage: int2;
+    c_mmrb: mmrb_ptr;
+    c_sdb, stop_sdb: sdb_ptr;
+    located: boolean;
+    c_event: pe_log_event;
+    c_pcb: ptr_pcb;
+    errnum: int2;
+
+  begin
+    located:=false;
+    if (pe_access = 2) and (*normal access?*)
+       ((pe_type = 2) or (pe_type = 3)) then (*locatable?*)
+      begin (* locatable error during normal access *)
+        (* convert physical addr to logical page*)
+        badpage:=(pe_addr - membase) div mempgsize;
+
+        (* find segment containing bad page*)
+        c_mmrb:=pointer(mmrb_addr);
+        stop_sdb:=@c_mmrb^.tail_sdb;
+        c_sdb:=pointer(ord(c_mmrb^.head_sdb.memchain.fwd_link)); (*1st sdb*)
+        while (c_sdb <> stop_sdb) and not located do
+          begin (* cycle thru sdb entries *)
+            with c_sdb^ do
+              begin
+                if (memaddr <= badpage) and
+                   ((memaddr+memsize-1) >= badpage)
+                  then located:=true
+                  else c_sdb:=pointer(ord(memchain.fwd_link));
+              end;
+          end;(*with*)
+      end;
+
+    (* log the parity error *)
+    if LOGGING then
+      begin
+        with c_event do
+          begin
+            ev_type:=-1;
+            ev_pe_type:=pe_type;
+            ev_pe_access:=pe_access;
+            if located then if c_sdb^.sdbtype = code
+                              then ev_pe_access:=3 (* normal access to code seg *)
+                              else ev_pe_access:=4;(* normal access to data seg *)
+            ev_pe_addr:=pe_addr;
+            ev_reserved:=0;
+          end;
+        LOG(errnum,ord(@c_event));
+      end;
+
+    (*$IFC DEBUG1*)
+    writeln('******');
+    writeln('******WARNING - MEMORY PARITY ERROR AT ADDRESS = ',pe_addr);
+    writeln('******');
+    (*$ENDC*)
+
+    (* kill system following fatal parity error *)
+    if (pe_type = 3) or  (* uncorrectable pe *)
+       pe_onsupvstk      (* on supervisor stack at time of pe *)
+      then SYSTEM_ERROR(10590);
+    if c_pcb_ptr <> ord(nil) then
+      begin
+        c_pcb:=pointer(c_pcb_ptr);
+        if c_pcb^.domain = 0 then SYSTEM_ERROR(10590); (* in system code *)
+      end;
+    if located then if c_sdb^.lockcount > 0 then SYSTEM_ERROR(10590);
+
+    (* pe not fatal - abort processes using segment in question *)
+    if located then
+      begin
+        if c_sdb^.sdbtype = code then
+          begin
+            (* abort only the current process and *)
+            (* force the code seg to be swapped in again *)
+            ABORTPROCESS(c_pcb,true,parity_err);
+            TOSS_SEG(errnum,c_sdb,true);
+            (* no possible error - so ignore *)
+          end
+         else
+          begin
+            (* abort all processes using the data segment but *)
+            (* allow the data segment to remain in memory     *)
+            ABORT_VIA_SRB(c_sdb,parity_err);
+          end;
+      end;
+  end;(*PE_EVENT*)
+
+
+
+
+
+
+ÿ

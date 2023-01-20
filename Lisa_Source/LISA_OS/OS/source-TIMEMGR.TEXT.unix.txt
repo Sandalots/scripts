@@ -1,0 +1,327 @@
+
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+UNIT timemgr;                   (* time manager *)
+
+INTERFACE
+
+  USES
+  (*$U object/driverdefs.obj*)       driverdefs,
+  (*$U object/hwint.obj*)            hwint,
+  (*$U object/sysglobal.obj *)       globalda,
+  (*$U object/procprims.obj *)       proc_prims,
+  (*$U object/asynctr.obj *)         asynctr,
+  (*$U object/mmprim.obj *)          mmprimitives,
+  (*$U object/genio.obj *)           genio,
+  (*$U object/twiggy.obj *)          twiggy,
+  (*$U object/vmstuff.obj *)         vmstuff,
+  (*$U object/sfileio.obj *)         sfileio,
+  (*$U object/fsprim.obj *)          fs_primitives,
+  (*$U object/fsui.obj *)            FS_Interface,
+  (*$U object/osunitio.obj*)         osunitio,
+  (*$U object/clock.obj *)           clock,
+  (*$U object/objio *)               objio,
+  (*$U object/mm0.obj *)             memorymanager,
+  (*$U object/ds0.obj *)             datasegs,
+  (*$U object/measure.obj*)          measure,
+  (*$U object/exceprim.obj *)        exceprim,
+  (*$U object/eventchn.obj *)        eventchn;
+
+
+  TYPE
+    hour_range = -23..23;
+    minute_range = -59..59;
+
+
+  procedure delay_time (var errnum : integer;
+                        interval : timestmp_interval;
+                        clktime : time_rec);
+
+  procedure convert_time (var errnum : integer;
+                          var gmt_time : time_rec;
+                          var local_time : time_rec;
+                          to_gmt : boolean);
+
+  function timeversion : integer;
+
+
+IMPLEMENTATION
+
+(*$S timemgr    *)
+
+  CONST
+    curversion = 70;             (* current version number - alpha 5.2  *)
+    baseyear   = 1901;          (* base of year for convert_time *)
+
+    tpdef_size = 10;            (* physical number of blocks for timer pipe,
+                                   its about good for < 20 timer events. This can
+                                   be tuned to allow for a typical usage *)
+
+                                (* use driver's error range for timemgr *)
+    e_unblk_req     = 635;      (* request is not the same as the one being blocked on
+                                   after return from blk_req in delay_time *)
+    e_req_fail      = 636;      (* timer request does not complete successfully *)
+
+    e_timer_process = 10600;      (* base for system errors in timer process *)
+    e_make_pipe     = 10600;      (* error from make_pipe to make timer pipe *)
+    e_kill_object   = 10601;      (* error from kill_object of the existing timer pipe *)
+    e_make2_pipe    = 10602;      (* error from second make_pipe to make timer pipe *)
+    e_open_pipe     = 10603;      (* error from open to open timer pipe *)
+    e_no_head_tmlist= 10604;      (* no syslocal space for head of timer list *)
+    e_allocate      = 10605;      (* error from allocate space for timer pipe *)
+
+    e_info1         = 10610;      (* error from info about timer pipe *)
+    e_no_tm_le      = 10612;      (* no syslocal space for timer list element *)
+    e_read_data     = 10613;      (* error from read_data of timer pipe *)
+    e_r_actual      = 10614;      (* actual returned from read_data is not the same as
+                                   requested from timer pipe *)
+    e_open_recv     = 10615;      (* error from open the receiver's ec *)
+    e_write_event   = 10616;      (* error from write_event to the receiver's ec *)
+    e_close_event   = 10617;      (* error from close_event_chn on the receiver's pipe *)
+    e_no_timer      = 10618;      (* no timer in the list corresponding to the one
+                                   expires *)
+    e_no_treq       = 10619;      (* no sysglobal space for timer request block *)
+
+
+    ec_ui_level = 90;           (* timer trace level - use ec's fence *)
+
+  TYPE
+    head_tmlist = linkage;                    (* head of timer event list *)
+
+  VAR
+    hd_tml_ptr : ^head_tmlist;          (* pointer to the head of timer list *)
+    ltd_hour : -23..23;                 (* local time difference from GMT time *)
+    ltd_minute : -59..59;               (* i.e. ltd = gmt time - local time *)
+
+
+
+
+  function timeversion (* : integer *);
+
+    begin
+      timeversion := curversion;
+    end;  (* funtion timeversion *)
+
+
+
+                                 (* resident, since this is called in shut down. *)
+  procedure delay_time (* var errnum : integer;
+                          interval : timestmp_interval;
+                          clktime : time_rec *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   delay the calling process until the specified time has elapsed.   *)
+    (*   The calling process will issue a timer request and block on the   *)
+    (*   request. When the request is satisfied, the process will be       *)
+    (*   unblocked.                                                        *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   interval : the time interval to delay.                            *)
+    (*   clktime : if interval is 0, clktime will be used for delay.       *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : error return.                                            *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label
+      9;
+    var
+      req_ptr, firstreq_ptr : reqptr_type;
+      req_status : reqsts_type;
+      pre_state : intson_type;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 2;
+          parms [1].addr := ord (@interval);
+          parms [1].readwrite := false;
+          parms [2].addr := ord (@clktime);
+          parms [2].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (ec, ec_ui_level) then
+        begin
+          writeln ('e delay_time : interval =', interval.sec, interval.msec);
+          with clktime do
+             begin
+               writeln ('  clktime =', year, day, hour);
+               writeln ('  ', minute, second, msec);
+             end;
+        end;
+      (*$ENDC*)
+      errnum := no_error;
+      if (interval.sec = 0) and (interval.msec = 0) then goto 9;
+      timeout (errnum, interval, clktime, req_ptr);
+                                        (* issue a time out request - abortable *)
+      (*$IFC DEBUG2*)
+      if trace (ec, ec_ui_level) then
+        writeln ('a timeout : pcb_ptr =', c_pcb_ptr, ' req_ptr =', ord (req_ptr));
+      (*$ENDC*)
+      if errnum <= 0 then
+        begin
+          with req_ptr^.list_chain do
+            begin
+              fwd_link := ord(@fwd_link) - b_sysglobal_ptr;
+              bkwd_link := fwd_link
+            end;
+          blk_req (req_ptr, firstreq_ptr);
+                                        (* block the calling process until the time out
+                                           request is satisfied *)
+          if firstreq_ptr <> req_ptr then
+            begin                       (* get unblocked prematurely *)
+              (*$IFC DEBUG2*)
+              if trace (ec, ec_ui_level) then
+                writeln ('unblocked prematurely in delay_time : firstreqptr =',
+                                                             ord (firstreq_ptr));
+              (*$ENDC*)
+              errnum := e_unblk_req;
+              intsoff (clokints, pre_state);
+              dequeue (req_ptr^.dev_chain, b_sysglobal_ptr);
+                                        (* remove the timer from the timer chain *)
+                                        (* should not do this, should call abort_timer
+                                           routine in clock driver *)
+              intson (pre_state);
+            end
+          else                          (* unblocked normally *)
+            begin
+              (*$IFC DEBUG2*)
+              if trace (ec, ec_ui_level) then
+                writeln ('unblocked normally after blk_req');
+              (*$ENDC*)
+              status_req (req_ptr, req_status);
+              if not req_status.reqsuccess_f then
+                errnum := e_req_fail;
+            end;
+
+          relspace (ord (req_ptr), b_sysglobal_ptr);
+        end;
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (ec, ec_ui_level) then
+        writeln ('l delay_time : errnum =', errnum);
+      (*$ENDC*)
+    end;  (* procedure delay_time *)
+
+
+
+
+  procedure convert_time (* var errnum : integer;
+                            var gmt_time : time_rec;
+                            var local_time : time_rec;
+                            to_gmt : boolean *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Convert from local time to gmt time and vise versa. The local time*)
+    (*   difference ltd_hour and ltd_minute is used for convertion.        *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   gmt_time : if it is to convert to gmt time.                       *)
+    (*   local_time : if it is to convert to local time.                   *)
+    (*   to_gmt : boolean flag, it true, convert to gmt time, else, to     *)
+    (*            local time                                               *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : error return.                                            *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label 9;
+    var
+      diff_time, time2 : time_rec;
+      interval, julian : timestmp_interval;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 2;
+          parms [1].addr := ord (@gmt_time);
+          parms [1].readwrite := true;
+          parms [2].addr := ord (@local_time);
+          parms [2].readwrite := true;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (ec, ec_ui_level) then
+        begin
+          with gmt_time do
+            begin
+              writeln ('e convert_time : gmt_time =', year, day, hour);
+              writeln ('  ', minute, second, msec);
+            end;
+          with local_time do
+            begin
+              writeln ('  local_time =', year, day, hour);
+              writeln ('  ', minute, second, msec);
+            end;
+        end;
+      (*$ENDC*)
+
+      if to_gmt then
+        begin
+          gmt_time := local_time;
+          (*$IFC DEBUG2*)
+          if trace (ec, ec_ui_level) then
+            with gmt_time do
+              begin
+                writeln ('  convert to gmt_time =', year, day, hour);
+                writeln ('  ', minute, second, msec);
+              end;
+          (*$ENDC*)
+        end
+      else
+        begin
+          local_time := gmt_time;
+          (*$IFC DEBUG2*)
+          if trace (ec, ec_ui_level) then
+            with local_time do
+              begin
+                writeln ('  convert to local_time =', year, day, hour);
+                writeln ('  ', minute, second, msec);
+              end;
+          (*$ENDC*)
+        end;
+     9:
+      (*$IFC DEBUG2*)
+      if trace (ec, ec_ui_level) then
+        writeln ('l convert_time : errnum =', errnum);
+      (*$ENDC*)
+    end;  (* procedure convert_time *)
+end.
+
+ÿ

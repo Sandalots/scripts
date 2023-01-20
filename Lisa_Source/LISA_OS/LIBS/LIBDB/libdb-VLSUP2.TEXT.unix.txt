@@ -1,0 +1,647 @@
+{#f     libdb/vlsup2.text }
+{$S access}
+{**************************************************************************
+
+                             firstleaf
+
+        see interface.
+
+***************************************************************************}
+
+procedure firstleaf{(var kresult : integer;
+                        fileid : integer;
+                        pagetype : integer;
+                        pnewrec : ptrdata;
+                        size : integer;
+                    var ipage : fileptr;
+                    var iindex : integer)};
+var
+        page : fileptr;
+        pbd1 : ^ buffdesc;
+        pb1 : ptrdata;
+        po1 : ptroffsets;
+        pd1 : ptrpagedesc;
+        pfd : ptrfiledesc;
+        lresult,
+        tresult,
+        buff1 : integer;
+        canmove : boolean;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pfd := pfiletable^[fileid];
+        allocpage(lresult,fileid,buff1);
+        if lresult = noerr then
+            begin
+            pbd1 := @buffpool^[buff1];
+            ipage := pbd1^.page;
+            iindex := 0;
+            pb1 := pbd1^.pbuff;
+            pd1 := pointer(ord(pb1)+pfd^.pagesize-sizeof(pagedesc));
+            po1 := pointer(ord(pd1)-sizeof(integer));
+            canmove := (pagetype = labeltype) or (pfd^.pkdesc = nil);
+
+            pd1^.nkeys := 1;
+            pd1^.next := nilptr;
+            pd1^.prior := nilptr;
+            pd1^.ptype := pagetype;
+            po1^[-1] := size;
+            po1^[0] := 0;
+
+            if canmove then movelf(pnewrec,pb1,size)
+            else extractkey(pfd^.pkdesc,pfd^.pedesc,pfd^.nfields,
+                            pnewrec,pb1,pfd^.vflds);
+
+            (*dbif bdebug then dumpp(fileid,buff1);*)
+
+            page := pbd1^.page;
+            post(lresult,buff1);
+            relbuff(tresult,buff1,isleaf);
+            if tresult <> noerr then lresult := tresult;
+            if lresult = noerr then
+                if pagetype = labeltype then pfd^.labellist := page
+                else pfd^.root := page;
+            end;
+        kresult := lresult;
+end; { firstleaf }
+{***************************************************************************
+
+                                freepage
+
+        puts a page on the free list and releases the buffer that holds it.
+        sets dontusefreelist to true, since once we dont want to reuse
+        pages freed in a delete until the delete is complete, so that we
+        can always undo the delete if we run out of space.
+
+
+        Input Parameter:
+                buffer - buffer containing page
+
+        Output Parameter:
+                kresult - result of freeing page
+
+        Return Results:
+                noerr
+                inconsistent
+
+***************************************************************************}
+
+{$S access}
+procedure freepage(var kresult : integer;
+                       buffer : integer);
+var
+        pd : ptrpagedesc;
+        fileid : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        dont_use_freelist := true;
+        with buffpool^[buffer],pfiletable^[pfile]^ do
+            begin
+            pd := pointer(ord(pbuff)+pagesize-sizeof(pagedesc));
+            pd^.free := freelist;
+            pd^.ptype := freetype;
+            freelist := page;
+            state := dirty;
+            end;
+        relbuff(kresult,buffer,0);
+
+end;
+{****************************************************************************
+
+                                insrotate
+
+        does a simple move as needed by a key rotate.
+
+
+****************************************************************************}
+
+{$S access}
+procedure insrotate(pbs : ptrdata;
+                    pos : ptroffsets;
+                    src : integer;
+                    dest,
+                    dbuff,
+                    descoff : integer);
+var
+        pb : ptrdata;
+        pd : ptrpagedesc;
+        po : ptroffsets;
+        ponk : ^ integer;
+        nkeys,
+        ioff,
+        size : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pb := buffpool^[dbuff].pbuff;
+        pd := pointer(ord(pb)+descoff);
+        po := pointer(ord(pd)-sizeof(integer));
+        ioff := po^[-dest];
+        size := pos^[-src-1]-pos^[-src];
+        nkeys := pd^.nkeys;
+        ponk := @po^[-nkeys];
+        moverf(pointer(ord(pb)+ioff),pointer(ord(pb)+ioff+size),ponk^-ioff);
+        movl_inc(@ponk^,pointer(ord(ponk)-sizeof(integer)),nkeys-dest,size);
+        movelf(pointer(ord(pbs)+pos^[-src]),pointer(ord(pb)+po^[-dest]),size);
+        pd^.nkeys := nkeys + 1;
+end; { insrotate }
+{**************************************************************
+
+                        fix_pointers
+
+        if this is a leaf page we are reconstructing and it
+        had a following page, then retrieve that following
+        page and fix its prior or next pointer, depending on
+        NextPrior = next or prior.
+
+ Input Parameters
+        LinkPage - page whose pointer should be fixed (nilptr means noop)
+        NewLink - new value of pointer
+        NextPrior - if next, fix next pointer, if prior fix prior pointer
+        fileid - id of file
+        descoff - offset of pagedesc
+
+   output parameter
+        lresult - error result, only set if linkpage <> nilptr
+
+        return values
+            noerr
+            nobuffs
+            ioerr
+            noroom
+            ioerr
+            inconsistent
+
+ **************************************************************}
+
+{$S openclose}
+procedure fix_pointers(var lresult : integer;
+                           LinkPage,
+                           NewLink : fileptr;
+                           NextPrior : integer;
+                           fileid : integer;
+                           descoff : integer);
+var
+    nbuff : integer;
+    pdn : ptrpagedesc;
+    pnb : ^ buffdesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+if LinkPage <> nilptr then
+    begin
+    getpage(lresult,nbuff,fileid,LinkPage,true);
+    if lresult = noerr then
+        begin
+        pnb := @buffpool^[nbuff];
+        pdn := pointer(ord(pnb^.pbuff)+descoff);
+        if NextPrior = prior then pdn^.prior := NewLink
+        else pdn^.next := NewLink;
+        pnb^.state := dirty;
+        relbuff(lresult,nbuff,isleaf);
+        end;
+    end;
+end; { fix_pointers }
+{****************************************************************************
+
+                                pagedelete
+
+        see interface.
+
+
+****************************************************************************}
+
+{$S access}
+function pagedelete{(var kresult : integer;
+                        fileid : integer;
+                        pagetype : integer;
+                        buffer,
+                        index : integer;
+                        closestsib : fileptr;
+                    var rbuff : integer;
+                    var dpage : fileptr;
+                    var dindex : integer) : integer};
+label
+        1;
+var
+        PriorLink,
+        NextLink : fileptr;
+        sibkeys,
+        lbuff,
+        descoff,
+        halfpage,
+        pagesize,
+        lresult,
+        tresult : integer;
+
+        pfd : ptrfiledesc;
+        pb,pbs : ptrdata;
+        po,pos : ptroffsets;
+        pdr,
+        pd,pds : ptrpagedesc;
+        plb,prb : ^ buffdesc;
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'pagedel:',fileid:3,buffer:3,index:4);
+{$ENDC }
+
+        pfd := pfiletable^[fileid];
+        pagesize := pfd^.pagesize;
+        descoff := pagesize - sizeof(pagedesc);
+        plb := @buffpool^[buffer];
+        pb := plb^.pbuff;
+        pd := pointer(ord(pb)+descoff);
+        po := pointer(ord(pd)-sizeof(integer));
+
+        {  first delete the record and mark the page as touched }
+
+        ktouched(pfd^.scans,plb^.page);
+        delrecord(pb,po,pd,index);
+        halfpage := (pagesize - sizeof(pagedesc)) div 2;
+
+        {  if a page becomes less than half filled then we have underflow
+
+           1) if the page is the one and only page (rootpage) then we can
+              do nothing if the page still has one record.  if the page
+              is totally empty then we set the tree (or labellist) to empty
+
+           2) otherwise if we can, then we merge the half-filled page with its
+              closest sibling else we rotate a record over from the closest
+              sibling
+
+        }
+
+        if (po^[-pd^.nkeys]+(pd^.nkeys+1)*sizeof(integer) < halfpage)
+           and (closestsib <> nilptr)
+        then { we have underflow and there are siblings }
+            begin
+
+            (*dbif bdebug then writeln(dumpfile,'underflow:',closestsib);*)
+
+            if pd^.next = closestsib then
+                begin
+                lbuff := buffer;
+                getpage(lresult,rbuff,fileid,closestsib,true);
+                end
+            else
+                begin
+                rbuff := buffer;
+                getpage(lresult,lbuff,fileid,closestsib,true);
+                end;
+            if lresult <> noerr then
+                begin
+                relbuff(tresult,buffer,isleaf);
+                goto 1;
+                end;
+            plb := @buffpool^[lbuff];
+            prb := @buffpool^[rbuff];
+            pbs := plb^.pbuff;
+            pds := pointer(ord(pbs)+descoff);
+            sibkeys := pds^.nkeys;
+
+            ktouched(pfd^.scans,closestsib);
+            if mergepages(lbuff,rbuff,pagesize) then
+                begin
+
+            {   pages merged successfully
+
+                1) free the old page
+
+                2) update the prior pointer of the next page }
+
+{$IFC debug }
+                if bdebug then writeln(dumpfile,'coallesce');
+{$ENDC }
+
+                pdr := pointer(ord(prb^.pbuff)+descoff);
+                pds^.next := pdr^.next;
+                dpage := plb^.page;
+                if lbuff = buffer then dindex := index
+                else dindex := index + sibkeys;
+                pagedelete := coallesce;
+                freepage(lresult,rbuff);
+                fix_pointers(lresult,pds^.next,plb^.page,prior,fileid,descoff);
+                relbuff(tresult,lbuff,isleaf);
+                if tresult <> noerr then lresult := tresult;
+                end
+            else
+            {   have to do a rotate instead }
+
+                begin
+                if lbuff = buffer then { rotate to left }
+                    begin
+                    dpage := plb^.page;
+                    dindex := index;
+                    pbs := prb^.pbuff;
+                    pds := pointer(ord(pbs)+descoff);
+                    pos := pointer(ord(pds)-sizeof(integer));
+                    insrotate(pbs,pos,0,pd^.nkeys,lbuff,descoff);
+                    delrecord(pbs,pos,pds,0);
+                    end
+                else { rbuff = buffer, rotate to right }
+                    begin
+                    dpage := prb^.page;
+                    dindex := index+1;
+                    pos := pointer(ord(pds)-sizeof(integer));
+                    insrotate(pbs,pos,sibkeys-1,0,rbuff,descoff);
+                    delrecord(pbs,pos,pds,sibkeys-1);
+                    end;
+                plb^.state := dirty;
+                prb^.state := dirty;
+                relbuff(lresult,lbuff,isleaf);
+                if lresult <> noerr then
+                    relbuff(tresult,rbuff,isleaf);
+                pagedelete := rotate;
+                end; { rotate }
+            end { underflow }
+        else if pd^.nkeys <> 0 then { tree can't be empty }
+            begin
+            pagedelete := noflow;
+            dpage := plb^.page;
+            dindex := index;
+            plb^.state := dirty;
+            relbuff(lresult,buffer,isleaf);
+            lresult := noerr;
+            end
+        else { page is empty now - check if tree is, too }
+            begin
+            pagedelete := treeempty;
+            dpage := nilptr;
+            PriorLink := pd^.prior;
+            NextLink := pd^.next;
+            freepage(lresult,buffer);
+            if lresult = noerr then
+                begin
+                if pagetype = labeltype then pfd^.labellist := nilptr
+                else if pfd^.root = plb^.page then pfd^.root := nilptr
+                else
+                    begin { page empty, fix neighbors links and record
+                            neighbors for possible recovery }
+                    with pstack^[pfd^.depth] do
+                        begin
+                        rec_lpage := PriorLink;
+                        rec_rpage := NextLink;
+                        end;
+                    fix_pointers(lresult,PriorLink,NextLink,next,fileid,descoff);
+                    if lresult = noerr then
+                      fix_pointers(lresult,NextLink,PriorLink,prior,fileid,descoff);
+                    pagedelete := pageempty;
+                    end
+                end;
+            end;
+1 :     kresult := lresult;
+
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'pagedel:',kresult:6);
+{$ENDC }
+end; { pagedelete }
+{****************************************************************************
+
+                                findduplicate
+
+        see interface.
+
+
+****************************************************************************}
+
+{$S access}
+procedure findduplicate{(var kresult : integer;
+                            fileid : integer;
+                            pedesc,
+                            psdesc : ptrrecptr;
+                            nsearch : integer;
+                            is_insert,
+                            duplimpossible : boolean;
+                            pkey : ptrdata:
+                        var buffer,
+                            index : integer;
+                        var stackinvalid : integer)};
+label
+        1,2;
+var
+        c,
+        lresult,
+        saveresult,
+        descoff : integer;
+        pd : ptrpagedesc;
+        po : ptroffsets;
+        pb : ptrdata;
+        firstpage,
+        nextpage,
+        page : fileptr;
+        pivotleft : boolean;
+
+{$S access}
+        procedure getnextpage;
+        label
+                1;
+        begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+                relbuff(lresult,buffer,isleaf);
+                if lresult <> noerr then goto 1;
+                getpage(lresult,buffer,fileid,nextpage,true);
+                if lresult <> noerr then goto 1;
+                pb := buffpool^[buffer].pbuff;
+                pd := pointer(ord(pb)+descoff);
+                po := pointer(ord(pd)-sizeof(integer));
+
+                (*dbif bdebug then writeln('getp:',nextpage:14);*)
+
+        1 :
+        end;
+
+{$S access}
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        descoff := pfiletable^[fileid]^.pagesize-sizeof(pagedesc);
+        pb := buffpool^[buffer].pbuff;
+        pd := pointer(ord(pb)+descoff);
+        po := pointer(ord(pd)-sizeof(integer));
+
+        (*dbif bdebug then
+            writeln(dumpfile,'findd:',buffer:7,
+                    buffpool^[buffer].page:14,index:7,nsearch:3);*)
+
+        if pd^.nkeys = 0 then
+            begin
+            lresult := notfound;
+            goto 1;
+            end;
+
+        {  decide whether to search to the left or right
+
+           if the initial point is not at the end of the page
+           then we compare the search record with the initial point.
+           we only go right if we are sure that there can be no record
+           to the left of the initial point that is greater than or
+           equal to the search key  }
+
+        if index = pd^.nkeys then pivotleft := false
+        else pivotleft := compare(psdesc,pedesc,nsearch,
+                                  pkey,
+                                  pointer(ord(pb)+po^[-index])) <> gt;
+
+
+        (*dbif bdebug then writeln(dumpfile,'left ',ord(pivotleft):2);*)
+
+        page := buffpool^[buffer].page;
+        firstpage := page;
+        saveresult := notfound;
+        lresult := noerr;
+        if pivotleft then
+            begin
+
+        {   search to the left until we find a record that is less than
+            the search key.  then we back up to the next higher record.
+            if we have gone left of the initial page then stackinvalid
+            becomes left  }
+
+            stackinvalid := left;
+            repeat
+                if index < 0 then
+                    begin
+                    nextpage := pd^.prior;
+                    if nextpage = nilptr then
+                        begin
+                        index := 0;
+                        goto 2;
+                        end;
+                    getnextpage;
+                    if lresult <> noerr then goto 1;
+
+                    c := compare(psdesc,pedesc,nsearch,
+                                 pkey,
+                                 pointer(ord(pb)+po^[-pd^.nkeys+1]));
+                    if c = gt then
+                        begin
+                        index := 0;
+                        goto 2;
+                        end;
+                    page := nextpage;
+                    index := pd^.nkeys-1;
+                    end
+                else c := compare(psdesc,pedesc,nsearch,
+                                  pkey,
+                                  pointer(ord(pb)+po^[-index]));
+                if c = gt then
+                    begin
+                    index := index + 1;
+                    goto 2;
+                    end;
+                if c = eq then
+                    begin
+                    saveresult := noerr;
+                    if duplimpossible then goto 2;
+                    end;
+                index := index - 1;
+            until false;
+            end
+        else
+            begin
+
+        {   search to the right until we find a record greater than or equal
+            to the search key.  if we are finding the place for an insert,
+            then if we find that the first such record is the first record
+            of a subsequent page, then we return the index at the end of
+            the previous page }
+
+            stackinvalid := right;
+            repeat
+                if index = pd^.nkeys then
+                    begin
+                    nextpage := pd^.next;
+                    if nextpage = nilptr then goto 2;
+                    getnextpage;
+                    if lresult <> noerr then goto 1;
+                    c := compare(psdesc,pedesc,nsearch,pkey,pb);
+                    if (c = lt) and is_insert then goto 2;
+                    page := nextpage;
+                    index := 0;
+                    end
+                else
+                    c := compare(psdesc,pedesc,nsearch,pkey,
+                                 pointer(ord(pb)+po^[-index]));
+                if c = eq then
+                    begin
+                    saveresult := noerr;
+                    goto 2;
+                    end;
+                if c = lt then goto 2;
+                index := index + 1;
+            until false;
+            end;
+2 :     if firstpage = page then stackinvalid := ok;
+        if buffpool^[buffer].page <> page then
+            begin
+            nextpage := page;
+            getnextpage;
+            end;
+        if lresult = noerr then lresult := saveresult;
+
+1 :     kresult := lresult;
+
+        (*dbif bdebug then writeln(dumpfile,'findd:',kresult);
+        if bdebug then
+            writeln(dumpfile,'findd:',buffer:7,
+                    buffpool^[buffer].page:14,index:7);*)
+end;
+{**************************************************************************
+
+                                nextprior
+
+        see interface.
+
+
+**************************************************************************}
+
+{$S access}
+procedure nextprior{(var kresult : integer;
+                        fileid : integer;
+                    var buffer,
+                        index : integer;
+                        which : integer)};
+label
+        1;
+var
+        lresult : integer;
+        pd : ptrpagedesc;
+        page : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+            pd := pointer(ord(buffpool^[buffer].pbuff)+pagesize-sizeof(pagedesc));
+            lresult := noerr;
+            if which = prior then
+                begin
+                if index >= 0 then goto 1;
+                page := pd^.prior;
+                if page = nilptr then
+                    begin
+                    lresult := eos;
+                    index := 0;
+                    goto 1;
+                    end;
+                end
+            else { which = next }
+                begin
+                if (index >= 0) and (index < pd^.nkeys) then goto 1;
+                page := pd^.next;
+                if page = nilptr then
+                    begin
+                    lresult := eos;
+                    index := pd^.nkeys;
+                    goto 1;
+                    end;
+                end;
+
+            relbuff(lresult,buffer,isleaf);
+            if lresult <> noerr then goto 1;
+            getpage(lresult,buffer,fileid,page,true);
+            if lresult <> noerr then goto 1;
+            pd := pointer(ord(buffpool^[buffer].pbuff)+pagesize-sizeof(pagedesc));
+            if which = prior then index := pd^.nkeys-1
+            else index := 0;
+            end;
+1 :     kresult := lresult;
+end; { nextprior }
+ÿ

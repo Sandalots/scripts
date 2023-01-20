@@ -1,0 +1,768 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+
+(* File : excepnr1  *)
+(* Exception management non-resident : internal service routines  *)
+
+
+
+  procedure hard_def_hdl (env_ptr : p_env_blk;
+                          data_ptr : p_ex_data);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Hardware exception default handler.      It is like an exception  *)
+    (*   handler. It will abort the current process. It sets pcb.terming   *)
+    (*   flag and force the terminate exception to be signalled regardless *)
+    (*   whether the exception state is enabled or not. Since when the     *)
+    (*   exception occurs, the process is in inconsist state, the execution*)
+    (*   should not continue. For environment block passed to the user's   *)
+    (*   terminate exception handler to have the same registers as when the*)
+    (*   hardware exception occurs, the registers saved in the environment *)
+    (*   block passed to this handler is reinstated before going to the    *)
+    (*   scheduler to let the terminate exception to take effect. At the   *)
+    (*   end of this handler, return_excep will reinstate the registers,   *)
+    (*   and returnuser will catch excep_pending flag and go to scheduler  *)
+    (*   to let the terminate exception take effect.                       *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   env_ptr : pointer to the environment block.                       *)
+    (*   data_ptr : pointer to the exception data block.                   *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by excep_prolog only, and entered as default hardware      *)
+    (*   exception handler. The handler executes in system mode,      it   *)
+    (*   has to be inside system since crea_ecb and declare_excep needs to *)
+    (*   to know this handler's address.                                   *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   None.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label
+      1;
+    var
+      hard_ptr : p_hard_ex_data;
+      pcb_ptr : ptr_pcb;
+      charin : char;
+
+    begin
+      pcb_ptr := pointer (c_pcb_ptr);
+      hard_ptr := pointer (ord (data_ptr));
+      with hard_ptr^ do
+        begin
+          { Wait until break facility is further defined.
+          if excep_kind = nmi_key then          (* NMI key pressed *)
+            begin
+             writeln ('NMI key exception default handler is entered in process of gid',
+                       pcb_ptr^.glob_id);
+             write ('Do you want to abort this process ? y/n');
+             readln (charin);
+             if (charin <> 'Y') and (charin <> 'y') then
+               goto 1;                         (* no abort, continue execution *)
+            end;
+          }
+          (*$IFC DEBUG2*)
+          if excep_kind <> nmi_key then
+            begin
+              writeln ('System/Hardware exception default handler is entered.');
+              writeln ('Process is terminated.');
+            end;
+          (*$ENDC*)
+          case excep_kind of
+            div_zero    : excep_kind := def_div_zero;
+            value_oob   : excep_kind := def_value_oob;
+            ovfw        : excep_kind := def_ovfw;
+            value_range : excep_kind := def_range;
+            str_index   : excep_kind := def_str_index;
+          end;
+        end;
+      force_term_excep (data_ptr^);
+                                (* force terminate exception to be signalled *)
+                                (* return_excep will catch excep_pending and goto
+                                 scheduler to let terminate exception take effect *)
+     1:
+    end;  (* procedure err_def_hdl *)
+
+
+
+
+  procedure term_def_hdl (env_ptr : p_env_blk;
+                          data_ptr : p_ex_data);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Terminate exception default handler.     It is like an exception  *)
+    (*   handler. It does nothing, just enables the exception and returns. *)
+    (*   So that terminate exception can be signalled any time without     *)
+    (*   being terminated.                                                 *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   env_ptr : pointer to the environment block.                       *)
+    (*   data_ptr : pointer to the exception data block.                   *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by excep_prolog only, and entered as default terminate     *)
+    (*   exception handler. The handler executes in system mode like the   *)
+    (*   other default handlers.                                           *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   System error if error from enable_excep.                          *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      errnum : integer;
+      excep_name : t_ex_name;
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then
+        writeln ('e term_def_hdl :');
+      (*$ENDC*)
+      excep_name := sys_terminate;
+      enable_excep (errnum, excep_name);
+      if errnum <> no_error then system_error (e_term_def);
+    end;  (* procedure term_def_hdl *)
+
+
+
+  procedure crea_ecb (var errnum : integer;
+                      excep_name : t_ex_name;
+                      entry_point : longadr;
+                      var ecb_ptr : exctrb_ptr;
+                      b_sloc_ptr : slocal_ptr);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   creates a local or global exception control block for system type *)
+    (*   exception and enqueue to the ecb list.                            *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   excep_name : exception name.                                      *)
+    (*   entry_point : address of the exception handler.                   *)
+    (*   b_sloc_ptr : pointer to the syslocal area of the target process.  *)
+    (*   sys_exname : true if system exception, else false.                *)
+    (*   pcb_ptr : pointer to the process that system exception is linked. *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   ecb_ptr : pointer to the exception control block created.         *)
+    (*   errnum : error return - no_space if no space left.                *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by excep_setup for a child process and declare_excep_hdl.  *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      ecb_ordadr, b_sysarea : absptr;
+      leftlink : ^exctrblk;
+      up_excep_name : e_name;
+
+    begin                               (* begin crea_ecb *)
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        begin
+          writeln ('e crea_ecb : excep_name = ', excep_name, ' entry_point =',
+                   ord (entry_point));
+          writeln ('  b_sloc =', ord (b_sloc_ptr));
+        end;
+      (*$ENDC*)
+      b_sysarea := ord (b_sloc_ptr);
+      leftlink := pointer (b_sloc_ptr^.head_ecb.bkwd_link + b_sysarea);
+
+      if getspace (sizeof (exctrblk), b_sysarea, ecb_ordadr) then
+        begin
+          ecb_ptr := pointer (ecb_ordadr);
+          with ecb_ptr^ do
+            begin
+              up_excep_name := copy (excep_name, 1, length (excep_name));
+              upshift (@up_excep_name);          (* store name in upper case *)
+              moveleft (up_excep_name, ex_name, length (excep_name)+1);
+              hdl_adr := entry_point;
+              insysmode := true;                (* default handler in system mode *)
+              num_excep := 0;
+              exq_head := ord (@exq_head) - b_sysarea;
+              exq_tail := exq_head;
+              ex_state := enabled;
+              ex_occurred_f := false;
+              ec_refnum := 0;
+
+              enqueue (ecb_link, leftlink^.ecb_link, b_sysarea);
+            end;
+          errnum := no_error;
+        end
+      else
+          errnum := no_space;
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('l crea_ecb : errnum =', errnum, ' ecb =', ord (ecb_ptr));
+      (*$ENDC*)
+
+   end;  (* procedure crea_ecb  *)
+
+
+
+  procedure excep_setup (* b_sloc_ptr : slocal_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   creates hardware and system exception control blocks when a       *)
+    (*   process is created. Initialize the system ecb header and the      *)
+    (*   excep_pending fields in pcb.                                      *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   b_sloc_ptr : pointer to syslocal area of the process to be created*)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : error returned - no_space if no system data space.       *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by make_process only.                                      *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   Error return if no space in sysglobal, system_error if no space   *)
+    (*   in syslocal.                                                      *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label
+      9, 8;
+    var
+      ecb_ptr : exctrb_ptr;
+      errnum : integer;
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('e excep_setup : b_sloc =', ord (b_sloc_ptr));
+      (*$ENDC*)
+      with b_sloc_ptr^ do               (* init the header in syslocal *)
+        begin
+          last_ecb_ptr := 0;
+          head_ecb.fwd_link := ord (@head_ecb) - ord (b_sloc_ptr);
+          head_ecb.bkwd_link := head_ecb.fwd_link;
+        end;   (* with *)
+
+      with b_sloc_ptr^ do               (* create the hardware exceptions in syslocal *)
+        begin
+          crea_ecb (errnum, sys_terminate, @term_def_hdl, ecb_ptr, b_sloc_ptr);
+          if errnum <> no_error then goto 8;
+
+          abort_ecb_rp := ord (ecb_ptr) - ord (b_sloc_ptr);
+                                (* for illegal, privilege instruction, address/bus
+                                   error, and any system error for now *)
+          crea_ecb (errnum, sys_zero_div, @hard_def_hdl, ecb_ptr, b_sloc_ptr);
+          if errnum <> no_error then goto 8;
+
+          divz_ecb_rp := ord (ecb_ptr) - ord (b_sloc_ptr);
+
+          crea_ecb (errnum, sys_value_oob, @hard_def_hdl, ecb_ptr, b_sloc_ptr);
+          if errnum <> no_error then goto 8;
+
+          oob_ecb_rp := ord (ecb_ptr) - ord (b_sloc_ptr);
+
+          crea_ecb (errnum, sys_overflow, @hard_def_hdl, ecb_ptr, b_sloc_ptr);
+          if errnum <> no_error then goto 8;
+
+          ovfw_ecb_rp := ord (ecb_ptr) - ord (b_sloc_ptr);
+
+          {
+          crea_ecb (errnum, sys_nmi_key, @hard_def_hdl, ecb_ptr, b_sloc_ptr);
+          if errnum <> no_error then goto 8;
+
+          nmik_ecb_rp := ord (ecb_ptr) - ord (b_sloc_ptr);
+          }
+        end;
+      goto 9;
+
+     8: system_error (e_excep_setup);
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('l excep_setup : errnum =', errnum);
+      (*$ENDC*)
+
+    end;  (* procedure excep_setup *)
+
+
+
+
+  procedure init_excep (* adr_return_excep : longint *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Initialize the address of return_excep procedure field in syslocal*)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   adr_return_excep : address of the return_excep procedure in oslib.*)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   Called by %_init in paslib only, every process must call this     *)
+    (*   procedure before execution to set up exception properly.          *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      b_sloc_ptr : ^syslocal;
+
+    begin
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      b_sloc_ptr^.adr_return_excep := adr_return_excep;
+      { exit_syscall (4);  }
+    end;  (* procedure init_excep *)
+
+
+
+
+(* Exception management system routines : user interface level *)
+
+
+  procedure declare_excep_hdl (* var errnum : integer;
+                                 var excep_name : t_ex_name;
+                                 entry_point : longadr *);
+
+    (****************************************************************)
+    (*                                                              *)
+    (* Description:                                                 *)
+    (*   Declares an exception and its exception handler or         *)
+    (*   dissociates the previous declared handler.                 *)
+    (*                                                              *)
+    (* Input Parameters:                                            *)
+    (*   excep_name: exception name                                 *)
+    (*   entry_point: address of the exception handler.             *)
+    (*                                                              *)
+    (* Output Parameters:                                           *)
+    (*   errnum : no_error - function completed successfully.       *)
+    (*            no_exname - tried to dissociate an non-existent   *)
+    (*                        exception.                            *)
+    (* Side Effects:                                                *)
+    (*   none.                                                      *)
+    (*                                                              *)
+    (* Special Conditions of Use:                                   *)
+    (*   none.                                                      *)
+    (*                                                              *)
+    (* Error Conditions:                                            *)
+    (*   see output parameters.                                     *)
+    (*                                                              *)
+    (****************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr, leftlink : exctrb_ptr;
+      b_sloc_ptr : slocal_ptr;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;                (* do not check entry_point, since it
+                                           is in code segment *)
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then
+        writeln ('e declare_excep_hdl : excep_name = ', excep_name,
+                 ' entry_point =', ord (entry_point));
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                        (* search the ecb of this name *)
+      if errnum = no_error then         (* exists an ecb of this name *)
+        begin
+          if entry_point = nil then       (* to disassociate *)
+              if (excep_name = sys_overflow) or
+                 (excep_name = sys_value_oob) or
+                 (excep_name = sys_zero_div) or
+                 (excep_name = sys_terminate)
+              then                      (* disassociate system defined exception *)
+                  begin
+                    if excep_name = sys_terminate then
+                      c_ecb_ptr^.hdl_adr := @term_def_hdl
+                    else
+                      c_ecb_ptr^.hdl_adr := @hard_def_hdl;
+                                        (* go to default handler      *)
+                    c_ecb_ptr^.insysmode := true;       (* default handler will be
+                                                           executed in system mode *)
+                    setup_state (c_ecb_ptr, enabled);
+                  end
+              else                      (* remove this ecb *)
+                  dequeue (c_ecb_ptr^.ecb_link, b_syslocal_ptr)
+          else                          (* re-declaration to another handler *)
+            begin
+              c_ecb_ptr^.hdl_adr := entry_point;
+              c_ecb_ptr^.insysmode := false;         (* user handler is in user mode *)
+              setup_state (c_ecb_ptr, enabled);
+            end;
+        end
+      else
+          if errnum = no_exname then         (* no ecb exists for this name *)
+              if entry_point <> nil then       (* genuine declaration   *)
+                begin
+                  b_sloc_ptr := pointer (b_syslocal_ptr);
+                  crea_ecb (errnum, excep_name, entry_point, c_ecb_ptr, b_sloc_ptr);
+                                                      (* to create an ecb *)
+                  c_ecb_ptr^.insysmode := false;      (* new handler is in user mode *)
+                end;
+              (* else, entry_point = 0, error, trying to disassociate
+                 an non-existent exception                          *)
+
+          (* else, other types of error from srch_ecb, return to caller *)
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l declare_excep_hdl : errnum =', errnum);
+      (*$ENDC*)
+     {  exit_syscall (12);   (* no of bytes in pars *)  }
+    end;   (* procedure declare_excep_hdl   *)
+
+
+
+
+  procedure disable_excep (* var errnum : integer;
+                             var excep_name : t_ex_name;
+                             queue : boolean *);
+
+    (******************************************************************)
+    (*                                                                *)
+    (* Description:                                                   *)
+    (*   Disables the trapping of an exception to be queued or ignored*)
+    (*                                                                *)
+    (* Input Parameters:                                              *)
+    (*   excep_name: exception name                                   *)
+    (*   queue : exception queued if true, ignored if false.          *)
+    (*                                                                *)
+    (* Output Parameters:                                             *)
+    (*   errnum : no_error - function completed successfully.         *)
+    (*            no_exname - tried to disable an non-existent        *)
+    (*                        exception.                              *)
+    (* Side Effects:                                                  *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Special Conditions of Use:                                     *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Error Conditions:                                              *)
+    (*   see output parameters.                                       *)
+    (*                                                                *)
+    (******************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr : exctrb_ptr;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then
+        begin
+          write ('e disable_excep : excep_name = ', excep_name, ' queue = ');
+          if queue then writeln ('true') else writeln ('false');
+        end;
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                        (* search the ecb of this name *)
+      if errnum = no_error then         (* exists an ecb of this name *)
+          if queue then
+              setup_state (c_ecb_ptr, queued)
+          else
+              setup_state (c_ecb_ptr, ignored);
+
+      (* else, error, trying to disable an non-esistent exception *)
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l disable_excep : errnum =', errnum);
+      (*$ENDC*)
+
+     {  exit_syscall (10);      (* no of bytes in pars *)  }
+    end;   (* procdure disable_excep  *)
+
+
+
+
+  procedure enable_excep (* var errnum : integer;
+                            var excep_name : t_ex_name *);
+
+    (******************************************************************)
+    (*                                                                *)
+    (* Description:                                                   *)
+    (*   enables an exception to be handled again.                    *)
+    (*                                                                *)
+    (* Input Parameters:                                              *)
+    (*   excep_name: exception name                                   *)
+    (*                                                                *)
+    (* Output Parameters:                                             *)
+    (*   errnum : no_error - function completed successfully.         *)
+    (*            no_exname - tried to enable an non-existent         *)
+    (*                        exception.                              *)
+    (* Side Effects:                                                  *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Special Conditions of Use:                                     *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Error Conditions:                                              *)
+    (*   see output parameters.                                       *)
+    (*                                                                *)
+    (******************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr : exctrb_ptr;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then
+        writeln ('e enable_excep : excep_name = ', excep_name);
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                        (* search the ecb of this name *)
+      if errnum = no_error then         (* exists an ecb of this name *)
+          setup_state (c_ecb_ptr, enabled);
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l enable_excep : errnum =', errnum);
+      (*$ENDC*)
+
+      { exit_syscall (8);    (* no of bytes in pars *)  }
+    end;    (* procedure enable_excep  *)
+
+
+
+
+  procedure info_excep (* var errnum : integer;
+                          var excep_name : t_ex_name;
+                          var excep_status : t_ex_sts *);
+
+    (******************************************************************)
+    (*                                                                *)
+    (* Description:                                                   *)
+    (*   gets the status infomation of the exception.                 *)
+    (*                                                                *)
+    (* Input Parameters:                                              *)
+    (*   excep_name: exception name                                   *)
+    (*                                                                *)
+    (* Output Parameters:                                             *)
+    (*   errnum : no_error - function completed successfully.         *)
+    (*            no_exname - tried to get status of a non-existent   *)
+    (*                        exception.                              *)
+    (*   excep_status : exception status                              *)
+    (*                                                                *)
+    (* Side Effects:                                                  *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Special Conditions of Use:                                     *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Error Conditions:                                              *)
+    (*   see output parameters.                                       *)
+    (*                                                                *)
+    (******************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr : exctrb_ptr;
+      ex_sts : t_ex_sts;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 2;
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          parms [2].addr := ord (@excep_status);
+          parms [2].readwrite := true;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then
+        writeln ('e info_excep : excep_name = ', excep_name);
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                        (* search the ecb of this name *)
+      if errnum = no_error then         (* exists an ecb of this name *)
+          with excep_status do
+              begin
+                  ex_occurred_f := c_ecb_ptr^.ex_occurred_f;
+                  ex_state := c_ecb_ptr^.ex_state;
+                  hdl_adr := c_ecb_ptr^.hdl_adr;
+                  num_excep := c_ecb_ptr^.num_excep;
+
+                  if c_ecb_ptr^.ec_refnum <> 0 then
+                      begin
+                        tr_ex_ec (c_ecb_ptr^.ec_refnum, ex_sts, false, true);
+                                                    (* transfer ex_sts from eccb *)
+                        ex_occurred_f := ex_occurred_f or ex_sts.ex_occurred_f;
+                        num_excep := num_excep + ex_sts.num_excep;
+                      end;
+              end;  (* with  *)
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l info_excep : errnum =', errnum);
+      (*$ENDC*)
+
+     {  exit_syscall (12);   (* no of bytes in pars *)  }
+
+    end;   (* procedure info_excep   *)
+
+
+
+
+  procedure flush_excep (* var errnum : integer;
+                           var excep_name : t_ex_name *);
+
+    (******************************************************************)
+    (*                                                                *)
+    (* Description:                                                   *)
+    (*   removes all the exceptions in the exception queue and resets *)
+    (*   the exception occurred flag.                                 *)
+    (*                                                                *)
+    (* Input Parameters:                                              *)
+    (*   excep_name: exception name                                   *)
+    (*                                                                *)
+    (* Output Parameters:                                             *)
+    (*   errnum : no_error - function completed successfully.         *)
+    (*            no_exname - tried to flush  an non-existent         *)
+    (*                        exception.                              *)
+    (*                                                                *)
+    (* Side Effects:                                                  *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Special Conditions of Use:                                     *)
+    (*   none.                                                        *)
+    (*                                                                *)
+    (* Error Conditions:                                              *)
+    (*   see output parameters.                                       *)
+    (*                                                                *)
+    (******************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr : exctrb_ptr;
+      data_ptr : exdata_ptr;
+      ex_sts : t_ex_sts;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then
+        writeln ('e flush_excep : excep_name = ', excep_name);
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                        (* search the ecb of this name *)
+      if errnum = no_error then         (* exists an ecb of this name *)
+        with c_ecb_ptr^ do
+          begin
+            ex_occurred_f := false;
+            if ec_refnum <> 0 then
+              begin
+                ex_sts.ex_occurred_f := false;
+                ex_sts.ex_state := ex_state;
+                tr_ex_ec (ec_refnum, ex_sts, true, true); (* transfer to eccb *)
+              end;
+
+            while num_excep > 0 do
+              begin
+                deq_ex_data (c_ecb_ptr, data_ptr);
+                relspace (ord (data_ptr), b_syslocal_ptr);
+              end;
+
+            if ec_refnum <> 0 then
+              flush_event_chn (errnum, ec_refnum);
+          end;
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l flush_excep : errnum =', errnum);
+      (*$ENDC*)
+
+    end;    (* procedure flush_excep   *)
+
+
+
+
+
+
+ÿ

@@ -1,0 +1,1562 @@
+{******************************************************************************}
+{*                                                                            *}
+{*       LisaGuide - imlib unit : Copyright 1983, Apple Computer Inc.         *}
+{*                                                                            *}
+{******************************************************************************}
+
+{
+
+  This unit primarily serves as a cover for the database intrinsics.  Most
+  routines simply provide a more convenient interface for the same DB function.
+
+  There is one catalog per volume.  The catalog is a table of records describing
+  all the high level objects on a disk (e.g., folders, documents, tools).  The
+  table is kept sorted first by parentID and then alphabetically by name.  Every
+  object record also contains an id which is unique on a volume.
+
+  Example catalog:
+
+
+     ParentId   Name          UniqueId   Kind     Tool Used  ... (other attributes)
+     --------   ----          --------   ----     ---------
+        0       My Disk           1      Disk       N/A
+        1       AppleWord       101      Tool        1
+        1       Document        102      Doc         1
+        1       Document        103      Doc         3
+        1       Folder 1        104      Folder     N/A
+      104       a Doc           105      Doc         4
+      104       b Doc           106      Doc         2
+      104       Folder 1.1      107      Folder     N/A
+      107       AppleCalc       108      Tool        3
+      107       Doc             109      Doc         3
+
+  All of the catalog access routines require a volume identifier, "volHdl", and a
+  catalog record Id, "catRID."  The catRID type is defined in unit "FGlobals."  It
+  is a record that contains a parentID and a uniqueID.  The uniqueID alone is
+  enough to identifiy the object; however, having the parentId allows faster access
+  given the catalog structure.  The access routines also provide sequential access
+  by using the catRID positioning constants defined below.  These allow positioning
+  to the first, next, and current records.  Also provided is the ability to
+  position to the first record with a given parentID.
+
+
+
+  last system error used = 300
+
+}
+
+
+(* ===== Conditional compilation variable (R) =====
+         if TRUE, then compile for real FILER;
+                  else compile for pseudo-FILER, which
+                       runs under LisaTutor.
+
+Changes made to support pseudo-FILER:
+o Working Catalog and DeskTop state filenames were changed to
+  {!TFCatalog} and {!TFSaveDesktop}.
+
+o Added the external procedures:
+     PROCEDURE RestoreCat  (VAR err : INTEGER;
+                                prefix : E_name;
+                                devHdl : TentryHdl);
+  Copies the 'real' Catalog and DeskTop to the working files.
+
+     PROCEDURE SaveCat     (VAR err : INTEGER;
+                                prefix : E_name;
+                                devHdl : TentryHdl);
+  The inverse of RestoreCat.
+
+o Added the internal procedures:
+     PROCEDURE CopyCatFile(VAR osErr:integer;
+                           source,destination:Pathname;
+                           bufrAdrs, bufrSize:Longint);
+  A modified version of CopyDiskfile (from Unit FilerComm), that handles
+  the case of the destination file already existing.
+
+     PROCEDURE CopyCatState(VAR err : integer;
+                            srcPrefix,dstPrefix : E_Name;
+                            devHdl : TentryHdl);
+  A procedure for copying the Catalog and DeskTop files to and from the
+  the working filenames expected by the rest of Unit Catalog.
+*)
+{$DECL R}
+{$SETC R:=FALSE}
+
+UNIT IFCatalog;
+
+INTERFACE
+
+USES {$U libos/SysCall  } SysCall,
+     {$U libos/PSysCall } PSysCall,
+     {$U UnitStd  } UnitStd,
+     {$U UnitHz    } UnitHz,
+     {$U Storage   } Storage,
+
+      { database modules }
+
+   {$U dbenv     } dbenv,
+   {$U dbdecl1   } dbdecl1,
+   {$U lowlevel  } lowlevel,
+   {$U pooler    } pooler,
+   {$U heap      } heap,
+   {$U czCompact } czCompact,
+   {$U vltree    } vltree,
+   {$U scan      } scan,
+   {$U labscan   } labscan,
+   {$U schema    } schema,
+
+      { other library modules }
+
+   {$U QuickDraw } QuickDraw,
+   {$U FontMgr   } FontMgr,
+   {$U PmDecl    } PmDecl,
+   {$U PMM       } PMM,
+   {$U WM.Events } Events,
+   {$U WM.Windows}Windows,
+   {$U WM.Folders}Folders,
+   {$U WM.Menus  } Menus,
+   {$U AlertMgr  } AlertMgr,
+
+      { Filer modules }
+
+   {$U apim/TFGlobals  } IFGlobals,
+   {$U apim/TFEntry    } IFEntry,
+   {$U Scrap    } Scrap;
+
+
+CONST
+
+      { Object kinds.  Stored in catalog record and in memory "Object" record.
+        Determines what operations are legal for this object and which icon to
+        draw on the screen  }
+
+
+   nilKind     = 0;
+   fileKind    = 1;
+   drawerKind  = 2;
+   folderkind  = 3;
+   docKind     = 4;
+   docPad      = 5;
+   trashKind   = 6;
+   printKind   = 7;
+   calcKind    = 8;
+   trayKind    = 9;
+   computerKind= 10;
+   wpDocKind   = 11;
+   bgDocKind   = 12;
+   lcDocKind   = 13;
+   geDocKind   = 14;
+   lmDocKind   = 15;
+   folderPad   = 16;
+   scrapKind   = 17;
+   scrap2Kind  = 18;
+   clockKind   = 19;
+   lanternKind = 20;
+   toolBoxKind = 21;
+   houseKind   = 22;
+   bookKind    = 23;
+   toolKind    = 24;
+   diskKind    = 25;
+   disk1Kind   = 26;
+   disk2Kind   = 27;
+   profileKind = 28;
+   pertDocKind = 29;   (*** DS ***)
+   termDocKind = 30;   (*** DS ***)
+   imKind      = 31;   (*** DS ***)
+   deskKind    = 32;
+   lastKind    = deskKind;
+
+
+      { Reserved catalog id numbers.  Newly created catalogs have some records
+        created with these reserved unique id's
+      }
+
+   idNil          = 0;
+   idDisk         = 1;
+   idTrash        = 2;
+   idScrap        = 3;
+   idComputer     = 4;
+   idPrinter      = 5;
+   idLastReserved = 100;
+
+   idFirst     = -1;   { positioning id numbers }
+   idNext      = -2;
+   idCurrent   = -3;
+   idAny       = -4;   { used to position to first record in a container }
+
+   endOfCat    =  3;   { DB end of scan redefinition, save units importing DB }
+
+   xWastebasket  = 5;  { menu item numbers from TFiler            }
+   xClipboard    = 6;  { eXtra menu items for catalog names       }
+   xPreferences  = 7;  { LisaGuide nr bug #4 fix for translation  }
+   xDisk         = 8;  { 3/2/83 -gb                               }
+   xDiskette     = 9;  { nr fix #4                                }
+
+
+   desktopFile = '{!TFSaveDesktop}';   { holds saved desktop state }
+
+
+
+
+TYPE
+
+   VarLenData = PACKED ARRAY [0..fMaxStrLen] OF CHAR;
+
+
+      { Catalog record definition }
+
+
+   TcatRec =
+      RECORD
+      parentId   : IdType;      { Id of parent }
+      nameDesc   : Vfld;        { length & offset of name of the object }
+      selfId     : IdType;      { unique id of the object }
+      objKind    : INTEGER;     { the type of object }
+      objState   : INTEGER;     { state information.  currently unused }
+      objSize    : LongInt;     { diskSize in blocks }
+      openRect   : Rect;        { last open location and size }
+      closedPt   : Point;       { closed location in container }
+      created    : LongInt;     { date & time created }
+      modified   : LongInt;     { date & time modified }
+      toolId     : TtoolId;     { program to run }
+      extraDesc  : Vfld;        { length & offset of future object data }
+      varLenPart : VarLenData;  { data for variable length fields }
+      END;
+
+   PtrCatRec = ^TcatRec;
+
+
+
+VAR
+
+      { Positioning constants.  These can be passed in to the access routines
+        for accessing records based on position in the file }
+
+   posFirst   : TcatRID;  { positions to the first record }
+   posNext    : TcatRID;  { positions to the next record, useful for iterating  }
+   posCurrent : TcatRID;  { positions to the current record }
+   posApprox  : TcatRID;  { used to position to first record with a given parentID
+                            set posApprox.parentID to the parentID desired }
+
+
+      { Predefined record id's.  These are constants which can be passed in to
+        any catalog routine. }
+
+   diskCatRID  : TcatRID;
+   trashCatRID : TcatRID;
+
+   pXtraMenu:     MenuPtr;  { LisaGuide nr fix #4 - for translation }
+                    { 3/2/83 -gb   puts sys obj names in menu file }
+
+
+
+FUNCTION  CatRecSize  (VAR catRec : TcatRec) : INTEGER;
+PROCEDURE CheckCatErr (err : INTEGER; errMsg : String80);
+PROCEDURE CloseCat    (VAR err : INTEGER; VAR volHdl : TentryHdl);
+PROCEDURE CreateCat   (VAR err : INTEGER; devHdl : TentryHdl);
+PROCEDURE DBError     (err : INTEGER);
+PROCEDURE DestroyCat  (VAR err : INTEGER; devHdl : TentryHdl);
+PROCEDURE ExtObjName  (VAR catRec : TcatRec; VAR objName : FMaxStr);
+PROCEDURE FlushCat    (volHdl: TentryHdl);
+PROCEDURE GetObjName  (volHdl : TentryHdl; catRID : TcatRID; VAR name : FMaxStr);
+PROCEDURE GetToolName (VAR err: INTEGER; toolID: TtoolID; devHdl: TentryHdl;
+                       VAR toolName: FMaxStr);
+PROCEDURE InitCat     (VAR err : INTEGER; devName: E_Name);
+PROCEDURE InsObjName  (VAR catRec : TcatRec; objName : FMaxStr);
+PROCEDURE OpenCat     (VAR err : INTEGER; devHdl : TentryHdl);
+PROCEDURE PrintCatRec (VAR catRec : TcatRec);
+PROCEDURE RestoreCat  (VAR err : INTEGER;
+                           prefix : E_name;
+                           devHdl : TentryHdl);
+PROCEDURE SaveCat     (VAR err : INTEGER;
+                           prefix : E_name;
+                           devHdl : TentryHdl);
+PROCEDURE TraceDB     (traceStatus : BOOLEAN);
+
+
+PROCEDURE AddCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                    VAR catRec : TcatRec;
+                        genID  : BOOLEAN;
+                    VAR catRID : TcatRID);
+
+PROCEDURE DelCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID);
+
+PROCEDURE GetCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR catRec : TcatRec);
+
+PROCEDURE PosCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR pCatRec: PtrCatRec);
+
+PROCEDURE UpdCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR catRec : TcatRec);
+
+{########################################################################}
+
+IMPLEMENTATION
+
+{$S Catalog }
+
+CONST
+      { O/S file names for catalog files }
+
+copyright = 'copyright 1983, Apple Computer Inc.';
+
+   catDBName      = '{!TFCATALOG}'; { name of catalog }
+
+   dbBufName      = '{!DBBUFFER}';  { name of DB bufr data seg }
+
+      { Memory structure parameters }
+
+   nDBBuffs   = 6;    { number of DB buffers (2K bytes each) }
+   nOpenFiles = 3;    { max number of DB files open (1 per catalog) }
+   nOpenScans = 3;    { max number of DB scans open (1 per catalog) }
+   dbHeapSize = 2000; { heap space (bytes) for DB intrinsics }
+
+
+      { field numbers for catalog record descriptor }
+
+   fldParent   = 0;    { Parent ID }
+   fldName     = 1;    { object name }
+   fldID       = 2;    { Unique object ID }
+   fldKind     = 3;    { object kind }
+   fldState    = 4;    { state information }
+   fldSize     = 5;    { object size in blocks }
+   fldRect     = 6;    { window rect }
+   fldPt       = 7;    { closed position }
+   fldCreated  = 8;    { time & date created }
+   fldModified = 9;    { date & date modified }
+   fldTool     = 10;   { ID of tool associated with document }
+   fldExtra    = 11;   { future object data }
+
+   fldLast     = fldExtra;
+
+   numFlds     = 12;   { # of fields in record }
+   numKeyFlds  = 3;    { # of fields in key (first "numKeys" fields) }
+   numSortFlds = 1;    { # of fields in key promoted to nonleaves }
+
+
+
+
+VAR
+
+   bufrDsRefNum  : INTEGER;
+   heapDsRefNum  : INTEGER;
+
+
+   { Forward declarations for internal procedures }
+
+PROCEDURE GetNextId(volHdl: TentryHdl; VAR nextId: IdType);
+   FORWARD;
+PROCEDURE CopyCatFile(VAR osErr:integer;
+                      source,destination:Pathname;
+                      bufrAdrs, bufrSize:Longint);
+   FORWARD;
+PROCEDURE CopyCatState(VAR err : integer;
+                       srcPrefix,dstPrefix : E_Name;
+                       devHdl : TentryHdl);
+   FORWARD;
+PROCEDURE SetNextId(volHdl: TentryHdl; nextId: IdType);
+   FORWARD;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE AddCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                      VAR catRec : TcatRec;
+                          genId  : BOOLEAN;
+                      VAR catRID : TcatRID *};
+
+{ Inserts a record into the object catalog.  If genId is TRUE then the field
+  "selfId" in the catalog record will automatically be filled in with a unique id;
+  otherwise, a check is made to ensure that id generator will not duplicate the
+  id passed in.  If the record is inserted successfully then a catalog record
+  id, "catRID", is returned.  This token can then be used to fetch, update, or
+  delete the record
+}
+
+VAR
+   offendID : INTEGER;
+   pCatRec  : PtrCatRec;
+   nextId   : IdType;
+
+BEGIN
+IF trcCatalog THEN
+   BEGIN
+   GetNextId(volHdl,nextId);
+   WRITELN('AddCatRec.  volHdl: ',ORD(volHdl):1,' scanID: ',
+           volHdl^^.catScanID:1,'  genId: ',genID,'  nextID: ',nextId:1);
+   PrintCatRec(catRec);
+   END;
+
+EInsert(err,offendID,volHdl^^.catScanID,@catRec,catRecSize(catRec),genId);
+
+IF err = 0 THEN
+   BEGIN
+   {$R-}     { get pointer to newly inserted record }
+   pCatRec := POINTER(ORD(pScanTable^[volHdl^^.catScanId]^.ptrCOS));
+   {$R+}
+
+   { if an id was supplied then ensure that next generated id doesn't conflict }
+   IF NOT genID THEN
+      BEGIN
+      GetNextId(volHdl,nextId);         { fetch the next id to be generated }
+      IF catRec.selfID >= nextId THEN
+         SetNextId(volHdl,catRec.selfID+1);
+      END;
+
+   { build the "token" for this record }
+   catRID.fatherID := catRec.parentId;
+   catRID.uniqueId := pCatRec^.selfId;
+   END;
+
+IF trcCatalog THEN WRITELN('   exit AddCatRec.  uniqueID = ',pCatRec^.selfID:1);
+END;
+
+
+{---------------------------------------------------------------------------}
+
+FUNCTION CatRecSize{* VAR catRec : TcatRec) : INTEGER *};
+   { computes size of catalog record by adding fixed + variable parts }
+VAR
+   recSize : INTEGER;
+
+BEGIN
+WITH catRec DO
+   recSize := SIZEOF(catRec) - SIZEOF(varLenPart) + nameDesc.size +
+              extraDesc.size;
+
+   { Ensure even length.  (DB intrinsics restriction) }
+IF ODD(recSize) THEN
+   recSize := recSize + 1;
+
+catRecSize := recSize;
+
+IF recSize > SIZEOF(catRec) THEN
+   BEGIN
+{$IFC filerDebug }
+   WRITELN(CHR(bell),'Bad size in catRecSize = ',recSize,'  Max used.');
+   recSize := SIZEOF(catRec);
+{$ENDC }
+   END;
+
+IF trcCatalog THEN WRITELN('CatRecSize.  size = ',recSize:1);
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE CheckCatErr{* err : INTEGER; errMsg : String80 *};
+
+{ Temporary error handler for catalog errors }
+
+BEGIN
+IF err <> noErr THEN
+   BEGIN
+{$IFC filerDebug }
+   WRITELN(errMsg);
+   DBError(err);
+   IF (err > 0) AND trcCatalog THEN
+      BEGIN
+      WRITELN('Type return to continue.');
+      READLN;
+      END;
+{$ENDC }
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE CloseCat{* VAR err : INTEGER; VAR volHdl : TentryHdl *};
+
+{ Closes a catalog on a given volume.  Deallocates the volume entry }
+BEGIN
+IF trcCatalog THEN WRITELN('CloseCat.  volHdl :',ORD(volHdl):1);
+
+IF NOT volHdl^^.catOpen THEN EXIT(CloseCat);
+
+   { set immediately, so won't try to close again from terminate exception }
+volHdl^^.catOpen := FALSE;
+
+CloseScan(err,volHdl^^.catScanID);
+IF (err <> 0) AND dbgFiler THEN
+   BEGIN
+   WRITE('Unable to close catalog.');
+   DBError(err);
+   END;
+
+KillEntry(vol,volHdl);
+volHdl := NIL;
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE CreateCat{* VAR err : INTEGER; devHdl: TentryHdl *};
+
+{ Creates a new catalog on a given device.  Adds  an entry for the disk itself
+  and for the "system objects" (scrap, printer, etc) should this be used as a boot
+  disk.
+}
+
+VAR
+   fileName : PathName;       { holds concatenation of devName and DB name }
+   fDesc    : FileDesc;       { DB file descriptor }
+   recDesc  :                 { DB record descriptor }
+      ARRAY [0..fldLast] of FldDesc;
+   catRec : TcatRec;          { used to determine offset of each field }
+   volHdl : TentryHdl;
+   catRID : TcatRID;
+   itemString: Str255;  { LisaGuide nr bug fix #4 3/2/83 -gb }
+   nameString: FMaxStr; { LisaGuide nr bug fix #4 3/2/83 -gb }
+
+
+   PROCEDURE BuildRecDesc;
+
+   { builds the record descriptor reqired by the database intrinsics.  Specifies
+     each field's location, sort order, type, and size }
+
+   BEGIN
+   WITH catRec DO
+      BEGIN
+
+         { parentId  - ID of parent record for this object }
+      WITH recDesc[fldParent] DO
+         BEGIN
+         offset    := ORD(@parentId) - ORD(@catRec);
+         direction := ascending;
+         fType     := ftypInt4;
+         size      := SIZEOF(parentId);
+         END;
+
+         { object Name - variable length field }
+      WITH recDesc[fldName] DO
+         BEGIN
+         offset    := ORD(@nameDesc) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypVStr;
+         size      := SIZEOF(nameDesc);
+         END;
+
+         { selfId - unique identifier (on a volume) for this object }
+      WITH recDesc[fldID] DO
+         BEGIN
+         offset    := ORD(@selfID) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypTick;       { this type is used for unique id generation}
+         size      := SIZEOF(selfID);
+         END;
+
+         { kind - what kind of object }
+      WITH recDesc[fldKind] DO
+         BEGIN
+         offset    := ORD(@objKind) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt2;
+         size      := SIZEOF(objKind);
+         END;
+
+         { state - state info about the object }
+      WITH recDesc[fldState] DO
+         BEGIN
+         offset    := ORD(@objState) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt2;
+         size      := SIZEOF(objState);
+         END;
+
+         { size }
+      WITH recDesc[fldSize] DO
+         BEGIN
+         offset    := ORD(@objSize) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(objSize);
+         END;
+
+         { openRect - screen loc and size last time out }
+      WITH recDesc[fldRect] DO
+         BEGIN
+         offset    := ORD(@openRect) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypNull;
+         size      := SIZEOF(openRect);
+         END;
+
+         { closed pt - closed screen location last time out }
+      WITH recDesc[fldPt] DO
+         BEGIN
+         offset    := ORD(@closedPt) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypNull;
+         size      := SIZEOF(closedPt);
+         END;
+
+         { creation date  }
+      WITH recDesc[fldcreated] DO
+         BEGIN
+         offset    := ORD(@created) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(created);
+         END;
+
+         { modified date }
+      WITH recDesc[fldModified] DO
+         BEGIN
+         offset    := ORD(@modified) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(modified);
+         END;
+
+         { toolID - Id of program to run when this document is pulled }
+      WITH recDesc[fldTool] DO
+         BEGIN
+         offset    := ORD(@toolID) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(toolID);
+         END;
+
+         { extra - variable length field for any future document data }
+      WITH recDesc[fldExtra] DO
+         BEGIN
+         offset    := ORD(@extraDesc) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypVNull;
+         size      := SIZEOF(extraDesc);
+         END;
+
+      END;
+   END;
+
+
+
+   PROCEDURE BuildFDesc;
+
+   { Builds the catalog file descriptor.  Specifies information about the file
+     stucture }
+
+   VAR
+      i : INTEGER;
+
+   BEGIN
+
+   WITH FDesc DO
+      BEGIN
+      flags        := [];
+      nFields      := numFlds;      { # fields in record }
+      nKeys        := numKeyFlds;   { # fields in record key }
+      nSort        := numSortFlds;  { # fields in nonleaves of b-tree }
+      ticketFld    := fldID;        { field to use for unique ids }
+
+         { compute size of record (fixed part) }
+      vFlds        := SIZEOF(catRec) - SIZEOF(catRec.varLenPart);
+
+      kVFlds := 0;     { compute size of non-leaf record (fixed part) }
+      FOR i := 0 TO nSort-1 DO
+         kVFlds := kVFlds + recDesc[i].size;
+
+      pEDesc := @recDesc;
+      END;
+   END;
+
+{ Outer block for CreateCat }
+
+BEGIN
+IF trcCatalog THEN WRITELN('CreateCat');
+
+   { Build the descriptors }
+
+BuildRecDesc;
+BuildFDesc;
+
+   { Create the database file }
+
+fileName := CONCAT('-', catVolName, '-',devHdl^^.nameHdl^^, catDBname);
+MakeDescFile(err,@fileName,@fDesc);
+IF err <> 0 THEN EXIT(CreateCat);
+
+   { Open the newly created catalog }
+
+OpenCat(err,devHdl);
+CheckCatErr(err,'CreateCat: Unable to open newly created catalog');
+IF err <> 0 THEN EXIT(CreateCat);
+
+volHdl := devHdl^^.volHdl;
+
+   { Add an entry for the disk,trash can, and other "system" objects }
+   { LisaGuide nr bug fix #4 - getting names from eXtraMenu  change  }
+   { added for translation 3/2/83 -gb                                }
+
+WITH catRec DO
+   BEGIN
+   parentID := idNil;
+   selfID   := idDisk;
+   CASE devHdl^^.device OF
+      upperDrive,lowerDrive:
+         BEGIN
+         objKind  := diskKind;
+         { changed from: InsObjName(catRec,'Diskette'); { nr bug fix #4 }
+         GetItem(pXtraMenu^,xDiskette,@itemString);     { nr bug fix #4 }
+         nameString := itemString;                      { nr bug fix #4 }
+         InsObjName(catRec, nameString {'Diskette'});   { nr bug fix #4 }
+         END;
+      OTHERWISE
+         BEGIN
+         objKind  := profileKind;
+         { changed from: InsObjName(catRec,'Disk'); { nr bug fix #4 }
+         GetItem(pXtraMenu^,xDisk,@itemString);     { nr bug fix #4 }
+         nameString := itemString;                  { nr bug fix #4 }
+         InsObjName(catRec, nameString {'Disk'});   { nr bug fix #4 }
+         END;
+      END;
+   toolId   := 0;
+   objState := 0;
+   created  := 0;
+   modified := 0;
+   objState := 0;
+   objSize  := 0;
+   SetPt(closedPt,MAXINT,MAXINT);   { flag to choose non overlapping position }
+   SetRect(openRect,20,40,650,250);
+   AddCatRec(err,volHdl,catRec,FALSE,catRID);
+
+   { changed from: InsObjName(catRec,'Wastebasket'); { nr bug fix #4 }
+   GetItem(pXtraMenu^,xWastebasket,@itemString);     { nr bug fix #4 }
+   nameString := itemString;                         { nr bug fix #4 }
+   InsObjName(catRec, nameString {'Wastebasket'});   { nr bug fix #4 }
+   selfID  := idTrash;
+   objKind := trashKind;
+   SetPt(closedPt,1650,150);
+   SetRect(openRect,450,250,650,350);
+   AddCatRec(err,volHdl,catRec,FALSE,catRID);
+
+   { changed from: InsObjName(catRec,'Clipboard'); { nr bug fix #4 }
+   GetItem(pXtraMenu^,xClipboard,@itemString);     { nr bug fix #4 }
+   nameString := itemString;                       { nr bug fix #4 }
+   InsObjName(catRec, nameString {'Clipboard'});   { nr bug fix #4 }
+   selfID  := idScrap;
+   objKind := scrapKind;
+   SetPt(closedPt,1650,200);
+   SetRect(openRect,50,310,600,360);
+   AddCatRec(err,volHdl,catRec,FALSE,catRID);
+
+   { changed from: InsObjName(catRec,'Preferences'); { nr bug fix #4 }
+   GetItem(pXtraMenu^,xPreferences,@itemString);     { nr bug fix #4 }
+   nameString := itemString;                         { nr bug fix #4 }
+   InsObjName(catRec, nameString {'Preferences'});   { nr bug fix #4 }
+   selfID  := idComputer;
+   objKind := computerKind;
+   toolId  := 11;
+   SetPt(closedPt,1650,250);
+   SetRect(openRect,500,260,700,360);
+   AddCatRec(err,volHdl,catRec,FALSE,catRID);
+
+
+   SetNextId(volHdl,idLastReserved+1);
+   END;
+
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE CopyCatFile(* VAR err:integer;
+                        source,destination:Pathname;
+                        bufrAdrs, bufrSize:Longint *);
+
+{ A modified version of CopyDiskfile (from Unit FilerComm), which
+  handles the case of the destination file already existing. It also
+  passes back the OS error in osErr rather than in a separate parameter.
+  Does not return an internal FilerComm error.  The only real changes were
+  to allow a 'file exists' error when creating the destination, and to
+  Truncate the destination before closing it.}
+
+{ This proc copies a single diskfile from source to destination. It uses
+  a memory-resident data seg as a buffer. Normally the buffer is unbound
+  and sized to zero for performance reasons. This proc checks its size and,
+  if = 0, sizes and binds it. The caller should unbind it and resize it after
+  it returns from the last call. The memory size delta should be -useDsAdrs,
+  its disk size delta should be zero. Its refnum is copyDsRefnum. }
+
+CONST
+      retries =      5;
+
+VAR
+    atEnd:          BOOLEAN;
+    blksAllocated:  LONGINT;
+    bytesPerIO:     INTEGER;
+    bytesRead:      LONGINT;
+    bytesWritten:   LONGINT;
+    dDfRefInfo:     fs_Info;
+    dDfRefNum:      INTEGER;
+    dontCare:       BOOLEAN;
+    gcdBytesPerBlk: INTEGER;
+    i:              INTEGER;
+    newDiskSize:    LONGINT;
+    sDfRefInfo:     fs_Info;
+    sDfRefNum:      INTEGER;
+
+  PROCEDURE OSError (at: INTEGER);
+  VAR tempErr:  INTEGER;
+  BEGIN
+  IF osErr <> 0
+  THEN BEGIN
+{$IFC filerDebug }
+    WRITELN ('Error at ',at:1,' in CopyCatfile: ',osErr:1,
+                       '; copying ',source,' to ',destination);
+{$ENDC }
+    Close_Object (tempErr, sDfRefNum);          { Close the source file      }
+    Close_Object (tempErr, dDfRefNum);          { Close the destination file }
+    Kill_Object (tempErr, destination);         { Only part of it was copied }
+    EXIT (CopyCatfile);
+    END;
+  END;
+
+  FUNCTION Gcd (m, n: INTEGER) : INTEGER;
+  BEGIN
+  IF n = 0
+  THEN gcd := m
+  ELSE gcd := Gcd (n, m MOD n);
+  END;
+
+
+BEGIN
+
+osErr := 0;
+
+Lookup (osErr, source, sDfRefInfo);           { Need various information     }
+OSError(1);
+osErr := 1;                                   { For the following tests      }
+IF sDfRefInfo.nWriters > 0                    { Being written to, don't xfer }
+THEN BEGIN
+{$IFC filerDebug }
+  WRITELN ('CopyCatFile: not xfering, nWriters = ',
+           sDfRefInfo.nWriters:1);
+{$ENDC }
+  OsError (2);
+  END;
+IF sDfRefInfo.fType IN [undefined, MDDFfile, rootCat, freeList, badBlocks, pipe,
+                        bootFile, raMap, killedObject]
+THEN BEGIN                                    { These should not be xfered   }
+{$IFC filerDebug }
+  WRITELN ('CopyCatFile: not xfering, file type is ',
+           ORD(sDfRefInfo.fType):1);
+{$ENDC }
+  OsError (3);
+  END;
+
+POpen (osErr, source, sDfRefNum, [dread], dontCare);{ Open a source diskfile }
+CASE osErr OF
+  0, -1173, -1174, -1175: ;            { Ignore these warnings        }
+  950, 951: OsError (4);               { Already opened privately     }
+  OTHERWISE OsError (5);
+  END;
+
+Make_File (osErr, destination, max_Label_Size);  { Create destination }
+case osErr of
+  0, 890: osErr := 0;             {890=file exists}
+  otherwise OSError(6);
+  end;
+
+IF sDfRefInfo.protected                    { Set protections if appropriate}
+THEN Protect (osErr, destination, FALSE, sDfRefInfo.machine_ID);
+OSError(7);
+POpen (osErr, destination, dDfRefNum, [dwrite, append], dontCare);
+OSError(8);
+Info (osErr, dDfRefNum, dDfRefInfo);       { Need the logical block size  }
+OSError(9);
+IF dDfRefInfo.pSize = 0                    { Destination is not a blocked dev}
+THEN OSError(10);
+
+   { Copy the label }
+
+Read_Label (osErr, source, bufrAdrs, max_Label_Size, bytesRead);
+IF osErr = 0
+THEN BEGIN
+  Write_Label (osErr, destination, bufrAdrs, bytesRead, bytesWritten);
+  OSError(11);
+  END
+ELSE IF osErr <> 848 THEN OSError(12); { 848 = no label }
+
+   { Calculate bytes per IO       }
+
+gcdBytesPerBlk := sDfRefInfo.LpSize *
+                  (dDfRefInfo.LpSize DIV
+                   Gcd (sDfRefInfo.LpSize, dDfRefInfo.LpSize));
+IF gcdBytesPerBlk > bufrSize
+THEN bytesPerIO := bufrSize              { inefficient but necessary        }
+ELSE bytesPerIO := (bufrSize DIV gcdBytesPerBlk) * gcdBytesPerBlk;
+IF bytesPerIO <= 0
+     THEN BEGIN
+{$IFC filerDebug }
+       WRITELN ('ERROR in CopyCatFile: bytesPerIO = ',bytesPerIO:1,
+                ', bufrSize = ',bufrSize:1,
+                ', gcdBytesPerBlk =',gcdBytesPerBlk:1);
+{$ENDC }
+       END;
+
+   { Copy the diskfile }
+
+CASE sDfRefInfo.fType OF                  { Not all diskfiles can be copied  }
+  userFile, userCat, exec,
+  spool, sysData, swapData,
+  swapCode, bootFile: BEGIN               { Copy the diskfile                }
+      atEnd := FALSE;
+      REPEAT
+        Read_Data (osErr, sDfRefNum, bufrAdrs, bytesPerIO, bytesRead,
+                    sequential, 0);
+        CASE osErr OF
+          0, 848, 881, 883, 956: BEGIN    { Various end-of-file conditions   }
+              IF osErr <> 0
+              THEN BEGIN
+                atEnd := TRUE;
+                osErr := 0;
+                END;
+              IF bytesRead > 0
+              THEN Write_Data (osErr, dDfRefNum, bufrAdrs, bytesRead, bytesWritten,
+                               sequential, 0);
+              CASE osErr OF
+                0: ;
+                848, 882: OsError (13);
+                OTHERWISE OsError (14);
+                END;
+              END;
+          OTHERWISE OsError (15);
+          END;
+        UNTIL atEnd;
+      END;
+
+  OTHERWISE                               { 'File types' shouldn't be copied }
+      IF trcCatalog THEN
+        WRITELN ('   skipping ',source,', file type is ',
+                   ORD(sDfRefInfo.fType));
+  END;
+
+PSet_File_Info (osErr, dDfRefNum, sDfRefInfo);{ Set date/time, file close flds}
+OSError(16);
+
+Truncate(osErr, dDfRefNum);                { Compact destination file          }
+OSError(18);
+Close_Object (osErr, dDfRefNum);          { Close the destination file        }
+OSError(17);
+Close_Object (osErr, sDfRefNum);          { Close the source file             }
+osErr := 0;
+
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE CopyCatState(* VAR err : integer;
+                         srcPrefix,dstPrefix : E_Name;
+                         devHdl : TentryHdl *);
+
+{ Copy the Catalog and DeskTop files.  The working files used by the
+  rest of Catalog are named by giving a null prefix for source or
+  destination. }
+
+CONST
+  BufSize=2048;
+
+VAR
+  srcFile,dstFile:pathname;
+  copyBuf:array[1..BufSize] of Integer;
+
+BEGIN
+
+{ First do the Catalog }
+
+  srcFile := concat('-', catVolName, '-', srcPrefix,catDBName);
+  dstFile := concat('-', catVolName, '-', dstPrefix,catDBName);
+
+  IF trcCatalog THEN WRITELN('CopyCatState (catalog):  srcFile=',srcFile,
+                                   '   dstFile=',dstFile);
+
+  CopyCatFile(err,
+               srcFile,dstFile,
+               ORD4(@copyBuf),ORD4(SizeOf(copyBuf)));
+  if err<>0
+  then begin
+    IF trcCatalog THEN writeln('CopyCatState: OS Error from CopyCatFile=',err);
+    exit(CopyCatState);
+  end;
+
+{ Then do the DeskTop }
+{
+{   srcFile := concat('-', catVolName, '-', srcPrefix,desktopFile);
+{   dstFile := concat('-', catVolName, '-', dstPrefix,desktopFile);
+{
+{   IF trcCatalog THEN WRITELN('CopyCatState (desktop):  srcFile=',srcFile,
+{                                    '   dstFile=',dstFile);
+{
+{   CopyCatFile(err,
+{                srcFile,dstFile,
+{                ORD4(@copyBuf),ORD4(SizeOf(copyBuf)));
+{   if err<>0
+{   then begin
+{     IF trcCatalog THEN
+{         writeln('CopyCatState: OS Error from CopyCatFile=',err);
+{     exit(CopyCatState);
+{   end;   }
+
+  IF trcCatalog THEN writeln('   exit CopyCatState');
+
+END;
+
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE DBError{ *err : INTEGER *};
+
+{ displays text message for database errors }
+
+BEGIN
+{$IFC filerDebug }
+
+IF err = noerr THEN EXIT(DBError);
+
+CASE err OF
+   notfound:       WRITE('Not found');
+   duplKey:        WRITE('Duplicate key');
+   eos:            WRITE('End Of Scan');
+   noBuffs:        WRITE('Buffer pool exhausted');
+   ioerr:          WRITE('I/O error');
+   noRoom:         WRITE('No more room on volume');
+   inconsistent:   WRITE('File is inconsistent');
+   badscanid:      WRITE('Scan ID not open');
+   ticketoverflow: WRITE('Ticket dispenser ran out');
+   ticketchanged:  WRITE('User changed ticket on update');
+   nomem:          WRITE('Out of memory');
+   illegalscan:    WRITE('Scan not allowed');
+   rectoobig:      WRITE('Record is too big');
+   notdbfile:      WRITE('File is not a database file');
+   wrongfile:      WRITE('Index file ID does not match that of data file');
+   badversion:     WRITE('Index file version does not match that of data file');
+   END;
+
+IF trcCatalog THEN WRITELN(' (DB error ',err:1,')');
+{$ENDC }
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE DelCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID *};
+
+{ Deleted the catalog record identified by the token "catRID", on the volume
+  identified by "volHdl
+}
+
+VAR
+   pCatRec : PtrCatRec;
+
+BEGIN
+IF trcCatalog THEN WRITELN('DelCatRec');
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN Edelete(err,volHdl^^.catScanID,current,0,NIL);   { delete it }
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE DestroyCat{* VAR err : INTEGER; devHdl : TentryHdl *};
+
+{ Destroys a catalog on a given volume }
+
+VAR
+   fileName : PathName;
+
+BEGIN
+IF trcCatalog THEN WRITELN('DestroyCat: ',devHdl^^.nameHdl^^);
+
+fileName := CONCAT('-', catVolName, '-',devHdl^^.nameHdl^^, catDBName);
+DeleteFile(err,@fileName);
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE FlushCat{* volHdl: TentryHdl *};
+
+{ flushes dirty pages to disk for catalog on given volume }
+
+VAR
+   err: INTEGER;
+BEGIN
+IF volHdl <> bootVol  {  dont muck with boot catalog  -gb }
+  THEN BEGIN
+    FlushScan(err,volHdl^^.catScanId);
+    CheckCatErr(err,'Unable to flush catalog');
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE GetCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID;
+                      VAR catRec : TcatRec *};
+
+{ Fetches a catalog record on a given volume.  The record to fetch is identified
+  by "catRID" ( see positioning documentation at top ).
+}
+
+VAR
+   pCatRec : PtrCatRec;
+
+BEGIN
+IF trcCatalog THEN WRITELN('GetCatRec - parent: ',catRID.fatherID:1,
+                                        '  id: ',catRID.uniqueID:1);
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN                         { copy it to "catRec" }
+   MoveLF(Pointer(ORD(pCatRec)),@catRec,CatRecSize(pCatRec^));
+
+IF trcCatalog THEN WRITELN('   exit GetCatRec');
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE ExtObjName{* VAR catRec : TcatRec; VAR objName : FMaxStr *};
+
+{ Extracts the name field from a catalog record and returns it in a string }
+
+BEGIN
+WITH catRec.nameDesc DO
+   ArrayToStr(POINTER(ORD(@catRec)+offset),size,@objName);
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE GetNextId{* volHdl: TentryHdl; VAR nextId: IdType *};
+
+{ Returns next id to be used from DB unique id generator for a given volume }
+
+BEGIN
+{$R-}
+WITH pScanTable^[volHdl^^.catScanId]^ DO
+   WITH pFileTable^[onFile]^.tickets DO
+      BEGIN
+      nextId := low;
+      END;
+{$R+}
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE GetObjName{* volHdl : TentryHdl; catRID : TcatRID; VAR name : FMaxStr *};
+
+{ convenience routine to fetch object name only }
+
+VAR
+   pCatRec : PtrCatRec;
+   err : INTEGER;
+BEGIN
+IF trcCatalog THEN WRITELN('GetObjName');
+PosCatRec(err,volHdl,catRID,pCatRec);
+IF err <> 0 THEN
+   BEGIN
+   SysErr(300,err);
+   name := 'unknown';
+   END
+ELSE
+   ExtObjName(pCatRec^,name);
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE GetToolName {* VAR err: INTEGER; toolID: TtoolID; devHdl: TentryHdl;
+                         VAR toolName: FMaxStr *};
+
+{ GetToolName - returns tool name given toolId }
+{*** More work needed here for OEM tool names ****}
+
+BEGIN
+IF trcCatalog THEN WRITELN ('GetToolName: toolID = ',toolID);
+err := 0;
+CASE toolID OF
+   1:  toolName := 'AppleWord';
+   2:  toolName := 'AppleGraph';
+   3:  toolName := 'AppleCalc';
+   4:  toolName := 'AppleDraw';
+   5:  toolName := 'AppleList';
+   6:  toolName := 'Bouncing Balls';
+   7:  toolName := 'LisaGuide';
+   8:  toolName := 'ApplePert';
+   9:  toolName := 'Printer Status';
+   10: toolName := 'AppleDial';
+   11: toolName := 'Configuration';
+   12: toolName := 'Calculator';
+   13: toolName := 'Clock';
+   OTHERWISE toolName := 'Other';
+   END;
+IF trcCatalog THEN WRITELN ('   exit GetToolName: ',toolname);
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S FInit }
+PROCEDURE InitCat{* VAR err : INTEGER; devName : E_Name *};
+
+{ Initializes positioning constants and the database intrinsics }
+
+VAR
+   bufNameStr : Pathname;
+
+BEGIN
+IF trcCatalog THEN WRITELN('InitCat');
+
+WITH posFirst DO
+   BEGIN
+   fatherID := idFirst;
+   uniqueID := idFirst;
+   END;
+
+WITH posCurrent DO
+   BEGIN
+   fatherID := idCurrent;
+   uniqueID := idCurrent;
+   END;
+
+WITH posNext DO
+   BEGIN
+   fatherID := idNext;
+   uniqueID := idNext;
+   END;
+
+WITH posApprox DO
+   BEGIN
+   fatherID := idAny;
+   uniqueID := idAny;
+   END;
+
+WITH diskCatRID DO
+   BEGIN
+   fatherID := idNil;
+   uniqueID := idDisk;
+   END;
+
+WITH trashCatRID DO
+   BEGIN
+   fatherID := idNil;
+   uniqueID := idTrash;
+   END;
+
+   { Initiailize the DB intrinsics }
+
+bufNameStr  := dbBufName;
+InitPool(err,TRUE,DBLDSN,nDBBuffs,dbHeapSize,@bufNameStr,ds_shared,2048);
+
+END;
+{$S Catalog }
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE InsObjName{* VAR catRec : TcatRec; VAR objName : FMaxStr *};
+
+{ Inserts object name into catalog record, setting appropriate fields }
+{*** must be modified when "extra" field is used ***}
+
+BEGIN
+IF trcCatalog THEN WRITELN('InsObjName: "',objName,'"');
+WITH catRec DO
+   BEGIN
+   StrToArray(@objName,@varLenPart,SIZEOF(varLenPart));
+   WITH nameDesc DO
+      BEGIN
+      offset := ORD(@catRec.varLenPart) - ORD(@catRec);
+      size := MIN(LENGTH(objName),SIZEOF(varLenPart));
+      END;
+   WITH extraDesc DO
+      BEGIN
+      offset := nameDesc.offset + nameDesc.size;
+      size := 0;
+      END;
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE OpenCat{* VAR err : INTEGER; devHdl : TentryHdl *};
+
+{ opens catalog on the specified device, creates a volume entry }
+
+VAR
+   fileName    : PathName;
+   devPathname : Pathname;
+   volName     : E_Name;
+   volHdl      : TentryHdl;
+   scanID,
+   osErr       : INTEGER;
+   devInfo     : FS_Info;
+
+BEGIN
+IF trcCatalog THEN WRITELN('OpenCat.  Device = ',devHdl^^.nameHdl^^);
+
+fileName := CONCAT('-', catVolName, '-', devHdl^^.nameHdl^^, catDbName);
+IF trcCatalog THEN WRITELN('OpenCat file name: ', fileName);
+OpenScan(err,@fileName,@fileName,scanID,update);
+IF err <> 0 THEN EXIT(OpenCat);
+
+ { create a volume entry for this volume }
+volName := '';
+CreateEntry(vol, @volName, volHdl);
+
+ { link the device and volume entries }
+
+volHdl^^.devHdl := devHdl;
+devHdl^^.volHdl := volHdl;
+
+   { finish initializing the volume entry }
+
+WITH volHdl^^ DO
+   BEGIN
+   catScanID  := scanID;   { remember the scan id for use in database intrinsics }
+   catOpen    := TRUE;
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE PosCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID;
+                      VAR pcatRec: PtrCatRec *};
+
+{ Positions to specified record.  Returns a pointer to the record.
+  NOTE: The record pointer becomes invalid after the next catalog call on this
+        volume.  This routine is primarily intended for internal use.
+}
+
+VAR
+   filter : TcatRec;
+   scanID : INTEGER;
+
+BEGIN
+IF trcCatalog THEN WRITE('PosCatRec - ');
+{$R-}
+scanId := volHdl^^.catScanID;
+
+WITH pScanTable^[scanID]^ DO
+   BEGIN
+   CASE catRID.uniqueId OF
+
+      idFirst :    { Position to first record }
+         BEGIN
+         IF trcCatalog THEN WRITELN('Position to "First"');
+         EFetch(err,scanID,first,0,NIL);
+         IF err = eos THEN
+            EFetch(err,scanID,next,0,NIL);
+         END;
+
+      idCurrent :  { Position to current record }
+         BEGIN
+         IF trcCatalog THEN WRITELN('Position to "Current"');
+         EFetch(err,scanID,current,0,NIL);
+         END;
+
+      idNext :     { Position to next record }
+         BEGIN
+         IF trcCatalog THEN WRITELN('Position to "Next"');
+         EFetch(err,scanID,next,0,NIL);
+         END;
+
+      OTHERWISE    { Position to a particular record or to first record in a }
+         BEGIN     { container }
+         IF trcCatalog THEN
+            BEGIN
+            WRITE('Position to  parent: ',catRID.fatherID:1,'  id: ');
+            IF catRID.uniqueId = idAny THEN
+               WRITELN('Any')
+            ELSE
+               WRITELN(catRID.uniqueId:1);
+            END;
+
+            { try using fatherID to minimize access time }
+
+         filter.parentID := catRID.fatherID;
+         EFetch(err,scanID,approx,1,@filter); { postion to first rec with fatherID}
+         pCatRec := POINTER(ORD(ptrCOS));
+
+         IF catRID.uniqueID = idAny THEN    { will accept any record }
+            BEGIN
+            IF err = notFound THEN err := endOfCat;
+            END
+         ELSE       { now look for record with this father and unique ID }
+            BEGIN
+            WHILE (err = 0) AND (pCatRec^.parentId = catRid.fatherID) AND
+                                (pCatRec^.selfId <> catRID.uniqueID) DO
+               BEGIN
+               EFetch(err,scanID,next,0,NIL);
+               pCatRec := POINTER(ORD(ptrCOS));
+               END;
+
+               { if unsuccessfull using fatherID then use sequential search }
+               { this feature is rarely used.  Usually have fatheID }
+
+            IF (err = notFound) OR (err = eos) OR
+                                   (pCatRec^.parentId <> catRid.fatherID) THEN
+               BEGIN
+               IF trcCatalog THEN WRITELN('   Not found using fatherID.');
+               EFetch(err,scanID,first,0,NIL);
+               IF err = eos THEN
+                  REPEAT
+                     EFetch(err,scanID,next,0,NIL);
+                     pCatRec := POINTER(ORD(ptrCOS));
+                  UNTIL (err <> 0) OR (pCatRec^.selfID = catRID.uniqueID);
+               END;
+            END;
+         END;
+
+      END;  { CASE }
+
+   pCatRec := POINTER(ORD(ptrCOS));   { set pointer to record in DB buffer }
+   END;
+
+IF trcCatalog THEN
+   IF err = 0 THEN
+      BEGIN
+      IF catRID.uniqueID <> idCurrent THEN PrintCatRec(pCatRec^);
+      END
+   ELSE DBError(err);
+
+{$R+}
+IF trcCatalog THEN WRITELN('   exit PosCatRec');
+END;
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE PrintCatRec{* VAR catRec : TcatRec *};
+
+{ Debugging routine to display an object record }
+
+VAR
+   objNameStr : fMaxStr;
+
+BEGIN
+{$IFC filerDebug }
+
+ExtObjName(catRec,objNameStr);   { fetch the name in string form }
+
+WITH catRec DO
+   BEGIN
+   WRITELN('   Parent   : ',parentId:1);
+   WRITELN('   Name     : ',objNameStr);
+   WRITELN('   Obj ID   : ',selfId:1);
+   WRITELN('   kind     : ',objKind:1);
+   WRITELN('   state    : ',objState:1);
+   WRITELN('   size     : ',objSize:1);
+   WRITELN('   created  : ',created:1);
+   WRITELN('   modified : ',modified:1);
+   WRITELN('   Tool ID  : ',toolID:1);
+   WITH openRect DO
+   WRITELN('   openRect : (',left:1,',',top:1,') (',right:1,',',bottom:1,')');
+   WRITELN('   closedPt : (',closedPt.h:1,',',closedPt.v:1,')');
+   END;
+
+{$ENDC }
+END;
+
+{---------------------------------------------------------------------------}
+
+
+PROCEDURE RestoreCat (* VAR err:    INTEGER;
+                            prefix: E_Name;
+                            devHdl: TentryHdl *);
+
+{ Copies a Catalog and DeskTop to the working files. }
+
+BEGIN
+
+CopyCatState (err, prefix, devHdl^^.nameHdl^^ ,devHdl)
+
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE SaveCat (* VAR err:    INTEGER;
+                         prefix: E_Name;
+                         devHdl: TentryHdl *);
+{ Copies the working Catalog and DeskTop to other files. }
+
+BEGIN
+
+CopyCatState (err, devHdl^^.nameHdl^^, prefix, devHdl)
+
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE SetNextId{* volHdl: TentryHdl; nextId: IdType *};
+
+{ Sets DB uniqueid generator to the given value }
+
+BEGIN
+{$R-}
+WITH pScanTable^[volHdl^^.catScanId]^ DO
+   WITH pFileTable^[onFile]^.tickets DO
+      BEGIN
+      high := 0;
+      low := nextId;
+      END;
+{$R+}
+END;
+
+{---------------------------------------------------------------------------}
+
+
+PROCEDURE TraceDB{* traceStatus : BOOLEAN *};
+
+{ sets DB intrinsic tracing flags }
+
+BEGIN
+{
+pDebug    := traceStatus;
+scanDebug := traceStatus;
+labdebug  := traceStatus;
+bDebug    := traceStatus;
+dbDebug   := traceStatus;
+debug_Compact := traceStatus;
+}
+END;
+
+
+{---------------------------------------------------------------------------}
+
+PROCEDURE UpdCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                      VAR catRID : TcatRID;
+                      VAR catRec : TcatRec *};
+
+{ updates selected catalog record }
+
+VAR
+   offendID : INTEGER;
+   pCatRec  : PtrCatRec;
+
+BEGIN
+IF trcCatalog THEN WRITELN('UpdCatRec');
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN
+   Eupdate(err,offendID,volHdl^^.catScanID,current,0,NIL,@catRec,                                                     CatRecSize(catRec));
+END;
+
+
+END.
+ÿ

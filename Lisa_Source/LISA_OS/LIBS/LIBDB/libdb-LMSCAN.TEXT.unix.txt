@@ -1,0 +1,948 @@
+{ Copyright 1983,Apple Computer Inc. }
+{#f     libdb/lmscan.text }
+{$L-}
+{$R-}
+{$SETC OSBUILT := TRUE }
+unit lmscan;
+
+interface
+
+uses
+{$IFC OSBUILT }
+  {$U libdb/dbenv.obj } dbenv,
+     {$U libin/INTRLIB.obj } international,
+       {$U libdb/dbdecl1.obj } dbdecl1,
+       {$U libos/syscall.obj } syscall,
+       {$U libdb/lowlevel.obj } lowlevel,
+       {$U libdb/pooler.obj } pooler,
+       {$U libdb/heap.obj } heap,
+       {$U libdb/czcompact.obj } czCompact,
+       {$U libdb/vltree.obj } vltree,
+       {$U libdb/scan.obj } scan,
+       {$U libdb/labscan.obj } labscan,
+       {$U libdb/schema.obj } schema,
+       {$U libdb/extnsort.obj } extnsort;
+{$ELSEC}
+  {$U OBJ:dbenv.obj } dbenv,
+     {$U INTRLIB.obj } international,
+       {$U OBJ:dbdecl1.obj } dbdecl1,
+       {$U OBJ:syscall.obj } syscall,
+       {$U OBJ:lowlevel.obj } lowlevel,
+       {$U OBJ:pooler.obj } pooler,
+       {$U OBJ:heap.obj } heap,
+       {$U OBJ:czcompact.obj } czCompact,
+       {$U OBJ:vltree.obj } vltree,
+       {$U OBJ:scan.obj } scan,
+       {$U OBJ:labscan.obj } labscan,
+       {$U OBJ:schema.obj } schema,
+       {$U OBJ:extnsort.obj } extnsort;
+{$ENDC}
+const
+
+        {  expression action constants }
+
+        ex_const  =   0;                { constant }
+        ex_field  =   1;                { field    }
+        ex_and    =   2;                { and      }
+        ex_eq     =   3;                { = }
+        ex_ne     =   4;                { <> }
+        ex_lt     =   5;                { < }
+        ex_gt     =   6;                { > }
+        ex_le     =   7;                { <= }
+        ex_ge     =   8;                { >= }
+
+        {  maximum constraint count for estimating filtration fractions
+           (see below for a discussion of strategy tables) }
+
+        max_filtrate = 5;
+
+        {  codes used for whichway   }
+
+       {next                              scan real file from first to last
+        prior                             scan real file from last to first }
+        noway      = first;             { no longer scanning real file }
+
+        handle_overflow = 3422;         { can't compute a unique handle }
+        some_violations = 3423;         { null not allowed or duplicates
+                                          not allowed errors in diffclose }
+        badCheckPoint = 3424;           { check point info is fucked }{##}
+
+
+        {   user type errors on diffclose and posting of updates }
+
+       {noerr = 0;                        no problem }
+        dupl_error = 1;                 { violates duplicates not allowed }
+        null_error = 2;                 { violates nulls not allowed }
+        just_fyi = 3;                   { this is a fyi record, the record
+                                          at this handle + 1 conflicted with
+                                          this record }
+
+type
+        {*******************************************************************
+
+                all differential scans passed to and from the lmscan routines
+                have the following structure:
+
+                preamble
+                     lmhandle of record
+                     code (used by lmscan)
+                     actual record, of the format of real file
+
+        *******************************************************************}
+
+
+        preamble =                      { all diff. entries shared this }
+            record
+                handle : lmhandle;      { case diff_code = tretrieve
+                                          true : handle of last rec.
+                                          false: handle of logical rec. }
+                code : integer;         { <4,12> : diff_code }
+                                        { <12,0> : unused except tretrieve }
+            end;
+        ptrpreamble = ^ preamble;
+
+        ptrlmhandle = ^ lmhandle;
+
+{*************************************************************************
+
+        Parsed Query Format
+
+        The parsed query is stored as an array that contains three
+        types of entry (an array of variant records):
+
+        action
+                1) ops = and,<,>,<=,>=,=,<>
+                2) binary or unary (no unary ops at first release)
+                3) has two or one operands, which are represented by the
+                   the index of their action, constant or field entry
+                4) triple 0 is the root of the tree
+                5) for first release the following restrictions are placed
+                   on the operands of <,..,<>:
+
+                   a) op1 is a field
+                   b) op2 is a constant
+                   c) op1,op2 are the following two triples
+
+
+        constant
+                1) contains a flddesc which describes the constant.  the
+                   offset is relative to the start of the constants in
+                   the query (see below).
+
+        field
+                1) contains a file number and field number within that
+                   file.
+
+
+        All the constants for the query are grouped together in an array
+        of bytes.  These constants are aligned and packed as if they
+        were one big record of asundry fields. The constant offsets
+        are relative to the start of the constants in the query.
+
+
+*************************************************************************}
+
+
+        triple =
+            record
+                case action : integer of
+                ex_and :                    { and, etc. }
+                    (
+                    op1 : integer;          { an entry index }
+                    op2 : integer);         { an entry index }
+                ex_const :                  { constant }
+                    (
+                    desc : flddesc);
+                ex_field :                  { field  }
+                    (
+                    fileid : integer;       { file }
+                    fldid  : integer)       { field # in file record }
+            end;
+        ptrtriple = ^ triple;
+
+        expr = array[0..0] of triple;
+        ptrexpr = ^ expr;
+
+{**************************************************************************
+
+        The query execution strategy is table driven:
+
+        Qualifications on an access path are broken into four classes:
+
+        onesided - access path constrained by a single inequality
+                (<=, <, >=, >)
+
+        twosided - access path constrained by two opposing inequalities
+                which together form a range (e.g. 10 < x < 20)
+
+        equals - access path constrained by equality on some prefix of
+                the complete search key
+
+        unbounded - access path is not constrained and so the whole
+                access path must be scanned
+
+        For each class one must specify a strategy for guessing the
+        number of participating records.  This is done by filling in
+        four parameters: abs_ios, fract_ios, abs_recs, fract_recs.
+        The four parameters are used as follows:
+
+        pages touched  := abs_ios + fract_ios * total pages in file
+        records touched := abs_recs + fract_recs * total records in file
+
+        To estimate the cost of sorting one must specify an estimate of
+        the number of pages (2K) available for sorting in Run_pages and
+        a table of fractions which are used in the following fashion to
+        estimate the number of records filtered out of the file before
+        sorting.
+
+        1) Count the number of equality and inequality (<,>,<=,>=, but
+           not <> ) field constraints, eliminating any constraints used
+           to establish a scan range on the access path (i.e. onesided,
+           twosided, etc.)
+
+        2) If either count exceeds a constant, max_filtrate, then set that
+           count to max_filtrate.
+
+        3) Estimate the number of records passing filter as:
+
+           eq_filtrate[count of equal constraints] *
+           ineq_filtrate[count of inequality constraints] *
+           estimated number of unfiltered records
+
+
+
+**************************************************************************}
+
+        qualifications_type = (onesided,twosided,equals,unbounded);
+
+        a_fraction =
+            record
+                numerator,
+                denominator : integer;
+            end;
+var
+
+{$IFC PRERELEASE }
+        lmdebug : boolean;
+{$ENDC}
+        set_sort : integer;             { temporary kludge to set sort
+                                          mode - tretrieve or tsorted }
+        LastPermanant : fileptr;        { gives the lastpage setting for the
+                                          permanant length of diff file }
+
+        {     Strategy parameters - see above description }
+
+        Run_pages : fileptr;
+        ineq_filtrate,
+        eq_filtrate : array[0..max_filtrate] of a_fraction;
+        strategy :
+            array[qualifications_type] of
+                record
+                    abs_ios : fileptr;
+                    abs_recs: fileptr;
+                    fract_ios : a_fraction;
+                    fract_recs : a_fraction;
+                end;
+
+
+{**********************************************************************
+
+                                diffcreate
+
+        creates a differential scan on pname using pname as the real
+        file (data file) and pdname as the differential file.
+
+        opens an update scan on pname.  creates and opens an update scan
+        on the differential file, pdname.  initiallizes the differential
+        scan.  after diffcreate is called, <diffopen,diffclose> may be
+        called repeatedly to set up different queries & sort orders.
+
+        Input Parameters
+
+                pname - pts to pathname for real file
+                pdname - pts to pathname for differential file
+                pnullset - pts to bit vector of fields that are allowed
+                    to be null
+                setsize - size in bytes of pnullset
+
+        Output Parameters
+
+                lmresult - result of operation
+
+                noerr
+                badCheckPoint
+                notfound
+                nomem
+                ioerr
+                noroom
+                nobuffs
+                inconsistent
+                wrongfile
+                notdbfile
+                DBVersionMismatch
+                OS(open,lookup,info,make_file,close_object)
+
+                scanid - index of differential scan
+                clear - true iff there wasn't a suspended query
+
+
+**********************************************************************}{##}
+
+procedure diffcreate(var lmresult : integer;
+                     var scanid : integer;
+                     var clear : boolean;{##}
+                         pname : ptrpathname;
+                         pdname : ptrpathname;
+                         pnullset : ptrdata;
+                         setsize : integer);
+
+{##}{*********************************************************************
+
+                              diffdestroy
+
+        destroys the differential scan scanid.  closes the update scan on
+        the real file.  saves the state of the differential scan.
+
+        Input Parameters
+
+                scanid - differential scan index
+
+        Output Parameters
+
+                lmresult - result of operation
+
+                noerr
+                ioerr
+                inconsistent
+                nobuffs
+                noroom
+                OS(close_object)
+
+***********************************************************************}
+
+procedure diffdestroy(var lmresult : integer;{##}
+                          scanid : integer);{##}
+
+{##}{*********************************************************************
+
+                              diffclose
+
+    IF POSTUPDATES THEN :
+
+        closes the differential scan scanid.  posts the updates in
+        the differential file.  flushes the real file and differential
+        file scans.  if lmresult is some_violations, then everything
+        went okay, except that there were some updates that couldn't
+        be performed due to null not allowed violations and/or duplicates
+        not allowed violations.  after diffclose, only these illegal
+        updates will still be in the differential file.  it will also
+        be the case that for every duplicates are not allowed violation
+        the record that caused the clash will be inserted in the scan
+        with a handle number one less than the erroneous update or
+        insert record.  this record will be a fyi (for your information
+        record).
+
+    ELSE :
+
+        closes the differential scan scanid.  does not post the updates in
+        the differential file.  flushes the real file and differential
+        file scans.  the differential file will be empty.
+
+        Input Parameters
+
+                scanid - differential scan index
+                PostUpdates - if true, posts updates
+
+
+        Output Parameters
+
+        lmresult - result of operation
+
+        noerr
+        some_violations
+        nomem
+        ioerr
+        inconsistent
+        noroom
+        nobuffs
+        rectoobig
+        OS(truncate,compact)
+
+
+***********************************************************************}
+
+procedure diffclose(var lmresult : integer;
+                        scanid : integer;
+                        PostUpdates : boolean);{##}
+
+{##}{**********************************************************************
+
+                              diffWADelete
+
+        given an open differential scan and a query (an expression tree
+        and a record of constants), develops an execution plan and deletes
+        all the records that satisfy the query.  the differential file is
+        not affected.
+
+        !!!!WARNING!!!!
+
+        THERE MUST BE NO RETRIEVE RECORDS IN THE DIFFERENTIAL FILE!!!!
+
+        query description is as for diffopen, below.
+
+        Input Parameters
+
+                scanid - index of an open differential scan
+                pexpr - (if ntriples <> 0) pts to an array of ntriples
+                        triples, which give the query expression :
+                        triple 0 is the root triple
+                ntriples - number of triples in the query expression, if
+                        0, there is no query
+                pconst - (if ntriples <> 0) pts to a record of constants
+                        used in the expression
+                constsize - (if ntriples <> 0) gives the size of the
+                        record of constants used in the expression
+
+        Output Parameters
+
+        lmresult - result of open
+
+        noerr
+        nomem
+        ioerr
+        nobuffs
+        inconsistent
+        noroom
+
+****************************************************************************}
+
+procedure diffWAdDelete(var lmresult : integer;{##}
+                                  scanid : integer;{##}
+                                  pexpr : ptrexpr;{##}
+                                  ntriples : integer;{##}
+                                  pconst : ptrdata;{##}
+                                  constsize : integer;{##}
+                                  temp_ldsn : integer);{##}
+
+
+{**********************************************************************
+
+                              diffopen
+
+        given an open differential scan, a query (an expression tree and a
+        record of constants), a sort order and a scan direction, develops
+        an execution plan and sets up the differential scan so that the
+        solution set of the query may be retrieved in sort order and
+        modified.  if there is no query or sort order then the ntriples
+        and nskeys, respectively are set to 0.  the null query selects all
+        records of the data file.  the null sort order indicates that any
+        sort order is acceptable:  the system will choose one.  the scan
+        direction must be either prior or next.  the scan direction is
+        simply an optimization.  if it is prior then lmfetch will start
+        retrieving the real file records from the end of the solution set.
+        if it is next then the lmfetch will start retrieving from the
+        start of the solution set.  take note: if you choose scan direction
+        prior (next) and you position the scan to the first (last) record,
+        the entire solution set will be evaluated and inserted in the
+        differential file at once.
+
+        diffclose must be called to make permanent the changes.
+
+        note: for the short term set the global variable set_sort to
+        tretrieve if a key sort is desired or tsorted if a real sort
+        is desired. in the final version, diffopen will make this
+        determination.
+
+        Input Parameters
+
+                scanid - index of an open differential scan
+                qwhichway - scan direction (prior or next)
+                pexpr - (if ntriples <> 0) pts to an array of ntriples
+                        triples, which give the query expression :
+                        triple 0 is the root triple
+                ntriples - number of triples in the query expression, if
+                        0, there is no query
+                pconst - (if ntriples <> 0) pts to a record of constants
+                        used in the expression
+                constsize - (if ntriples <> 0) gives the size of the
+                        record of constants used in the expression
+                nskeys - number of fields in the sort key, if 0, no sort
+                        order is specified
+                psort - pts to a sort key descriptor
+                tempdir1,
+                tempdir2 - pts to pathnames for directories to be used for
+                        sort scratch space
+                temp_ldsn - ldsn for temporary segment for sort
+
+        Output Parameters
+
+        lmresult - return result
+
+        noerr
+        nomem
+        ioerr
+        nobuffs
+        inconsistent
+        noroom
+        temperror
+        if sorting then also OS(make_dataseg,close_dataseg)
+
+
+
+****************************************************************************}
+
+procedure diffopen(var lmresult : integer;
+                       scanid : integer;
+                       qwhichway : integer;
+                       pexpr : ptrexpr;
+                       ntriples : integer;
+                       pconst : ptrdata;
+                       constsize : integer;
+                       nskeys : integer;
+                       psort : ptridesc;
+                       tempdir1,
+                       tempdir2 : ptrpathname;
+                       temp_ldsn : integer);
+
+{***********************************************************************
+
+                                lmfetch
+
+        positions the list manager scan, depending on which.  no
+        record is copied out until lmcopy is called.  the size of
+        the record is returned.  lmfetch skips deleted entries and
+        entries for old record values.
+
+        Input Parameters
+                scanid - index of differential scan
+                which - positioning mode - works as with standard scans
+                    values accepted:
+
+                    first
+                    last
+                    exact
+                    next
+                    prior
+
+                s_handle - if which = exact, then s_handle is the handle
+                    of the desired record
+                phighlights - where to return bitmap of fields to highlight
+                    if nil, then don't return it
+
+        Output Parameters
+
+                lmresult - result of operation
+
+                noerr
+                eos
+                notfound
+                nobuffs
+                ioerr
+                inconsistent
+                noroom
+                rectoobig
+                nomem
+                badscanid
+                oddrecsize
+                badwhich
+
+                user_error - whether cos represents a record that had some
+                    problem on the last diffclose:
+                        noerr
+                        dupl_error
+                        null_error
+                        just_fyi
+                phighlights - if user_error = dupl_error,null_error or
+                        just_fyi then returns the fields to highlight
+                        in a bitmap
+
+                recsize - size of current of scan, valid only if lmresult =
+                        noerr.  includes the preamble
+
+**********************************************************************}
+
+procedure lmfetch(var lmresult : integer;
+                  var user_error : integer;
+                      phighlights : ptrbits;
+                      scanid : integer;
+                      which : integer;
+                      s_handle : lmhandle;
+                  var recsize : integer);
+
+{***********************************************************************
+
+                                lmcopy
+
+        copies the cos of the list manager scan into prec.  the cos
+        must be on an entry (e.g. not first, last or prior).  the
+        caller should call lmfetch immediately prior to with which
+        either next,prior or exact and must have received lmresult = noerr.
+        the caller should have allocated recsize bytes to receive
+        the record.
+
+        Input Parameters
+                scanid - index of differential scan
+                prec - pts to place to move record to
+
+        Output Parameters
+                lmresult - result of operation
+                        noerr
+                        nomem
+                        ioerr
+                        nobuffs
+                        inconsistent
+                        notfound
+
+***************************************************************************}
+
+procedure lmcopy(var lmresult : integer;
+                     scanid : integer;
+                     prec : ptrdata);
+
+{*****************************************************************************
+
+                                lminsert
+
+        inserts a brand new record into the differential scan immediately
+        after cos.  if the cos is first, then the record is appended to the
+        top of the file.  if the cos is last, then the record is appended
+        to the end of the file. the new record is made cos.  the handle for
+        the new record is filled into the preamble of prec.
+
+        Input Parameters
+                scanid - index of differential scan
+                prec - pts to record to be inserted (includes preamble).
+                        preamble will be set by lminsert
+                recsize - size of record to be inserted (includes preamble)
+
+        Output Parameters
+                lmresult - result of operation
+
+                noerr
+                eos
+                notfound
+                nobuffs
+                ioerr
+                inconsistent
+                noroom
+                rectoobig
+                nomem
+                badscanid
+                oddrecsize
+                badwhich
+
+                handle_overflow - couldn't compute a handle between
+                    priorrec and nextrec
+                various errors returned by efetch,eupdate,edelete,einsert
+
+*****************************************************************************}
+
+procedure lminsert(var lmresult : integer;
+                       scanid : integer;
+                       prec : ptrdata;
+                       recsize : integer);
+
+
+{****************************************************************************
+
+                                lmdelete
+
+        deletes the cos of the differential scan.  the handle of this
+        record is not reused.  the cos is now prior to the next record
+        of the differential scan.
+
+        Input Parameters
+                scanid - index of differential scan
+
+        Output Parameters
+                lmresult - result of operation
+
+                noerr
+                eos
+                notfound
+                nobuffs
+                ioerr
+                inconsistent
+                noroom
+                rectoobig
+                nomem
+                badscanid
+                oddrecsize
+                badwhich
+
+
+*****************************************************************************}
+
+procedure lmdelete(var lmresult : integer;
+                       scanid : integer);
+
+{****************************************************************************
+
+                                lmupdate
+
+        changes the cos of the differential scan to prec.  the cos remains
+        on this new record.  the record's handle does not change. the
+        new record must include a preamble.
+
+        Input Parameters
+                scanid - index of differential scan
+                prec - new value for cos record, lmupdate will set preamble
+                recsize - size of new value, including preamble
+
+        Output Parameters
+                lmresult - result of operation
+
+                noerr
+                eos
+                notfound
+                nobuffs
+                ioerr
+                inconsistent
+                noroom
+                rectoobig
+                nomem
+                badscanid
+                oddrecsize
+                badwhich
+
+
+*****************************************************************************}
+
+procedure lmupdate(var lmresult : integer;
+                       scanid : integer;
+                       prec : ptrdata;
+                       recsize : integer);
+
+
+
+
+
+implementation
+
+const
+
+    {##}noSuchFile = 948;               { file not found by OPEN - OS status}
+
+
+        diff_nfields = 2;               { number of fields in diff. file
+                                          that shared by all variants }
+        diff_nkeys =   2;               { only key fields are shared }
+        diff_nsort = 1;                 { only the handle is promoted }
+
+        diff_sbit  = 12;                { extract parameters for diff. file
+                                          entry code }
+        diff_nbits = 4;
+
+        sub_sbit = 10;                  { sub_codes used for null violations,
+                                          duplicate not allowed violations and
+                                          marking the performance of a delete
+                                          operation }
+        sub_nbits = 2;
+
+        idx_sbit = 0;                   { idx_codes used for # of offending
+                                          file in the case of duplicates not
+                                          allowed }
+        idx_nbits = 10;
+
+        {  differential file entry codes: <code_nbits,code_sbit>
+
+           warning:
+
+           1) tretrieve must = 0
+           2) tupdate must be < tdelete
+
+
+           }
+
+        tretrieve  = 0;                 { we kludge and take advantage of
+                                          the retrieve code being 0 }
+        tsorted    = 1;                 { sorted entry (retrieval) }
+
+        tinsert    = 3;                 { newly inserted record }
+        tupdate    = 4;                 { code for update value }
+        tdelete    = 5;                 { " " deleted record }
+        tbefore    = 6;                 { " " before image of updated record }
+        tfyi       = 7;                 { " " for your information record }
+
+    {##}h_increment = 16384;            { handle increment for insertion
+                                          between two records }{##}
+        NextStart =  $00000001;         { first handle for diffopen ...next...}
+        PriorStart = $FFF00000;         { first handle for diffopen ...prior...}
+
+        deleted    = 3;                 { sub code for an already posted
+                                          tbefore delete }
+
+    {   check point size constants  } {##}
+
+    {##}CPPieceSize = 100;              { size of pieces into which checkpt is
+                                          broken }{##}
+    {##}MinCheckPointSize = 500;        { minimum size always allocated to
+                                          checkpoint }
+
+type
+
+    {   There are two cases for run encoding:
+
+        1) reversescan is false and the mapping of handles to physical
+           addresses is positive.  that is, in a range as handle.high
+           decreases (in steps of 1) the physical address for the cor-
+           responding record decreases (in steps of 1)
+
+        2) reverscan is true and the mapping of handles to physical
+           addresses is negative.  that is, as handle.high decreases
+           (in steps of 1) the physical address for the corresponding
+           record increases (in steps of 1)
+
+        This is necessary to encode runs in the case that we are scanning
+        the data file is the opposite direction that the differential
+        file is being scanned (due to a sort order that is the inverse of
+        the primary key sort order).
+
+        In either case, handle gives the largest handle in the range,
+        while code gives the # of records - 1 in the run.  Physaddr gives
+        the physical address of the largest handle. For example:
+
+        handle : 10
+        code   :  9
+        physaddr : 521
+        reversescan : false
+
+        physaddrs: 512 513 514 515 516 517 518 519 520 521
+        handles  :   1   2   3   4   5   6   7   8   9  10
+
+        handle : 10
+        code   :  9
+        physaddr : 512
+        reversescan : true
+
+        physaddrs: 521 520 519 518 517 516 515 514 513 512
+        handles  :   1   2   3   4   5   6   7   8   9  10
+
+
+        under reversescan = false a range describes records :
+
+
+            phys_X : physaddr-code .. physaddr-1 physaddr
+
+            located at page
+
+            firstpage + (physaddr-firstpage) div pagesize * pagesize
+
+            and record
+
+            remainder(phys_X-firstpage,pagesize)
+
+        under reversescan = true a range describes records :
+
+            phys_X : physaddr+code .. physaddr+1 physaddr
+
+            located at page
+
+            firstpage + (physaddr-firstpage) div pagesize * pagesize
+
+            and record
+
+            remainder(phys_X-firstpage,pagesize)
+
+                                          }
+
+        range_rec =                     { if diff_code is tretrieve (0)
+                                             used for directly retrieved
+                                             and keysorted records }
+            record
+                handle : lmhandle;      { handle.low = 0 }
+                code : integer;         { <4,12> : 0 }
+                                        { <12,0> : # recs - 1 in range }
+                physaddr : fileptr;     { physical address of rec for handle:
+                                          pageaddr + record # in page }
+            end;
+        ptrrange_rec = ^ range_rec;
+
+
+                                        { globals for sorting index rec's
+                                          the procedure parameters for
+                                          readrecord, etc. need a global
+                                          variable to find their state
+                                          info }
+        sort_globals =
+            record
+            needrecord,                 { have an unused record? }
+            havebuff : boolean;         { buffer allocated? }
+            psdesc,                     { copied from pfiletable^[onfile]^ }
+            pxdesc : ptrrecptr;
+            physaddr : fileptr;         { physical address of current rec. }
+            pinput : ptrdata;           { pts to current record }
+            shift,                      { amount by which to shift data record
+                                          if tsorted.  if there is a var. len.
+                                          field in the key, then we lay record
+                                          where preamble normally goes until
+                                          we are done sorting (shift = 0).
+                                          this is to avoid twiddling the
+                                          pvfld^.offset for every var. len.
+                                          field in key }
+            sort_code,                  { tkeysorted or tsorted }
+            which,                      { whichway for diff scan }
+            scanid,                     { differential scan }
+            rsize,                      { biggest index record found }
+            buffer,                     { current buffer # }
+            offoff,                     { offset for record offsets }
+            v1st,                       { 1st var. len. field (index) }
+            vnth,                       { last var. len. field (index)}
+            vflds,                      { size of fixed part of index rec. }
+            ifields : integer;          { # of fields in index rec }
+            end;
+        ptrsort_globals = ^sort_globals;
+
+        ptrflddesc = ^ flddesc;
+
+        query =                         { complete query description }
+            record
+                ntriples : integer;         { # of triples in expr }
+                qexp : expr;                { var. len. array }
+               {constants : data; }         { all the constants }
+            end;
+        ptrquery = ^ query;
+
+        approxrec =                     { stores list of constant triples
+                                          for high & low search keys }
+            record
+                high : integer;
+                low : integer;
+            end;
+
+        approxkey =
+            array[0..0] of approxrec;
+        ptrapproxkey = ^ approxkey;
+
+Var
+        psort_globals : ptrsort_globals;        { pts to sort globals, used
+                                                  in sorting index rec's. }
+
+{$SETC debug := false }
+{$IFC DOLLARD }
+{$D- }
+{$ENDC}
+
+{$IFC OSBuilt }
+{$I libdb/lmfetch.text }
+{$I libdb/lmsort.text }
+{$I libdb/lmupdate.text }
+{$I libdb/strategy.text }
+{$I libdb/checkpt.text }
+{$I libdb/lmclose.text }
+{$I libdb/lmopen.text }
+{$ELSEC }
+{$I l:lmfetch.text }
+{$I l:lmsort.text }
+{$I l:lmupdate.text }
+{$I l:strategy.text }
+{$I l:checkpt.text }
+{$I l:lmclose.text }
+{$I l:lmopen.text }
+{$ENDC }
+
+end.
+
+
+
+ÿ

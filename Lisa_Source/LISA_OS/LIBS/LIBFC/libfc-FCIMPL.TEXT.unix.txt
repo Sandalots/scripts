@@ -1,0 +1,1222 @@
+{libfc/FCimpl.text, 2-Nov-83, F.Ludolph - Implementation of FilerComm.text}
+{ Copyright 1983, 1984, Apple Computer Inc. }
+
+{$SETC doTraceFC := TRUE}
+{$SetC fTraceFC := doTraceFC AND fTRACE}
+
+
+
+{$S FCwork}
+
+CONST
+
+{$IFC fcDebug}
+  flrcomDebug  = TRUE;
+{$ELSEC }
+  flrcomDebug  = FALSE;
+{$ENDC }
+
+VAR
+    clientCall:         TProc;
+    clientErr:          INTEGER;
+    clientIdentPtr:    ^TIconRef;
+    clientProcPtr:     ^ProcessID;
+    clientWindowPtr:   ^WindowPtr;
+    pic:                PicHandle;
+    lineHt:             INTEGER;       { height of line in list view }
+    refQDProcs:         QDProcs;
+    refLine:            Point;
+    scrapHeap:          THz;
+
+PROCEDURE CallProc (btnProc: TProc);             EXTERNAL;
+
+{***************************************************************************************}
+
+{$S FCwork}
+PROCEDURE AskCatalog (VAR err, offset: INTEGER; myFolder: WindowPtr; askWhat: FilerOp;
+                      VAR name, prefix: Pathname; toolNum: INTEGER);
+VAR me:       LONGINT;
+    paramHdl: HFilerExt;
+    saveHeap: THz;
+    theEvent: EventRecord;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+IF flrcomDebug THEN WRITE ('AskCatalog: what is ',ORD(askWhat):1);
+me := My_ID;
+
+  { Build the event to send to the Desktop Manager }
+GetHeap (saveHeap);
+SetHeap (wmHeap);
+paramHdl := POINTER(ORD(NewHandle(SIZEOF(FilerExt))));
+IF paramHdl = NIL THEN
+  BEGIN
+  err := fceNoMemory;
+  EXIT (AskCatalog);
+  END;
+WITH theEvent DO BEGIN
+  who         := filerFolder;
+  what        := catalogEvent;
+  toProcess   := filerProcess;
+  fromProcess := me;
+  fromFolder  := myFolder;
+  userData    := ORD(paramHdl);
+  END;
+WITH paramHdl^^ DO BEGIN
+  theFlrOp    := askWhat;
+  theErr      := 0;
+  theDf       := toolNum;
+  thePassWord := '';
+  thePrefix   := '';
+  theResult   := '';
+  CASE askWhat OF
+    fcNameToPrefix,
+    fcMakeTool:      thePrefix := name;
+    fcPrefixToName:  thePrefix := prefix;
+    fcDupIcon:       BEGIN
+                     thePrefix := name;
+                     theResult := prefix;
+                     theDF     := toolNum;
+                     END;
+    OTHERWISE BEGIN
+              err := fceBadEventType;
+              EXIT (AskCatalog);
+              END;
+    END;
+  IF flrcomDebug THEN WRITELN (', input is ',thePrefix);
+  END;
+SetHeap (saveHeap);
+
+   { Call the Desktop Manager and wait for the reply }
+PushEvent (theEvent);
+REPEAT
+  IF flrcomDebug THEN WRITELN ('   waiting for reply');
+  Suspend_Process (err, me, FALSE);
+  IF PeekEvent (theEvent) THEN;
+  UNTIL (theEvent.who = myFolder) AND (theEvent.what = catalogEvent);
+
+   { Return the results }
+WITH paramHdl^^ DO BEGIN
+  err := theErr;
+  offset := theOffset;
+  IF err <= 0 THEN CASE askWhat OF
+    fcNameToPrefix,
+    fcPrefixToName: name   := theResult;
+    fcDupIcon:      prefix := theResult;
+    END;
+  END;
+GetHeap (saveHeap);
+SetHeap (wmHeap);
+DisposeHandle (POINTER(theEvent.userData));
+SetHeap (saveHeap);
+
+END;
+
+
+{***************************************************************************************}
+
+{$S FCwork}
+PROCEDURE CopyDiskfile {VAR err: INTEGER; source, destination: Pathname;
+                        bufrAdrs, bufrSize: LONGINT; theOp: FCopyOp;
+                        VAR osErr: INTEGER};
+
+{ This proc copies a single diskfile from source to destination. It uses
+  a memory-resident data seg as a buffer. Normally the buffer is unbound
+  and sized to zero for performance reasons. This proc checks its size and,
+  if = 0, sizes and binds it. The caller should unbind it and resize it after
+  it returns from the last call. The memory size delta should be -useDsAdrs,
+  its disk size delta should be zero. Its refnum is copyDsRefnum. }
+
+CONST  retries =  3;
+
+VAR atEnd:          BOOLEAN;
+    blocksAllocated:LONGINT;
+    blocksNeeded:   LONGINT;
+    bytesPerIO:     INTEGER;
+    bytesRead:      LONGINT;
+    bytesWritten:   LONGINT;
+    dDfRefInfo:     fs_Info;
+    dDfRefNum:      INTEGER;
+    dontCare:       BOOLEAN;
+    gcdBytesPerBlk: INTEGER;
+    i:              INTEGER;
+    newDiskSize:    LONGINT;
+    otherErr:       INTEGER;
+    sDfRefInfo:     fs_Info;
+    sDfRefNum:      INTEGER;
+    fsUtilParams:   Ut_Parmt;
+
+{$S FCwork}
+  PROCEDURE ZapPassword (VAR fileName: Pathname);
+  VAR  err:      INTEGER;
+
+  BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+  WITH fsUtilParams DO BEGIN
+    gp_Parm  := 0;
+    command := xfer_Passwd;
+    path     := fileName;
+    password := '';
+    op       := pswWrite;
+    END;
+  FS_Utilities (err, fsUtilParams);
+  END;
+
+{$S FCwork}
+  PROCEDURE OSError (at: INTEGER; result: INTEGER);
+  VAR tempErr:  INTEGER;
+  BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+  IF Abort                      { Check for user abort        }
+  THEN BEGIN
+    osErr := fceAborted;
+    result := fceAborted;
+    END;
+
+  IF osErr > 0
+  THEN BEGIN
+    IF flrcomDebug THEN WRITELN ('Error at ',at:1,' in CopyDiskfile: ',osErr:1,
+                             '; copying ',source,' to ',destination);
+    err := result;
+    Close_Object (tempErr, sDfRefNum);          { Close the source file      }
+    Close_Object (tempErr, dDfRefNum);          { Close the destination file }
+    IF dDfRefnum <> 0                           { Don't kill if not opened   }
+    THEN BEGIN
+      ZapPassword (destination);
+      Kill_Object (tempErr, destination);       { Only part of it was copied }
+      END;
+    Sched_Class (tempErr, TRUE);
+    EXIT (CopyDiskfile);
+    END;
+  END;
+
+{$S FCwork}
+  FUNCTION Gcd (m, n: INTEGER) : INTEGER;
+  BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+  IF n = 0
+  THEN gcd := m
+  ELSE gcd := Gcd (n, m MOD n);
+  END;
+
+
+{$S FCwork}
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+err := 0;
+dDfRefNum := 0;
+Sched_Class (osErr, FALSE);
+
+  { Verify allright to copy }
+
+Lookup (osErr, source, sDfRefInfo);           { Need various information     }
+OSError(1,fceCantRead);
+osErr := 1;                                   { For the following tests      }
+IF sDfRefInfo.nWriters > 0                    { Being written to, don't xfer }
+THEN BEGIN
+  IF flrcomDebug THEN WRITELN ('CopyDiskFile: not xfering, nWriters = ',
+                            sDfRefInfo.nWriters:1);
+  OsError (2,fceInuse);
+  END;
+
+IF NOT (sDfRefInfo.fType IN [userFile, userCat, exec, spool, sysData, swapData,
+                             swapCode, bootFile])
+THEN BEGIN                                    { Only certain types are copied }
+  IF flrcomDebug THEN WRITELN ('CopyDiskFile: not xfering, file type is ',
+                            ORD(sDfRefInfo.fType):1);
+  OsError (3,fceCantRead);
+  END;
+
+POpen (osErr, source, sDfRefNum, [dread], dontCare);{ Open a source diskfile }
+CASE osErr OF
+  0, -1173, -1174, -1175: ;                   { Ignore these warnings        }
+  950, 951: OsError (4,fceInUse);             { Already opened privately     }
+  OTHERWISE OsError (5,fceCantRead);
+  END;
+
+  { Create the destination diskfile }
+
+Make_File (osErr, destination, max_Label_Size);{ Create destination           }
+IF osErr = 890
+THEN BEGIN                                    { See if the file has been damaged}
+  Lookup (otherErr, destination, dDfRefInfo);
+  IF dDfRefInfo.file_Scavenged
+  THEN BEGIN                                  { File scavenged, replace it   }
+    ZapPassword (destination);
+    Kill_Object (osErr, destination);
+    Make_File (osErr, destination, max_Label_Size);
+    END;
+  END;
+OSError(6,fceOutOfDiskSpace);
+
+  { Allocate the disk space }
+
+POpen (osErr, destination, dDfRefNum, [dwrite, append], dontCare);
+OSError(8,fceCantWrite);
+Info (osErr, dDfRefNum, dDfRefInfo);       { Need the logical block size  }
+OSError(9,fceCantWrite);
+IF dDfRefInfo.pSize = 0                    { Destination is not a blocked dev}
+THEN OSError(10,fceCantWrite);
+blocksNeeded := sDfRefInfo.pSize DIV dDfRefinfo.lpSize; { Size of source in blocks }
+Allocate (osErr, dDfRefNum, FALSE, blocksNeeded, blocksAllocated);
+IF blocksAllocated < blocksNeeded
+THEN BEGIN
+  IF osErr < 0 THEN osErr := -osErr;       { Change warning to error }
+  IF osErr = 0 THEN osErr := 826;          { Allocate doesn't necessarily return an error }
+  OSError (18,fceOutOfDiskSpace);
+  END;
+
+  { Set protections as appropriate}
+
+IF sDfRefInfo.protected
+THEN Protect (osErr, destination, FALSE, sDfRefInfo.machine_ID);
+OSError(7,fceCantWrite);
+fsUtilParams.command := xfer_passwd;        { copy password to the new file }
+fsUtilParams.op := pswRead;
+fsUtilParams.path := source;
+Fs_Utilities(osErr,fsUtilParams);
+IF osErr <= 0
+THEN BEGIN
+  fsUtilParams.op := pswWrite;
+  fsUtilParams.path := destination;
+  Fs_Utilities(osErr,fsUtilParams);
+  END;
+
+   { Copy the label }
+
+Read_Label (osErr, source, bufrAdrs, max_Label_Size, bytesRead);
+IF osErr <= 0
+THEN BEGIN
+  Write_Label (osErr, destination, bufrAdrs, bytesRead, bytesWritten);
+  OSError(11,fceCantWrite);
+  END
+ELSE IF osErr <> 848 THEN OSError(12,fceCantRead); { 848 = no label }
+
+   { Calculate bytes per IO       }
+
+gcdBytesPerBlk := sDfRefInfo.LpSize *
+                  (dDfRefInfo.LpSize DIV
+                   Gcd (sDfRefInfo.LpSize, dDfRefInfo.LpSize));
+IF gcdBytesPerBlk > bufrSize
+THEN bytesPerIO := bufrSize              { inefficient but necessary        }
+ELSE bytesPerIO := (bufrSize DIV gcdBytesPerBlk) * gcdBytesPerBlk;
+IF flrcomDebug
+THEN IF bytesPerIO <= 0
+     THEN BEGIN
+       WRITELN ('ERROR in CopyDiskfile: bytesPerIO = ',bytesPerIO:1,
+                ', bufrSize = ',bufrSize:1,
+                ', gcdBytesPerBlk =',gcdBytesPerBlk:1);
+       END;
+
+   { Copy the diskfile }
+
+atEnd := FALSE;
+REPEAT
+  Read_Data (osErr, sDfRefNum, bufrAdrs, bytesPerIO, bytesRead,
+              sequential, 0);
+  CASE osErr OF
+    0, 848, 881, 883, 956: BEGIN    { Various end-of-file conditions   }
+        IF osErr <> 0
+        THEN BEGIN
+          atEnd := TRUE;
+          osErr := 0;
+          END;
+        IF bytesRead > 0
+        THEN Write_Data (osErr, dDfRefNum, bufrAdrs, bytesRead, bytesWritten,
+                         sequential, 0);
+        CASE osErr OF
+          0: ;
+          848, 882: OsError (13,fceOutOfDiskSpace);
+          OTHERWISE OsError (14,fceCantWrite);
+          END;
+        END;
+    OTHERWISE OsError (15,fceCantRead);
+    END;
+  UNTIL atEnd;
+
+IF theOp <> fcDocCopy
+THEN BEGIN
+  PSet_File_Info (osErr, dDfRefNum, sDfRefInfo);{ Set date/time, file close flds}
+  OSError(19,fceCantWrite);
+  IF theOp = fcDocBackup
+  THEN BEGIN
+    sDfRefInfo.DTB := sDfRefInfo.DTM;
+    PSet_File_Info (osErr, sDfRefNum, sDfRefInfo);{ Set date/time backudup field }
+    OSError(16,fceCantWrite);
+    END;
+  END;
+
+Close_Object (osErr, dDfRefNum);          { Close the destination file        }
+OSError(17,fceCantWrite);
+Close_Object (osErr, sDfRefNum);          { Close the source file             }
+Sched_Class (osErr, TRUE);
+osErr := 0;
+
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE CopyDoc {VAR error: INTEGER; fromPrefix, toPrefix: Pathname; useLdsn: INTEGER;
+                   theOp: FCopyOp; VAR docSize: LONGINT};
+CONST copyDsSize =  20000;
+VAR copyDsName:     Pathname;
+    copyDsRefnum:   INTEGER;
+    dDevName:       E_Name;
+    dDevPathname:   Pathname;
+    dDfName:        E_Name;
+    dDfPathname:    Pathname;
+    dDocName:       E_Name;
+    dfInfo:         Fs_Info;
+    docNameStart:   INTEGER;
+    dsInfo:         DsInfoRec;
+    lengthSDocName: INTEGER;
+    osErr:          INTEGER;
+    otherErr:       INTEGER;
+    sDevName:       E_Name;
+    sDfName:        E_Name;
+    sDfPathname:    Pathname;
+    sDocName:       E_Name;
+    sDevPathname:   Pathname;
+    useDsAdrs:      LONGINT;
+    useDsMemSize:   LONGINT;
+    dcParams:       DcType;
+    fsUtilParams:   Ut_Parmt;
+
+
+{$S FCwork}
+  PROCEDURE OSError (result: INTEGER);
+  BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+  IF Abort                        { Check for user abort        }
+  THEN BEGIN
+    osErr := fceAborted;
+    result := fceAborted;
+    END;
+
+  IF osErr <> 0
+  THEN BEGIN
+    IF flrcomDebug THEN WRITELN ('Error in CopyDoc: ',osErr:1);
+    error := result;
+    IF useLDSN > 0 THEN Close_DataSeg (osErr, copyDsRefnum);
+    EXIT (CopyDoc);
+    END;
+  END;
+
+{$S FCwork}
+  PROCEDURE ZapPassword (VAR fileName: Pathname);
+  VAR  err:      INTEGER;
+
+  BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+  WITH fsUtilParams DO BEGIN
+    gp_Parm  := 0;
+    command := xfer_Passwd;
+    path     := fileName;
+    password := '';
+    op       := pswWrite;
+    END;
+  FS_Utilities (err, fsUtilParams);
+  END;
+
+{$S FCwork}
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+    (* Extract device and doc names: prefix looks like  -devName-{Dx...Tx...} *)
+
+docNameStart := POS ('{', fromPrefix);
+sDevName := COPY (fromPrefix, 2, docNameStart-3);
+sDevPathname := COPY (fromPrefix, 1, docNameStart-2);
+sDocName := COPY (fromPrefix, docNameStart, LENGTH(fromPrefix)-docNameStart+1);
+lengthSDocName := LENGTH (sDocName);
+
+docNameStart := POS ('{', toPrefix);
+dDevName := COPY (toPrefix, 2, docNameStart-3);
+dDevPathname := CONCAT ('-',dDevName);
+dDocName := COPY (toPrefix, docNameStart, LENGTH(toPrefix)-docNameStart+1);
+
+    { Locate the first document diskfile }
+
+osErr := 0;
+Reset_Catalog (osErr, sDevPathname);
+OSError (fceCantRead);
+Get_Next_Entry (osErr, sDocName, sDfName);
+IF osErr <> 848 THEN OSError(fceCantRead);     { 848 - no diskfiles            }
+
+    { If diskfiles found, open the buffer ldsn }
+
+IF osErr <= 0
+THEN BEGIN
+  IF useLDSN > 0
+  THEN BEGIN                                   { Create temporary dataseg      }
+    copyDsName := 'copyTemp';
+    Make_DataSeg (osErr, copyDsName, copyDsSize, 0, copyDsRefnum, useDsAdrs,
+                  useLdsn, ds_private);
+    OSError(fceNoMemory);
+    useDsMemSize := copyDsSize;
+    END
+  ELSE IF useLDSN < 0
+  THEN BEGIN                                   { Use the client's LDSN         }
+    Info_LDSN (osErr, -useLDSN, copyDsRefnum);
+    IF osErr <= 0 THEN Info_DataSeg (osErr, copyDsRefnum, dsInfo);
+    OSError (fceBadLDSN);
+    useDsAdrs := dsInfo.segPtr;
+    useDsMemSize := dsInfo.mem_Size;
+    END
+  ELSE BEGIN                                   { No LDSN provided              }
+    osErr := 2;
+    OSError (fceBadLDSN);
+    END;
+  END;
+
+error := 0;
+docSize := 0;
+WHILE (osErr <= 0) AND (error <= 0)
+DO BEGIN                                       { Copy the diskfile             }
+  sDfPathname := CONCAT (sDevPathname,'-',sDfName);
+  dDfPathname := CONCAT (dDevPathname,'-',dDocName,
+                 COPY (sDfName, lengthSDocName+1, LENGTH(sDfName)-lengthSDocName));
+  CopyDiskfile (error, sDfPathname, dDfPathname, useDsAdrs, useDsMemSize,
+                theOp, osErr);
+  IF (error <= 0) AND (osErr <= 0)
+  THEN BEGIN                                   { Sum the diskfile sizes        }
+    Lookup (otherErr, dDfPathname, dfInfo);
+    IF otherErr <= 0
+    THEN docSize := docSize + (dfInfo.pSize DIV dfInfo.lpSize) + dfInfo.fs_Overhead;
+    END;
+  Get_Next_Entry (osErr, sDocName, sDfName);
+  END;
+
+   { Document copying finished, delete it if there was an error }
+
+IF error <> fceNoErrors
+THEN BEGIN                             { Delete any diskfiles that were copied }
+  Reset_Catalog (osErr, dDevPathname);
+  IF osErr <= 0 THEN Get_Next_Entry (osErr, dDocName, dDfName);
+  WHILE osErr <= 0
+  DO BEGIN
+    dDfPathname := CONCAT ('-',dDevName,'-',dDfName);
+    ZapPassword (dDfPathname);
+    Kill_Object (osErr, dDfPathname);
+    Get_Next_Entry (osErr, dDocName, dDfName);
+    END;
+  END;
+
+IF useLDSN > 0 THEN Close_DataSeg (osErr, copyDsRefnum);
+
+END;
+
+{****************************************************************************}
+
+{$S FCact}
+PROCEDURE DoFilingCmd {whichCmd: FilingCmd};
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+MakeFldrActive (filerFolder, whichCmd);
+END;
+
+{****************************************************************************}
+
+{$S FCopen2}
+PROCEDURE GetAddParms {VAR error: FError; theEvent: EventRecord;
+                       VAR theFilerExt: FilerExt};
+VAR
+    flrRecHdl:  hFilerExt;
+    saveHeap:   THz;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+IF (theEvent.what <> filerEvent)     { Not a FilerEvent }
+OR (theEvent.userData = 0)           { Already called once for this event }
+THEN error := fceBadEventType
+ELSE BEGIN                           { Retrieve the params }
+  error := fceNoErrors;
+  flrRecHdl := POINTER(theEvent.userData);
+  theFilerExt := flrRecHdl^^;
+  GetHeap (saveHeap);
+  SetHeap (wmHeap);
+  DisposeHandle (POINTER(theEvent.userData));
+  SetHeap (saveHeap);
+  theEvent.userData := 0;
+  END;
+END;
+
+{****************************************************************************}
+(*
+{$S FCwork}
+FUNCTION FreeDisk {deviceName: Pathname; bytesNeeded: LONGINT;
+                   myFolder: WindowPtr) : LONGINT};
+
+VAR bytesStart:  LONGINT;
+    devInfo:     Fs_Info;
+    foundReply:  BOOLEAN;
+    myProcess:   ProcessID;
+    osErr:       INTEGER;
+    theEvent:    EventRecord;
+    parmsHdl:    hFilerExt;
+    saveHeap:    THz;
+    udPtr:       ReplyPtr;
+    whichEvent:  EventHandle;
+
+   PROCEDURE CheckErr;
+   BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+   IF osErr <= 0 THEN EXIT (CheckErr);
+   bytesNeeded := 0;
+   EXIT (FreeDisk);
+   END;
+
+{$S FCwork}
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+FreeDisk := 0;
+myProcess := My_ID;
+Lookup (osErr, deviceName, devInfo);
+CheckErr;
+bytesStart := devInfo.freeCount * devInfo.blockSize;
+
+   { Build the request event and send it to the filer }
+
+theEvent.who := filerFolder;
+theEvent.what := filerEvent;
+theEvent.toProcess := filerProcess;
+theEvent.fromFolder := myFolder;
+theEvent.fromProcess := myProcess;
+GetHeap (saveHeap);
+SetHeap (wmHeap);
+theEvent.userData := ORD(NewHandle(SIZEOF(FilerExt)));
+SetHeap (saveHeap);
+parmsHdl := POINTER(theEvent.userData);
+WITH parmsHdl^^
+DO BEGIN
+  theFlrOp := fcFreeDisk;
+  thePrefix := deviceName;
+  bytesReqd := bytesNeeded;
+  END;
+PushEvent (theEvent);
+
+   { Wait for a reply from the filer - almost same as WM.Events:GetEvFrom }
+
+whichEvent := FirstEvent;
+foundReply := FALSE;
+REPEAT
+  IF whichEvent = NIL
+  THEN BEGIN
+    LetOthersRun;
+    whichEvent := FirstEvent;
+    END
+  ELSE WITH whichEvent^^ DO BEGIN
+    IF (what = filerEvent)
+    AND (fromProcess = filerProcess)
+    AND (toProcess = myProcess)
+    THEN BEGIN                                  { Found a filer event for us }
+      udPtr := @curEvent.userData;
+      IF udPtr^.theReply IN [diskFreed, diskNotFreed]
+      THEN foundReply := TRUE                   { It's our reply             }
+      ELSE whichEvent := NextEvent (whichEvent);
+      END
+    ELSE whichEvent := NextEvent (whichEvent);
+    END;
+  UNTIL foundReply;
+theEvent := whichEvent^^;
+DeleteEvent (whichEvent);
+
+IF udPtr.theReply = diskNotFreed
+THEN FreeDisk := 0
+ELSE BEGIN
+  Lookup (osErr, devName, devInfo);
+  CheckErr;
+  bytesEnd := devInfo.freeCount * devInfo.blockCount;
+  IF bytesEnd > bytesStart
+  THEN FreeDisk := bytesEnd - bytesStart;
+  THEN BEGIN                                     { Bullet-proofing           }
+    FreeDisk := 0;
+    IF flrcomDebug THEN WRITELN ('ERROR in FilerComm.FreeDisk - free space decreased by ',
+                              bytesStart-bytesEnd:1);
+    END;
+  END;
+END;
+*)
+
+
+{****************************************************************************}
+
+{$S FCwork}
+PROCEDURE NameToPrefix {VAR err, offset: INTEGER; myFolder: WindowPtr; name: Pathname;
+                        VAR prefix: Pathname};
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+AskCatalog (err, offset, myFolder, fcNameToPrefix, name, prefix, 0);
+END;
+
+{****************************************************************************}
+
+{$S FCwork}
+PROCEDURE PrefixToName {VAR err, offset: INTEGER; myFolder: WindowPtr; prefix: Pathname;
+                        VAR name: Pathname};
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+AskCatalog (err, offset, myFolder, fcPrefixToName, name, prefix, 0);
+END;
+
+
+{****************************************************************************}
+
+{$S FCact}
+PROCEDURE TellFiler {VAR error: FError; what: FReply; why: FReason;
+                     myFolder: WindowPtr};
+
+VAR theEvent:   EventRecord;
+    msgPtr:     ReplyPtr;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+error := fceNoErrors;                     { Verify the what and why params   }
+
+{$IFC fcDebug}
+
+CASE what OF
+  dfClosed,
+  dfNotClosed:
+           IF NOT (((what = dfClosed) AND (why = allOK))
+                   OR ((what = dfNotClosed) AND (why = internalError)))
+           THEN error := fceBadReason;
+
+  docClosd,
+  docNotClosed:
+           IF NOT (((what = docClosd) AND (why IN [allOK,badData,noDiskSpace,
+                                                   newerDoc,noMemory,internalError,needToConvert,
+                                                   docPutBack,noMoreDocs,aUserAbort,wrongPassword]))
+                   OR ((what = docNotClosed)
+                       AND (why IN [cantWrite,cantRead,dirtyDoc,
+                                    noDiskSpace,noMemory,internalError,aUserAbort])))
+           THEN error := fceBadReason;
+
+  docXfered,
+  docNotXfered:
+           IF NOT (((what = docXfered) AND (why = allOK))
+                   OR ((what = docNotXfered)
+                       AND (why IN [cantRead,cantWrite,dirtyDoc,noDiskSpace,
+                                    internalError,aUserAbort,wrongPassword])))
+           THEN error := fceBadReason;
+
+  InitFailed:
+           IF NOT (why IN [noDiskSpace, noMemory, internalErr, aUserAbort, wrongPassword])
+           THEN error := fceBadReason;
+
+  OTHERWISE error := fceBadReason;
+  END;
+IF error <> fceNoErrors THEN EXIT (TellFiler);
+
+{$ENDC }
+
+  { Send the message to the Filer }
+
+IF what = docClosd THEN GiveWindow (myFolder, filerProcess);
+          { Must do before pushing following event 'cuz this changes fromProcess field }
+
+WITH theEvent
+DO BEGIN
+   who := filerFolder;
+   what := filerEvent;
+   why := whyNot;
+   toProcess := filerProcess;
+   fromProcess := My_ID;
+   fromFolder := myFolder;
+   END;
+msgPtr := @theEvent.userData;
+msgPtr^.theReply := what;
+msgPtr^.theReason := why;
+PushEvent (theEvent);
+
+  { If the window to the Filer }
+
+IF  (what = docClosd)
+AND (myFolder = activeFolder)
+AND (why <> docPutBack)                 { The window is going away }
+THEN WITH theEvent DO BEGIN             { Give control to the Filer }
+  who := NIL;                           { Don't want tab to flicker  }
+  toProcess := My_ID;
+  fromProcess := filerProcess;
+  fromFolder := myFolder;
+  GiveControl (theEvent);               { Activate Filer with this window }
+  END;
+
+END;
+
+
+{****************************************************************************}
+
+{$S FCInit }
+PROCEDURE InitIcons;
+{ Initializes tables associated with icons. }
+VAR i: INTEGER;
+
+   PROCEDURE CalcBBox(font: Tfam; ch: Char; VAR bbox: Rect);
+
+   { calculate the bounding box of each icon by looking at its mask }
+
+   LABEL 1,2,3,4;
+
+   VAR h,v:        INTEGER;
+       tempBits:   BitMap;
+       savePort:   GrafPtr;
+       tempPort:   GrafPort;
+       tempBuf:    ARRAY[0..95] OF INTEGER;
+
+   BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+   IF ch = CHR(noIcon) THEN
+      BEGIN
+      SetRect(bbox,0,0,0,0);
+      EXIT(CalcBBox);
+      END;
+
+   GetPort(savePort);
+   OpenPort(@tempPort);
+
+   { set up an offscreen bitmap }
+   tempBits.baseAddr := @tempBuf;
+   tempBits.rowBytes := 6;
+   SetRect(tempBits.bounds,0,0,iconWidth,iconHt);
+   SetPortBits(tempBits);
+
+   TextFont(font);
+
+   EraseRect(tempBits.bounds);
+   MoveTo(0,0);
+   DrawChar(ch);   { draw the character into the bitmap }
+
+   bbox.left   := 0;
+   bbox.right  := iconWidth;
+   bbox.top    := 0;
+   bbox.bottom := iconHt;
+
+   FOR h := 0 TO iconWidth-1 DO  { scan for left }
+       FOR v := 0 TO iconHt-1 DO IF BitTst(@tempBuf, v*iconWidth + h) THEN
+          BEGIN
+          bbox.left := h;
+          GOTO 1;
+          END;
+   1:
+
+   FOR v := 0 TO iconHt-1 DO  { scan for top }
+       FOR h := 0 TO iconWidth-1 DO IF BitTst(@tempBuf, v*iconWidth + h) THEN
+          BEGIN
+          bbox.top := v;
+          GOTO 2;
+          END;
+   2:
+
+   FOR h := iconWidth-1 DOWNTO 0 DO  { scan for right }
+       FOR v := 0 TO iconHt-1 DO IF BitTst(@tempBuf, v*iconWidth + h) THEN
+          BEGIN
+          bbox.right := h + 1;
+          GOTO 3;
+          END;
+   3:
+
+   FOR v := iconHt-1 DOWNTO 0 DO  { scan for bottom }
+       FOR h := 0 TO iconWidth-1 DO IF BitTst(@tempBuf, v*iconWidth + h) THEN
+          BEGIN
+          bbox.bottom := v + 1;
+          GOTO 4;
+          END;
+   4:
+
+   { deallocate regions for temporary port }
+   DisposeRgn(thePort^.clipRgn);
+   DisposeRgn(thePort^.visRgn);
+
+   SetPort(savePort);
+   END;
+
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+FOR i := nilKind TO lastKind DO
+   BEGIN
+   iconData[i] := CHR(noIcon);
+   iconMask[i] := CHR(noIcon);
+   END;
+
+iconData[folderkind]  := CHR(4);      iconMask[folderkind]    := CHR(5);
+iconData[docKind]     := CHR(6);      iconMask[docKind]       := CHR(7);
+iconData[docPad]      := CHR(8);      iconMask[docPad]        := CHR(9);
+iconData[trashKind]   := CHR(10);     iconMask[trashKind]     := CHR(11);
+iconData[calcKind]    := CHR(14);     iconMask[calcKind]      := CHR(15);
+iconData[comp2Kind]   := CHR(16);     iconMask[comp2Kind]     := CHR(19);
+iconData[computerKind]:= CHR(18);     iconMask[computerKind]  := CHR(19);
+iconData[folderPad]   := CHR(30);     iconMask[folderPad]     := CHR(31);
+   { char code 32 can't be used for icons, must always be a space }
+iconData[clockKind]   := CHR(34);     iconMask[clockKind]     := CHR(35);
+iconData[toolKind]    := CHR(36);     iconMask[toolKind]      := CHR(37);
+iconData[diskKind]    := CHR(38);     iconMask[diskKind]      := CHR(39);
+iconData[disk1Kind]   := CHR(40);     iconMask[disk1Kind]     := CHR(41);
+iconData[disk2Kind]   := CHR(42);     iconMask[disk2Kind]     := CHR(41);
+iconData[profileKind] := CHR(44);     iconMask[profileKind]   := CHR(45);
+iconData[priamKind]   := CHR(70);     iconMask[priamKind]     := CHR(71);
+iconData[clipBdKind]  := CHR(52);     iconMask[clipBdKind]    := CHR(53);
+iconData[inBox1Kind]  := CHR(56);     iconMask[inBox1Kind]    := CHR(57);
+iconData[inBox2Kind]  := CHR(58);     iconMask[inBox2Kind]    := CHR(59);
+iconData[outBox1Kind] := CHR(60);     iconMask[outBox1Kind]   := CHR(61);
+iconData[outBox2Kind] := CHR(62);     iconMask[outBox2Kind]   := CHR(63);
+iconData[letterKind]  := CHR(64);     iconMask[letterKind]    := CHR(65);
+iconData[letterPad]   := CHR(66);     iconMask[letterPad]     := CHR(67);
+iconData[drawerKind]  := CHR(68);     iconMask[drawerKind]    := CHR(69);
+iconData[slotKind]    := CHR(72);     iconMask[slotKind]      := CHR(73);
+iconData[slot1Kind]   := CHR(74);     iconMask[slot1Kind]     := CHR(75);
+iconData[slot2Kind]   := CHR(76);     iconMask[slot2Kind]     := CHR(77);
+
+FOR i := nilKind TO lastKind DO
+   BEGIN
+   tinyData[i] := CHR(86);
+   tinyMask[i] := CHR(87);
+   END;
+
+tinyData[folderkind]  := CHR(82);     tinyMask[folderkind]    := CHR(83);
+tinyData[docKind]     := CHR(80);     tinyMask[docKind]       := CHR(81);
+tinyData[docPad]      := CHR(78);     tinyMask[docPad]        := CHR(79);
+tinyData[trashKind]   := CHR(112);    tinyMask[trashKind]     := CHR(113);
+tinyData[calcKind]    := CHR(94);     tinyMask[calcKind]      := CHR(95);
+tinyData[computerKind]:= CHR(104);    tinyMask[computerKind]  := CHR(105);
+tinyData[comp2Kind]   := CHR(90);     tinyMask[comp2Kind]     := CHR(105);
+tinyData[folderPad]   := CHR(92);     tinyMask[folderPad]     := CHR(93);
+   { char code 32 can't be used for icons, must always be a space }
+tinyData[clockKind]   := CHR(114);    tinyMask[clockKind]     := CHR(115);
+tinyData[toolKind]    := CHR(98);     tinyMask[toolKind]      := CHR(99);
+tinyData[diskKind]    := CHR(118);    tinyMask[diskKind]      := CHR(119);
+tinyData[disk1Kind]   := CHR(84);     tinyMask[disk1Kind]     := CHR(85);
+tinyData[disk2Kind]   := CHR(86);     tinyMask[disk2Kind]     := CHR(85);
+tinyData[profileKind] := CHR(96);     tinyMask[profileKind]   := CHR(97);
+tinyData[priamKind]   := CHR(120);    tinyMask[priamKind]     := CHR(121);
+tinyData[clipBdKind]  := CHR(100);    tinyMask[clipBdKind]    := CHR(101);
+tinyData[outBox1Kind] := CHR(34);     tinyMask[outBox1Kind]   := CHR(34);
+tinyData[outBox2Kind] := CHR(34);     tinyMask[outBox2Kind]   := CHR(34);
+tinyData[inBox1Kind]  := CHR(33);     tinyMask[inBox1Kind]    := CHR(33);
+tinyData[inBox2Kind]  := CHR(33);     tinyMask[inBox2Kind]    := CHR(33);
+tinyData[letterKind]  := CHR(38);     tinyMask[letterKind]    := CHR(39);
+tinyData[letterPad]   := CHR(36);     tinyMask[letterPad]     := CHR(37);
+tinyData[drawerKind]  := CHR(116);    tinyMask[drawerKind]    := CHR(117);
+
+FOR i := deskTool TO maxKnownTool DO
+   BEGIN
+   iconOverlay[i] := CHR(noIcon);
+   tinyOverlay[i] := CHR(noIcon);
+   END;
+
+iconOverlay[writeTool]   := CHR(20);  tinyOverlay[writeTool]   := CHR(40);
+iconOverlay[graphTool]   := CHR(22);  tinyOverlay[graphTool]   := CHR(41);
+iconOverlay[matrixTool]  := CHR(24);  tinyOverlay[matrixTool]  := CHR(43);
+iconOverlay[drawTool]    := CHR(26);  tinyOverlay[drawTool]    := CHR(44);
+iconOverlay[listTool]    := CHR(28);  tinyOverlay[listTool]    := CHR(42);
+iconOverlay[projectTool] := CHR(46);  tinyOverlay[projectTool] := CHR(45);
+iconOverlay[termEmTool]  := CHR(48);  tinyOverlay[termEmTool]  := CHR(46);
+iconOverlay[manualTool]  := CHR(50);  tinyOverlay[manualTool]  := CHR(noIcon);
+iconOverlay[ballsTool]   := CHR(54);  tinyOverlay[ballsTool]   := CHR(47);
+
+FOR i := nilKind TO lastKind DO
+   CalcBBox(fIconFont,iconMask[i],iconBoxes[i]);
+END;
+
+{****************************************************************************}
+
+{$S FCInit}
+PROCEDURE InitFC;
+VAR
+    fntInfo: FontInfo;
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+TextFont (sysText);
+GetFontInfo(fntInfo);
+WITH fntInfo DO
+  BEGIN
+  lineHt := ascent+descent+leading;
+  IF lineHt < 15 THEN lineHt := 15;
+  lineHt := ((lineHt+3) DIV 4)*4;        { must be multiple of 4 }
+  END;
+
+InitIcons;
+
+END;
+
+
+{****************************************************************************}
+
+{$S FCwork}
+FUNCTION RefInScrap (VAR pic: PicHandle) : BOOLEAN;
+VAR heapHdl: TH;
+    scrapKind: scrapType;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+GetScrap (scrapKind, heapHdl);
+IF scrapKind = scrapRef
+THEN BEGIN
+  pic := POINTER(ORD(heapHdl));
+  RefInScrap := TRUE;
+  END
+ELSE BEGIN
+  pic := NIL;
+  RefInScrap := FALSE;
+  END;
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE DrawRefScrap {VAR err: INTEGER};
+VAR
+    savePort: GrafPtr;
+    pic: PicHandle;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+err := 1;
+IF NOT RefInScrap (pic) THEN EXIT(DrawRefScrap);
+
+GetPort (savePort);
+SetPort (scrapFolder);
+
+ClipRect (thePort^.portRect);
+WITH thePort^.PortRect DO
+  SetRectRgn (thePort^.clipRgn, left, top, right-dhSBox+1, bottom-dvSBox+1);
+StartGetScrap (err);
+DrawPicture (pic, pic^^.picFrame);
+EndGetScrap (err);
+
+SetPort (savePort);
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE StartIconRef {VAR err: INTEGER; myWindow: WindowPtr};
+VAR
+    appInfo: TAppInfo;
+    appInfoHdl: HAppInfo;
+    picRect: Rect;
+    saveHeap: THz;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+
+{ ready the scrap for a copy }
+InheritScrap (TRUE {save current for undo});
+EraseScrapData (err);
+IF err > 0 THEN EXIT(StartIconRef);
+StartPutScrap (err);
+IF err > 0 THEN EXIT(StartIconRef);
+scrapHeap := HzOfScrap;
+
+{ open the picture }
+refLine.h := 15;
+refLine.v := 0;
+WITH picRect DO BEGIN
+  left := 0;
+  right := 720;
+  top := 0;
+  bottom := 320;  {*** adjust for number of icons ***}
+  END;
+GetHeap(saveHeap);
+SetHeap(scrapHeap);
+pic := OpenPicture (picRect);
+SetHeap(saveHeap);
+
+{ identify process creating this reference }
+appInfoHdl := POINTER(ORD(HAllocate (scrapHeap, SIZEOF(TAppInfo))));
+WITH appInfoHdl^^ DO BEGIN
+  window := myWindow;
+  proc := My_ID;
+  END;
+PicComment (cmAppInfo, SIZEOF(appInfo), POINTER(ORD(appInfoHdl)));
+
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE AddIconRef {iconInfo: TIconRef};
+VAR
+    iconHdl: HIconRef;
+
+BEGIN
+
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+{ insert icon comment }
+iconHdl := POINTER(ORD(HAllocate(scrapHeap, SIZEOF(TIconRef))));
+iconHdl^^ := iconInfo;
+PicComment (cmIconInfo, SIZEOF(iconInfo), POINTER(ORD(iconHdl)));
+
+{ draw the reference }
+TextFont (wmFont);
+TextMode (srcOR);
+WITH iconInfo DO BEGIN
+  refLine.v := refLine.v + lineHt;
+  MoveTo (refLine.h, refLine.v-13);
+  DrawChar (tinyData[kind]);
+  IF (toolID > deskTool) AND (toolID < maxKnownTool)
+  THEN BEGIN
+    IF tinyOverlay[toolID] <> CHR(noIcon)
+    THEN BEGIN
+      MoveTo (refLine.h, refLine.v-13);
+      DrawChar (tinyOverlay[toolID]);
+      END;
+    END;
+  TextFont (sysText);
+  MoveTo (refLine.h+25, refLine.v);
+  DrawString (userName);
+  END;
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE EndIconRef;
+VAR
+    err: INTEGER;
+    picSize: TC;
+    scrapPeek: WindowPeek;
+    savePort: GrafPtr;
+
+BEGIN
+
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+{ close the picture }
+ClosePicture;
+EndPutScrap (err);
+IF err > 0 THEN EXIT(EndIconRef);
+PutScrap (scrapRef, POINTER(ORD(pic)), err);
+IF err > 0 THEN EXIT(EndIconRef);
+
+scrapPeek := POINTER(ORD(scrapFolder));
+IF scrapPeek^.visible
+THEN BEGIN
+   DrawRefScrap (err);           { show icon refs in open scrap window }
+
+(*   GetPort (savePort);
+   SetPort (scrapFolder);
+   WmOpenPicture (scrapFolder);
+   ClipRect (thePort^.portRect);
+   HideSBorder (thePort^.portRect);
+   WITH thePort^.PortRect DO
+     SetRectRgn (thePort^.clipRgn, left, top, right-dhSBox+1, bottom-dvSBox+1);
+   EraseRect (thePort^.portRect);
+   DrawRefScrap (err);
+   ClosePicture;
+   SetPort (SavePort);  *)
+   END;
+
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE MyComments (kind, dataSize: INTEGER; dataHandle: QDHandle);
+VAR appInfoHdl: HAppInfo;
+    hIconInfo:  HIconRef;
+    info:       ProcInfoRec;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+CASE kind OF
+  cmAppInfo:  BEGIN
+              appInfoHdl := POINTER(ORD(dataHandle));
+              clientProcPtr^ := appInfoHdl^^.proc;
+              clientWindowPtr^ := appInfoHdl^^.window;
+              Info_Process (clientErr, appInfoHdl^^.proc, info);  { is the process still alive? }
+              END;
+  cmIconInfo: IF clientErr = 0 THEN BEGIN
+                MoveLeft (dataHandle^^, clientIdentPtr^, SIZEOF(TIconRef));
+                CallProc (clientCall);   {*** call asm routine ***}
+                END;
+  END;
+END;
+
+
+{**************************************************************************}
+
+{$S FCwork}
+PROCEDURE ReadIconRefs {VAR err: INTEGER; VAR proc: ProcessID; VAR window: WindowPtr;
+                        VAR identity: TiconRef; IDProc: TProc};
+LABEL 99;
+VAR
+    saveQDProcs: QDProcsPtr;
+    myGrafProcs: QDProcs;
+    savePort: GrafPtr;
+    pic: PicHandle;
+
+BEGIN
+{$IFC fTraceFC}    LogCall;     {$ENDC}
+err := 1;
+IF NOT RefInScrap (pic) THEN EXIT(ReadIconRefs);
+
+SetStdProcs (myGrafProcs);
+myGrafProcs.commentProc := @MyComments;
+clientProcPtr := @proc;
+clientWindowPtr := @window;
+clientIdentPtr := @identity;
+clientCall := IDProc;
+
+GetPort (savePort);
+SetPort (scrapFolder);
+saveQDProcs := thePort^.grafProcs;
+thePort^.grafProcs := @myGrafProcs;
+
+ClipRect (thePort^.portRect);
+WITH thePort^.PortRect DO
+  SetRectRgn (thePort^.clipRgn, left, top, right-dhSBox+1, bottom-dvSBox+1);
+StartGetScrap (err);
+IF err > 0 THEN GOTO 99;
+DrawPicture (pic, pic^^.picFrame);
+EndGetScrap (err);
+err := clientErr;
+
+99:
+thePort^.grafProcs := saveQDProcs;
+SetPort (savePort);
+END;
+
+{
+
+Change Log:
+
+ 5-Oct-82  A2 Release
+
+28-Oct-82  Added CopyDoc/CopyDiskFile user abort check.
+           Added TellFiler docClosd, docPutBack check.
+           Added CopyDoc/CopyDiskFile FCopy Param.
+           Added CopyDiskFile Allocate disk space loop.
+
+ 1-Nov-82  A3 Release
+ 1-Nov-82  Bug fix: TellFiler - added 'noMoreDocs' to 'docClosd' check.
+ 2-Nov-82  Bug fix: TellFiler - now GiveWindow if not active window.
+ 2-Nov-82  A3 ReRelease
+ 3-Nov-82  Bug Fix: TellFiler - added docPutBack check before GiveControl.
+ 3-Nov-82  A3 ReRelease
+ 5-Nov-82  Added: TellFiler - 'aUserAbort' now accepted for several replies.
+ 9-Nov-82  A3 ReRelease
+18-Nov-82  Added: CopyDoc - device_control calls to turn write verify on/off.
+18-Nov-82  A3 ReRelease
+14-Dec-82  TellFiler: Moved GiveWindow before pushing reply event.
+14-Dec-82  CopyDiskFile: In allocate loop, test for zero blocks allocated.
+ 3-Jan-83  Removed 'cmdPutBack', 'docOpened', 'docNotOpened' - support for old protocols.
+ 3-Jan-83  A4 pre-release
+ 5-Jan-83  Added 'newerDoc' check to TellFiler, docClosd
+ 5-Jan-83  A4 pre-release
+
+}
+ÿ

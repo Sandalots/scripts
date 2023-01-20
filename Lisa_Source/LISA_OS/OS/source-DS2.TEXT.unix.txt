@@ -1,0 +1,1102 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+(* DS2 *)
+
+
+procedure RELSDSCB(c_sdscb_ptr: sdscb_ptr);
+  (*************************************************)
+  (*                                               *)
+  (* Dequeue and release the sdscb entry           *)
+  (*                                               *)
+  (*************************************************)
+
+  begin
+    (* release sdscb *)
+    DEQUEUE(c_sdscb_ptr^.chain,b_sysglobal_ptr);
+    RELSPACE(ord(c_sdscb_ptr),b_sysglobal_ptr);
+  end; (* RELSDSCB *)
+
+
+procedure SRCH_SDSCB(var p: pathname; var c_sdscb_ptr: sdscb_ptr);
+
+  (*************************************************)
+  (*                                               *)
+  (* Search the sdscb chain for an entry with the  *)
+  (* same name as p and on the same device.        *)
+  (* If found then return the address of the sdscb *)
+  (* entry; otherwise, nil                         *)
+  (*                                               *)
+  (*************************************************)
+
+  var
+    c_mmrb: mmrb_ptr;
+    l_sdscb_ptr, n_sdscb_ptr: sdscb_ptr;
+    unitno, sfileno, dummy: int2;
+    fname: pathname;
+    error: int2;
+
+    procedure Find_it(key: integer);
+      begin
+        with c_mmrb^.hd_sdscb_list do
+          begin
+            l_sdscb_ptr:=@fwd_link; (*stopper*)
+            n_sdscb_ptr:=pointer(fwd_link + b_sysglobal_ptr);
+          end;
+
+        while (n_sdscb_ptr <> l_sdscb_ptr) and
+              (c_sdscb_ptr = nil) do
+          begin
+            with n_sdscb_ptr^ do
+              begin
+                if unitid = unitno then
+                  if (key = 0) then
+                    begin (*compare unitno and sfileno*)
+                      if sfileid=sfileno then c_sdscb_ptr:=n_sdscb_ptr;(*match*)
+                    end
+                   else
+                    begin (*compare unitno and filename*)
+                      SplitPathname(error,p,dummy,fname);
+                      UpShift(@fname);
+                      if ptr_e_name^=fname then c_sdscb_ptr:=n_sdscb_ptr;(*match*)
+                    end;
+                  if c_sdscb_ptr = nil
+                    then n_sdscb_ptr:=pointer(chain.fwd_link + b_sysglobal_ptr);
+              end;(*with n_sdscb_ptr*)
+          end;
+      end;(*find_it*)
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    c_sdscb_ptr:=nil;
+
+
+    c_mmrb:=pointer(mmrb_addr);
+    c_sdscb_ptr:=nil;
+    PARSE_PATHNAME(error,p,unitno,sfileno);
+    if error <= 0 then
+      begin (*file exists - search using unitno and sfileno*)
+        Find_it(0);
+      end
+     else
+      begin
+        if error = 1270 then
+          begin (*file does not exist - search using unitno and file name*)
+            Find_it(1);
+          end;
+      end;
+  end;(*SRCH_SDSCB*)
+
+
+
+procedure RELDSREFDB(c_ptr_ds_refdb: ptr_ds_refdb);
+  (* free refnum and release refdb space *)
+
+  begin
+    FREE_REFNUM(c_ptr_ds_refdb^.ds_refnum);
+    DEQUEUE(c_ptr_ds_refdb^.header.refdb_list,b_syslocal_ptr);
+    RELSPACE(ord(c_ptr_ds_refdb),b_syslocal_ptr);
+  end; (* RELDSREFDB *)
+
+
+
+procedure DS_CLOSE(var errnum: int2; refnum_ds: int2);
+  (*************************************************)
+  (*                                               *)
+  (* Do the file system operations to close a data *)
+  (* segment.  Release the sdb if the segment is   *)
+  (* marked to be deleted.  Release the refnum and *)
+  (* ds_refdb entries.                             *)
+  (*                                               *)
+  (*************************************************)
+
+  label 10;
+
+  var
+    ordrefdbptr: absptr;
+    c_ptr_ds_refdb: ptr_ds_refdb;
+    c_sdb_ptr: sdb_ptr;
+    c_sdscb_ptr: sdscb_ptr;
+    c_mmlist: ptr_1mmlist;
+    fcbRP: int2;                                                             (*P*)
+    fcbptr: sfcb_ptr;                                                        (*P*)
+
+  procedure RECOVER(error: int2);                                            (*P*)
+    (* used to recover from any errors during DS_CLOSE execution *)          (*P*)
+    begin                                                                    (*P*)
+      if error <> 0 then errnum:=e_dsbase+error;                             (*P*)
+      goto 10;                                                               (*P*)
+    end;(*RECOVER*)                                                          (*P*)
+
+  begin
+    CHK_REFNUM(errnum,refnum_ds,dsrefdb,ordrefdbptr);
+    if errnum = 0 then
+      begin
+        c_ptr_ds_refdb:=pointer(ordrefdbptr);
+        with c_ptr_ds_refdb^ do
+          begin
+            if boundF then
+              begin (* make sure segment is no longer bound to an ldsn *)
+                UNBIND_DATASEG(errnum,refnum_ds);
+                if errnum > 0 then RECOVER(0);                               (*P*)
+              end;
+
+            (* remove from open list registry*)
+            if unitid <> -1 then REG_OPEN_LIST(errnum,unitid,refnum_ds,0,dsrefnum);
+            errnum:=0;
+
+            c_sdb_ptr:=a_sdb_ptr;
+            with c_sdb_ptr^ do
+              begin
+                c_mmlist:=pointer(srbRP + b_sysglobal_ptr);
+                c_sdscb_ptr:=pointer(c_mmlist^.sdscb_addr);
+                fcbRP:=discaddr.fid;                                         (*P*)
+
+                numbopen:=numbopen-1; (* decrement open count *)
+                if numbopen = 0 then
+                  begin (* no users of data segment *)
+                    if not sdbstate.deleteF and (disclength < length) then
+                      begin (* last close of memory resident data segment *)
+                        if c_sdscb_ptr <> nil then
+                          if c_sdscb_ptr^.f_refnum <> -1 then (*file exists that*)
+                            c_sdscb_ptr^.open_needed:=true;(*must be opened again*)
+                      end
+                     else
+                      begin (* last close of disc resident data segment *)
+                        if sdbtype = data then
+                          begin (* stack and syslocal treated special *)
+                            if not sdbstate.deleteF then FLUSH_SEG(errnum,c_sdb_ptr);
+
+                            (* release sdscb and sdb *)
+                            if c_sdscb_ptr <> nil then RELSDSCB(c_sdscb_ptr);
+                            REL_SEG(c_sdb_ptr);
+                          end;
+                      end;
+
+                    if fs_refnum <> -1 then
+                      begin  (* close file for segment *)
+                        SHOW_REFNUM(errnum,fs_refnum); (* make  it visible*)
+                        CLOSE_OBJECT(errnum,fs_refnum);
+                        if errnum > 0 then RECOVER(e_filesyserr);            (*P*)
+                      end                                                    (*P*)
+                     else                                                    (*P*)
+                      begin  (* see if temp file exists for segment*)        (*P*)
+                        if fcbRP <> 0 then                                   (*P*)
+                          begin  (*close temp file*)                         (*P*)
+                            fcbptr:=pointer(fcbRP + b_sysglobal_ptr);        (*P*)
+                            CLOSE_TEMP(errnum,fcbptr);                       (*P*)
+                            if errnum > 0 then RECOVER(e_filesyserr);        (*P*)
+                          end;                                               (*P*)
+                      end;                                                   (*P*)
+                  end;
+              end (* with c_sdb_ptr*);
+          end (* with c_ptr_ds_refdb *);
+
+10:     (* release refnum and the space for refdb - even on error exit*)
+        RELDSREFDB(c_ptr_ds_refdb);
+      end;
+  end; (* DS_CLOSE *)
+
+
+procedure DS_OPEN(var errnum: int2; c_name: ptr_pathname; ds_type: Tdstype;
+                  mem_size, disc_size: int4; c_ldsn, numb_ldsn: int2;
+                  var refnum_fs, refnum_ds: integer;
+                  var segptr: longint; var c_sdb_ptr: sdb_ptr;
+                  var fcbptr: sfcb_ptr; funct: Tdsopen);                     (*P*)
+  (******************************************************)
+  (*                                                    *)
+  (* Do the file system operations to open the file     *)
+  (* for the data segment.  Build seg and sdscb entry   *)
+  (* for the segment.  Build a refdb and refnum entry.  *)
+  (* Bind the data segment to the desired ldsn.         *)
+  (*                                                    *)
+  (******************************************************)
+
+  label 10;
+
+  (*$IFC DEBUG1*)
+  type
+    ev_log = record
+               ev_type: int1;             { type = 11 }
+               ev_segT: int1;             { seg type 1=private code }
+                                          {          2=data}
+                                          {          3=stack}
+                                          {          4=intrinsic code }
+               ev_sdb: sdb_ptr;           { seg sdb ptr }
+               ev_segN: int2;             { seg number }
+               ev_pcb: absptr;            { c_pcb_ptr }
+             end;
+  (*$ENDC*)
+
+  var
+    c_sdscb_ptr: sdscb_ptr;
+    c_syslocal_ptr: slocal_ptr;
+    c_mmrb: mmrb_ptr;
+    ordaddr: absptr;
+    d_addr: addrdisc;
+    c_ptr_ds_refdb: ptr_ds_refdb;
+    read_in_data, fopenT, incT, segT, refdbT, sdscbT, fswarning: boolean;
+    unitno, sfileno, errnum2, sdslen: int2;
+    lsize, psize, c_length: int4;
+    newlength: int2;
+    attributes: fs_info;
+    size_substituted: boolean;
+    c_mmlist: ptr_1mmlist;
+    private: boolean;
+    fname: pathname;
+
+    (*$IFC DEBUG1*)
+    c_event: ev_log;                      { logging event }
+    (*$ENDC*)
+
+  procedure RECOVER(error: int2);
+    (* used to recover from any errors during DS_OPEN execution *)
+    begin
+      if refdbT then RELDSREFDB(c_ptr_ds_refdb);
+      if incT then c_sdb_ptr^.numbopen:=c_sdb_ptr^.numbopen - 1;
+      if sdscbT then RELSDSCB(c_sdscb_ptr);
+      if segT then REL_SEG(c_sdb_ptr);
+      if fopenT then
+        begin
+          if private then                                                    (*P*)
+            begin                                                            (*P*)
+              CLOSE_TEMP(errnum2,fcbptr);                                    (*P*)
+            end                                                              (*P*)
+           else                                                              (*P*)
+            begin                                                            (*P*)
+              SHOW_REFNUM(errnum2,refnum_fs);                             (*OS154*)
+              CLOSE_OBJECT(errnum2,refnum_fs);
+            end;                                                             (*P*)
+        end;
+      if error <> 0 then errnum:=e_dsbase+error;
+      refnum_ds:=-1;                                                  (*OS154*)
+      goto 10; (* take error exit *)
+    end;(*RECOVER*)
+
+
+  procedure OPENIT;
+    (*open the file, get unitno, sfileid, and fcbptr and*)
+    (*compute disc address of segment                   *)
+    begin
+      if private then                                                        (*P*)
+        begin                                                                (*P*)
+          SplitPathname(errnum,c_name^,unitno,fname);
+          OPEN_TEMP(errnum,unitno,fcbptr);                                   (*P*)
+          if errnum > 0 then RECOVER(e_filesyserr);                          (*P*)
+          fopenT:=true;                                                      (*P*)
+        end                                                                  (*P*)
+       else                                                                  (*P*)
+        begin                                                                (*P*)
+          OPEN(errnum,c_name^,refnum_fs,[dread,dwrite,global_refnum]);       (*P*)
+          if errnum > 0 then if errnum = 948 then RECOVER(e_nods)
+                                             else RECOVER(e_filesyserr);
+          if errnum < 0 then
+            begin
+              if (errnum = -1174) or (errnum = -1175) then fswarning:=true;
+              errnum:=0;
+            end;
+          fopenT:=true;
+
+          CVT_NAME(refnum_fs,unitno,sfileno,fcbptr);
+          HIDE_REFNUM(errnum,refnum_fs);
+          if errnum <> 0 then RECOVER(e_filesyserr);
+        end;                                                                 (*P*)
+
+      (* compute disc address *)
+      d_addr.fid:=ord(fcbptr) - b_sysglobal_ptr;
+      d_addr.offset:=0;
+    end;(*OPENIT*)
+
+  begin
+    errnum:=0;
+    fopenT:=false;
+    incT:=false;
+    segT:=false;
+    refdbT:=false;
+    sdscbT:=false;
+    c_sdb_ptr:=nil;
+    c_sdscb_ptr:=nil;
+    size_substituted:=false;
+    d_addr.fid:=0;
+    d_addr.offset:=0;
+    unitno:=-1;
+    sfileno:=-1;
+    refnum_fs:=-1;
+    c_mmrb:=pointer(mmrb_addr);
+    fswarning:=false;
+    private:=ds_type = ds_private;                                           (*P*)
+
+    if (funct = dsopen) or (funct = dsmake_nf) then
+      SRCH_SDSCB(c_name^,c_sdscb_ptr);
+
+    if c_sdscb_ptr <> nil then
+      begin (* not 1st access - dsopen(defined in sdscb *)
+        if funct = dsmake_nf then Recover (e_dupds);
+
+        with c_sdscb_ptr^ do
+          begin
+            c_sdb_ptr:=sdb_addr;
+            with c_sdb_ptr^ do numbopen:=numbopen+1;
+            incT:=true;
+
+            if open_needed then
+              begin (* closed memory resident data segment*)
+                OPENIT;
+                open_needed:=false;
+                f_refnum:=refnum_fs; (* update sdscb entry *)
+                unitid:=unitno;      (* update sdscb entry *)
+                sfileid:=sfileno;    (* update sdscb entry *)
+                sdb_addr^.discaddr:=d_addr; (* update sdb entry *)
+              end
+             else
+              begin (* already opened data segment *)
+                refnum_fs:=f_refnum;
+                unitno:=unitid;
+                sfileno:=sfileid;
+              end;
+          end;
+      end
+     else
+      begin (* 1st access- dsmake,dsopen(not in sdscb),dsopen-nr,dsmake_nf *)
+
+        if funct <> dsmake_nf then OPENIT; (* open the file *)
+
+        if (funct = dsmake) or (funct = dsmake_nf) then
+          begin (* use the sizes passed by the caller *)
+            c_length:=0;
+            newlength:=mem_size div mempgsize;
+          end
+         else
+          begin (* use the sizes specified by the file *)
+            if funct = dsopen_nr
+              then read_in_data:=false
+              else read_in_data:=true;
+
+            SHOW_REFNUM(errnum,refnum_fs);
+            INFO(errnum,refnum_fs,attributes);
+            if errnum <> 0 then RECOVER(e_filesyserr);
+            HIDE_REFNUM(errnum,refnum_fs);
+            if errnum <> 0 then RECOVER(e_filesyserr);
+            lsize:=attributes.size;
+            psize:=attributes.psize;
+
+            if (lsize > s_maxDsSize) then
+              begin (* existing file has too much disc space-- invalid *)
+                RECOVER(e_dstoobig);
+              end
+             else
+              begin (* length of existing file is nonzero - valid *)
+                if lsize = 0 then
+                  begin
+                    read_in_data:=false;(* no data to read *)
+                    size_substituted:=true;
+                    if psize = 0 then lsize:=512 (* minimum size *)
+                                 else if psize < s_maxDsSize
+                                        then lsize:=psize (* current size *)
+                                        else lsize:=s_maxDsSize; (* max size *)
+                  end;
+              end;
+            if not read_in_data then
+              begin (* ignore data on disc *)
+                c_length:=0;
+                newlength:=lsize div mempgsize;
+              end
+             else
+              begin (* read data from disc *)
+                c_length:=lsize;
+                newlength:=0;
+              end;
+
+            disc_size:=psize;
+          end;
+
+        (* build sdb entry *)
+        BLD_SEG(data,c_length,newlength,d_addr,disc_size,0,c_sdb_ptr);
+        if c_sdb_ptr = nil then RECOVER(e_nosysresources);
+        segT:=true; (* seg built *)
+
+        (*$IFC DEBUG1*)
+        if TRACE(spare2,10) then
+          begin
+            if LOGGING then
+              begin
+                with c_event do
+                  begin
+                    ev_type:=11;
+                    ev_segT:=2;
+                    ev_sdb:=c_sdb_ptr;
+                    ev_segN:=0;
+                    ev_pcb:=c_pcb_ptr;
+                    LOG(errnum,ord(@c_event));
+                    errnum:=0;
+                  end;
+              end;
+          end;
+        (*$ENDC*)
+
+        if private then c_sdb_ptr^.sdbstate.deleteF:=true  (* delete at close *)
+          else
+           begin  (* build sdscb entry *)
+             sdslen:=SIZEOF(sdscb);
+             if funct = dsmake_nf then
+               begin (*no file so save ds name as well*)
+                 SplitPathname(errnum,c_name^,unitno,fname);
+                 UpShift(@fname);
+                 sdslen:=sdslen+length(fname)+1;
+               end;
+             if not GETSPACE(sdslen,b_sysglobal_ptr,ordaddr)
+               then RECOVER(e_nosysresources);
+
+             c_sdscb_ptr:=pointer(ordaddr);
+             with c_sdscb_ptr^ do
+               begin
+                 open_needed:=false;
+                 sdb_addr:=c_sdb_ptr;
+                 f_refnum:=refnum_fs;
+                 unitid:=unitno;
+                 sfileid:=sfileno;
+                 if funct <> dsmake_nf
+                   then ptr_e_name:=nil
+                   else
+                    begin
+                      ptr_e_name:=pointer(ordaddr+sizeof(sdscb));
+                      MOVELEFT(fname,ptr_e_name^,length(fname)+1);
+                    end;
+                 ENQUEUE(chain,c_mmrb^.hd_sdscb_list,b_sysglobal_ptr);
+                 c_mmlist:=pointer(c_sdb_ptr^.srbRP + b_sysglobal_ptr);
+                 c_mmlist^.sdscb_addr:=ordaddr;
+               end;
+             sdscbT:=true;
+           end;
+      end;
+
+    (* allocate space for refdb *)
+    if not GETSPACE(SIZEOF(ds_refdb),b_syslocal_ptr,ordaddr)
+      then RECOVER(e_nosysresources);
+
+    (* allocate refnum *)
+    refnum_ds:=GET_REFNUM(ordaddr,false);
+
+    (* initialize refdb *)
+    c_ptr_ds_refdb:=pointer(ordaddr);
+    with c_ptr_ds_refdb^ do
+      begin
+        header.kind:=dsrefdb;
+        a_sdb_ptr:=c_sdb_ptr;
+        if (funct = dsopen) or (funct = dsopen_nr)
+          then access:=mmureadonly
+          else access:=mmureadwrite;
+        ldsn:=c_ldsn;
+        no_ldsn:=numb_ldsn;
+        dstype:=ds_user;
+        ds_refnum:=refnum_ds;
+        fs_refnum:=refnum_fs;
+        creatorF:=(funct = dsmake) or (funct = dsmake_nf);
+        boundF:=false;
+        privateF:=private;
+        unitid:=unitno;
+
+        (* link refdb into process's data segment chain *)
+        c_syslocal_ptr:=pointer(b_syslocal_ptr);
+        ENQUEUE(header.refdb_list,c_syslocal_ptr^.hd_ds_refdb_list,b_syslocal_ptr);
+      end;(* with *)
+    refdbT:=true; (* refdb and refnum allocated *)
+
+    (* register new refnum with open list *)
+    if (funct = dsmake) or (funct = dsopen)
+      then if private or not fopenT                                          (*P*)
+             then REG_OPEN_LIST(errnum,unitno,0,refnum_ds,dsrefnum)
+             else
+              begin
+                SHOW_REFNUM(errnum,refnum_fs);
+                REG_OPEN_LIST(errnum,unitno,refnum_fs,refnum_ds,dsrefnum);
+                HIDE_REFNUM(errnum,refnum_fs);
+              end;
+    if errnum <> 0 then RECOVER(e_filesyserr);
+
+    (* bind data segment to ldsn *)
+    BIND_DATASEG(errnum,refnum_ds);
+    if errnum <> 0 then RECOVER(0);
+
+    (* return pointer to base of data segment *)
+    segptr:=MMU_BASE(LDSN_TO_MMU(c_ldsn));
+
+    if size_substituted then errnum:=-(e_dsbase + e_subsize)  (* issue warning *)
+                        else if fswarning then errnum:=-(e_dsbase + e_baddata);
+
+10: (* error exit *)
+  end; (* DS_OPEN *)
+
+
+function FULLPAGES( size: int4): int4;
+  (***************************************)
+  (*                                     *)
+  (* Convert size into number of bytes   *)
+  (* which is a multiple of mem pages    *)
+  (*                                     *)
+  (***************************************)
+  begin
+    fullpages:=((size+mempgsize-1) div mempgsize)*mempgsize;
+  end; (*FULLPAGES*)
+
+
+
+procedure MAKE_DATASEG(* var errnum: integer; var segname: pathname;
+                         mem_size, disc_size: longint; var refnum: integer;
+                         var segptr: longint; ldsn: integer; dstype: Tdstype *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Create a data segment of type shared or private.    *)
+       (*    If shared then segname is used to identify it.      *)
+       (*    if private then a name is created using only the    *)
+       (*    volume portion of segname (if present).             *)
+       (*    If segname is null (valid only from the system) then*)
+       (*    a memory resident data segment is created.          *)
+       (*    Once created the segment will be bound  to ldsn.    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    segname is the pathname to be used to identify this *)
+       (*    data segment.                                       *)
+       (*    mem_size is the initial size (bytes) of the segment *)
+       (*    in memory.                                          *)
+       (*    disc_size is the initial size (bytes) of the segment*)
+       (*    while on disc.                                      *)
+       (*    ldsn specifies the mmu to which this segment is to  *)
+       (*    be bound.                                           *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*    refnum is the id to be used for further references  *)
+       (*    to this segment.                                    *)
+       (*    segptr is the absptr to the data segment.           *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*    The mapping registers will be changed if the create *)
+       (*    is successful.                                      *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful creation                      *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badldsn  -- invalid ldsn                *)
+       (*              e_ldsnused -- ds already bound to ldsn    *)
+       (*              e_dstoobig -- segment too large           *)
+       (*              e_dupds    -- data segment already exists *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;                                                                    (*P*)
+
+var
+  errnum2: int2;
+  c_sdb_ptr: sdb_ptr;
+  ptr_segname: ptr_pathname;
+  c_mmrb: mmrb_ptr;
+  refnum_fs: int2;
+  openT, makeT, semT: boolean;
+  private: boolean;
+  blkcnt, actcnt: int4;
+  numb_ldsn: int2;
+  f_segname: pathname;
+  funct: Tdsopen;
+  unitno: int2;
+  fcbptr: sfcb_ptr;                                                          (*P*)
+
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+  procedure RECOVER(error: int2);
+    (* recover from errors during make_dataseg execution *)
+    begin
+      if openT then
+        begin
+          (* force deletion of the data segment *)
+          c_sdb_ptr^.sdbstate.deleteF:=true;
+          DS_CLOSE(errnum2,refnum); (* close data seg *)
+        end;
+      if makeT then KILL_OBJECT(errnum2,ptr_segname^);
+      if semT then SIGNAL_SEM(c_mmrb^.sds_sem);
+      if error <> 0 then errnum:=error+e_dsbase;
+      refnum:=-1; (* make sure refnum indicates invalid value *)
+      goto 10; (* take error exit *)
+    end;
+
+begin
+  openT:=false;
+  makeT:=false;
+  semT:=false;
+
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' make_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  with parmarr do
+    begin
+      numcheck:=3;
+      parms[1].addr:=ord(@segname);
+      parms[1].readwrite:=false;
+      parms[2].addr:=ord(@refnum);
+      parms[2].readwrite:=true;
+      parms[3].addr:=ord(@segptr);
+      parms[3].readwrite:=true;
+    end;
+  if not VALID_ADDR(errnum,parmarr) then RECOVER(0);
+  (*$ENDC*)
+
+  (* validate mem_size and disc_size *)
+  if (mem_size <= 0) or (disc_size < 0) then RECOVER(e_invalidsize);
+  mem_size:=FULLPAGES(mem_size);
+  disc_size:=FULLPAGES(disc_size);
+  if mem_size > s_maxDsSize
+    then if (dstype = ds_shared) or (mem_size > p_maxDsSize)
+           then RECOVER(e_dstoobig);
+
+  (* calculate number of ldsns required to map segment and ensure they are free *)
+  numb_ldsn:=((mem_size-1) div maxmmusize) + 1;
+  if ldsn <= 0 then if not SYS_CALLED then RECOVER(e_badldsn);
+  CHK_LDSN_FREE(errnum,ldsn,numb_ldsn);
+  if errnum <> e_ldsnfree then RECOVER(errnum);
+
+  if disc_size <> 0 then funct:=dsmake                                    (*P*)
+                    else funct:=dsmake_nf;                                (*P*)
+  if dstype = ds_shared then
+    begin (* the shared name is to be used *)
+      ptr_segname:=@segname;
+      private:=false;
+    end
+   else
+    begin (* a private name is to be constructed *)
+      private:=true;
+      SplitPathname(errnum,segname,unitno,f_segname);
+      f_segname:=concat('-',configinfo[unitno]^.devname,'-PDS');
+      ptr_segname:=@f_segname;
+    end;
+
+  c_mmrb:=pointer(mmrb_addr);
+  WAIT_SEM(c_mmrb^.sds_sem,[]);   (* get sds semaphore *)                    (*P*)
+  semT:=true;  (* have semaphore *)
+
+  if (funct = dsmake) and not private then                                   (*P*)
+    begin (* make a file on disk for the data segment *)
+      MAKE_FILE(errnum,ptr_segname^,0);
+      if errnum > 0 then                                                     (*P*)
+        if errnum = 890                                                      (*P*)
+          then RECOVER(e_dupds)                                              (*P*)
+          else RECOVER(e_nodiscspace);                                       (*P*)
+      makeT:=true;  (* file object has been made *)
+    end;
+
+  (* finish open of data segmemt *)
+  DS_OPEN(errnum,ptr_segname,dstype,mem_size,disc_size,ldsn,numb_ldsn,       (*P*)
+          refnum_fs,refnum,segptr,c_sdb_ptr,fcbptr,funct);                   (*P*)
+  if errnum <> 0 then RECOVER(0);
+  openT:=true; (* file is open *)
+
+  if funct = dsmake_nf then
+    begin  (* memory resident seg *)                                         (*P*)
+      c_sdb_ptr^.lockcount:=1;                                               (*P*)
+    end                                                                      (*P*)
+   else                                                                      (*P*)
+    begin  (* pre-allocate disk space for data segment *)
+      blkcnt:=disc_size div 512;
+      if private then                                                        (*P*)
+        begin                                                                (*P*)
+          ALLOCPAGES(errnum,fcbptr,blkcnt);                                  (*P*)
+          if errnum > 0 then RECOVER(e_nodiscspace);                         (*P*)
+        end                                                                  (*P*)
+       else                                                                  (*P*)
+        begin                                                                (*P*)
+          SHOW_REFNUM(errnum,refnum_fs); (* make refnum visible *)
+          ALLOCATE(errnum,refnum_fs,false,blkcnt,actcnt);
+          if (errnum <> 0) or (actcnt < blkcnt) then RECOVER(e_nodiscspace);
+          HIDE_REFNUM(errnum,refnum_fs);
+        end;                                                                 (*P*)
+    end;
+
+  SIGNAL_SEM(c_mmrb^.sds_sem);   (* release sds semaphore *)
+
+10: (* error exit *)
+
+end; (* MAKE_DATASEG *)
+
+
+procedure OPEN2_DATASEG(var errnum: integer; var segname: pathname;
+                        var refnum: integer; var segptr: longint; ldsn: integer;
+                        funct: Tdsopen);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Open the named data segment for immediate use.  The *)
+       (*    named segment must have already been created. The   *)
+       (*    segment will be bound to ldsn.                      *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    segname is the pathname of the desired data segment *)
+       (*    ldsn is the logical mmu to which the data segment   *)
+       (*      is to be bound.                                   *)
+       (*    read_in_data will signal that the disk data is to be*)
+       (*      read in before the segment is accessed if true.   *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    refnum is the id to be used for further references  *)
+       (*       to the data segment.                             *)
+       (*    segptr is an absptr to the data segment.            *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  c_mmrb: mmrb_ptr;
+  refnum_fs: int2;
+  semT: boolean;
+  c_sdb_ptr: sdb_ptr;
+  fcbptr: sfcb_ptr;                                                          (*P*)
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+procedure RECOVER(error: int2);
+  (* recover from errors during open_dataseg execution *)
+  begin
+    if error <> 0 then errnum:=error+e_dsbase;
+    refnum:=-1; (* make sure refnum indicates an invalid value *)
+    goto 10; (* take error exit *)
+  end;
+
+begin
+  semT:=false;
+
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' open_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  with parmarr do
+    begin
+      numcheck:=3;
+      parms[1].addr:=ord(@segname);
+      parms[1].readwrite:=false;
+      parms[2].addr:=ord(@refnum);
+      parms[2].readwrite:=true;
+      parms[3].addr:=ord(@segptr);
+      parms[3].readwrite:=true;
+    end;
+  if not VALID_ADDR(errnum,parmarr) then RECOVER(0);
+  (*$ENDC*)
+
+  CHK_LDSN_FREE(errnum,ldsn,1);
+  if errnum <> e_ldsnfree then RECOVER(errnum);
+
+  if LENGTH(segname) = 0
+    then RECOVER(e_badpathname)
+    else
+     begin (* shared data segment *)
+       c_mmrb:=pointer(mmrb_addr);
+       WAIT_SEM(c_mmrb^.sds_sem,[]);   (* get sds semaphore *)
+       semT:=true; (* have semaphore *)
+
+       (* complete open of data segment *)
+       DS_OPEN(errnum,@segname,ds_shared,0,0,ldsn,1,                         (*P*)
+                  refnum_fs,refnum,segptr,c_sdb_ptr,fcbptr,funct);           (*P*)
+       if errnum > 0 then RECOVER(0);
+     end;
+
+10: (* error exit *)
+  if semT then SIGNAL_SEM(c_mmrb^.sds_sem);                                  (*P*)
+end; (* OPEN2_DATASEG *)
+
+
+procedure OPEN_DATASEG(* var errnum: integer; var segname: pathname;
+                 var refnum: integer; var segptr: longint; ldsn: integer *);
+
+       (**************************************************************)
+       (*                                                            *)
+       (* Open the data segment and read the data from the disc      *)
+       (* before the segment is initially accessed.                  *)
+       (* See OPEN2_DATASEG for description of parameters.           *)
+       (*                                                            *)
+       (**************************************************************)
+   label 10;                                                                  (*P*)
+   begin                                                                      (*P*)
+     if ldsn > 0 then                                                         (*P*)
+       begin                                                                  (*P*)
+10:      OPEN2_DATASEG(errnum,segname,refnum,segptr,ldsn,dsopen);             (*P*)
+       end                                                                    (*P*)
+      else                                                                    (*P*)
+       begin                                                                  (*P*)
+         if SYS_CALLED then goto 10                                           (*P*)
+                       else errnum:=e_dsbase + e_badldsn;                     (*P*)
+       end;                                                                   (*P*)
+   end;(* OPEN_DATASEG *)
+
+
+
+procedure OPEN_NR_DATASEG(* var errnum: integer; var segname: pathname;
+                 var refnum: integer; var segptr: longint; ldsn: integer *);
+
+       (**************************************************************)
+       (*                                                            *)
+       (* Open the data segment and ignore any data on the disc      *)
+       (* when the segment is initially accessed.                    *)
+       (* See OPEN2_DATASEG for description of parameters.           *)
+       (*                                                            *)
+       (**************************************************************)
+
+   begin
+     OPEN2_DATASEG(errnum,segname,refnum,segptr,ldsn,dsopen_nr);              (*P*)
+   end;(* OPEN_NR_DATASEG *)
+
+
+
+procedure MAKE_SYSDATASEG(* var errnum: int2; var progname: pathname; memsize,
+                         discsize: int4; var refnum: int2; var segptr: absptr;
+                         ldsn: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Create a data segment of type private.  This        *)
+       (*    interface is used only by the system.  The segment  *)
+       (*    created is located on a disc using the following    *)
+       (*    hierarchy:                                          *)
+       (*       Boot disk = Hard Disk    All other Combinations  *)       (*P*)
+       (*       Skill on Twiggy                                  *)       (*P*)
+       (*       1st - Boot disk          1st - Skill Disk        *)
+       (*       2nd - Skill Disk         2nd - Boot Disk         *)
+       (*    Once created the segment will be bound  to ldsn.    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    progname is the pathname to be used to identify the *)
+       (*    skill                                               *)
+       (*    memsize is the initial size (bytes) of the segment  *)
+       (*    in memory.                                          *)
+       (*    discsize is the initial size (bytes) of the segment *)
+       (*    on disk.                                            *)
+       (*    ldsn specifies the mmu to which this segment is to  *)
+       (*    be bound.                                           *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*    refnum is the id to be used for further references  *)
+       (*    to this segment.                                    *)
+       (*    segptr is the absptr to the data segment.           *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*    The mapping registers will be changed if the create *)
+       (*    is successful.                                      *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful creation                      *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badldsn  -- invalid ldsn                *)
+       (*              e_ldsnused -- ds already bound to ldsn    *)
+       (*              e_dstoobig -- segment too large           *)
+       (*              e_dupds    -- data segment already exists *)
+       (*                                                        *)
+       (**********************************************************)
+   var
+     firstunit, secondunit, progunit: int2;
+     fname: pathname;
+
+   procedure MAKE_IT(unitno: int2);
+     var
+       dsname: pathname;
+
+     begin
+       if unitno = -1                                                         (*P*)
+         then dsname:='x'                                                     (*P*)
+         else dsname:=concat('-',configinfo[unitno]^.devname,'-PDS');         (*P*)
+       MAKE_DATASEG(errnum,dsname,memsize,discsize,refnum,segptr,ldsn,ds_private);
+     end;(*MAKE_IT*)
+
+   begin
+     if discsize = 0 then                                                     (*P*)
+       begin  (*memory resident data seg *)                                   (*P*)
+         MAKE_IT(-1);                                                         (*P*)
+       end                                                                    (*P*)
+      else                                                                    (*P*)
+       begin  (*disc resident data seg *)                                     (*P*)
+         SPLITPATHNAME(errnum,progname,progunit,fname);
+         IF ((bootdev <> 1) and (bootdev <> 2)) and                           (*P*)
+            ((progunit = 1) or  (progunit = 2)) then                          (*P*)
+           begin (*Booted from non-twiggy and skill is on twiggy *)           (*P*)
+             firstunit:=bootdev;                                              (*P*)
+             secondunit:=progunit;                                            (*P*)
+           end                                                                (*P*)
+          else                                                                (*P*)
+           begin                                                              (*P*)
+             firstunit:=progunit;                                             (*P*)
+             secondunit:=bootdev;                                             (*P*)
+           end;                                                               (*P*)
+
+         MAKE_IT(firstunit);
+         if (errnum = 309) or  (* no disc space *)
+            (errnum = 312) then  (* unexpected file system error *)
+           begin
+             if secondunit <> firstunit then MAKE_IT(secondunit);             (*P*)
+           end;
+       end;                                                                   (*P*)
+   end;(*MAKE_SYSDATASEG*)                                                    (*P*)
+
+
+
+procedure CLOSE_DATASEG(* var errnum: integer; refnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Close the data segment defined by refnum to further *)
+       (*    access by the calling process.  The refnum will be  *)
+       (*    deallocated.  The data segment will be unbound.     *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum specifies the data segment to be closed.     *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*       close operation.                                 *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  ordrefdbptr: absptr;
+  c_sdb_ptr: sdb_ptr;
+  c_mmrb: mmrb_ptr;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' close_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  parmarr.numcheck:=0;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;                             (*P*)
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10;                                                (*P*)
+
+  c_mmrb:=pointer(mmrb_addr);
+  WAIT_SEM(c_mmrb^.sds_sem,[]);   (* get sds semaphore *)                     (*P*)
+  DS_CLOSE(errnum,refnum);  (* complete close of data segment *)              (*P*)
+  SIGNAL_SEM(c_mmrb^.sds_sem);                                                (*P*)
+
+10: (* error exit *)
+
+end; (* CLOSE_DATASEG *)
+
+
+procedure KILL_DATASEG(* var errnum: integer; var segname: pathname *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Deletes the pathname "segname" from the file system *)
+       (*    directory.                                          *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    segname is the pathname which identifies the data   *)
+       (*    segment to be deleted.                              *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum specifies the success or failure of the      *)
+       (*    delete operation.                                   *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  c_sdscb_ptr: sdscb_ptr;
+  c_mmrb: mmrb_ptr;
+  semT: boolean;
+  c_mmlist: ptr_1mmlist;
+
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+procedure RECOVER(error: int2);
+  (* recover from errors during execution of kill_dataseg *)
+  begin
+    if semT then SIGNAL_SEM(c_mmrb^.sds_sem);
+    if error <> 0 then errnum:=e_dsbase+error;
+    goto 10; (* take error exit *)
+  end;
+
+begin
+  semT:=false;
+  errnum:=0;
+
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' kill_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  with parmarr do
+    begin
+      numcheck:=1;
+      parms[1].addr:=ord(@segname);
+      parms[1].readwrite:=false;
+    end;
+  if not VALID_ADDR(errnum,parmarr) then RECOVER(0);
+  (*$ENDC*)
+
+  c_mmrb:=pointer(mmrb_addr);
+  WAIT_SEM(c_mmrb^.sds_sem,[]);   (* get sds semaphore *)                     (*P*)
+  semT:=true;
+
+  SRCH_SDSCB(segname,c_sdscb_ptr);
+  if c_sdscb_ptr <> nil then
+    begin
+      with c_sdscb_ptr^.sdb_addr^ do
+        begin
+          c_mmlist:=pointer(srbRP + b_sysglobal_ptr);
+          c_mmlist^.sdscb_addr:=ord(nil);
+
+          if numbopen = 0
+            then REL_SEG(c_sdscb_ptr^.sdb_addr) (* no users *)
+            else sdbstate.deleteF:=true; (*delete when no users *)
+
+          RELSDSCB(c_sdscb_ptr);
+
+          if discaddr.fid <> 0 then                                           (*P*)
+            begin (* a file is behind the data segment*)                      (*P*)
+              (* kill file system object *)                                   (*P*)
+              KILL_OBJECT(errnum,segname);                                    (*P*)
+              if (errnum <> 0) and                                            (*P*)
+                 (errnum <> 894) then RECOVER(e_filesyserr);                  (*P*)
+            end;                                                              (*P*)
+        end;                                                                  (*P*)
+    end                                                                       (*P*)
+   else                                                                       (*P*)
+    begin                                                                     (*P*)
+      (* kill file system object *)                                           (*P*)
+      KILL_OBJECT(errnum,segname);                                            (*P*)
+      if errnum <> 0                                                          (*P*)
+        then if errnum = 894 then RECOVER(e_nods) (* object not found *)      (*P*)
+                             else RECOVER(e_filesyserr);                      (*P*)
+    end;                                                                      (*P*)
+
+
+  SIGNAL_SEM(c_mmrb^.sds_sem);   (* release sds semaphore *)
+
+10:  (* error exit *)
+
+end; (* KILL_DATASEG *)
+
+
+ÿ

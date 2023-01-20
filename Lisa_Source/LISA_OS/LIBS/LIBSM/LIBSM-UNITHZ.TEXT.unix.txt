@@ -1,0 +1,2890 @@
+{$R-}
+
+UNIT UnitHz;
+
+(* copyright 1983, Apple Computer Inc. *)
+
+{ 1/25/83 Steve Rhodes Added LockHandleInConcrete and UnlockHandleFromConcrete
+                       in order to support the QuickDraw. Unlike HLockN & UnlockN
+                       these are "real" locks that force the block to be
+                       non-relocatable for a short period of time. It assumes
+                       (correctly according to Bill) that QuickDraw during locking
+                       will:
+                             1. Do no HAllocate's.
+                             2. Only lock 1 block at a time.
+                             3. Not grow the locked block.
+                             4. Not dereference the handle until the lock returns.
+                             5. Make locking duration short (a few insrtucions).
+
+                       This implementation is admittedly a kludge.
+                                    [Mother of God, Pray for us sinners!]       }
+
+{ 5/10/83 TJM  added TBp to increase number of handles;
+               implemented handles for named objects }
+{ 3/14/83 B. Silverberg  BkNrelGrow routine called within AllocBk;
+    add scrambler version info to TAHz (fScramble, fCheck, cCompact) }
+{ 2/10/83 B. Silverberg  added (hz^.cbFree >= db) test to GrowHInPlace }
+{ 2/9/83  Bruce Daniels  Commented out the lock & unlock of HZ fSemMapping }
+
+INTRINSIC SHARED;
+
+INTERFACE
+
+{$SETC fhz  := FALSE}
+{$SETC fhzP := FALSE}
+
+USES
+     {$U libsm/UnitStd} UnitStd,
+     {$U libos/SysCall} SysCall;
+
+CONST tybkFree = 0;
+      tybkStd = 1;
+      tybkN = 2;
+      tybkNrel = 3;
+      {$IFC NOT fhz}  fTstHz  = FALSE; {$ENDC}
+      {$IFC NOT fhz}  fTstHzV = FALSE; {$ENDC}
+      {$IFC NOT fhzP} fTstHzP = FALSE; {$ENDC}
+
+      ipPoolMax = 32000;                {32767 is exactly correct +-1}
+      cbMinAsk = 512;                   {The least I will ask to grow the heap by}
+      MaxBlkSize = 32767;               {Maximum block size + 1}
+
+TYPE TH = ^TP;
+
+ TArgh = ARRAY [0..0] OF TH;
+ TRgh = ^TArgh;
+
+ TTybk = 0..3;
+
+ THz = ^TAhz;
+
+ {All this stuff is here so THz can exist in interface}
+ TBp = PACKED RECORD
+    fRelPBase: TF;
+    CASE {fRelPBase} TF OF
+    FALSE: (ip: 0..32000);
+    TRUE:  (iwP: 0..32000);
+    END;
+
+ TPpn = ^TPn;
+ TStn = PACKED RECORD
+    tybk:   TTybk; {Tybk is repeated in stn so that by going back from handle
+                    of locked, named object you can find the type.  Here it
+                    is in same position relative to where handle points as for
+                    standard relocatable block}
+    fDirty: TF;
+    fLock: TF;
+    fill: 0..15;
+    ubt: TB;
+    END;
+ TNob = RECORD n: TN; stn: TStn; bp: TBp; data: TW; END;
+ TPnob = ^TNob;
+ TPpnob = ^TPnob;
+ TArgpnob = ARRAY [0..0] OF TPnob;
+ TRgpnob = ^TArgpnob;
+ THrgpnob = ^TRgpnob;
+
+ TBk = ^TAbk;
+ TAbk = RECORD
+    CASE {free block?} TF OF
+    FALSE:
+           (hdr: PACKED RECORD
+                tybk:   TTybk;
+                cw:     0..16000;
+                END;
+           CASE TTybk OF
+           tybkNrel: (dataNrel: TW);
+           tybkStd: (bp: TBp; dataStd: TW);
+           tybkN:  (SpaceForCompactRoutine: Integer;
+                    nob:   TNob);
+           );
+    TRUE:
+           (cwFree: TL;
+           bkfNxt: TBk;
+           bkfPrv: TBk;
+           );
+    END;
+
+ TArgwBase = ARRAY [0..0] OF TW;
+ TRgwBase = ^TArgwBase;
+
+ TAhz = RECORD
+    bkFst:   TBk;
+    bkLst:   TBk;
+    bkfFst:   TBk;
+    rgwBase:  TRgwBase;
+    ipPoolMac:     TC;
+    hFstFree: TH;
+    cbFree: TL;
+    hrgpnob:   THrgpnob;
+    mskIpnLst: TW;
+    ipnCur: TC;
+    cpnAvail: TC;
+    ubtCur: TB;
+    procCbMore: TProc;
+    procCbOfN: TProc;
+    procFSwapInN: TProc;
+    procSwapOutN: TProc;
+    fScramble: TF;      {scramble flag}
+    hScramble: TH;      {block to scramble below}
+    fUpScramble: TF;    {Scrambling up(or down) flag}
+    fCheck: TF;         {if true, check hz}
+    cCompact: TC;       {# of compactions}
+    HasConcrete: TF;    {There is a LockHandleInConcrete in progress in this Heap}
+    argpPool: ARRAY [0..0] OF TP;
+    END;
+
+VAR hNil:   TH;
+    pNil:   TP;
+    hzNil:  THz;
+   {$IFC fhz}  fTstHzV: TF; {$ENDC}
+   {$IFC fhz}  fTstHz:  TF; {$ENDC}
+   {$IFC fhzP} fTstHzP: TF; {$ENDC}
+
+FUNCTION HAllocate(hz: THz; cb: TC) : TH;
+
+FUNCTION HzInit(pFst: TP; pLim: TP; pBase: TP; ipPoolMac: TC;
+ logIpnLim: TC; procCbMore: TProc; procCbOfN: TProc; procFSwapInN: TProc;
+ procSwapOutN: TProc) : THz;
+
+PROCEDURE PxHz(hz: THz);
+
+PROCEDURE ChangeSizeH(hz: THz; h: TH; cbNew: TC);
+
+PROCEDURE ChangeNSize(hz: THz; n: TN; cbNew: TC);
+
+PROCEDURE FreeBk(hz: THz; h: TH; tybk: TTybk);
+
+PROCEDURE AllocBk(hz: THz; hDst: TH; cb: TC; tybk: TTybk);
+
+FUNCTION PMapN(hz: THz; nSrc: TN) :TP;
+
+FUNCTION PCreateNob(hz: THz; nSrc: TN; cbData: TC) : TP;
+
+PROCEDURE SetFDirty(hz: THz; n: TN; fDirty: TF);
+
+PROCEDURE SetCbFree(hz: THz; cbFree: TL; fEnlargeHz: TF);
+
+FUNCTION CbDataOfH(hz: THz; h: TH) : TC;
+
+FUNCTION PAllocate(hz: THz; cb: TC) : TP;
+
+PROCEDURE FreeH(hz: THz; h: TH);
+
+PROCEDURE FreeP(hz: THz; p: TP);
+
+PROCEDURE FreeN(hz: THz; n: TN);
+
+PROCEDURE ReleaseBkNrel(hz: THz; pFstRelease: TP);
+
+FUNCTION PLstFree(hz: THz) : TP;
+
+FUNCTION HzFromH(h: TH) : THz;
+
+FUNCTION FCheckHzOk(hz: THz; VAR cBkStd: TC) : TF;
+
+FUNCTION HLockN(hz: THz; n: TN; fNeedH: TF) : TH;
+
+PROCEDURE UnlockN(hz: THz; n: TN);
+
+PROCEDURE LockHandleInConcrete(h: TH);     {ONLY for use by QuickDraw!!!}
+
+PROCEDURE UnlockHandleFromConcrete(h: TH); {ONLY for use by QuickDraw!!!}
+
+PROCEDURE EnlargeHz(hz: THz; cbMore: TL);
+
+FUNCTION CbShrinkHz(hz: THz; cbLess: TL) : TL;
+
+FUNCTION CbOfHz(hz: THz) : TL;
+
+{$IFC fOS}
+FUNCTION CbMoreGrowSeg(hz: THz; cbNeed: TC) : TC;
+{$ENDC}
+
+FUNCTION PnobFromN(hz: THz; n: TN) : TPnob;
+
+PROCEDURE Scramble(hz: THz);
+
+IMPLEMENTATION
+
+CONST cbTybkAndCw = 2;
+      cbOvhStd = 4;
+      cbMinFree = 12;
+      cbMinDataStd = 8;  {i.e. cbMinFree - dbBkStd }
+      cbBkLst = 12;   { i.e. = cbMinFree }
+      dbBkStd = 4;       {offset of data from bk for tybkStd}
+      dbBkNrel = 2;      {offset of data from bk for tybkNrel}
+      dbBkNNob = 4;      {offset of nob from bk for tybkN}
+      dbBkNData = 12;       {offset of data from bk for tybkN}
+      mskUbt = 255;
+      cpnSearch = 5;
+      ipnNil = MAXINT;
+      ohMax = MAXINT;
+      mskEven = -2;
+      cpPoolMore = 20;
+      cbNoFind = 2000000000;
+      iwPMax = MAXINT;
+      Init_Scramble = FALSE;  {Default to not scrambling unless fScramble is set}
+      Ask_Question = FALSE;
+
+TYPE TNOrFoo = PACKED RECORD
+    CASE TC OF
+    1:   (n:     TN);
+    2:      (b1: TB; b2: TB; b3: TB; b4: TB);
+    3:      (w1: TW; w2: TW);
+    END;
+ TPh = ^TH;
+
+VAR bkNil:  TBk;
+    argcbOvh: ARRAY [TTybk] OF TC;
+    argdbBk: ARRAY [TTybk] OF TC;
+    cbPoolMore: TL;
+
+FUNCTION CbOfN(n: TN; proc: TProc): TC; EXTERNAL;
+
+FUNCTION FSwapInN(hz: THz; n: TN; proc: TProc): TF; EXTERNAL;
+
+PROCEDURE SwapOutN(hz: THz; n: TN; proc: TProc); EXTERNAL;
+
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  CbOfHz
+
+**********************************************************************************}
+
+FUNCTION CbOfHz{hz: THz) : TL};
+BEGIN {CbOfHz}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('CbOfHz:   hz = ', ORD(hz):1);
+
+CbOfHz := ORD(hz^.bkLst) + cbBkLst - ORD(hz);
+END; {CbOfHz}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  IpnChoose
+
+**********************************************************************************}
+
+FUNCTION IpnChoose(hz: THz) : TC;
+LABEL   40;
+VAR
+ipn:    TC;
+ipnMin: TC;
+worth:  TC;
+worthMin:       TC;
+pnob:   TPnob;
+cpn:    TC;
+ipnFst: TC;
+ipnOfPnNil: TC;
+BEGIN {IpnChoose}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+
+worthMin := MAXINT;
+ipnMin := ipnNil;
+ipn := hz^.ipnCur;
+ipnFst := ipn;
+cpn := 0;
+WHILE TRUE DO
+ BEGIN
+ pnob := hz^.hrgpnob^^[ipn];
+ IF (pnob <> NIL) THEN
+          BEGIN
+          IF NOT pnob^.stn.fLock THEN
+               BEGIN
+               worth := mskUbt-WAnd(hz^.ubtCur-pnob^.stn.ubt, mskUbt);
+               IF worth < worthMin THEN
+                    BEGIN
+                    ipnMin := ipn;
+                    worthMin := worth;
+                    END;
+               cpn := cpn+1;
+               IF cpn = cpnSearch THEN GOTO 40;
+               END;
+          END;
+ ipn := WAnd(ipn+1, hz^.mskIpnLst);
+ IF ipn = ipnFst THEN GOTO 40;
+ END;
+40:
+IpnChoose := ipnMin;
+hz^.ipnCur := ipn;
+IF fTstHz THEN WRITELN('IpnChoose:   hz = ', ORD(hz):1, '   ipnMin = ', ipnMin:1);
+END; {IpnChoose}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  IpnMapN
+
+**********************************************************************************}
+
+FUNCTION IpnMapN(hz: THz; nSrc: TN) : TC; EXTERNAL;
+(* LABEL   11;
+VAR
+ipn:    TC;
+nOrFooT:     TNOrFoo;
+nOrFooT1:    TNOrFoo;
+ppnobT:   TPpnob;
+pnobT:    TPnob;
+BEGIN {IpnMapN}
+nOrFooT.n := nSrc;
+IF (fTstHz) AND (NOT fPxingHz) THEN
+ BEGIN
+ WRITE('IpnMapN - pnSrc:'); PxN(nSrc);
+ WITH nOrFooT DO
+ WRITELN(' nT:(',b1,',',b2,',',b3,',',b4,') (',w1,',',w2,')');
+ END;
+nOrFooT1.w1 := WXor(nOrFooT.w1,nOrFooT.w2);
+ipn := WAnd(WXor(nOrFooT1.b1,nOrFooT1.b2), hz^.mskIpnLst);
+WHILE TRUE DO
+ BEGIN
+ IF (fTstHz) AND (NOT fPxingHz) THEN WRITE(ipn, ' ');
+ pnobT := hz^.hrgpnob^^[ipn];
+ IF pnobT = NIL THEN GOTO 11;
+ IF pnobT^.n = nSrc THEN GOTO 11;
+ ipn := WAnd(ipn+1, hz^.mskIpnLst);
+ END;
+11:
+IF (fTstHz) AND (NOT fPxingHz) THEN WRITELN('IpnMapN:',ipn);
+IpnMapN := ipn;
+END; {IpnMapN}
+*)
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  PnobFromN
+
+**********************************************************************************}
+
+FUNCTION PnobFromN{hz: THz; n: TN) : TPnob};
+BEGIN {PnobFromN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN WRITELN('PnobFromN:   hz = ', ORD(hz):1, '   n = ', n:1);
+PnobFromN := hz^.hrgpnob^^[IpnMapN(hz, n)];
+END; {PnobFromN}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  SetFDirty
+
+**********************************************************************************}
+
+PROCEDURE SetFDirty{hz: THz; n: TN; fDirty: TF};
+VAR
+pnob:   TPNob;
+BEGIN {SetFDirty}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN WRITELN('SetFDirty:   hz = ', ORD(hz):1, '   n = ', n:1);
+pnob := PnobFromN(hz, n);
+IF pnob <> NIL THEN pnob^.stn.fDirty := fDirty;
+END; {SetFDirty}
+
+
+
+{$S SegPxHz}
+{**********************************************************************************
+
+==========>  PxN
+
+**********************************************************************************}
+
+PROCEDURE PxN(n: TN);
+VAR pfd: TPfd;
+BEGIN {PxN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+pfd := @n;
+WRITELN('[ifil bhi iblo]: [', pfd^.ifil:2, ' ', pfd^.bhi:4,
+ ' ', pfd^.iblo:4, ']');
+{$ENDC}
+END; {PxN}
+
+
+{$S SegPxHz}
+{**********************************************************************************
+
+==========>  CbPxBk
+
+**********************************************************************************}
+
+FUNCTION CbPxBk(hz: THz; bk: TBk) : TL;
+VAR
+hT:     TH;
+pT:     TP;
+pnT:    TPn;
+ipn:    TC;
+pnobT:  TPnob;
+cb:     TL;
+typebk:  TTybk;
+BEGIN {CbPxBk}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+IF bk^.hdr.tybk <> tybkFree THEN
+ cb := bk^.hdr.cw * 2
+ELSE    cb := bk^.cwFree * 2;
+CbPxBk := cb;
+WRITELN('bk: ', ORD(bk), '; cb:', cb:5, '; tybk');
+typebk := bk^.hdr.tybk;
+IF (typebk = tybkNrel) AND hz^.HasConcrete THEN BEGIN
+   WRITE('+++LOCKED+++ ');
+   typebk := tybkStd;
+END;
+
+CASE typebk OF
+tybkFree:
+ WRITELN('Free; bkfNxt: ', ORD(bk^.bkfNxt), '; bkfPrv: ', ORD(bk^.bkfPrv));
+tybkNrel:
+ WRITELN('Nrel');
+tybkStd:
+ BEGIN
+ IF bk^.bp.fRelPBase THEN
+         hT := POINTER(ORD(hz^.rgwBase) + (ORD4(bk^.bp.iwP) * 2))
+ ELSE    hT := POINTER(ORD(@hz^.argpPool) + (ORD4(bk^.bp.ip) * 4));
+ pT := @bk^.dataStd;
+ IF hT^ <> pT THEN
+          BEGIN
+          WRITELN;
+          WRITELN('Back pointer error - h^ (', ORD(hT^),
+           ') <> bk^.data (', ORD(pT), ')');
+          END;
+ WRITELN('Std; bp: (', bk^.bp.fRelPBase, ', ', bk^.bp.ip, ')');
+ END;
+tybkN:  BEGIN
+ ipn := IpnMapN(hz, bk^.nob.n);
+ WRITE('N; ipn:', ipn:3, '; '); PxN(bk^.nob.n);
+ pnobT := @bk^.nob;
+ WRITELN('; ubt: ', bk^.nob.stn.ubt:1, '; stn.tybk:', bk^.nob.stn.tybk:2,
+    '; fDirty:', ORD(bk^.nob.stn.fDirty):2);
+ WRITELN('bp: (', bk^.nob.bp.fRelPBase, ', ', bk^.nob.bp.ip, ')');
+ IF hz^.hrgpnob^^[ipn] <> pnobT THEN
+          WRITELN('Nob error - hrgpnob^^[ipn] <> nob (',
+           ORD(pnobT), ')');
+ END;
+END;
+{$ENDC}
+END; {CbPxBk}
+
+
+{$S SegPxHz}
+{**********************************************************************************
+
+==========>  PxHz
+
+**********************************************************************************}
+
+PROCEDURE PxHz;
+VAR
+cbFreeT: TL;
+bk:     TBk;
+ipn:    TC;
+BEGIN {PxHz}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+WRITELN('..................  P x H z    D U M P    S T A R T  ...................');
+WRITELN('hz: ', ORD(hz), ', bkFst: ', ORD(hz^.bkFst), ' bkLst: ', ORD(hz^.bkLst),
+ ', bkfFst: ', ORD(hz^.bkfFst));
+WRITELN('  rgwBase: ', ORD(hz^.rgwBase),
+ ', ipPoolMac: ', hz^.ipPoolMac, ', hFstFree: ', ORD(hz^.hFstFree),
+ ', cbFree: ', hz^.cbFree);
+WRITELN('  hrgpnob: ', ORD(hz^.hrgpnob), ', mskIpnLst: ', hz^.mskIpnLst,
+ ', ubtCur: ', hz^.ubtCur, ', ipnCur: ', hz^.ipnCur);
+bk := hz^.bkFst;
+WHILE (ORD(bk) >= ORD(hz^.bkFst)) AND (ORD(bk) <= ORD(hz^.bkLst)) DO
+ BEGIN
+ bk := POINTER(ORD(bk) + CbPxBk(hz, bk));
+ END;
+WRITELN('Free List:');
+cbFreeT := 0;
+bk := hz^.bkfFst;
+ REPEAT
+ cbFreeT := cbFreeT+CbPxBk(hz, bk);
+ bk := bk^.bkfNxt;
+ UNTIL bk = hz^.bkfFst;
+IF (cbFreeT - cbBkLst) <> hz^.cbFree THEN
+ WRITELN('cbFreeT (', cbFreeT, ') <> hz^.cbFree(', hz^.cbFree, ')');
+WRITELN('..................  P x H z    D U M P    E N D  .......................');
+{$ENDC}
+END; {PxHz}
+
+
+{$S SegPxHz}
+{**********************************************************************************
+
+==========>  FCheckHzOk
+
+**********************************************************************************}
+
+FUNCTION FCheckHzOk{hz: THz; cBkStd: TC) : TF};
+const
+  tyChkLex = 0;
+  tyChkFreeBk = 1;
+  tyChkMasters  = 2;
+  tyChkContP  = 3;
+  tyChkRgpnob = 4;
+type
+  TTyChk = 0..4;
+var
+  tyChk: TTyChk;
+  fOkay: TF;
+
+
+{**********************************************************************************
+
+==========>  HeapErr
+
+**********************************************************************************}
+
+procedure HeapErr (iErrNum: TC; iBadVal: TL; spMsg: TSp);
+
+var
+  spT: TSp;
+begin {HeapErr}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+   WRITELN;
+   writeln ('Heap error found during check heap.  hz: (', ORD(hz), ')');
+   writeln (spMsg);
+   write ('Error found during ');
+   case tyChk of
+     tyChkLex: spT := 'Contiguous block check';
+     tyChkFreeBk: spT := 'Free block list traversal';
+     tyChkMasters:  spT := 'Free master pointer list traversal';
+     tyChkContP:  spT := 'Contiguous check of master pointer pool';
+     tyChkRgpnob: spT := 'Contiguous check of named objects pool';
+   end;
+   writeln (spT);
+
+   writeln ('Error ID: <', iErrNum:3, '>;   Suspected bad value: (',
+                 iBadVal, ')');
+   fOkay := FALSE;
+{$ENDC}
+   end; {HeapErr}
+
+
+{**********************************************************************************
+
+==========>  FChkBk
+
+**********************************************************************************}
+
+function FChkBk (bk: Tbk; tybkExp: TTybk; var cb: TL): TF;
+  var
+    hT:    TH;
+    pT:    TP;
+    ipn:   TC;
+    pnobT: Tpnob;
+    fGood: TF;
+    bkNxt: TBk;
+    bkPrv: TBk;
+    typebk:  TTybk;
+    ItsOkay: TF;
+  begin {FChkBk}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+IF fTstHz THEN
+   WRITE('FChkBk:  bk=', ORD(bk):1, '  tybkExp=', ORD(tybkExp):1);
+
+    ItsOkay := TRUE;
+    typebk := bk^.hdr.tybk;
+    IF (typebk = tybkNrel) AND hz^.HasConcrete THEN {Change to real type}
+       typebk := tybkStd;
+
+    fGood := (ORD(bk) >= ORD(hz^.bkFst)) AND (ORD(bk) <= ORD(hz^.bkLst));
+    IF fGood THEN
+      BEGIN
+      if typebk = tybkFree then
+        cb := bk^.cwFree * 2
+      else
+        cb := bk^.hdr.cw * 2;
+
+      if typebk <> tybkExp then begin
+        HeapErr (1, ORD(typebk), 'tybk does not match expected type');
+        ItsOkay := FALSE;
+      end;
+
+      case typebk of
+
+       tybkFree:
+        begin
+          {check nxt and prv pointers in valid range}
+        fGood := (ORD(bk^.bkfNxt) >= ORD(hz^.bkFst)) and
+                   (ORD(bk^.bkfNxt) <= ORD(hz^.bkLst)) and
+                   (ORD(bk^.bkfPrv) >= ORD(hz^.bkFst)) and
+                   (ORD(bk^.bkfPrv) <= ORD(hz^.bkLst));
+        bkNxt := bk^.bkfNxt;
+        bkPrv := bk^.bkfPrv;
+        fGood := fGood AND
+                  (ORD(bkNxt^.bkfPrv) = ORD(bk)) AND (ORD(bkPrv^.bkfNxt) =
+                  ORD(bk));
+        end;
+
+       tybkStd:
+        begin
+          IF bk^.bp.fRelPBase THEN
+                  hT := POINTER(ORD(hz^.rgwBase) + (ORD4(bk^.bp.iwP) * 2))
+          ELSE    hT := POINTER(ORD(@hz^.argpPool) + (ORD4(bk^.bp.ip) * 4));
+          pT := @bk^.dataStd;
+          if hT^ <> pT then
+            begin
+              fGood := false;
+              HeapErr (2, ORD(hT), 'Back pointer error in tybkStd block');
+              ItsOkay := FALSE;
+            end;
+        end;
+
+       tybkN:
+        begin
+          ipn := IpnMapN (hz, bk^.nob.n);
+          pnobT := @bk^.nob;
+          if hz^.hrgpnob^^[ipn] <> pnobT then
+            begin
+              fGood := false;
+              HeapErr (3, ORD(pnobT), 'Name mismatch in tybkN block');
+              ItsOkay := FALSE;
+            end;
+        end;
+
+       tybkNRel:
+        begin
+        end;
+
+      end; {case}
+      END
+    ELSE BEGIN
+      HeapErr(4, ORD(bk), 'Bk out of bounds');
+      ItsOkay := FALSE;
+    END;
+
+    FChkBk := ItsOkay;
+    IF fTstHz THEN
+       WRITELN('  cb = ', cb:1, '  Okay = ', ORD(ItsOkay):1);
+{$ENDC}
+  end; {FChkBk}
+
+
+{**********************************************************************************
+
+==========>  CheckContBlks
+
+**********************************************************************************}
+
+PROCEDURE CheckContBlks;
+
+  var
+    bk:     TBk;
+    cbBk: TL;
+    typebk:  TTybk;
+
+  begin {CheckContBlks}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+IF fTstHz THEN WRITELN('CheckContBlks');
+
+  tyChk := tyChkLex;
+  bk := hz^.bkFst;
+  cBkStd := 0;
+  while (ORD(bk) >= ORD(hz^.bkFst)) and (ORD(bk) <= ORD(hz^.bkLst)) and
+        fOkay DO
+    begin
+    typebk := bk^.hdr.tybk;
+    IF (typebk = tybkNrel) AND hz^.HasConcrete THEN {Change to real type}
+       typebk := tybkStd;
+    fOkay := FChkBk (bk, typebk, cbBk);
+    IF typebk = tybkStd THEN cBkStd := cBkStd + 1;
+    bk := POINTER (ORD(bk) + cbBk);
+    end;
+{$ENDC}
+  end; {CheckContBlks}
+
+
+
+{**********************************************************************************
+
+==========>  CheckFreeList
+
+**********************************************************************************}
+
+procedure CheckFreeList;
+  var
+    bk: TBk;
+    cbFreeT: TL;
+    cbBk: TL;
+  begin {CheckFreeList}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+    IF fTstHz THEN WRITELN('CheckFreeList');
+
+    tyChk := tyChkFreeBk;
+    bk := hz^.bkfFst;
+    cbFreeT := 0;
+    repeat
+      fOkay := fOkay AND FChkBk (bk, tybkFree, cbBk);
+      if fOkay then
+        begin
+          cbFreeT := cbFreeT + cbBk;
+          bk := bk^.bkfNxt;
+        end;
+    until (bk = hz^.bkfFst) or (not fOkay) or (cbFreeT > hz^.cbFree);
+    if fOkay AND ((cbFreeT - cbBkLst) <> hz^.cbFree) then
+      HeapErr (10, cbFreeT, 'Too many (few) free bytes found');
+{$ENDC}
+    end; {CheckFreeList}
+
+
+{**********************************************************************************
+
+==========>  CheckPtrPool
+
+**********************************************************************************}
+
+procedure CheckPtrPool;
+  var
+    hT: TH;
+    cfh, cuh: TL;
+    ip: TC;
+    cbBk: TL;
+    bk: TBk;
+    pT: TP;
+  begin {CheckPtrPool}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+    IF fTstHz THEN WRITELN('CheckPtrPool');
+
+    tyChk := tyChkMasters;
+    hT := hz^.hFstFree;
+    cfh := 0;
+    while (hT <> hNil) and (cfh <= hz^.ipPoolMac) and
+            (ORD(hT) >= ORD(@hz^.argpPool[0])) and
+            (ORD(hT) < ORD(hz^.bkFst)) do
+      begin
+        hT := POINTER(ORD(hT^));
+        cfh := cfh+1;
+      end;
+    if hT <> hNil then
+      if cfh > hz^.ipPoolMac then
+        HeapErr (5, cfh, 'Too many master pointers in free list')
+      else
+        HeapErr (6, ORD(hT), 'Master pointer out of bounds');
+
+     tyChk := tyChkContP;
+     cuh := 0;
+     for ip := 1 to hz^.ipPoolMac - 1 do {Start at 1 because of reserved 1st ptr}
+       BEGIN
+       hT := POINTER(ORD(@hz^.argpPool) + (ORD4(ip) * 4));
+       pT := hT^;
+       if (ORD(pT) >= ORD(hz^.bkFst)) THEN
+         BEGIN
+         IF (ORD(pT) < ORD(hz^.bkLst)) then
+           begin
+             cuh := cuh + 1;
+             bk := POINTER(ORD(pT)-dbBkStd);
+             fOkay := fOkay AND FChkBk (bk, tybkStd, cbBk);
+           end
+         ELSE
+           HeapErr (7, ORD(hT), 'master pointer out of bounds');
+         END
+       else
+         BEGIN
+         IF (ORD(pT) <> ORD(hNil)) AND (ORD(pT) < ORD(@hz^.argpPool)) THEN
+           HeapErr (7, ORD(hT), 'master pointer out of bounds');
+         END;
+       END;
+     if (cfh + cuh) <> (hz^.ipPoolMac - 1) then { -1 is for reserved 1st pointer }
+       HeapErr (8, cfh+cuh, 'free + used master pointers <> ipPoolMac');
+{$ENDC}
+  end; {CheckPtrPool}
+
+
+{**********************************************************************************
+
+==========>  CheckRgpnob
+
+**********************************************************************************}
+
+procedure CheckRgpnob;
+  var
+    pT: TPnob;
+    bk: TBk;
+    cbBk: TL;
+    ipn: TC;
+  begin {CheckRgpnob}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fHz}
+    IF fTstHz THEN WRITELN('CheckRgpnob');
+
+    tyChk := tyChkRgpnob;
+    for ipn := 0 to hz^.mskIpnLst do
+      begin
+        pT := hz^.hrgpnob^^[ipn];
+        if pT <> NIL then
+          begin
+          bk := POINTER(ORD(pT)-dbBkNNob);
+          fOkay := fOkay AND FChkBk (bk, tybkN, cbBk);
+          end;
+       end;
+{$ENDC}
+  end; {CheckRgpnob}
+
+
+begin {FCheckHzOk}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+fOkay := TRUE;
+{$IFC fHz}
+IF fTstHz THEN
+   WRITELN('FCheckHzOk: cbFree=', ORD(hz^.cbFree):1,
+           ' bkFst=', ORD(hz^.bkFst):1,
+           ' bkLst=', ORD(hz^.bkLst):1,
+           ' bkfFst=', ORD(hz^.bkfFst):1,
+           ' hFstFree=', ORD(hz^.hFstFree):1);
+
+CheckContBlks;
+CheckFreeList;
+CheckPtrPool;
+CheckRgpnob;
+{$ENDC}
+FCheckHzOk := fOkay;
+end; {FCheckHzOk}
+
+
+FUNCTION CallCbMore(hz: THz; cbNeed: TC; proc: TProc) : TC; EXTERNAL;
+
+
+
+{**********************************************************************************
+
+==========>  HzFromH
+
+**********************************************************************************}
+
+{$S SMgraf}
+FUNCTION HzFromH{h: TH) : THz};
+VAR
+pbp: ^TBp;
+hzDummy: THz;
+orgpPool: TL;
+HeapFound: THz;
+BEGIN {HzFromH}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+pbp := POINTER(ORD(h^) - SIZEOF(TBp));
+IF pbp^.fRelPBase THEN
+        HeapFound := hzNil
+ELSE    BEGIN
+        hzDummy := POINTER(0);
+        orgpPool := ORD(@hzDummy^.argpPool) { - ORD(hzDummy) };
+        HeapFound := POINTER(ORD(h) - (ORD4(pbp^.ip) * 4) - orgpPool);
+        END;
+IF fTstHz THEN WRITELN('HzFromH:   h = ', ORD(h):1,
+                       '   HeapFound = ', ORD(HeapFound):1);
+HzFromH := HeapFound;
+END; {HzFromH}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  DeleteBkf
+
+**********************************************************************************}
+
+PROCEDURE DeleteBkf(hz: THz; bkf: TBk);
+
+VAR
+   NoRelBlocksFound: TC;
+   Okay: TF;
+
+BEGIN {DeleteBkf}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('DeleteBkf:   hz = ', ORD(hz), '   bkf = ', ORD(bkf));
+
+bkf^.bkfPrv^.bkfNxt := bkf^.bkfNxt;
+bkf^.bkfNxt^.bkfPrv := bkf^.bkfPrv;
+IF hz^.bkfFst = bkf THEN hz^.bkfFst := bkf^.bkfNxt;
+END; {DeleteBkf}
+
+
+
+{**********************************************************************************
+
+==========>  MakeBkf
+
+**********************************************************************************}
+
+{$S SMwork}
+FUNCTION MakeBkf(hz: THz; bk: TBk; cb: TL; Block_Above: TBk): TBk;
+
+VAR
+   bkfPrv: TBk;
+   typebk: TTybk;
+   NoRelBlocksFound: TC;
+   Okay: TF;
+
+BEGIN {MakeBkf}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('MakeBkf:   hz = ', ORD(hz):1, '   bk = ', ORD(bk):1,
+           '   cb = ', cb:1);
+
+IF cb >= cbMinFree THEN
+   BEGIN
+   bk^.cwFree := cb DIV 2;
+   { done by cwFree assignment:
+   bk^.hdr.tybk := tybkFree;
+   }
+   bk^.bkfNxt := hz^.bkfFst;
+   bkfPrv := hz^.bkfFst^.bkfPrv;
+   bk^.bkfPrv := bkfPrv;
+   bkfPrv^.bkfNxt := bk;
+   hz^.bkfFst^.bkfPrv := bk;
+   hz^.bkfFst := bk;
+   MakeBkf := bk;
+   END {if}
+ELSE {Must be a block that is too small}
+   BEGIN
+   MakeBkf := bkNil;
+   IF (Block_Above <> bkNil) AND (cb > 0) THEN {Fix up by appending to block above}
+      BEGIN
+      typebk := Block_Above^.hdr.tybk;
+      IF typebk = tybkFree THEN
+         Block_Above^.cwFree := Block_Above^.cwFree + (cb DIV 2)
+      ELSE
+         Block_Above^.hdr.cw := Block_Above^.hdr.cw + (cb DIV 2);
+      END; {if <> bkNil}
+   END; {else < cbMinFree}
+
+END; {MakeBkf}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  BkFindCb
+
+**********************************************************************************}
+
+FUNCTION BkFindCb(hz: THz; cb: TL): TBk;
+
+LABEL   10, 100;
+VAR
+bk:     TBk;
+cbFree: TL;
+bkAft:  TBk;
+cwAft:  TL;
+fT:     TF;
+BkFound: TBk;
+
+BEGIN {BkFindCb}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('BkFindCb:   hz = ', ORD(hz):1, '   cb = ', cb:1);
+
+bk := hz^.bkfFst;
+WHILE TRUE DO
+ BEGIN
+100:
+ cbFree := bk^.cwFree*2;
+ bkAft := POINTER(ORD(bk)+cbFree);
+ IF (ORD(bkAft) < ORD(hz^.bkLst)) THEN
+          BEGIN
+          IF (bkAft^.hdr.tybk = tybkFree) THEN
+                 BEGIN
+                 cwAft := bkAft^.cwFree;
+                 DeleteBkf(hz, bkAft);
+                 bk^.cwFree := bk^.cwFree+cwAft;
+                 GOTO 100;
+                 END;
+          END;
+ IF (ORD(bk) < ORD(hz^.bkLst)) AND (cbFree >= cb) THEN
+          BEGIN
+          BkFound := bk;
+          GOTO 10;
+          END
+ ELSE    BEGIN
+          bk := bk^.bkfNxt;
+          IF bk = hz^.bkfFst THEN
+                 BEGIN
+                 BkFound := bkNil;
+                 GOTO 10;
+                 END;
+          END;
+ END;
+
+10:
+BkFindCb := BkFound;
+IF fTstHz THEN
+    WRITELN('Exit BkFindCb: bkFound=', ORD(bkFound):1,
+            ' cbFree=', cbFree:1, ' bk=', ORD(bk):1,
+            ' hz.cbfree=', (hz^.cbfree):1);
+END; {BkFindCb}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  BkfLow
+
+**********************************************************************************}
+
+FUNCTION BkfLow(hz: THz; bkMin: TBk) : TBk;
+LABEL   50;
+VAR
+bkf:    TBk;
+bkfLow1:    TBk;
+BEGIN {BkfLow}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+bkf := hz^.bkLst;
+bkfLow1 := bkf;
+WHILE TRUE DO
+     BEGIN
+     bkf := bkf^.bkfNxt;
+     IF bkf = hz^.bkLst THEN GOTO 50;
+     IF (ORD(bkMin) <= ORD(bkf)) AND (ORD(bkf) < ORD(bkfLow1)) THEN
+              bkfLow1 := bkf;
+     END;
+50:
+IF fTstHz THEN WRITELN('BkfLow:   hz = ', ORD(hz):1, '   bkMin = ', ORD(bkMin):1,
+                     '   bkfLow = ', ORD(bkfLow1):1);
+
+BkfLow := bkfLow1;
+END; {BkfLow}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  BkCompactCb
+
+**********************************************************************************}
+
+FUNCTION BkCompactCb(hz: THz; cb: TL; bkLst: TBk; VAR cbFound: TL) : TBk;
+LABEL   10, 20, 30;
+VAR
+h:      TH;
+bkSrc:  TBk;
+bkDst,
+bkDstAfterConcrete,
+bkDstBeforeConcrete,
+bkDstofConcrete,
+oldbkDst:  TBk;
+FreeBlock,
+Block_Above:  TBk;
+cbFree,
+SpaceToConcrete: TL;
+cbBk:   TL;
+pn:     TPn;
+FoundConcreteBlock,
+ExactFitAboveConcrete: TF;
+typebk:  TTybk;
+BkAddr,
+BkBefore,
+BkAfter: TBk;
+NoRelBlocksFound: TC;
+Okay: TF;
+
+BEGIN {BkCompactCb}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('BkCompactCb: hz=', ORD(hz):1, ' cb=', cb:1, ' bkFst=',
+         ORD(hz^.bkFst):1, ' bkLst=', ORD(bkLst):1,
+         ' hz^.cbfree=', hz^.cbfree:1);
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+IF fTstHzV THEN
+   Okay := FCheckHzOk(hz, NoRelBlocksFound);
+
+hz^.cCompact := hz^.cCompact + 1;  { Count # of compactations }
+FoundConcreteBlock := FALSE;
+ExactFitAboveConcrete := FALSE;
+SpaceToConcrete := 0;
+bkDst := hz^.bkFst;
+Block_Above := bkNil;
+WHILE TRUE DO
+     BEGIN
+     bkDst := BkfLow(hz, bkDst);
+     bkSrc := bkDst;
+     cbFree := 0;
+     WHILE TRUE DO
+          BEGIN
+          oldbkDst := bkDst; {save for debugging printout}
+          IF ORD(bkSrc) >= ORD(bkLst) THEN GOTO 10;
+          ExactFitAboveConcrete := FALSE;
+          { cbBk is not hdr.cw if tybkFree but we fix it quickly }
+          cbBk := bkSrc^.hdr.cw*2;
+          typebk := bkSrc^.hdr.tybk;
+          CASE typebk OF
+          tybkFree:
+                 BEGIN
+                 cbBk := bkSrc^.cwFree*2;
+                 cbFree := cbFree+cbBk;
+                 DeleteBkf(hz, bkSrc);
+                 IF fTstHz THEN
+                    WRITELN('In BkCompact(Free) cbfree=', cbfree:1,
+                            ' ToCon=', SpaceToConcrete:1,
+                            ' cbBk=', cbBk:1, ' Src=', ORD(bkSrc):1,
+                            ' Dst=', ORD(oldbkDst):1);
+                GOTO 30;
+                 END;
+          tybkStd:
+                 BEGIN
+                 IF bkSrc^.bp.fRelPBase THEN
+                         h := POINTER(ORD(hz^.rgwBase) +
+                              (ORD4(bkSrc^.bp.iwP) * 2))
+                 ELSE    h := POINTER(ORD(@hz^.argpPool) +
+                              (ORD4(bkSrc^.bp.ip) * 4));
+                 h^ := @bkDst^.dataStd;
+                 END;
+          tybkN:
+                 BEGIN
+                 hz^.hrgpnob^^[IpnMapN(hz, bkSrc^.nob.n)] := @bkDst^.nob;
+                 {fRelPBase => no handle allocated }
+                 IF NOT bkSrc^.nob.bp.fRelPBase THEN
+                      BEGIN
+                      h := POINTER(ORD(@hz^.argpPool) +
+                           (ORD4(bkSrc^.nob.bp.ip) * 4));
+                      h^ := @bkDst^.nob.data;
+                      END;
+                 END;
+          tybkNrel:
+                 IF hz^.HasConcrete THEN {This must be a locked in concrete block}
+                    BEGIN
+                    bkDstofConcrete := bkSrc;
+                    FoundConcreteBlock := TRUE;
+                    SpaceToConcrete := cbfree;
+                    cbfree := 0;
+                    bkDstBeforeConcrete := bkDst;
+                    bkDstAfterConcrete := POINTER(ORD(bkSrc) + cbBk);
+                    IF fTstHz THEN
+                       WRITELN('In BkCompact(CONCRETE) free=', cbfree:1,
+                               ' ToCon=', SpaceToConcrete:1,
+                               ' cbBk=', cbBk:1, ' Src=', ORD(bkSrc):1,
+                               ' Dst=', ORD(oldbkDst):1);
+                    GOTO 30;
+                    END
+                 ELSE {It must be a real non-relocatable block}
+                    GOTO 20;
+          END; {case}
+          IF FoundConcreteBlock THEN
+             BEGIN
+                IF cbBk <= SpaceToConcrete THEN BEGIN{if room above Concrete block}
+                   bkDstBeforeConcrete := POINTER(ORD(bkDstBeforeConcrete) + cbBk);
+                   SpaceToConcrete := SpaceToConcrete - cbBk; {Free space above Con.}
+                   cbFree := cbFree + cbBk; {Free space below Concrete block}
+                   IF SpaceToConcrete = 0 THEN BEGIN
+                        FoundConcreteBlock := FALSE;
+                        ExactFitAboveConcrete := TRUE;
+                   END; {if}
+                END {if}
+                ELSE {start putting blocks below Concrete block}
+                   BEGIN
+                   IF SpaceToConcrete > 0 THEN {Make SpaceToConcrete free block}
+                      BEGIN
+                      BkAddr := MakeBkf(hz, bkDst, SpaceToConcrete, Block_Above);
+                      SpaceToConcrete := 0;
+                      bkDst := bkDstAfterConcrete;
+                      FoundConcreteBlock := FALSE;
+                      END;
+                   IF typebk = tybkN THEN {really shouldn't be any named objects}
+                      h^ := @bkDst^.nob.data
+                   ELSE {reset handle for standard case of relocatable objects}
+                      h^ := @bkDst^.dataStd;
+                   END; {else}
+             END; {if FoundConcreteBlock}
+          MoveRgch(@bkDst^, @bkSrc^, cbBk);
+          Block_Above := bkDst; { Remember block above for MakeBkf }
+          bkDst := POINTER(ORD(bkDst)+cbBk);
+          IF fTstHz THEN
+             WRITELN('In BkCompact cbfree=', cbfree:1,
+                     ' ToCon=', SpaceToConcrete:1,
+                     ' cbBk=', cbBk:1, ' Src=', ORD(bkSrc):1,
+                     ' Dst=', ORD(oldbkDst):1,
+                     ' t=', ORD(typebk):1);
+          IF cbFree >= cb THEN GOTO 10;
+ 30:
+          bkSrc := POINTER(ORD(bkSrc)+cbBk);
+          END; {while}
+ 20:
+     IF cbFree <> 0 THEN
+        BkAddr := MakeBkf(hz, bkDst, cbFree, Block_Above);
+     Block_Above := bkSrc; { Remember block above for MakeBkf }
+     bkDst := POINTER(ORD(bkSrc)+cbBk);
+     cbFree := 0;
+
+     END; {while}
+10:
+IF SpaceToConcrete > 0 THEN {Make free block of space to concrete}
+   BEGIN
+      BkBefore := MakeBkf(hz, bkDstBeforeConcrete, SpaceToConcrete, Block_Above);
+      IF cbFree > 0 THEN
+         BkAfter := MakeBkf(hz, bkDstAfterConcrete, cbFree, bkDstofConcrete);
+      IF cbFree >= SpaceToConcrete THEN {choose space after concrete}
+         IF cbFree >= cb THEN
+            FreeBlock := BkAfter {BkAfter is bkNil when cbfree < cbMinFree}
+         ELSE
+            FreeBlock := bkNil
+      ELSE {choose space before concrete since it is larger}
+         BEGIN
+            cbFree := SpaceToConcrete;
+            IF cbFree >= cb THEN
+               FreeBlock := BkBefore {BkBefore is bkNil when SpaceTo < cbMinFree}
+            ELSE
+               FreeBlock := bkNil;
+         END;
+   END
+ELSE
+   BEGIN
+      IF cbFree > 0 THEN
+         IF ExactFitAboveConcrete THEN
+            BkAddr := MakeBkf(hz, bkDstAfterConcrete, cbFree, bkDstofConcrete)
+         ELSE
+            BkAddr := MakeBkf(hz, bkDst, cbFree, Block_Above);
+      IF cbFree >= cb THEN
+         FreeBlock := BkAddr
+      ELSE
+         FreeBlock := bkNil;
+   END;
+BkCompactCb := FreeBlock;
+cbFound := cbfree;
+
+IF fTstHz THEN
+   WRITELN('Exit BkCompactCb:  hz^.cbfree = ', hz^.cbfree:1,
+           ' free block = ', ORD(FreeBlock):1, ' its size = ', cbfree:1);
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+IF fTstHzV THEN
+   Okay := FCheckHzOk(hz, NoRelBlocksFound);
+END; {BkCompactCb}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  FreeIpn
+
+**********************************************************************************}
+
+PROCEDURE FreeIpn(hz: THz; ipn: TC);
+LABEL 1;
+VAR
+pnob:   TPnob;
+pn:     TPn;
+ipnT:   TC;
+hrgpnob: THrgpnob;
+nob:      TNob;
+BEGIN {FreeIpn}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN  WRITELN('FreeIpn - ipn: ', ipn);
+hrgpnob := hz^.hrgpnob;
+IF ipn <> ipnNil THEN
+     BEGIN
+     pnob := hrgpnob^^[ipn];
+     IF pnob <> NIL THEN
+              BEGIN
+              nob := pnob^;
+              IF nob.stn.fDirty THEN
+                     BEGIN
+                     pnob^.stn.fDirty := FALSE;
+                     pnob^.stn.fLock := TRUE;
+                     SwapOutN(hz, nob.n, hz^.procSwapOutN);
+                     ipn := IpnMapN(hz, nob.n);
+                     hrgpnob^^[ipn]^.stn.fLock := nob.stn.fLock;
+                     END;
+              IF NOT nob.stn.fLock THEN
+                     BEGIN
+                     FreeBk(hz, @hrgpnob^^[ipn], tybkN);
+                     hrgpnob^^[ipn] := NIL;
+                     hz^.cpnAvail := hz^.cpnAvail + 1;
+                     WHILE TRUE DO
+                          BEGIN
+                          ipn := WAnd(ipn+1, hz^.mskIpnLst);
+                          pnob := hrgpnob^^[ipn];
+                          IF pnob=NIL THEN GOTO 1;
+                          hrgpnob^^[ipn] := NIL;
+                          ipnT := IpnMapN(hz, pnob^.n);
+                          IF hrgpnob^^[ipnT] <> NIL THEN Break(8);
+                          hrgpnob^^[ipnT]:=pnob;
+                          END;
+                     END;
+1:
+              END;
+     END;
+END; {FreeIpn}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  SetCbFree
+
+**********************************************************************************}
+
+PROCEDURE SetCbFree{hz: THz; cbFree: TL; fEnlargeHz: TF};
+LABEL   11;
+VAR
+ipn:  TC;
+cbMore: TC;
+cbAsk: TC;
+bkT: TBk;
+BEGIN {SetCbFree}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN WRITELN('SetCbFree:   cbFree = ', cbFree:1, '   hz = ', ORD(hz):1,
+                       '   fEnlargeHz = ', fEnlargeHz:1,
+                       '   hz^.cbfree = ', hz^.cbfree:1);
+
+WHILE hz^.cbFree < cbFree DO
+     BEGIN
+     ipn := IpnChoose(hz);
+     IF ipn = ipnNil THEN
+          BEGIN
+          IF fEnlargeHz THEN
+               BEGIN
+               cbAsk := CMax(cbFree - hz^.cbFree, cbMinAsk);
+               cbMore := CallCbMore(hz, cbAsk, hz^.procCbMore);
+               EnlargeHz(hz, cbMore);
+               bkT := BkFindCb(hz, cbNoFind);  { to coalesce }
+               IF cbAsk > cbMore THEN GOTO 11; {otherwise go to loop check}
+                                               {this control is important}
+                                               {for concurrency correctness}
+               END
+          ELSE GOTO 11;
+          END;
+     FreeIpn(hz, ipn);
+     END;
+11:
+END; {SetCbFree}
+
+{ bas 3/14/83 addition here ----> }
+{ names begin with Z for reuasability. should be removed at a later time }
+
+
+{$S SMcold }
+{**********************************************************************************
+
+==========>  ZBkfHi
+
+**********************************************************************************}
+
+FUNCTION ZBkfHi (hz: THz; bkMax: TBk) : TBk;
+ { returns free block with highest address less than bkMax,
+   hz^.bkLst if none }
+LABEL   50;
+VAR bkf: TBk; bkfHi1: TBk;
+BEGIN {ZBkfHi}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN WRITELN('ZBkfHi:   hz = ', ORD(hz):1,
+                       '   bkMax = ', ORD(bkMax):1);
+
+    bkf := hz^.bkLst;
+    bkfHi1 := bkf;
+    WHILE TRUE DO BEGIN
+        bkf := bkf^.bkfNxt;
+        IF bkf = hz^.bkLst THEN GOTO 50;
+        if (ORD(bkf) < ORD(bkMax)) and
+           ((ord(bkMax) <= ord(bkfHi1)) or (ord(bkfHi1) < ord(bkf))) then
+           bkfHi1 := bkf;
+    END;
+50: ZBkfHi := bkfHi1;
+END; {ZBkfHi}
+
+
+{$S SMcold}
+{**********************************************************************************
+
+==========>  ZBkNrelGrow
+
+**********************************************************************************}
+
+FUNCTION ZBkNrelGrow (hz: THz; cb: TL): TBk;
+ { grow heap zone to accommodate nonrel bk of cb bytes }
+VAR bk: TBk; cbAsk, cbMore, cbF: TC;
+BEGIN {ZBkNrelGrow}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN  WRITELN('ZBkNrelGrow     hz = ', ORD(hz):1,'   cb = ', cb:1);
+
+    bk := BkFindCb (hz, cbNoFind);   { coalesce }
+    bk := ZBkfHi (hz, hz^.bkLst);     { last free block in zone }
+    cbF := bk^.cwFree*2;
+    if ord(bk)+cbF = ord(hz^.bkLst) then  { last non-dummy in zone }
+        cbAsk := cb - cbF
+    else
+        cbAsk := cb;
+    cbAsk := CMax(cbAsk, cbMinAsk);
+    cbMore := CallCbMore(hz, cbAsk, hz^.procCbMore);
+    EnlargeHz(hz, cbMore);
+    ZBkNrelGrow := BkFindCb(hz, cb);
+END; {ZBkNrelGrow}
+
+{ <----- to here bas 3/14/83 }
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  AllocBk
+
+**********************************************************************************}
+
+PROCEDURE AllocBk{(hz: THz; hDst: TH; cb: TC; tybk: TTybk)};
+LABEL   17;
+VAR
+bk:    TBk;
+bk1:   TBk;
+cbBk,
+cbFound,
+Long_cb:   TL;
+bp:     TBp;
+BkAddr: TBk;
+
+BEGIN {AllocBk}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+
+Long_cb := ORD4(WAnd(cb+1, mskEven)) + argcbOvh[tybk];
+IF (Long_cb < MaxBlkSize) AND (cb >= 0) AND (cb <> MaxBlkSize) THEN BEGIN
+   IF Long_cb < cbMinFree THEN
+      Long_cb := cbMinFree;
+
+   IF fTstHz THEN
+      BEGIN
+      WRITELN('AllocBk: hz=', ORD(hz):1, ' hDst=', ORD(hDst):1,
+              ' cb=', cb:1,
+              ' Long=', Long_cb:1, ' t=', ORD(tybk):1,
+              ' hz.cbfree=', hz^.cbfree:1,
+              ' old=', (CMax(WAnd(cb+argcbOvh[tybk]+1, mskEven), cbMinFree)):1);
+      END;
+
+   IF Long_cb + cbMinFree > hz^.cbFree THEN SetCbFree(hz, Long_cb + cbMinFree, TRUE);
+
+   bk := BkFindCb(hz, Long_cb);
+   IF bk = bkNil THEN
+      BEGIN
+      bk := BkCompactCb(hz, Long_cb, hz^.bkLst, cbFound);
+      IF cbFound < Long_cb THEN
+         BEGIN{maybe there was a concrete island problem}
+         SetCbFree(hz, Long_cb + cbMinFree + hz^.cbFree, TRUE);
+         bk := BkFindCb(hz, Long_cb);
+         END;
+
+       { bas 3/14/83 next stmt }
+      IF (bk = bkNil) AND (tybk = tybkNrel) THEN
+          bk := ZBkNrelGrow (hz, Long_cb);
+      IF bk = bkNil THEN
+         BEGIN
+         hDst^ := pNil;
+         IF fTstHz THEN
+            BEGIN
+            WRITELN('***** Error in AllocBk -> ',
+                    'BkFindCb(or ZBkNrelGrow) returned a Nil pointer.',
+                    '   tybk = ', ORD(tybk):1,
+                    '   hz^.cbfree = ', hz^.cbfree:1);
+            PxHz(hz);
+            END;
+         GOTO 17;
+         END;
+      END;
+
+   IF (tybk = tybkStd) THEN
+    BEGIN
+    IF (ORD(@hz^.argpPool) <= ORD(hDst))
+       AND (ORD(hDst) < ORD(hz^.bkFst)) THEN
+             BEGIN
+             bp.fRelPBase := FALSE;
+             bp.ip := WShRt(ORD(hDst)-ORD(@hz^.argpPool), 2);
+             END
+    ELSE IF (ORD(hz^.rgwBase) <= ORD(hDst))
+       AND (ORD(hDst) < (ORD(hz^.rgwBase) + (ORD4(iwPMax) * 2))) THEN
+             BEGIN
+             bp.fRelPBase := TRUE;
+             bp.iwP := WShRt(ORD(hDst)-ORD(hz^.rgwBase), 1);
+             END
+    ELSE     BEGIN
+             hDst^ := pNil;
+             GOTO 17;
+             END;
+    END;
+
+   DeleteBkf(hz, bk);
+   cbBk := bk^.cwFree*2;
+   IF cbBk >= Long_cb + cbMinFree THEN {if made it too big, create a free block}
+        BEGIN
+        bk1 := POINTER(ORD(bk) + Long_cb);
+        BkAddr := MakeBkf(hz, bk1, cbBk - Long_cb, bkNil);
+        END
+   ELSE Long_cb := cbBk;
+   hz^.cbFree := hz^.cbFree - Long_cb;
+
+   bk^.hdr.cw := Long_cb DIV 2;
+   bk^.hdr.tybk := tybk;
+   CASE tybk OF
+   tybkNrel:
+    hDst^ := @bk^.dataNrel;
+   tybkStd:
+    BEGIN
+    hDst^ := @bk^.dataStd;
+    bk^.bp := bp;
+    END;
+   tybkN:
+    BEGIN
+    bk^.SpaceForCompactRoutine := $1984; {For debugging purposes}
+    hDst^ := @bk^.nob;
+    END;
+   END;
+IF fTstHz THEN
+     WRITELN('Exit AllocBk:   Long_cb = ', Long_cb:1,
+             '   cbBk = ', cbBk:1);
+END {if legal cb size}
+ELSE BEGIN {bad cb size}
+   hDst^ := pNil;
+   IF fTstHz THEN
+      BEGIN
+      WRITELN('***** Error in AllocBk -> cb size negative or too big!   cb = ',
+              cb:1, '   hz^.cbfree = ', hz^.cbfree:1);
+      PxHz(hz);
+      END; {if}
+END; {else}
+17:     {RETURN}
+
+END; {AllocBk}
+
+
+{$S SMcold}
+{$IFC fOS}
+{**********************************************************************************
+
+==========>  CbMoreGrowSeg
+
+**********************************************************************************}
+
+FUNCTION CbMoreGrowSeg{hz: THz; cbNeed: TC) : TC};
+
+CONST
+    cbIncrement = 2048;    {Must be power of 2}
+
+VAR errnum  : integer;
+    refnum : integer;
+    cbMem  : longint;
+    cbDisk  : longint;
+    cbNeedDisk: TC;
+    dsinfo: DsInfoRec;
+    size: LongInt;
+
+BEGIN {CbMoreGrowSeg}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN  WRITELN('CbMoreGrowSeg   hz = ', ORD(hz):1,
+                        '   cbNeed = ', cbNeed:1);
+
+IF cbNeed < (MAXINT - cbIncrement) THEN
+     cbNeed := WAnd(cbNeed + cbIncrement - 1, WNot(cbIncrement - 1));
+
+Info_Address(errnum, ORD(hz), refnum);
+IF errnum = 0 THEN
+     BEGIN
+     Info_DataSeg(errnum, refnum, dsinfo);
+     IF errnum = 0 THEN
+          BEGIN
+          IF dsinfo.Disc_Size = 0 THEN
+               cbNeedDisk := 0
+          ELSE cbNeedDisk := cbNeed;
+          Size_DataSeg(errnum, refnum, cbNeed, cbMem, cbNeedDisk, cbDisk);
+          END;
+     END;
+
+IF errNum <> 0 THEN
+     Size := 0
+ELSE Size := (cbMem - dsinfo.Mem_Size);
+IF Size > MAXINT THEN {Since it is an integer function rather than a LongInt}
+   Size := MAXINT;
+CbMoreGrowSeg := Size;
+
+IF fTstHz THEN
+     WRITELN('Exit CbMoreGrowSeg: cbNeed=', cbNeed:1, ' cbMem=', cbMem:1,
+             ' cbDisk=', cbDisk:1, ' size=', size:1, ' Mem=', dsinfo.Mem_Size:1);
+END; {CbMoreGrowSeg}
+
+
+{$ELSEC}
+{$S SMcold}
+{**********************************************************************************
+
+==========>  CbNoMore
+
+**********************************************************************************}
+
+FUNCTION CbNoMore(hz: THz; cbNeed: TC) : TC;
+
+BEGIN {CbNoMore}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+WRITELN('Zone too small');
+Break(4);
+CbNoMore := 0;
+END; {CbNoMore}
+{$ENDC}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  EnlargeHz
+
+**********************************************************************************}
+
+PROCEDURE EnlargeHz{hz: THz; cbMore: TL};
+
+VAR
+   BkAddr: TBk;
+
+BEGIN {EnlargeHz}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN  WRITELN('EnlargeHz    hz = ', ORD(hz):1, '   cbMore = ', cbMore:1,
+                        '   hz^.cbFree = ', hz^.cbFree:1, '   hz^.bkLst = ',
+                        ORD(hz^.bkLst):1);
+IF ODD(cbMore) THEN cbMore := cbMore - 1;
+IF cbMore >= cbMinFree THEN
+     BEGIN
+     hz^.bkLst^.cwFree := cbMore DIV 2;
+     hz^.bkLst := POINTER(ORD(hz^.bkLst) + cbMore);
+     BkAddr := MakeBkf(hz, hz^.bkLst, cbMinFree, bkNil);
+     hz^.cbFree := hz^.cbFree + cbMore;
+     END;
+IF fTstHz THEN  WRITELN('Exit EnlargeHz     hz^.cbFree = ', hz^.cbFree:1,
+                        '   hz^.bkLst = ', ORD(hz^.bkLst):1);
+END; {EnlargeHz}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  CbShrinkHz
+
+**********************************************************************************}
+
+FUNCTION CbShrinkHz{hz: THz; cbLess: TL) : TL};
+LABEL 50;
+VAR
+bkT: TBk;
+cbBk,
+cbFound: TL;
+BkAddr: TBk;
+
+BEGIN {CbShrinkHz}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN  WRITELN('CbShrinkHz    hz = ', ORD(hz):1,
+                        '   cbLess = ', cbLess:1);
+
+IF ODD(cbLess) THEN cbLess := cbLess + 1;
+SetCbFree(hz, cbLess, FALSE);
+bkT := BkCompactCb(hz, cbNoFind, hz^.bkLst, cbFound);
+bkT := hz^.bkLst;
+WHILE (ORD(bkT) + (bkT^.cwFree * 2)) <> ORD(hz^.bkLst) DO
+     BEGIN
+     bkT := bkT^.bkfNxt;
+     IF bkT = hz^.bkLst THEN
+          BEGIN
+          CbShrinkHz := 0;
+          GOTO 50;
+          END;
+     END;
+cbBk := bkT^.cwFree * 2;
+DeleteBkf(hz, hz^.bkLst);
+IF (cbBk - cbLess) < cbMinFree THEN
+     BEGIN
+     cbLess := cbBk;
+     hz^.bkLst := bkT;
+     bkT^.cwFree := cbMinFree DIV 2;
+     END
+ELSE BEGIN
+     bkT^.cwFree := (cbBk - cbLess) DIV 2;
+     hz^.bkLst := POINTER(ORD(bkT) + (cbBk - cbLess));
+     BkAddr := MakeBkf(hz, hz^.bkLst, cbMinFree, bkNil);
+     END;
+hz^.cbFree := hz^.cbFree - cbLess;
+CbShrinkHz := cbLess;
+50:
+END; {CbShrinkHz}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  CbMakeBkfBefore
+
+**********************************************************************************}
+
+FUNCTION CbMakeBkfBefore(hz: THz; bkAfter: TBk; cbNeed: TL; TrySetCbFree: TF;
+                         Block_Above: TBk) : TL;
+
+LABEL   16;
+
+VAR
+bkLst:    TBk;
+bkDst:    TBk;
+bkCur:    TBk;
+cbBk:   TL;
+cwT:   TL;
+cbFreeFound:   TL;
+h:      TH;
+abkLst: TAbk;   { only use the two variants of first 4 bytes of this temp }
+typebk:  TTybk;
+BkAddr: TBk;
+NoRelBlocksFound: TC;
+Okay: TF;
+
+BEGIN {CbMakeBkfBefore}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('CbMakeBkfBefore  hz = ', ORD(hz):1, '  bkAfter = ', ORD(bkAfter):1,
+           '  cbNeed = ', cbNeed:1, '  hz^.cbFree = ', hz^.cbFree:1);
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+IF fTstHzV THEN
+   Okay := FCheckHzOk(hz, NoRelBlocksFound);
+
+hz^.cCompact := hz^.cCompact + 1;  { Count # of compactations }
+IF TrySetCbFree THEN
+   SetCbFree(hz, cbNeed, TRUE);
+bkLst := hz^.bkLst;
+bkCur := bkAfter;
+cbFreeFound := 0;
+abkLst.cwFree := bkCur^.cwFree;
+WHILE (ORD(bkCur) < ORD(bkLst)) AND (cbFreeFound < cbNeed) DO
+     BEGIN
+     cbBk := bkCur^.hdr.cw*2;
+     typebk := bkCur^.hdr.tybk;
+     CASE typebk OF
+     tybkStd:
+        BEGIN
+        END;
+     tybkN:
+        BEGIN
+        {IF bkCur^.nob.stn.fLock THEN GOTO 16;}
+        END;
+     tybkFree:
+        BEGIN
+        cbBk := bkCur^.cwFree*2;
+        cbFreeFound := cbFreeFound + cbBk;
+        END;
+     tybkNrel:
+        GOTO 16;
+     END;
+     cwT := abkLst.cwFree;
+     abkLst.cwFree := bkCur^.cwFree;
+     bkCur^.cwFree := cwT;
+     bkCur := POINTER(ORD(bkCur)+cbBk);
+     IF fTstHz THEN
+        WRITELN('In CbMakeBkfBefore  cbBk=', cbBk:1, '  bkCur=', ORD(bkCur):1,
+                '  cbFreeFound=', cbFreeFound:1,
+                '  type=', ORD(typebk):1);
+     END;
+16:
+IF fTstHz THEN
+   WRITELN('    ---------- Starting Shifting Down in CbMakeBkfBefore ----------');
+
+IF ORD(bkCur) > ORD(bkAfter) THEN
+     BEGIN
+     bkDst := bkCur;
+          REPEAT
+          IF abkLst.hdr.tybk = tybkFree THEN
+               cbBk := abkLst.cwFree
+          ELSE cbBk := abkLst.hdr.cw;
+          cbBk := cbBk * 2;
+          bkCur := POINTER(ORD(bkCur) - cbBk);
+          cwT := bkCur^.cwFree;
+          bkCur^.cwFree := abkLst.cwFree;
+          abkLst.cwFree := cwT;
+          typebk := bkCur^.hdr.tybk;
+          IF typebk = tybkFree THEN
+               BEGIN
+               DeleteBkf(hz, bkCur);
+               END
+          ELSE BEGIN
+               bkDst := POINTER(ORD(bkDst) - cbBk);
+               IF ORD(bkDst) <> ORD(bkCur) THEN
+                  BEGIN
+                  cbBk := bkCur^.hdr.cw*2;
+                  CASE (bkCur^.hdr.tybk) OF
+                  tybkStd:
+                           BEGIN
+                           IF bkCur^.bp.fRelPBase THEN
+                                h := POINTER(ORD(hz^.rgwBase)
+                                       + (ORD4(bkCur^.bp.iwP) * 2))
+                           ELSE h := POINTER(ORD(@hz^.argpPool)
+                                       + (ORD4(bkCur^.bp.ip) * 4));
+                           h^ := @bkDst^.dataStd;
+                           END;
+                  tybkN: BEGIN
+                           hz^.hrgpnob^^[IpnMapN(hz, bkCur^.nob.n)] := @bkDst^.nob;
+                           {fRelPBase => no handle allocated }
+                           IF NOT bkCur^.nob.bp.fRelPBase THEN
+                                BEGIN
+                                h := POINTER(ORD(@hz^.argpPool)
+                                       + (ORD4(bkCur^.nob.bp.ip) * 4));
+                                h^ := @bkDst^.nob.data;
+                                END;
+                           END;
+                  END;
+                  MoveRgch(POINTER(ORD(bkDst)), POINTER(ORD(bkCur)), cbBk);
+                  END;
+               END;
+          IF fTstHz THEN
+             WRITELN('In CbMakeBkfBefore  cbBk=', cbBk:1, ' bkCur=', ORD(bkCur):1,
+                     '  bkDst=', ORD(bkDst):1,
+                     '  cwt=', cwt:1,
+                     '  type=', ORD(typebk):1);
+          UNTIL ORD(bkCur) = ORD(bkAfter);
+     IF cbFreeFound > 0 THEN
+          BEGIN
+          cbBk := ORD(bkDst) - ORD(bkAfter);
+          IF cbBk <> cbFreeFound THEN
+             BEGIN
+             IF fTstHz THEN WRITELN('cbBk (', cbBk, ') <> cbFreeFound (',
+             cbFreeFound, ')');
+             Break(5);
+             END;
+          BkAddr := MakeBkf(hz, bkAfter, cbBk, Block_Above);
+          IF BkAddr = bkNil THEN {BkAddr will be bkNil if cbBk < cbMinFree}
+             cbFreeFound := 0;
+          END;
+     END;
+CbMakeBkfBefore := cbFreeFound;
+
+IF fTstHzV THEN
+   Okay := FCheckHzOk(hz, NoRelBlocksFound);
+END; {CbMakeBkfBefore}
+
+
+{$S SMcold}
+{**********************************************************************************
+
+==========>  HMakeMoreMasters
+
+**********************************************************************************}
+
+FUNCTION HMakeMoreMasters(hz: THz) : TH;
+
+VAR
+cbBk:        TL;
+ip:          TC;
+hT:          TH;
+BkAddr:      TBk;
+
+BEGIN {HMakeMoreMasters}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN WRITELN('HMakeMoreMasters   hz = ', ORD(hz):1, '   hz^.hFstFree = ',
+                       ORD(hz^.hFstFree):1, '   hz^.cbfree = ', hz^.cbfree);
+
+BkAddr := bkNil;
+cbBk := CbMakeBkfBefore(hz, hz^.bkFst, cbPoolMore + cbMinFree, TRUE, bkNil);
+IF (hz^.ipPoolMac + cpPoolMore <= ipPoolMax)
+  AND (cbBk >= cbPoolMore + cbMinFree) THEN
+     BEGIN
+     DeleteBkf(hz, hz^.bkFst);
+     hz^.bkFst := POINTER(ORD(hz^.bkFst) + cbPoolMore);
+     BkAddr := MakeBkf(hz, hz^.bkFst, cbBk - cbPoolMore, bkNil);
+     IF BkAddr <> bkNil THEN
+        BEGIN
+        FOR ip := hz^.ipPoolMac TO hz^.ipPoolMac + cpPoolMore - 1 DO
+             BEGIN
+             hT := POINTER(ORD(@hz^.argpPool) + (ORD4(ip) * 4));
+             hT^ := POINTER(ORD(hz^.hFstFree));
+             hz^.hFstFree := hT;
+             END;
+        hz^.ipPoolMac := hz^.ipPoolMac + cpPoolMore;
+        hz^.cbFree := hz^.cbFree - cbPoolMore;
+        END; {if}
+     END;
+
+IF BkAddr <> bkNil THEN
+   HMakeMoreMasters := hz^.hFstFree
+ELSE
+   HMakeMoreMasters := hNil;
+
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+
+END; {HMakeMoreMasters}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  GrowHInPlace
+
+**********************************************************************************}
+
+FUNCTION GrowHInPlace(hz: THz; h: TH; cbNew: TC; tybk: TTybk): TF;
+VAR
+dbBk:   TC;
+db:   TC;
+bkNxt: TBk;
+bkOld: TBk;
+cbBk:  TC;
+cbCur:  TC;
+cbCurPlusOvh:  TC;
+Enough: TF;
+cbFound: TL;
+BkAddr: TBk;
+
+BEGIN {GrowHInPlace}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   WRITELN('GrowHInPlace  h=', ORD(h):1, '  h^=', ORD(h^):1,
+           '  cbNew=', cbNew:1, '  tybk=', ORD(tybk):1,
+           '  hz^.cbFree=', hz^.cbFree:1);
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+
+cbNew := CMax(WAnd(cbNew+1, mskEven), cbMinDataStd);
+IF tybk = tybkN THEN dbBk := dbBkNData ELSE dbBk := dbBkStd;
+bkOld := POINTER(ORD(h^) - dbBk);
+cbCurPlusOvh := bkOld^.hdr.cw*2;
+cbCur := cbCurPlusOvh - argcbOvh[tybk];
+db := cbNew - cbCur;
+SetCbFree(hz, db + cbMinFree, TRUE);
+IF (db > 0) AND (hz^.cbFree >= db) THEN   { cbFree test added by bas }
+     BEGIN
+     bkNxt := POINTER(ORD(h^) + cbCur);
+     bkNxt := BkCompactCb(hz, cbNoFind, bkNxt, cbFound);
+     bkNxt := POINTER(ORD(h^) + cbCur);
+     cbBk := CbMakeBkfBefore(hz, bkNxt, db, TRUE, POINTER(ORD(h^)));
+     IF cbBk >= db THEN {if got enough}
+        BEGIN
+        Enough := TRUE; {Got enough space}
+        DeleteBkf(hz, bkNxt);
+        IF cbBk >= db + cbMinFree THEN
+           BEGIN
+           bkNxt := POINTER(ORD(bkNxt)+db);
+           BkAddr := MakeBkf(hz, bkNxt, cbBk-db, bkNil);
+           END
+        ELSE
+           db := cbBk;
+        bkOld := POINTER(ORD(h^) - dbBk);
+        bkOld^.hdr.cw := bkOld^.hdr.cw + (db DIV 2);
+        hz^.cbFree := hz^.cbFree-db;
+        END {if got enough}
+     ELSE
+        Enough := FALSE; {Could not get enough space}
+     END; {else}
+GrowHInPlace := Enough;
+IF fTstHz THEN
+   WRITELN('Exit GrowHInPlace Enough=', Enough:1,
+           ' bkNxt=', ORD(bkNxt):1, ' bkOld=', ORD(bkOld):1,
+           ' hz^.cbFree=', hz^.cbFree:1, ' db=', db:1);
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+
+END; {GrowHInPlace}
+
+
+{$S SMlwop1}
+{**********************************************************************************
+
+==========>  IncLogIpnLim
+
+**********************************************************************************}
+
+PROCEDURE IncLogIpnLim(hz: THz);
+VAR
+ipnLimNew: TC;
+bk: TBk;
+ipn: TC;
+cbBk: TL;
+BEGIN {IncLogIpnLim}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('IncLogIpnLim   hz = ', ORD(hz):1);
+   END;
+
+ipnLimNew := (hz^.mskIpnLst + 1) * 2;
+ChangeSizeH(hz, POINTER(ORD(hz^.hrgpnob)), ipnLimNew * SIZEOF(TN));
+hz^.mskIpnLst := ipnLimNew - 1;
+hz^.cpnAvail := ipnLimNew;
+FOR ipn := 0 TO hz^.mskIpnLst DO hz^.hrgpnob^^[ipn] := NIL;
+bk := hz^.bkFst;
+WHILE ORD(bk) < ORD(hz^.bkLst) DO
+     BEGIN
+     { cbBk is not hdr.cw if tybkFree but we fix it quickly }
+     cbBk := bk^.hdr.cw*2;
+     CASE (bk^.hdr.tybk) OF
+     tybkFree:
+          BEGIN
+          cbBk := bk^.cwFree*2;
+          END;
+     tybkN:
+          BEGIN
+          {IF bkSrc^.nob.stn.fLock THEN GOTO 20;}
+          hz^.hrgpnob^^[IpnMapN(hz, bk^.nob.n)] := @bk^.nob;
+          hz^.cpnAvail := hz^.cpnAvail - 1;
+          END;
+     END;
+     bk := POINTER(ORD(bk)+cbBk);
+     END;
+END; {IncLogIpnLim}
+
+
+{$S SMlwop1}
+{**********************************************************************************
+
+==========>  HLockN
+
+**********************************************************************************}
+
+FUNCTION HLockN{hz: THz; n: TN; fNeedH: TF) : TH};
+VAR
+pnobT: TPnob;
+h: TH;
+bp: TBp;
+p: TP;
+BEGIN {HLockN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('HLockN   hz = ', ORD(hz):1, '   n = ', n, '   fNeedH = ', fNeedH);
+   END;
+
+p := PMapN(hz, n); { Make sure its swapped in }
+pnobT := hz^.hrgpnob^^[IpnMapN(hz, n)];
+IF pnobT <> NIL THEN
+     BEGIN
+     pnobT^.stn.fLock := TRUE;
+     pnobT^.stn.tybk := tybkN;
+     {fRelPBase => no handle allocated}
+     IF pnobT^.bp.fRelPBase THEN
+          BEGIN
+          IF fNeedH THEN
+               BEGIN
+               h := hz^.hFstFree;
+               IF h = hNil THEN h := HMakeMoreMasters(hz);
+               IF h <> hNil THEN
+                    hz^.hFstFree := POINTER(ORD(h^));
+               END
+          ELSE h := hNil;
+          IF h <> hNil THEN
+               BEGIN
+               pnobT := hz^.hrgpnob^^[IpnMapN(hz, n)];
+               h^ := @pnobT^.data;
+               bp.fRelPBase := FALSE;
+               bp.ip := WShRt(ORD(h)-ORD(@hz^.argpPool), 2);
+               pnobT^.bp := bp;
+               END;
+          END
+     ELSE h := POINTER(ORD(@hz^.argpPool) + (ORD4(pnobT^.bp.ip) * 4));
+     END
+ELSE h := hNil;
+HLockN := h;
+END; {HLockN}
+
+
+{$S SMlwop1}
+{**********************************************************************************
+
+==========>  UnlockN
+
+**********************************************************************************}
+
+PROCEDURE UnlockN{hz: THz; n: TN};
+VAR
+pnobT: TPnob;
+h: TH;
+BEGIN {UnlockN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('UnlockN   hz = ', ORD(hz):1, '   n = ', n);
+   END;
+
+pnobT := hz^.hrgpnob^^[IpnMapN(hz, n)];
+IF pnobT <> NIL THEN
+     BEGIN
+     pnobT^.stn.fLock := FALSE;
+     {fRelPBase => no handle allocated}
+     IF NOT pnobT^.bp.fRelPBase THEN
+          BEGIN
+          h := POINTER(ORD(@hz^.argpPool) + (ORD4(pnobT^.bp.ip) * 4));
+          h^ := POINTER(ORD(hz^.hFstFree));
+          hz^.hFstFree := h;
+          pnobT^.bp.fRelPBase := TRUE;
+          END;
+     END;
+END; {UnlockN}
+
+
+{$S SMalert}
+{**********************************************************************************
+
+==========>  LockHandleInConcrete
+
+**********************************************************************************}
+
+PROCEDURE LockHandleInConcrete{h: TH};
+
+VAR
+   bk:    TBk;
+   Heap_Found: THz;
+
+BEGIN {LockHandleInConcrete}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+
+Heap_Found := HzFromH(h);
+IF fTstHz THEN
+   BEGIN
+   WRITELN('LockHandleInConcrete   Heap_Found = ', ORD(Heap_Found):1,
+           '   h = ', ORD(h):1,
+           '   h^ = ', ORD(h^):1);
+   END;
+
+bk := POINTER(ORD(h^) - dbBkStd);
+bk^.hdr.tybk := tybkNrel; {Make it non-relocatable for just a short while}
+Heap_Found^.HasConcrete := TRUE;
+
+END; {LockHandleInConcrete}
+
+
+{$S SMalert}
+{**********************************************************************************
+
+==========>  UnlockHandleFromConcrete
+
+**********************************************************************************}
+
+PROCEDURE UnlockHandleFromConcrete{h: TH};
+
+VAR
+   bk:    TBk;
+   Heap_Found: THz;
+
+BEGIN {UnlockHandleFromConcrete}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+
+Heap_Found := HzFromH(h);
+IF fTstHz THEN
+   BEGIN
+   WRITELN('UnlockHandleFromConcrete   Heap_Found = ', ORD(Heap_Found):1,
+           '   h = ', ORD(h):1,
+           '   h^ = ', ORD(h^):1);
+   END;
+
+bk := POINTER(ORD(h^) - dbBkStd);
+bk^.hdr.tybk := tybkStd; {Make it relocatable once again}
+Heap_Found^.HasConcrete := FALSE;
+
+END; {UnlockHandleFromConcrete}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  HAllocate
+
+**********************************************************************************}
+
+FUNCTION HAllocate{(hz: THz; cb: TC) : TH};
+VAR
+h:      TH;
+BEGIN {HAllocate}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('HAllocate   hz = ', ORD(hz):1, '   cb = ', cb:1);
+END;
+
+IF hz^.fScramble THEN
+   Scramble(hz);
+
+h := hz^.hFstFree;
+IF h = hNil THEN h := HMakeMoreMasters(hz);
+IF h <> hNil THEN
+   BEGIN
+   hz^.hFstFree := POINTER(ORD(h^));
+   AllocBk(hz, h, cb, tybkStd);
+   IF h^ = pNil THEN
+      BEGIN
+      h^ := POINTER(ORD(hz^.hFstFree));
+      hz^.hFstFree := h;
+      h := hNil;
+      END;
+   END;
+HAllocate := h;
+END; {HAllocate}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  PAllocate
+
+**********************************************************************************}
+
+FUNCTION PAllocate{(hz: THz; cb: TC) : TP};
+VAR
+p:      TP;
+BEGIN {PAllocate}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('PAllocate   hz = ', ORD(hz):1, '   cb = ', cb:1);
+END;
+
+AllocBk(hz, @p, cb, tybkNrel);
+PAllocate := p;
+END; {PAllocate}
+
+
+{$S SMgraf}
+{**********************************************************************************
+
+==========>  CbDataOfH
+
+**********************************************************************************}
+
+FUNCTION CbDataOfH{(hz: THz; h: TH) : TC};
+VAR
+bk:    TBk;
+tybk:  TTybk;
+DataSize: TC;
+
+BEGIN {CbDataOfH}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+
+bk := POINTER(ORD(h^)-dbBkStd);
+{If this is a handle on a locked named object we will find the tybk in
+the stn just like it was a hdr - but we are not really pointing at the bk yet }
+tybk := bk^.hdr.tybk;
+IF tybk = tybkN THEN
+   bk := POINTER(ORD(h^)-dbBkNData);
+
+IF (tybk = tybkNrel) AND (hz^.HasConcrete) THEN {Just a locked Std (fake Nrel)?}
+   tybk := tybkStd;   {Set to real block type}
+DataSize := bk^.hdr.cw*2 - argcbOvh[tybk];
+CbDataOfH := DataSize;
+
+IF fTstHz THEN
+   BEGIN
+   WRITELN('CbDataOfH:   hz=', ORD(hz):1, ' h=', ORD(h):1,
+           ' DataSize=', DataSize:1, ' bk=', ORD(bk):1,
+           ' type=', ORD(tybk):1);
+   END;
+END; {CbDataOfH}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  FreeBk
+
+**********************************************************************************}
+
+PROCEDURE FreeBk{(hz: THz; h: TH; tybk: TTybk)};
+VAR
+bk:    TBk;
+cbBk:   TC;
+BkAddr: TBk;
+
+BEGIN {FreeBk}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('FreeBk  hz = ', ORD(hz):1, '  h = ', ORD(h):1, '  h^ = ', ORD(h^):1,
+        '  ttybk = ',  ORD(tybk):1);
+END;
+
+bk := POINTER(ORD(h^)-argdbBk[tybk]);
+IF bk^.hdr.tybk <> tybkFree THEN BEGIN {Bullet-proofing of "impossible case"}
+   cbBk := bk^.hdr.cw*2;
+   hz^.cbFree := hz^.cbFree+cbBk;
+   BkAddr := MakeBkf(hz, bk, cbBk, bkNil);
+END;
+
+IF (ORD(@hz^.argpPool) < ORD(h))
+   AND (ORD(h) < ORD(hz^.bkFst)) THEN
+      BEGIN
+      h^ := POINTER(ORD(hz^.hFstFree));
+      hz^.hFstFree := h;
+      END
+ELSE IF ORD(@hz^.argpPool) = ORD(h) THEN {Do not add reserved 1st ptr to free list}
+          BEGIN
+          h^ := pNil;
+          END;
+
+END; {FreeBk}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  FreeH
+
+**********************************************************************************}
+
+PROCEDURE FreeH{(hz: THz; h: TH)};
+VAR tybk: TTYbk;
+    bk: TBk;
+    pnob: TPnob;
+BEGIN {FreeH}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('FreeH   hz = ', ORD(hz):1, '   h = ', ORD(h):1);
+END;
+
+bk := POINTER(ORD(h^)-dbBkStd);
+{If this is a handle on a locked named object we will find the tybk in
+the stn just like it was a hdr - but we are not really pointing at the bk yet }
+tybk := bk^.hdr.tybk;
+IF tybk = tybkN THEN
+     BEGIN
+     bk := POINTER(ORD(h^)-dbBkNData);
+     pnob := @bk^.nob;
+     FreeBk(hz, @pnob, tybkN);
+     END
+ELSE FreeBk(hz, h, tybkStd);
+END; {FreeH}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  FreeP
+
+**********************************************************************************}
+
+PROCEDURE FreeP{(hz: THz; p: TP)};
+BEGIN {FreeP}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('FreeP   hz = ', ORD(hz):1, '   p = ', ORD(p):1);
+END;
+
+FreeBk(hz, @p, tybkNrel);
+END; {FreeP}
+
+
+{$S SMcold}
+{**********************************************************************************
+
+==========>  FreeN
+
+**********************************************************************************}
+
+PROCEDURE FreeN {jwp}
+    {    hz: THz;
+         n: TN};
+BEGIN {FreeN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+BEGIN
+WRITELN('FreeN   hz = ', ORD(hz):1, '   n = ', n:1);
+END;
+
+FreeIpn(hz, IpnMapN(hz, n));
+END; {FreeN}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  ChangeBkSize
+
+**********************************************************************************}
+
+PROCEDURE ChangeBkSize(hz: THz; h: TH; cbNew: TC);
+VAR
+cbMove: TC;
+cbCur: TC;
+cbNewPlusOvh: TC;
+bkNew: TBk;
+bkOld: TBk;
+bpT:    TBp;
+hT,
+hReserved: TH;
+SuccessfullyChanged: TF;
+BkAddr: TBk;
+
+BEGIN {ChangeBkSize}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('ChangeBkSize   hz = ', ORD(hz):1, '   h = ', ORD(h):1,
+           '   cbNew = ', cbNew:1, '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+cbCur := CbDataOfH(hz, h);
+cbNew := CMax(WAnd(cbNew+1, mskEven), cbMinDataStd);
+cbNewPlusOvh := cbNew + dbBkStd;
+SuccessfullyChanged := FALSE;
+IF (cbNew + cbMinFree) <= cbCur THEN
+     BEGIN
+     bkOld := POINTER(ORD(h^)-dbBkStd);
+     bkOld^.hdr.cw := cbNewPlusOvh DIV 2;
+     BkAddr := MakeBkf(hz, POINTER(ORD(bkOld) + cbNewPlusOvh), cbCur - cbNew, bkNil);
+     hz^.cbFree := hz^.cbFree + (cbCur - cbNew);
+     SuccessfullyChanged := TRUE;
+     IF fTstHz THEN
+        BEGIN
+        WRITELN('Exit ChangeBkSize(shrank) bkOld=', ORD(bkOld):1, ' cw=',
+                ORD(bkOld^.hdr.cw):1,
+                ' cbfree=', hz^.cbfree:1);
+        END;
+     END
+ELSE IF (hz^.cbFree < (cbNewPlusOvh + cbMinFree)) THEN {only enough for in place}
+        SuccessfullyChanged := GrowHInPlace(hz, h, cbNew, tybkStd);
+
+IF NOT SuccessfullyChanged THEN {Change by moving to a new block}
+     BEGIN
+     IF hz^.hFstFree = hNil THEN {Out of master ptrs -> use reserved 1st one}
+          BEGIN
+          hReserved := POINTER(ORD(@hz^.argpPool));
+          hz^.hFstFree := hReserved; {Make HAlloc use reserved one}
+          hReserved^ := pNil; {Make the reserved one the new end of the chain}
+          END;
+
+     hT := HAllocate(hz, cbNew);
+     IF hT <> hNil THEN
+          BEGIN
+          bkNew := POINTER(ORD(hT^) - dbBkStd);
+          bpT := bkNew^.bp;
+          bkOld := POINTER(ORD(h^)-dbBkStd);
+          cbMove := CMin(bkNew^.hdr.cw, bkOld^.hdr.cw)*2-cbTybkAndCb;
+          MoveRgch(@bkNew^.bp, @bkOld^.bp, cbMove);
+          bkOld^.bp := bpT; hT^ := h^; h^ := @bkNew^.dataStd;
+          FreeBk(hz, hT, tybkStd);
+          END;
+
+      IF fTstHz THEN
+         BEGIN
+         WRITELN('Exit ChangeBkSize   hT = ', ORD(hT):1, '   hT^ = ',
+                 ORD(hT^):1,
+                 '   h^ = ', ORD(h^):1,
+                 '   hz^.cbfree = ', hz^.cbfree:1);
+         END;
+      END;
+
+END; {ChangeBkSize}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  ChangeSizeH
+
+**********************************************************************************}
+
+PROCEDURE ChangeSizeH{hz: THz; h: TH; cbNew: TC};
+VAR bk: TBk;
+BEGIN {ChangeSizeH}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('ChangeSizeH   hz = ', ORD(hz):1, '   h = ', ORD(h):1,
+           '   cbNew = ', cbNew:1, '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+bk := POINTER(ORD(h^)-dbBkStd);
+IF bk^.hdr.tybk = tybkStd THEN
+     ChangeBkSize(hz, h, cbNew)
+ELSE BEGIN
+     {it is a locked, named block}
+     bk := POINTER(ORD(h^)-dbBkNData);
+     ChangeNSize(hz, bk^.nob.n, cbNew);
+     END;
+END; {ChangeSizeH}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  ChangeNSize
+
+**********************************************************************************}
+
+PROCEDURE ChangeNSize{hz: THz; n: TN; cbNew: TC};
+VAR pnobT: TPnob;
+    h: TH;
+    fLock,
+    result: TF;
+BEGIN {ChangeNSize}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('ChangeNSize   hz = ', ORD(hz):1, '   n = ', ORD(n):1,
+           '   cbNew = ', cbNew:1, '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+pnobT := hz^.hrgpnob^^[IpnMapN(hz, n)];
+IF pnobT <> NIL THEN fLock := pnobT^.stn.fLock ELSE fLock := FALSE;
+h := HLockN(hz, n, TRUE);
+result := GrowHInPlace(hz, h, cbNew, tybkN);
+IF NOT fLock THEN UnlockN(hz, n);
+END; {ChangeNSize}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  PCreateNob
+
+**********************************************************************************}
+
+FUNCTION PCreateNob{(hz: THz; nSrc: TN; cbData: TC) : TP};
+VAR
+pnob:   TPnob;
+ipn:    TC;
+cbFree: TL;
+w: TW;
+BEGIN {PCreateNob}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('PCreateNob   hz = ', ORD(hz):1, '   nSrc = ', nSrc:1,
+           '   cbData = ', cbData:1, '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+cbFree := 2*cbData + ((ORD(hz^.bkLst) - ORD(hz^.bkFst)) DIV 8);
+IF hz^.cbFree < cbFree THEN SetCbFree(hz, cbFree + 2, FALSE);
+
+IF hz^.cpnAvail <= 1 THEN IncLogIpnLim(hz);
+hz^.cpnAvail := hz^.cpnAvail - 1;
+
+AllocBk(hz, @pnob, cbData, tybkN);
+pnob^.n := nSrc;
+pnob^.stn.tybk := tybkN;
+pnob^.stn.ubt := hz^.ubtCur;
+pnob^.stn.fDirty := FALSE;
+pnob^.stn.fLock := FALSE;
+pnob^.bp.fRelPBase := TRUE;
+ipn := IpnMapN(hz, nSrc);
+IF hz^.hrgpnob^^[ipn] <> NIL THEN Break(8);
+hz^.hrgpnob^^[ipn] := pnob;
+hz^.ubtCur := hz^.ubtCur+1;
+PCreateNob := @pnob^.data;
+END; {PCreateNob}
+
+
+{$S SMwork}
+{**********************************************************************************
+
+==========>  PMapN
+
+**********************************************************************************}
+
+FUNCTION PMapN{(hz: THz; nSrc: TN) :TP};
+VAR
+pnobT: TPnob;
+pT:     TP;
+cError: TC;
+fSwapped: TF;
+BEGIN {PMapN}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('PMapN   hz = ', ORD(hz):1, '   nSrc = ', nSrc:1,
+           '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+pnobT := hz^.hrgpnob^^[IpnMapN(hz, nSrc)];
+IF pnobT = NIL THEN
+     BEGIN
+     pT := PCreateNob(hz, nSrc, CbOfN(nSrc, hz^.procCbOfN));
+     pnobT := hz^.hrgpnob^^[IpnMapN(hz, nSrc)];
+     pnobT^.stn.fLock := TRUE;
+     fSwapped := FSwapInN(hz, nSrc, hz^.procFSwapInN);
+     pnobT := hz^.hrgpnob^^[IpnMapN(hz, nSrc)];
+     pnobT^.stn.fLock := FALSE;
+     IF NOT fSwapped THEN
+          BEGIN
+          pT := NIL;
+          FreeIpn(hz, IpnMapN(hz, nSrc));
+         END
+     ELSE BEGIN
+          pT := @pnobT^.data;
+          END;
+     END
+ELSE BEGIN
+     pnobT^.stn.ubt := hz^.ubtCur;
+     pT := @pnobT^.data;
+     END;
+PMapN := pT;
+
+END; {PMapN}
+
+
+{$S SMcold}
+{**********************************************************************************
+
+==========>  ReleaseBkNrel
+
+**********************************************************************************}
+
+PROCEDURE ReleaseBkNrel{hz: THz; pFstRelease: TP};
+VAR
+bkT:    TBk;
+bkLst:  TBk;
+cbBk:   TL;
+p:      TP;
+BEGIN {ReleaseBkNrel}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('ReleaseBkNrel   hz = ', ORD(hz):1, '   pFstRelease = ',
+           ORD(pFstRelease):1,
+           '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+IF pFstRelease <> pNil THEN
+ BEGIN
+ bkT := hz^.bkFst;
+ bkLst := hz^.bkLst;
+ WHILE ORD(bkT) < ORD(bkLst) DO
+    BEGIN
+    if bkt^.hdr.tybk = tybkFree
+         then cbBk:=bkt^.cwFree*2
+         else cbBk := bkT^.hdr.cw*2;
+    IF (ORD(bkT) >= ORD(pFstRelease)) AND (bkT^.hdr.tybk = tybkNrel) THEN
+           BEGIN
+           p := @bkT^.dataNrel;
+           FreeBk(hz, @p, tybkNrel);
+           END;
+    bkT := POINTER(ORD(bkT)+cbBk);
+    END;
+ END;
+END; {ReleaseBkNrel}
+
+
+{$S SMcold}
+{**********************************************************************************
+
+==========>  PLstFree
+
+**********************************************************************************}
+
+FUNCTION PLstFree{hz) : TP};
+LABEL   50;
+VAR
+bkf:    TBk;
+bkfHi:    TBk;
+BEGIN {PLstFree}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+IF fTstHz THEN
+   BEGIN
+   WRITELN('PLstFree   hz = ', ORD(hz):1, '   hz^.cbfree = ', hz^.cbfree:1);
+   END;
+
+bkf := BkFindCb(hz, cbNoFind);   {To coalesce free blocks }
+bkf := hz^.bkLst;
+bkfHi := bkNil;
+WHILE TRUE DO
+ BEGIN
+ bkf := bkf^.bkfNxt;
+ IF bkf = hz^.bkLst THEN GOTO 50;
+ IF (bkfHi = bkNil) OR (ORD(bkfHi) < ORD(bkf)) THEN
+          bkfHi := bkf;
+ END;
+50:
+IF bkfHi = bkNil THEN
+ PLstFree := POINTER(ORD(pNil))
+ELSE PLstFree := POINTER(ORD(bkfHi));
+END; {PLstFree}
+
+
+
+{$S NEVER}
+{**********************************************************************************
+
+==========>  Scramble
+
+**********************************************************************************}
+
+PROCEDURE Scramble{(hz: THz)};
+
+VAR
+   Size: TC;
+   bkT: TBk;
+   Success: TF;
+   cbFound: TL;
+
+BEGIN {Scramble}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+   IF fTstHz THEN
+      WRITELN('Scramble   hz = ', ORD(hz):1,
+              '   hz^.cbfree = ', hz^.cbfree:1);
+   IF fTstHzP THEN
+      PxHz(hz); {Dump the heap}
+
+   IF NOT hz^.HasConcrete THEN BEGIN {Don't attempt to scamble if concrete lock}
+
+      IF hz^.fUpScramble THEN BEGIN {push blocks up}
+         bkT := BkCompactCb(hz, cbNoFind, hz^.bkLst, cbFound); {complete compact}
+         hz^.fUpScramble := FALSE;
+      END {if grow in place}
+
+      ELSE BEGIN {push blocks down}
+         Size := CbMakeBkfBefore(hz, POINTER(ORD(hz^.hScramble^) + cbMinFree),
+                                 cbNoFind, FALSE, bkNil); {complete forward move}
+         hz^.fUpScramble := TRUE;
+      END;
+
+   END; {if there currently is no concrete}
+
+   IF fTstHz THEN
+      WRITELN('Exit Scramble   hz = ', ORD(hz):1,
+              '   size = ', Size:1,
+              '   hz^.cbfree = ', hz^.cbfree:1);
+   IF fTstHzP THEN
+      PxHz(hz); {Dump the heap}
+END; {Scramble}
+
+
+{$S SMothrwk}
+{**********************************************************************************
+
+==========>  HzInit
+
+**********************************************************************************}
+
+FUNCTION HzInit{(pFst: TP; pLim: TP; pBase: TP; ipPoolMac: TC; logIpnLim: TC;
+                procCbMore: TProc; procCbOfN: TProc; procFSwapInN: TProc;
+                procSwapOutN: TProc) : THz};
+VAR
+hz:     THz;
+bk:     TBk;
+ip:     TC;
+ipn:    TC;
+i:      TC;
+ipnLim: TC;
+pn:     TPn;
+hT:     TH;
+BkAddr: TBk;
+NoRelBlocksFound: TC;
+Okay: TF;
+ch: CHAR;
+
+BEGIN {HzInit}
+{$IFC fTraceSM}   LogCall;   {$ENDC}
+{$IFC fhz}   fTstHz   := FALSE;  {$ENDC}
+{$IFC fhz}   fTstHzV  := FALSE; {$ENDC}
+{$IFC fstd1} fTstStd1 := TRUE;  {$ENDC}
+{$IFC fhzP}  fTstHzP  := FALSE; {$ENDC}
+
+IF fTstHz THEN
+   BEGIN
+   WRITELN('HzInit:   pFst = ', ORD(pFst):1, '   pLim = ', ORD(pLim):1,
+           '   pBase = ', ORD(pBase):1, '   ipPoolMac = ', ipPoolMac:1,
+           '   logIpnLim = ', logIpnLim:1, '   procCbMore = ', ORD(procCbMore):1,
+           '   procCbOfN = ', ORD(procCbOfN):1, '   procFSwapInN = ',
+           ORD(procFSwapInN):1, '   procSwapOutN = ', ORD(procSwapOutN):1);
+   END;
+
+argcbOvh[tybkFree] := cbMinFree;
+argcbOvh[tybkNrel] := cbTybkAndCw;
+argcbOvh[tybkStd] := cbOvhStd;
+argcbOvh[tybkN] := dbBkNData;
+argdbBk[tybkFree] := 1;                 {This will cause a trap if it is used}
+argdbBk[tybkNrel] := dbBkNrel;
+argdbBk[tybkStd] := dbBkStd;
+argdbBk[tybkN] := dbBkNNob;
+hNil := POINTER(1); bkNil := NIL;
+pNil := POINTER(1);
+hzNil := POINTER(1);
+IF ODD(ORD(pFst)) THEN pFst := POINTER(ORD(pFst) + 1);
+IF ODD(ORD(pLim)) THEN pLim := POINTER(ORD(pLim) - 1);
+IF ODD(ORD(pBase)) THEN pBase := POINTER(ORD(pBase) - 1);
+IF ipPoolMac <= 0 THEN {Up it now rather than shortly calling HMakeMoreMasters}
+   ipPoolMac := cpPoolMore;
+hz := POINTER(ORD(pFst));
+
+hz^.fScramble := FALSE;
+hz^.fUpScramble := FALSE;
+hz^.fCheck := FALSE;
+bk := @hz^.argpPool[ipPoolMac];
+IF procCbMore = POINTER(procNil) THEN
+     BEGIN
+     {$IFC fOs}
+     hz^.procCbMore := @CbMoreGrowSeg;
+     {$ELSEC}
+     hz^.procCbMore := @CbNoMore;
+     {$ENDC}
+     END
+ELSE hz^.procCbMore := procCbMore;
+hz^.procCbOfN := procCbOfN;
+hz^.procFSwapInN := procFSwapInN;
+hz^.procSwapOutN := procSwapOutN;
+hz^.HasConcrete := FALSE;
+hz^.ipnCur := 0;
+hz^.rgwBase := POINTER(ORD(pBase));
+hz^.bkFst := bk;
+bk := POINTER(ORD(pLim)-cbBkLst);
+bk^.cwFree := cbBkLst DIV 2;
+{ done by cwFree assignment
+bk^.hdr.tybk := tybkFree;
+}
+bk^.bkfNxt := bk;
+bk^.bkfPrv := bk;
+hz^.bkLst := bk;
+hz^.bkfFst := bk;
+BkAddr := MakeBkf(hz, hz^.bkFst, ORD(bk)-ORD(hz^.bkFst), bkNil);
+hz^.cbFree := ORD(bk)-ORD(hz^.bkFst);
+hz^.ipPoolMac := ipPoolMac;
+hz^.hFstFree := hNil;
+FOR ip := 0 TO ipPoolMac-1 DO
+     BEGIN
+     hT := POINTER(ORD(@hz^.argpPool) + (ORD4(ip) * 4));
+     hT^ := POINTER(ORD(hz^.hFstFree));
+     hz^.hFstFree := hT;
+     END;
+hT := POINTER(ORD(@hz^.argpPool) + 4);
+hT^ := pNil; {Make 2nd ptr be end of chain & save 1st ptr for LockHandleInConcrete}
+cbPoolMore := cpPoolMORE * SIZEOF(TP);
+ipnLim := 1;
+FOR i := 1 TO logIpnLim DO ipnLim := ipnLim*2;
+hz^.hrgpnob := POINTER(ORD(HAllocate(hz, ipnLim*SIZEOF(pn))));
+hz^.mskIpnLst := ipnLim-1;
+hz^.cpnAvail := ipnLim;
+FOR ipn := 0 TO hz^.mskIpnLst DO hz^.hrgpnob^^[ipn] := NIL;
+hz^.ubtCur := 0;
+hz^.cCompact := 0;
+hz^.hScramble := HAllocate(hz, cbMinFree); {Its size is changed when scrambling}
+
+hz^.fScramble := Init_Scramble;
+IF Ask_Question THEN
+   BEGIN
+      WRITE('Scramble Heap starting at ', ORD(pFst):1, '? ');
+      READLN(ch);
+      IF (ch = 'y') OR (ch = 'Y') THEN
+         hz^.fScramble := TRUE
+      ELSE
+         hz^.fScramble := FALSE;
+   END;
+
+HzInit := hz;
+
+IF fTstHz THEN
+   BEGIN
+   WRITELN('Exit HzInit   hz =', ORD(hz):1, '   bk = ', ORD(bk):1,
+           '   hz^.bkFst = ', ORD(hz^.bkFst):1);
+   WRITELN('     hz^.cbFree = ', ORD(hz^.cbFree):1, '   hT = ', ORD(hT):1,
+           '   hT^ = ', ORD(hT^):1, '   @hz^.argpPool = ', ORD(@hz^.argpPool):1);
+   WRITELN('     hz^.hFstFree = ', ORD(hz^.hFstFree):1,
+           '   hz^.hrgpnob = ', ORD(hz^.hrgpnob):1);
+   END;
+IF fTstHzP THEN
+   PxHz(hz); {Dump the heap}
+IF fTstHzV THEN
+   Okay := FCheckHzOk(hz, NoRelBlocksFound);
+
+END; {HzInit}
+
+
+END.
+
+
+ÿ

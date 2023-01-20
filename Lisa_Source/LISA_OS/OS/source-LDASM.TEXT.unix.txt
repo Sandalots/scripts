@@ -1,0 +1,991 @@
+;Copyright 1983, 1984, Apple Computer Inc.
+
+;File: source/ldasm
+
+        .INCLUDE SOURCE/PASCALDEFS.TEXT
+        .INCLUDE SOURCE/LDEQU.TEXT
+
+
+        .PROC   ENTEROP
+       ;*************************************************************)
+       ;*  PROCEDURE ENTEROP (VAR PPARMS : INTEGER; GLOBALS : INTEGER;
+       ;*                         ENDSTACKAREA, PENTRY : ABSPTR);
+       ;*
+       ;* Description:
+       ;*    Enter the main procedure of the newly loaded outer
+       ;*    process, but first:
+       ;*
+       ;*       1.  Build outer process' link to parameter data.
+       ;*       2.  Setup the registers required for Pascal runtime,
+       ;*            namely, a7 gets the prototype stack.
+       ;*       3.  Push the address of the input and output buffers
+       ;*            onto the prototype stack.
+       ;*
+       ;* Input Parameters:
+       ;*    Pparms - Address of first byte of parameter data.
+       ;*    Globals - Amount of unit global var space.
+       ;*    Endstackarea - Address where prototype stack starts.
+       ;*    Pentry - Program's entrypoint.
+       ;*
+       ;* Output Parameters:
+       ;*    Adrparamptr - Location receiving a pointer to the
+       ;*      the loader's parameter data to outer process.
+       ;*
+       ;* Special Conditions of Use:
+       ;*    The io buffer addresses for step 3, above, are into
+       ;*       the monitor's data area, until the monitor goes away.
+       ;*
+       ;*       is fixed to  zero, since the program is launched
+       ;*       on the user stack while the globals are in global
+       ;*       data.  The allocation of space for the globals
+       ;*       is done in the o.s. routine 'pascalinit'.
+       ;*
+       ;*************************************************************)
+
+;get parameters off  the stack prior to abandoning it in favor of prototype stack.
+        addq    #4,A7           ;discard return address
+        MOVE.L  (SP)+,A0        ;a0 := OS entrypoint.
+        MOVE.L  (SP)+,A6        ;a6 := adr of new stack
+        MOVE.W  (SP)+,A1        ;stash OS's unit global size
+        MOVE.L  (SP)+,adrparamptr;point paramptr to loader data base
+        MOVE.L  A6,A7           ;change stack to prototype stack area
+
+     ;build prototype stack:
+        clr.l   -(SP)                   ;clear 'C'
+        clr.l   -(SP)                   ;clear 'V'
+        clr.l   -(SP)                   ;clear 'os/mon flag'
+        move.l  a1,-(SP)                ;pass 'commonsize'
+
+        clr.l   -(SP)                   ;cleared buffer ptr means use soroc
+        clr.l   -(SP)
+
+     ;'jsr' to OS (from nowhere)
+        clr.l   -(SP)                   ;create nil return address
+        jmp     (a0)                    ;enter OS
+
+
+
+      .def    LDMACSBUG
+       ;*************************************************************)
+       ;*  PROCEDURE LDMACSBUG;
+       ;*
+       ;*  Fake the depression of the NMI button:
+       ;*
+       ;*  (this routine also preserves whether caller was
+       ;*   on the user or supervisor stack.)
+       ;*
+       ;*************************************************************)
+trap8   equ     160             ;intvt location of trap 8 handler
+ptr_litmus equ  $fc             ;location showing whether lisabug exists:
+                                ;  if contents $fc holds ptr to debuggers mmu,
+                                ;  then lisabug IS present
+ldmacsbug
+        move.w  ptr_litmus,d0   ;is lisabug even around?
+        cmp.w   #debugmmu*2,d0
+        beq     its_there
+        rts                     ;NO, it's not, so return immediately
+its_there
+        move.w  sr,d0           ; in supervisor state?
+        btst    #13,d0
+        bne     supstate
+userstate                       ;caller IS in user state
+        move.l  (sp)+,a1        ;get return address off user stack
+;get onto supervisor stack:
+        lea     trap8hand,a2    ;define trap 8 handler
+        move.l  a2,trap8
+        trap    #8
+trap8hand
+        addq    #6,sp           ;discard trap's SR and return adr
+        move.l  a1,-(sp)        ;supply real return adr and SR
+        move.w  d0,-(sp)
+        bra     fexit
+supstate                        ;caller IS in supervisor state
+        move.w  sr,-(sp)        ;push sr (return adr already on sup stack)
+fexit
+        move.l  $7c,a3          ;jump indirect thru 7c,
+        jmp     (a3)            ;  certified path to monitor.
+
+
+
+        .def    INITMMUTIL
+       ;*************************************************************)
+       ;*  FUNCTION INITMMUTIL(UTILADR : ABSPTR) : ABSPTR;
+       ;*
+       ;* Description:
+       ;*   Install the mmu programming utility at address UTILADR,
+       ;*     returning the address of the smt.
+       ;*
+       ;*    For the context this operates within, see the design notes.
+       ;*
+       ;*************************************************************)
+; some handy constants:
+hw_adjust       equ     $100            ;page offset to base (stack segs only)
+f_adr_to_lp     equ     $200            ;factor to convert an adr to a logical
+                                        ; page number
+mmu_to_base     equ     17              ;bits to shift seg number to convert
+                                        ; it into a mem address
+adr_to_lp       equ     9               ;shift count equivalent of adr_to_lp
+bit_14          equ     $4000           ;where setup's so-called bit-14 is
+mmustack        equ     $600            ;seg access for stack segment
+mmureadwrite    equ     $700            ;seg access for r/w segment
+
+mmunotmem       equ     $700            ;value which, if exceeded, signifies
+                                        ;  a non-memory segment, ie,
+                                        ;  IO, ABSENT, or SPECIAL (PROM).
+                                        ; (used to determine whether adr of
+                                        ;  physical byte zero must be added
+                                        ;  in prior to programming an mmu)
+
+smt_size        equ     512             ;bytes per domain in smt
+next_mmu        equ     $20000          ;offset between mmu's
+
+;effective address of the first byte within the mmucodemmu segment:
+mmusegorg       equ     next_mmu*mmucodemmu
+
+;memory locations to change mmu domain, ie domain 2
+;  is established by touching ct2on and ct1off,
+;   a binary '1', '0' selection.
+ctbit1on        equ     iommu+$E00A
+ctbit1off       equ     iommu+$E008
+ctbit2on        equ     iommu+$E00E
+ctbit2off       equ     iommu+$E00C
+
+;control ports to change domains:
+setupon         equ     iommu+$E010
+setupoff        equ     iommu+$E012
+
+; Calculate value used for mmucodemmu segment:
+;   segmmulen is the slim programming constant to create a segment 16KB +
+;    5 pages long, with read-write accessibility.  '5' pages is broken down
+;    into 1 page for the programs, and 4 pages (2048 bytes) for the smt.
+;   ~(  (16Kb.shr.9 + 5) - 1) => $DB     programs the length of the segment
+mmuseglen       equ     $DB+mmureadwrite
+
+safeplace       equ     $7800           ;work area where setup can be turned
+                                        ;  on safely.
+
+sorg            equ     $8008           ;base of sorg command ports
+slim            equ     $8000           ;base of slim command ports
+
+max_seg         equ     256             ;maximum page length of a segment
+
+trap6           equ     152             ;adr of vector table entry for trap 6
+
+initmmutil
+        move.l  (SP)+,a0                ;save the return address in A0
+
+;calculate do_an_mmu's home adr, and put it into the trap vector for trap6,
+;  the standard path to the utility:
+        move.l  #mmusegorg+bit_14,trap6
+
+;move both initmmutil and do_an_mmu to place where setup can be turned on:
+; while source < end marker do
+; begin
+;    destination^ := source^;
+;    increment destination pointer;
+;    increment source pointer;
+; end;
+        move.l  #safeplace,a1           ;a1 := destination pointer
+        lea     endtransfer,a2          ;d0 := end marker
+        move.l  a2,d0
+        lea     initmmutil,a2           ;a2 := source pointer
+loop
+        cmpa.l  d0,a2
+        bgt     exitloop
+        move.l  (a2)+,(a1)+
+        bra     loop
+exitloop
+
+;get into just created copy of self, specifically to label hello_there
+        lea     initmmutil,a1   ;what a god-awful way to calculate the
+        lea     hello_there,a2  ; the address:
+        suba.l  a1,a2           ;    #safe_place+hello_there-initmmutil
+        move.l  #safeplace,a1
+        adda.l  a2,a1
+        jmp     (a1)
+hello_there
+
+;calculate the PAGE address where DO_AN_MMU goes, and put it in D1:
+        move.l  (SP)+,d1                ;d1 := BYTE address where util goes
+        add.l   prom_byte0,d1           ;add in physical byte 0
+        move.b  #adr_to_lp,d6           ;convert parm to page address
+        lsr.l   d6,d1
+        subi.w  #bit_14/f_adr_to_lp,d1  ;adjust for offset within mmu
+
+;establish domain 0, the OS domain:
+        move.b  d0,ctbit1off
+        move.b  d0,ctbit2off
+
+        move.b  d0,setupon              ;turn setup on
+
+;program mmucodemmu:
+        move    d1,mmusegorg+sorg
+        move    #mmuseglen,mmusegorg+slim
+
+        move.b  d0,setupoff             ;turn setup off
+
+;copy do_an_mmu into the newly programmed code segment:
+; while source < end marker do
+; begin
+;    destination^ := source^;
+;    increment destination pointer;
+;    increment source pointer;
+; end;
+        move.l  #mmusegorg+bit_14,a1    ;a1 := destination pointer
+        lea     endtransfer,a2          ;d0 := end marker
+        move.l  a2,d0
+        lea     don_an_mmu,a2           ;a2 := source pointer
+loop2
+        cmpa.l  d0,a2
+        bgt     exit2
+        move.l  (a2)+,(a1)+
+        bra     loop2
+exit2
+
+        lea     don_an_mmu,a1           ;return the address of smt_base
+        lea     smt_base,a2             ;  in the mmucodemmu as
+        suba.l  a1,a2                   ;  initmmutil's function value
+        move.l  #mmusegorg+bit_14,a1
+        adda.l  a1,a2
+        move.l  a2,(SP)
+
+        jmp     (a0)                    ;returns
+
+
+
+
+        .def    PROG_MMU
+       ;*************************************************************)
+       ;*
+       ;* Description:
+       ;*   Gets control to DO_AN_MMU, where actual mmu programming
+       ;*      takes place.
+       ;*
+       ;*    For the context this operates within, see the design notes.
+       ;*
+       ;*************************************************************)
+prog_mmu
+        move.l  (SP)+,a0        ;a0 := return address
+        movem.w (SP)+,d0-d3     ;d0 := the domain to return to
+                                ;d1 := mmucount
+                                ;d2 := target domain
+                                ;d3 := mmu index
+
+        movem.l a3/d4-d7,-(SP)  ;save registers committed to compiler optim.
+        trap    #6              ;enter do_an_mmu
+        movem.l (SP)+,a3/d4-d7  ;restore registers before returning
+        jmp     (a0)
+
+
+       ;*************************************************************)
+       ;*  PROCEDURE DO_AN_MMU(INDEX, DOMAIN, MMUCOUNT, RET_DOMAIN:INTEGER);
+       ;*
+       ;* Description:
+       ;*   Program one or more mmu segments as defined by the SMT.
+       ;*
+       ;*   For the context this operates within, see the design notes.
+       ;*
+       ;* Input Parameters:
+       ;*    Index - Which mmu segment is being changed,
+       ;*    Domain - Which domain's mmu to change.
+       ;*    Mmucount - number of mmus to program.
+       ;*    Ret_Domain - which domain to return to
+       ;*
+       ;* Special Conditions of Use:
+       ;*    The same copy of this program is shared by both the loader
+       ;*     and the final OS environment.  It is not re-loaded as part
+       ;*     of the OS.
+       ;*
+       ;*    Several constants are from initmmutil's definitions.
+       ;*
+       ;*    The caller is responsible for saving pascals registers!
+       ;*
+       ;*************************************************************)
+
+do_an_mmu
+don_an_mmu              ;A second name for the same place is defined to
+                        ; overcome an assembler bug.  Apparently, the
+                        ;  'lea do_an_mmu,a1' instruction makes it
+                        ; impossible to define do_an_mmu.  Having
+                        ; duplicate, but fuctionally identical, labels
+                        ; works around the problem.
+
+;  locate smt[index,domain]
+;  establish desired domain;
+;  'value on entry' := the CALLER'S interrupt level;
+;  repeat
+;     setup off;
+;     intson('value on entry');
+;     intsoff;
+;     setup on;
+;     if access = stack then
+;        begin
+;           if (length=0) {meaning 128KB) then
+;               length := $100;
+;           origin := origin + length - hw_adjust;
+;           length := length - 1;
+;        end
+;     else
+;       length := twos_comp(length);
+;     if access <= mmunotmem then origin := origin + 'location of byte 0'
+;     program sorg;
+;     program slim;
+;     mmucount := mmucount - 1;
+;  until mmucount=0;
+;  restore domain;
+;  rte;
+
+;registers inherited from the caller:
+                                ;a0 := return address
+                                ;d0 := the domain to return to
+                                ;d1 := mmucount
+                                ;d2 := target domain
+                                ;d3 := mmu index
+
+;find location of physical byte 0, just in case non-iommu is needed:
+        move.l  prom_byte0,d5
+        lsr.l   #8,d5           ;convert to page address
+        lsr.l   #1,d5
+        move.l  d5,a3
+
+;capture callers interrupt 'value on entry', save it in d4:
+        move    sr,d4
+        move    #$2700,d6       ;stash a handy constant (ints off, super. stack)
+
+;find smt[index,domain], putting its address into A1:
+        lea     smt_base,a1     ;init a pointer to smt base
+        lsl     #8,d2           ;fold in domain
+        lsl     #1,d2           ; (8+1 => log (base 2) of smt_size.)
+        adda    d2,a1
+        lsl     #2,d3           ; and index (temporarily fudging mmu index)
+        adda    d3,a1
+        lsr     #2,d3           ; (restore mmu index from previous lookup/shift)
+
+;establish the requested context(bit alignment shifted in index into smt):
+        btst    #9,d2           ;bit one on?
+        bne.s   b1on
+        move.b  d1,ctbit1off    ;  bit 1 off!
+        bra.s   bit2next
+b1on    move.b  d1,ctbit1on     ;  bit 1 on!
+bit2next
+        btst    #10,d2          ;bit two on?
+        bne.s   b2on
+        move.b  d1,ctbit2off    ;  bit 2 off!
+        bra.s   ctxdone
+b2on    move.b  d1,ctbit2on     ;  bit 2 on!
+ctxdone
+
+;initialize other pointers for main loop:
+                                ;(a1 := pointer into smt)
+        move    #mmu_to_base,d7 ;a2 := initial control port for
+        lsl.l   d7,d3           ; mmu index.
+        add.l   #slim,d3
+        move.l  d3,a2
+        subq.b  #1,d1           ;'dbra' correction
+        move.l  #next_mmu,d5    ; (for use inside the loop)
+
+DoNextMmu                       ;repeat loop starts here
+
+;Enable interrupts on each loop, but leave them off while setup's on!
+        move.b  d1,setupoff     ;setup off
+        move    d4,sr           ;enable interrupts (to the level of the caller)
+; (interrupts/breakpoints can happen here)
+        move    d6,sr           ;disable interrupts
+        move.b  d1,setupon      ;setup on
+
+        move.w  (a1)+,d2        ;d2 := origin (in pages)
+        move.w  (a1),d7         ;d7 := access
+        clr.b   d7
+        addq    #1,a1
+        clr.w   d3              ;d3 := length (in pages)
+        move.b  (a1)+,d3        ; (smt buf ptr now fully incremented)
+
+        cmp.w   #mmustack,d7    ;if seg is a stack then
+        bne.s   not_stack      ;begin
+        move.b  d3,d3           ;if length=0 {meaning 128KB} then
+        bne.s   not_zero
+        move.l  #max_seg,d3     ;    length := $100;
+not_zero
+        add.w   d3,d2           ;  origin := origin + length - hw_ajust
+        sub.w   #hw_adjust,d2   ;  length := length - 1;
+        subq    #1,d3           ;end
+        bra.s   adj_parms
+not_stack                       ;else
+        neg.b   d3              ;  length := 2's of length
+adj_parms
+
+        cmp.w   #mmunotmem,d7   ;if access implies real memory
+        bgt.s   not_real_mem    ;   then origin := origin + 'location of byte 0'
+        add.w   a3,d2
+not_real_mem
+
+;program the mmu
+        or      d7,d3
+        move.w  d3,(a2)         ;complete slim programming
+        move    d2,8(a2)        ; and sorg (8 is the diff between sorg
+                                ;   and slim)
+;loop overhead and termination testing:
+        adda.l  d5,a2           ;update control port ptr, ala 'next_mmu'
+        dbra    d1,DoNextMmu    ;decrement mmucount, and perhaps one more time
+
+        move.b  d1,setupoff     ;turn setup off
+
+;establish returning domain
+        btst    #0,d0           ;bit one on?
+        bne.s   bit_1on
+        move.b  d1,ctbit1off    ;  bit 1 off!
+        bra.s   bit_2next
+bit_1on move.b  d1,ctbit1on     ;  bit 1 on!
+bit_2next
+        btst    #1,d0           ;bit two on?
+        bne.s   bit_2on
+        move.b  d1,ctbit2off    ;  bit 2 off!
+        bra.s   ctx_done
+bit_2on move.b d1,ctbit2on      ;  bit 2 on!
+ctx_done
+        rte
+
+smt_base                ;beginning of smt array data area.
+
+endtransfer             ;delimits region copied into mmucodemmu
+
+
+
+        .def    INIT_DEBUGGER
+        ;**********
+        ;*   PROCEDURE INIT_DEBUGGER(p1, p2, p3, p4 : absptr);
+        ;*
+        ;* Description:
+        ;*   Initialize the standalone debugger (Lisabug).
+        ;*
+        ;* Input Parameters:
+        ;*   p1 - address of the base of screen memory.
+        ;*   p2 - address of the bottom of the data buffer, used
+        ;*           as it's stack.
+        ;*   p3 - address of the base of the debugger code, serves
+        ;*           as it's entrypoint, but called ONLY if it's non-zero.
+        ;*   p4 - address of second part of the debugger code, but it's called
+        ;*           ONLY if it's non-zero.
+        ;*
+        ;* Lint:
+        ;*   For now, p1 and p2 MUST be the same, and so this routine
+        ;*      uses only one or the other value.  The definition of
+        ;*      BOTH parameters is in the hope the debugger can be changed
+        ;*      do de-link the association of the debugger's stack with
+        ;*      an immediately adjacent screen.
+        ;*
+        ;**********
+init_debugger
+
+lb_ptr          equ     $134    ;Where lisabug assumes pointer to disk logic
+
+save_sp equ             $220    ;place where this routine remembers it's
+                                ; stack pointer value
+soroc_channel   equ     $1F0    ;address holding soroc channel pointer:
+
+debug_console   equ     $11C    ;address selecting DEBUGGERS console channel
+
+; values which, when stored to soroc_chanel, select
+;  one or the other of the rs232 ports:
+use_ch_a        equ     1
+use_ch_b        equ     3
+
+trap7           equ     156     ;vector table trap 7 vector address
+
+
+;zero debugger context ($100-180)
+        move.l  #$100,a0
+        move.w  #$20,d0
+@1      clr.l   (a0)
+        addq    #4,a0
+        dbra    d0,@1
+
+;set lisabug var to point to disk controller, used to determine
+;  whether old or new ioboard is in place.
+        move.l  #disk_control,lb_ptr
+
+;get parameters and save actual stack pointer value.
+;  (the debugger initialization CHANGES A7 for its own purposes,
+;   without restoring it!)
+        move.l  (SP)+,a0        ;get return address
+        move.l  (SP)+,a2        ;get second debugger entrypoint
+        move.l  (SP)+,a1        ;get debugger entrypoint
+        move.l  (SP)+,$110      ;init debugger's screenbase/stack ptr
+        addq    #4,SP           ;pop second copy of the same
+
+        movem.l a0/a3-a6,-(SP)  ;save context prior to debugger call
+        movem.l d4-d7,-(SP)     ;save registers subj to compiler optimization!
+
+        move.l  trap6,-(SP)     ;dont clobber trap 6 initialization
+
+        move.l  a2,-(SP)        ;save second entrypoint
+
+        move.l  a1,d2           ;test for existence of debugger, part one
+        bne     first_part
+
+;init 0 to $100 to '-1', signifying NOT initialized by Lisabug:
+        move    #63,d0          ;init 64 entries
+        suba.l  a0,a0           ;starting at 0
+do_more move.l  #-1,(a0)+
+        dbra    d0,do_more
+
+        jmp     post_init
+
+first_part
+        move.l  a7,save_sp      ;save the stack pointer value
+        jsr     (a1)            ;initialize standalone debugger, part one
+        move.l  save_sp,a7      ;restore stack pointer
+post_init
+
+        move.l  (SP)+,a2        ;get second entrypoint
+        move.l  a2,d2           ;test for existence of second debugger
+        beq     no_second_part
+        move.l  a7,save_sp      ;save the stack pointer value
+        jsr     (a2)            ;initialize standalone debugger, part two
+        move.l  save_sp,a7      ;restore stack pointer
+
+no_second_part
+        move.l  (SP)+,trap6     ;restore trap6 vector
+
+; init trap 7 handler so that readln/writeln can disable interrupts:
+        lea     trap7hand,a1
+        move.l  a1,trap7
+
+        move.l  #use_ch_a,soroc_channel ;assign RS232 channel A as path to SOROC
+
+        movem.l (SP)+,d4-d7     ;restore 'promised' data registers
+        movem.l (SP)+,a0/a3-a6  ;restore context after debugger call
+
+;Set debuggers console channel to 0, selecting the lisa screen, but do it in
+;a way that allows space to re-select to soroc when debugging lisabug problems.
+        moveq   #1,d0           ;select soroc
+        sub.l   d0,d0            ;re-select to lisa screen
+        move.l  d0,debug_console
+
+        jmp     (a0)            ;that's all
+
+
+trap7hand                       ;trap 7 handler for readln/writeln:
+        addq    #6,SP           ;clear the stack from trap stuff
+        move    d0,SR           ;get new SR
+        jmp     (a0)
+
+
+
+
+        .def    CRASH
+       ;*************************************************************)
+       ;* PROCEDURE CRASH(errnum : integer);
+       ;*
+       ;* Description:
+       ;*    Display the error number and system error icon as we
+       ;*        re-enter the boot prom to reboot the OS.
+       ;*
+       ;*************************************************************)
+adr_ioboard     equ      $fcc031;  ;stores whether ioboard is a lisa:
+                                   ;   >= 0 means lisa
+                                   ;   <  0 means some sort of pepsi
+lisa_icon
+          .BYTE $0C,$03,$C0,$07,$80,$02,$E0,$03 ;compressed data for lisa 'system error'
+          .BYTE $0E,$80,$02,$BF,$FF,$FF,$00,$FA ;   icon (picture of lisa with
+          .BYTE $C0,$07,$D7,$FF,$FF,$D7,$E0,$00 ;   an 'X' across it)
+          .BYTE $0C,$AF,$FF,$E0,$6C,$30,$01,$F5
+          .BYTE $50,$FF,$F0,$DF,$80,$1B,$03,$86
+          .BYTE $AF,$0D,$80,$01,$7F,$41,$06,$C0
+          .BYTE $06,$C7,$80,$03,$18,$60,$0D,$80
+          .BYTE $01,$B0,$0B,$0F,$D8,$36,$0F,$80
+          .BYTE $E3,$6C,$6F,$F7,$08,$36,$DB,$F7
+          .BYTE $01,$FF,$EB,$B0,$40,$0F,$80,$0C
+          .BYTE $FF,$FD,$E0,$30,$00,$07,$FF,$FA
+          .BYTE $BF,$FF,$E0,$03,$FF,$00,$F7,$5F
+          .BYTE $FF,$C0,$03,$FF,$FB,$BF,$00,$FF
+          .BYTE $C0,$07,$FF,$D6,$D7,$FF,$E0,$61
+          .BYTE $AA,$6E,$ED,$2A,$FE,$18,$DF,$F7
+          .BYTE $3E,$5D,$BF,$FB,$86,$3E,$0B,$6A
+          .BYTE $AD,$AA,$20,$F8,$06,$C0,$06,$C0
+          .BYTE $DB,$FD,$00,$7F,$FD,$7F,$E0,$35
+          .BYTE $EB,$FF,$FF,$B0,$AF,$C0,$1B,$36
+          .BYTE $D8,$2C,$0D,$EC,$6C,$06,$D8,$CB
+          .BYTE $36,$03,$30,$32,$1B,$01,$E0,$0E
+          .BYTE $80,0
+
+pepsi_icon      ;pepsi equivalent of the lisa icon, above.
+          .BYTE $0C,$03,$C0,$07,$80,$02,$E0,$03
+          .BYTE $0E,$80,$02,$DF,$FF,$FF,$00,$F6
+          .BYTE $C0,$07,$B7,$FF,$FF,$DB,$E0,$00
+          .BYTE $0C,$B7,$FF,$E7,$DB,$B0,$01,$ED
+          .BYTE $50,$FF,$F7,$6F,$80,$1B,$07,$04
+          .BYTE $6F,$80,$0D,$80,$05,$BF,$80,$41
+          .BYTE $06,$C0,$05,$BF,$80,$03,$10,$60
+          .BYTE $0E,$FF,$80,$01,$B0,$0B,$0F,$D8
+          .BYTE $26,$03,$80,$E3,$6C,$6C,$FF,$08
+          .BYTE $36,$C8,$FF,$01,$FF,$ED,$70,$40
+          .BYTE $03,$80,$0C,$FF,$F9,$20,$30,$00
+          .BYTE $07,$FF,$F9,$3F,$FF,$E0,$03,$FF
+          .BYTE $00,$F6,$DF,$FF,$C0,$03,$FF,$F6
+          .BYTE $DF,$00,$FF,$E0,$07,$FF,$DB,$B7
+          .BYTE $FF,$F0,$61,$AA,$CE,$E6,$95,$FF
+          .BYTE $18,$3F,$F9,$9F,$5E,$7F,$FE,$86
+          .BYTE $1F,$09,$EA,$AD,$95,$20,$F8,$06
+          .BYTE $C0,$06,$C0,$DB,$FB,$00,$7F,$FD
+          .BYTE $BF,$F0,$35,$ED,$FF,$FF,$B0,$6F
+          .BYTE $E0,$1B,$36,$D8,$2C,$0D,$EC,$6C
+          .BYTE $06,$D8,$CB,$36,$03,$30,$32,$1B
+          .BYTE $01,$E0,$0E,$80
+
+crash;and burn
+        move.l  prom_realsize,d0        ;tell prom where the main screen is,
+        sub.l   #screensize,d0          ;   (top of mem minus screensize)
+        move.l  d0,prom_screen          ; in unmapped terminology.
+        lea     pepsi_icon,a2           ;Choose appropriate icon:
+        move.b  adr_ioboard,d0          ;  use pepsi system error icon,
+        bmi.s   is_pepsi
+        lea     lisa_icon,a2            ;  or the lisa icon.
+is_pepsi
+        suba.l  a3,a3                   ;no messages
+        move.l  (SP)+,d1                ;TOSS return address
+        move.w  (SP)+,d0                ;get the error number
+        move    #-1,$10000              ;turn off debug mode for next boot, if any.
+
+;if prom can't handle errnum, display 'boot bomb' string:
+        move    prom_vers,d3
+        cmpi    #$202,d3
+        ble     bad_prom
+        jmp     prom_monitor            ;BYE-BYE time
+bad_prom
+        lea     ya_got_me,a3
+        jmp     prom_monitor
+ya_got_me                               ;oversimplified crash message
+    .ascii  'OS BOOT FAILED      TRY A NEWER MACHINE AND BOOT PROM'
+    .byte   0                       ;terminate string
+ ;  .byte   0                       ; (avoid odd program counter)
+
+
+
+        .def    INIT_LLD
+        ;**********
+        ;*   PROCEDURE INIT_LLD(p1 : absptr);
+        ;*
+        ;* Description:
+        ;*   Initialize the low-level drivers.
+        ;*
+        ;* Input Parameters:
+        ;*   p1 - address of the initialization code.
+        ;*
+        ;**********
+init_lld
+        move.l  (SP)+,a0        ;get return address
+        move.l  (SP)+,a1        ;get initialization code address
+        jsr     (a1)            ;do init
+        jmp     (a0)            ;return
+
+
+
+        .def    LDRTRAP
+       ;***********************************
+       ;*
+       ;*  procedure LDRTRAP;
+       ;*
+       ;*  Description:
+       ;*     Get execution control into pascal (from the OS program),
+       ;*     by calling:  'DRIVER_CALL(parms: fake_parm);
+       ;*
+       ;*  Input Parameter (From the OS):
+       ;*     D1 - is a pointer to the call description (parms).
+       ;*
+       ;*  Implementation Notes:
+       ;*     Shouldn't there be a LINK/UNLK pair here?
+       ;*
+       ;*     The caller to ldrtrap arranges that A5 has the right value for
+       ;*     the loader.
+       ;*
+       ;***********************************
+ldrtrap
+        .ref    driver_call
+        move.l  d2,-(SP)        ;pass parms to the loader
+        lea     driver_call,a0  ;get loader's entrypoint
+        jsr     (a0)            ;go there
+        rts                     ;return back to the OS
+
+
+
+        .def    GET_A5
+       ;***********************************
+       ;*
+       ;*  function GET_A5 : longint;
+       ;*
+       ;*  Description:
+       ;*     Return the value of the loader's A5 register
+       ;*
+       ;***********************************
+get_a5
+        move.l  (SP)+,a0        ;get return address
+        move.l  a5,(SP)         ;return A5 value
+        jmp     (a0)            ;that's all folks
+
+
+
+        .PROC   MOVER,6
+;-------------------------------------------------------------------------
+;       procedure MOVER (source: absptr, dest: absptr, length: int4);
+;
+;       Move block of bytes to anywhere in memory.  Move 0-63 blocks of 4 bytes;
+;       0-32767 blocks of 256 bytes; 0-3 bytes one byte
+;       at a time.  This routine is optimized for speed of long moves.
+;       Not recommended for use when source or dest addr is odd.
+;       The move is perfromed without propagation of bytes at start or end.
+;
+;       During execution, stack holds: return-addr, orig D4-D7,A3-A6, 1-byte count,
+;       256-byte count (on top of stack)
+;
+;       D0 = scratch
+;       D1-D3 clobbered
+;       D4 = total length
+;       D6 = 4-byte count
+;       A0 = destination address
+;       A1 = source address
+;       A2 clobbered
+;       D4-D7,A3-A6 preserved
+;       A7 = SP
+;------------------------------------------------------------------------
+
+        MOVEM.L D4-D7/A3-A6,-(SP)
+        MOVEM.L 36(SP),D4/A0-A1         ;FROM STACK:  D4=LENG, A0=DEST, A1=SOURCE
+        MOVE.L  D4,D0
+        BLE     DUN                     ;LENGTH <= 0 MEANS EXIT
+        MOVEQ   #3,D1                   ;NEXT SET UP COUNTERS FOR VARIOUS LENGS
+        AND     D4,D1
+        MOVE    D1,-(SP)                ;1-BYTE-COUNT ONTO STACK
+        LSR.L   #2,D0
+        MOVEQ   #$3F,D6
+        AND     D0,D6                   ;4-BYTE COUNT INTO D6
+        LSR.L   #6,D0
+        MOVE    D0,-(SP)                ;256-BYTE MOVE COUNT ONTO TOP OF STACK
+
+        CMPA.L  A1,A0
+        BCS.S   FWD                     ;FORWARD IF DEST < SOURCE
+        ADDA.L  D4,A0                   ;FOR BACKWARD MOVE, POSITION TO END OF
+        ADDA.L  D4,A1                   ;  DATA IN SOURCE AND DEST
+
+        ;START THE BACKWARD MOVE -- 4-BYTE MOVES FIRST
+
+        SUBQ    #1,D6
+        BMI.S   BKW1P                   ;NO 4-BYTE MOVES
+@1      MOVE.L  -(A1),-(A0)
+        DBF     D6,@1
+
+        ;256 BYTE MOVES (BACKWARDS)
+
+BKW1P   SUBQ    #1,(SP)
+        BMI     BKW1                    ;NO 256-BYTE MOVES
+@1      LEA     -256(A1),A1             ;SUBTRACT 256 FROM SOURCE ADDRESS
+        MOVEM.L 208(A1),D0-D7/A2-A5
+        MOVEM.L D0-D7/A2-A5,-(A0)
+        MOVEM.L 156(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L 104(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L 52(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L (A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        SUBQ    #1,(SP)
+        BPL.S   @1
+
+        ;1-BYTE MOVE (BACKWARD)
+
+BKW1    ADDQ    #2,SP
+        MOVE    (SP)+,D7                ;LENGTH (0..3)
+        SUBQ    #1,D7
+        BMI.S   DUN                     ;NO SINGLE BYTES TO MOVE
+@1      MOVE.B  -(A1),-(A0)
+        DBF     D7,@1
+        BRA.S   DUN                     ;DONE
+
+        ;START THE FORWARD MOVE -- 4-BYTE FIRST
+
+FWD     SUBQ    #1,D6
+        BMI.S   MOV1P                   ;NO 4-BYTE MOVES
+@1      MOVE.L  (A1)+,(A0)+
+        DBF     D6,@1
+
+        ;256-BYTE MOVES (FORWARD)
+
+MOV1P   SUBQ    #1,(SP)
+        BMI.S   FWD1                    ;NO 256-BYTE MOVES
+@1      MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,52(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,104(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,156(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A5
+        MOVEM.L D0-D7/A2-A5,208(A0)
+        LEA     256(A0),A0                 ;ADD 256 TO DEST BASE ADDRESS
+        SUBQ    #1,(SP)
+        BPL.S   @1
+
+        ;1-BYTE MOVES (FORWARD)
+
+FWD1    ADDQ    #2,SP
+        MOVE    (SP)+,D7                ;LENGTH (0..3)
+        SUBQ    #1,D7
+        BMI.S   DUN                     ;NO SINGLE BYTES TO MOVE
+@1      MOVE.B  (A1)+,(A0)+
+        DBF     D7,@1
+
+        ;TIME TO RETURN
+
+DUN     MOVEM.L (SP)+,D4-D7/A3-A6       ;RESTORE REGS
+        MOVE.L  (SP)+,A0                ;RETURN ADDR
+        LEA     12(SP),SP               ;POP OFF PARAMS
+        JMP     (A0)
+
+
+
+        .def     UNPACKCODE
+        .INCLUDE source/unpack.text
+
+
+               .PROC     Search_Node
+;
+;procedure  Search_Node (   ptrRec     : rec_ptr;    { array of records }
+;                           ptrO       : offset_ptr; { array of offsets }
+;                           nentries   : integer;    { entry count }
+;                           ptrKey     : rec_ptr;    { search key }
+;                           keySize    : integer;    { bytes per key }
+;                       var index      : integer;    { record index }
+;                       var result     : boolean );  { found or not }
+;
+RegSaveArea    .EQU      32
+ArgBase        .EQU      RegSaveArea+4
+result         .EQU      ArgBase
+index          .EQU      ArgBase+4
+keySize        .EQU      ArgBase+8
+ptrKey         .EQU      ArgBase+10
+nentries       .EQU      ArgBase+14
+ptrO           .EQU      Argbase+16
+ptrRec         .EQU      ArgBase+20
+parmsz         .EQU      24
+
+               MOVEM.L   D2-D6/A2-A4,-(A7)   ; save registers
+               MOVE.L    A7,A2               ; A2 is parameter ptr
+               MOVE.L    ptrKey(A2),A3       ; ptrKey
+               MOVE.L    ptrO(A2),A4         ; ptrO
+               MOVE.L    ptrRec(A2),D6       ; ptrRec
+               MOVE.W    keySize(A2),D5      ; keySize
+
+               CLR.W     D2                  ; lower bnd := 0
+               MOVE.W    nentries(A2),D3     ; upper bnd := nentries - 1
+               SUBQ.W    #1,D3
+               CMP.W     D3,D2               ; while lower bnd <= upper bnd
+               BGT.S     SrchExit
+SrchLoop
+               MOVE.W    D2,D4               ; index := (upper+lower) / 2
+               ADD.W     D3,D4
+               LSR.W     #1,D4
+
+               MOVE.W    D4,D0               ; A1 <- @ptrRec^[ptrO^[-index]]
+               ADD.W     D0,D0
+               NEG.W     D0
+               MOVE.W    0(A4,D0),D0
+               MOVE.L    D6,A1
+               ADDA.W    D0,A1
+               MOVE.L    A3,A0               ; ptrKey
+Compare
+               MOVE.W    D5,D0               ; loop index is key length
+               SWAP      D5                  ; move key size out of the way
+               SUBQ.W    #4,D0               ; adjust loop index to skip PID
+               MOVE.W    #1,D1               ; parent ID is 2 bytes
+               CMPM.B    (A1)+,(A0)+         ; skip length byte
+CmpPID         CMPM.B    (A1)+,(A0)+         ; compare bytes of parent ID
+               DBNE      D1,CmpPID
+               BHI.S     IsGT
+               BEQ.S     CmpLoop
+               BRA.S     IsLT
+                                             ; parent ID's are the same
+CmpLoop
+               MOVE.B    (A0)+,D1            ; load next byte of trial key
+               BSR       UpShift             ; map to upper case
+               MOVE.B    D1,D5
+               MOVE.B    (A1)+,D1            ; load next byte of search key
+               BSR       UpShift             ; map to upper case
+               CMP.B     D1,D5               ; compare the characters
+               DBNE      D0,CmpLoop          ; keep looping if they're equal
+               BEQ.S     IsEQ
+               BHI.S     IsGT
+IsLT
+               SWAP      D5                  ; reinstate key size
+               MOVE.W    D4,D3               ; upper := index - 1
+               SUBQ.W    #1,D3
+               CMP.W     D3,D2               ; upper <= lower ?
+               BLE.S     SrchLoop
+               BRA.S     SrchExit
+IsEQ
+               MOVEQ     #1,D0               ; result := FOUND
+               BRA.S     SrchRet
+IsGT
+               SWAP      D5                  ; reinstate key size
+               MOVE.W    D4,D2               ; lower := index + 1
+               ADDQ.W    #1,D2
+               CMP.W     D3,D2               ; lower <= upper ?
+               BLE.S     SrchLoop
+SrchExit
+               MOVE.W    D2,D4               ; index := lower
+               CLR.W     D0                  ; result := NOT_FOUND
+SrchRet
+               MOVE.L    index(A2),A0        ; store index and result
+               MOVE.W    D4,(A0)
+               MOVE.L    result(A2),A0
+               MOVE.B    D0,(A0)
+
+               MOVEM.L   (A7)+,D2-D6/A2-A4   ; restore registers
+               MOVE.L    (A7)+,A0            ; pop return pc
+               MOVEQ     #parmsz,D0          ; pop stack frame
+               ADDA.L    D0,A7
+               JMP       (A0)                ; return
+UpShift
+               CMP.B     #97,D1              ; compare char to 'a'
+               BLT       UpRet
+               CMP.B     #122,D1             ; compare char to 'z'
+               BGT       UpRet
+               BCLR      #5,D1               ; shift char to upper case
+UpRet          RTS                           ; return
+
+
+
+               .PROC     Make_Key
+;
+;procedure  Make_Key ( parentID  : integer;
+;                      ptrName   : ename_ptr;
+;                      ptrKey    : key_ptr );
+
+               MOVEA.L   (A7)+,A0            ; pop return pc
+               MOVEA.L   (A7)+,A1            ; pop addr of key
+               MOVEA.L   (A7)+,A2            ; pop entry name
+
+               MOVE.B    #36,(A1)+           ; stuff key length
+               MOVE.B    (A7),(A1)+          ; stuff parent ID (high)
+               MOVE.W    (A7)+,D0            ; extract whole parent ID
+               MOVE.B    D0,(A1)+            ; stuff parent ID (low)
+               MOVE.B    (A2)+,D0            ; extract entry name length
+               EXT.W     D0
+               MOVE.W    #32,D1              ; max entry name length
+
+               SUB.W     D0,D1               ; max length - entry length
+               BRA.S     @2                  ; decrement before testing
+@1             MOVE.B    (A2)+,(A1)+         ; copy next byte from name to key
+@2             DBF       D0,@1
+               BRA.S     @4                  ; decrement before testing
+@3             CLR.B     (A1)+               ; clear next byte in key (null pad)
+@4             DBF       D1,@3
+               CLR.B     (A1)+               ; always null name-terminator in key
+
+               JMP       (A0)                ; return
+
+
+        .END    ;of loader
+
+ÿ

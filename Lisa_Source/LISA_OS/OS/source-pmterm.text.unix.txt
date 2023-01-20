@@ -1,0 +1,651 @@
+{ Copyright 1983, 1984, Apple Computer Inc. }
+
+(*$S ProcTerm *)
+
+  procedure Expire;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure for a process to remove itself from the       *)
+        (*   system.  The process forces its sons to begin           *)
+        (*   terminating, releases its own resources, waits for its  *)
+        (*   sons to die, and finally dies itself.                   *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is called by the procedures that the     *)
+        (*   user 'has access to' (i.e. Hit_End, Kill_Process, and   *)
+        (*   Terminate_Process).  Expire assumes that the user       *)
+        (*   declared handler for the 'terminate' exception has      *)
+        (*   already been executed.                                  *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  However, if process tracing is turned on and     *)
+        (*   refnums are left in the refncb list after the cleanup   *)
+        (*   procedures have been called, each refnum and its        *)
+        (*   address are printed and MACSBUG called.                 *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      error : int2;                       { error parameter for various calls }
+      mypcb_ptr : ptr_PCB;                { ptr to caller's PCB }
+      sysloc_ptr : slocal_ptr;            { local syslocal ptr }
+      old_domain : domainRange;           { domain of process before Term }
+      scanpcb_RP : relptr;                { relptr for scanning through sons }
+      sonpcb_ptr : ptr_PCB;               { ptr to a particular son's PCB }
+      term_event : s_eventblk;            { local copy of 'son_term' event }
+      event_ptr : p_s_eventblk;           { ptr to 'son_term' event in syslocal }
+      interval : timestmp_interval;       { for Send_Event_Chn }
+      clktime : time_rec;                 { ditto }
+      i : int2;                           { loop index for clearing event text }
+      old_fFence : FlushLevel;            { current value of flush fence }
+      ord_ptr : absptr;                   { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;              { pointer to an ECrefdb }
+
+
+    (*$IFC debug2 *)
+    procedure Chk_Leftovers;
+      { procedure for debugging to make sure that all resources acquired by
+        the terminating process have been returned to the system.  The
+        refnum control block definitions from sysglobal are duplicated here
+        so that they don't have to be placed in the interface.  Note that
+        this procedure will be removed eventually. }
+
+      type
+        ptr_refdb = ^refdb;
+
+        refdb = record
+                  header : refdbHead
+                end;
+
+        ptr_refncb = ^refncb;
+
+        refncb = record
+                   refnum_list : linkage;
+                   refn : int2;
+                   refdb_addr : ptr_refdb
+                 end;
+
+      var
+        scan_ptr : ptr_refncb;              { ptr for scanning refncbs }
+
+      begin
+        scan_ptr := pointer(sysloc_ptr^.loc_refnum.hd_refnum_list.fwd_link +
+                              b_syslocal_ptr);
+
+        while scan_ptr <> @sysloc_ptr^.loc_refnum.hd_refnum_list do
+          begin  { report the leftover }
+            writeln (' *** refnum ', scan_ptr^.refn, ' at ', ord(scan_ptr));
+            write ('     is of type ');
+            case scan_ptr^.refdb_addr^.header.kind of
+              dsrefdb   : writeln ('dsrefdb');
+              frefdb    : writeln ('frefdb');
+              ecrefdb   : writeln ('ecrefdb');
+              otherwise   writeln ('unknown!!!')
+            end;
+
+            MACSBUG;
+
+            scan_ptr := pointer(scan_ptr^.refnum_list.fwd_link +
+                                  b_syslocal_ptr)
+          end { refncb scan }
+      end { Chk_Leftovers };
+    (*$ENDC *)
+
+
+    procedure Dissolve;
+      { Procedure for a process to be completely removed from the system.  The
+        process removes its PCB from the process hierarchy and the global list.
+        It then releases its PCB and causes the Scheduler to be entered. }
+
+      var
+        int_level : intson_type;            { current interrupt level }
+        fatherpcb_ptr : ptr_PCB;            { ptr to caller's father's PCB }
+        prevpcb_ptr : ptr_PCB;              { ptr to caller's left brother }
+
+      begin
+        fatherpcb_ptr := pointer(mypcb_ptr^.fatherptr + b_sysglobal_ptr);
+        Intsoff (allints, int_level);
+        sonpcb_ptr := pointer(fatherpcb_ptr^.sonptr + b_sysglobal_ptr);
+
+        { remove process from the hierarchy }
+        if sonpcb_ptr = mypcb_ptr then
+          begin  { caller is the 1st son }
+            fatherpcb_ptr^.sonptr := mypcb_ptr^.brotherptr;
+            if fatherpcb_ptr^.terming and (mypcb_ptr^.brotherptr = 0) then
+              { also the last son }
+              Signal_sem (fatherpcb_ptr^.fam_sem)
+          end
+        else
+          begin  { caller is not the 1st son }
+            while sonpcb_ptr <> mypcb_ptr do
+              begin  { find the right PCB }
+                prevpcb_ptr := sonpcb_ptr;
+                sonpcb_ptr := pointer(sonpcb_ptr^.brotherptr + b_sysglobal_ptr)
+              end;
+
+            prevpcb_ptr^.brotherptr := sonpcb_ptr^.brotherptr
+          end;
+        Intson (int_level);
+
+        { close system segments }
+        Close_SysSegs;
+
+        { restore normal File System flushing }
+        SetFlushLevel (old_fFence, old_fFence);
+
+        { process now dissolves }
+        {Intsoff (allints, int_level); - currently assume non-preemption}
+        Evap_SysSegs;
+
+        Rel_PCBglist (mypcb_ptr);
+
+        with mypcb_ptr^ do
+          begin  { remove PCB from Ready queue }
+            Intsoff (allints, int_level);
+            prev_schedPtr^.next_schedPtr := next_schedPtr;
+            next_schedPtr^.prev_schedPtr := prev_schedPtr;
+            Intson (int_level)
+          end;
+        Relspace (c_pcb_ptr, b_sysglobal_ptr);
+        { running on the Ether now }
+        if sched_attn = c_pcb_ptr then sched_attn := ord(nil);
+        c_pcb_ptr := ord(nil);
+        Enter_Scheduler
+      end { Dissolve };
+
+
+    begin  { Expire }
+      { user's 'terminate' handler has already executed by now }
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('      entering Expire...');
+      (*$ENDC *)
+
+      mypcb_ptr := pointer(c_pcb_ptr);
+      sysloc_ptr := pointer(b_syslocal_ptr);
+
+      { make sure process is in the preemptive class }
+      mypcb_ptr^.np_count := 0;
+      if nonPreempt = c_pcb_ptr then nonPreempt := ord(nil);
+
+      { free process's old domain, if still assigned }
+      if anyBPs then
+        begin  { clear out any remaining BPs }
+          ClearBPs (mypcb_ptr^.glob_id);
+          Create_BP (mypcb_ptr^.glob_id, -1, error);
+          (*$IFC debug2 *)
+          if error <> 0 then
+            writeln ('   *** error removing BPs = ', error:1)
+          (*$ENDC *)
+        end;
+      old_domain := sysloc_ptr^.SCB.domvalue;
+      if DCT[old_domain].owner = mypcb_ptr^.glob_id then
+        DCT[old_domain].owner := -1;   { free  }
+
+      { prevent File System from flushing during termination }
+      SetFlushLevel (lowFlush, old_fFence);
+
+      { force the sons to start terminating }
+      scanpcb_RP := mypcb_ptr^.sonptr;
+      while scanpcb_RP <> 0 do
+        begin  { send 'die' soft interrupts to all sons }
+          sonpcb_ptr := pointer(scanpcb_RP + b_sysglobal_ptr);
+          AbortProcess (sonpcb_ptr, true, fthr_term);
+          scanpcb_RP := sonpcb_ptr^.brotherptr
+        end;
+
+      { let process clean up its own resources while all of its sons are
+        terminating concurrently }
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('          calling EC_Cleanup');
+      (*$ENDC *)
+      EC_Cleanup;
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('          calling DS_Cleanup');
+      (*$ENDC *)
+      DS_Cleanup;
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('          calling Unload_Program');
+      (*$ENDC *)
+      Unload_Program;
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('          calling FS_Cleanup');
+      (*$ENDC *)
+      FS_Cleanup;
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        begin  { make sure nothing is left over }
+          writeln ('          checking for leftovers...');
+          Chk_Leftovers;
+          writeln ('          done with clean ups')
+        end;
+      (*$ENDC *)
+
+      with sysloc_ptr^ do
+        if commchan <> -1 then
+          begin  { must send an event to father }
+            if termE_ptr <> ord(nil) then
+              begin  { user specified an event }
+                event_ptr := pointer(termE_ptr);
+                term_event := event_ptr^
+              end
+            else
+              { no event has been supplied - clear it out }
+              for i := 1 to size_etext do
+                term_event[i] := 0;
+            term_event[0] := termE_cause;
+            with interval do
+              begin
+                sec := 0;
+                msec := 0
+              end;
+
+            Send_Event_Chn (error, commchan, @term_event, interval, clktime);
+            { ignore any errors that occur - we tried }
+
+            Chk_Refnum (error, commchan, ecrefdb, ord_ptr);
+            if error = 0 then
+              begin  { refnum is valid }
+                ECrdb_ptr := pointer(ord_ptr);
+                with ECrdb_ptr^.eccb_ptr^ do
+                  numSenders := numSenders - 1
+              end
+          end { send an event };
+
+      { now wait for sons to die }
+      if mypcb_ptr^.sonptr <> 0 then
+        Wait_sem (mypcb_ptr^.fam_sem, []);
+
+      { all that's left are the 2 system data segments and the PCB }
+      Dissolve
+    end { Expire };
+
+
+  procedure Terminate_Process (* var errnum : int2;  event_ptr : p_s_eventblk *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure for a process to end its          *)
+        (*   execution and remove itself from the system.  The       *)
+        (*   'terminate' exception is signalled to the user so that  *)
+        (*   his handler, if defined, can execute before the system  *)
+        (*   termination code takes over.  The process then          *)
+        (*   executes the termination code which will perform the    *)
+        (*   necessary clean up functions and remove the process     *)
+        (*   from the system.                                        *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   event_ptr : a pointer to the event text which is to be  *)
+        (*               sent along with the type 'SYS_SON_TERM' to  *)
+        (*               the process's father as part of the         *)
+        (*               termination.                                *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.  Note that although there is an 'errnum'          *)
+        (*   parameter, no errors are returned to the user.  The     *)
+        (*   parameter is there only to be consistent with the rule  *)
+        (*   that the 1st parameter to a system call procedure is    *)
+        (*   an error return.                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.  Note that when a process calls this procedure,   *)
+        (*   it will never return.                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   Any errors encountered in calling Signal_Excep result   *)
+        (*   in a system error.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      exc_info : t_ex_data;               { info block for 'terminate' excep }
+      pcb_ptr : ptr_PCB;                  { ptr to current PCB }
+      sysloc_ptr : slocal_ptr;            { local syslocal ptr }
+      excep_name : t_ex_name;             { 'terminate' exception name }
+      termEvent_ptr : p_s_eventblk;       { ptr to sys_son_term event in syslocal }
+
+    begin
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then
+        writeln ('   Entering Terminate_Process...');
+      (*$ENDC *)
+
+      pcb_ptr := pointer(c_pcb_ptr);
+      sysloc_ptr := pointer(b_syslocal_ptr);
+      excep_name := term_excep;
+      termEvent_ptr := nil;
+
+      with sysloc_ptr^ do
+        begin
+          termE_cause := ord(call_Term);
+
+          if event_ptr = nil then
+            { don't send a user event }
+            termE_ptr := ord(nil)
+          else if termE_ptr <> ord(nil) then
+            { over-write previous event }
+            termEvent_ptr := pointer(termE_ptr)
+          else if GetSpace (Sizeof (s_eventblk), b_syslocal_ptr, termE_ptr) then
+            { save user's event for later }
+            termEvent_ptr := pointer(termE_ptr);
+
+          if termEvent_ptr <> nil then termEvent_ptr^ := event_ptr^
+        end { with };
+
+      if not pcb_ptr^.terming then
+        begin  { start termination sequence }
+          pcb_ptr^.terming := true;
+
+          Enable_Excep (errnum, excep_name);   { force the exception }
+          exc_info[0] := ord(call_Term);
+          Signal_Exception (errnum, excep_name, exc_info);
+          if errnum <> 0 then
+            { forget it - we tried }
+            Expire;
+
+          { return code from excep handler will send a 'die' soft interrupt }
+        end
+      else
+        Expire   { recursive call to Terminate_Process }
+    end { Terminate_Process };
+
+
+  procedure Hit_End;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to begin terminating a process when it hits   *)
+        (*   the 'end.' statement of its Pascal program.  Hit_End    *)
+        (*   is actually a system call procedure that is called      *)
+        (*   from %_TERM in the Pascal run-time library.  The        *)
+        (*   'terminate' exception is signalled to the user so that  *)
+        (*   his handler, if defined, can execute before the system  *)
+        (*   termination code takes over.                            *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.  Note that when a process calls this procedure,   *)
+        (*   it will never return.                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is intended only to be called from the   *)
+        (*   procedure %_TERM in the Pascal run-time library.        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   Any errors encountered in calling Signal_Excep result   *)
+        (*   in a system error.                                      *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      exc_info : t_ex_data;               { info block for 'terminate' excep }
+      pcb_ptr : ptr_PCB;                  { ptr to current PCB }
+      sysloc_ptr : slocal_ptr;            { local syslocal ptr }
+      event_ptr : p_s_eventblk;           { local ptr to 'SYS_SON_TERM' event }
+      excep_name : t_ex_name;             { 'terminate' exception name }
+      error : int2;                       { error parameter for various calls }
+
+    begin
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then
+        writeln ('   Entering Hit_End...');
+      (*$ENDC *)
+
+      pcb_ptr := pointer(c_pcb_ptr);
+      excep_name := term_excep;
+      sysloc_ptr := pointer(b_syslocal_ptr);
+
+      sysloc_ptr^.termE_cause := ord(ended);
+
+      if not pcb_ptr^.terming then
+        begin  { start termination sequence }
+          pcb_ptr^.terming := true;
+
+          Enable_Excep (error, excep_name);   { force the exception }
+          exc_info[0] := ord(ended);
+          Signal_Excep (error, excep_name, exc_info);
+          if error <> 0 then
+            { forget it - we tried }
+            Expire;
+
+          { return code from excep handler will send a 'die' soft interrupt }
+        end
+      else
+        { recursive call to Hit_End }
+        Expire
+    end { Hit_End };
+
+
+(*$S kr_prims *)
+
+  procedure Recv_SoftInt;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to receive a process control 'message'.       *)
+        (*   This procedure executes as a soft interrupt handler     *)
+        (*   that is forced on a process as soon as it leaves        *)
+        (*   system code.  Different actions are taken depending on  *)
+        (*   the type of message/soft interrupt received.  The       *)
+        (*   process will either block itself waiting for an         *)
+        (*   Activate, clean up a dead son process, or begin the     *)
+        (*   termination sequence on itself.  Currently, the soft    *)
+        (*   interrupt system is implemented with 'system'           *)
+        (*   exceptions.  Thus, Recv_Msg is written as an exception  *)
+        (*   handler.  This may change if a different mechanism is   *)
+        (*   used to implement the soft interrupts.                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.  But PCB.softints is used to determine what soft  *)
+        (*   interrupt is to be processed.                           *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is never called by a process; it is      *)
+        (*   'forced' on a process when there is a pending soft      *)
+        (*   interrupt and the process is not in system code.        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   Any errors encountered in making calls to Signal_Excep  *)
+        (*   result in a system error.                               *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      error : int2;                       { general error return }
+      pcb_ptr : ptr_PCB;                  { ptr to current PCB }
+      sysloc_ptr : slocal_ptr;            { local syslocal pointer }
+      highest_softint : sftint_types;     { highest pending soft int in PCB }
+      exc_info : t_ex_data;               { excep info block for 'term' excep }
+      event_ptr : p_s_eventblk;           { local ptr to 'SYS_SON_TERM' event }
+      excep_name : t_ex_name;             { 'terminate' exception name }
+
+    begin
+      { Intsoff (allints, int_level); }
+      sysloc_ptr := pointer(b_syslocal_ptr);
+      pcb_ptr := pointer(c_pcb_ptr);
+
+      { select the highest pending soft interrupt }
+      if die in pcb_ptr^.softints then
+        highest_softint := die
+      else
+        highest_softint := susp;
+
+      (*$IFC debug3 *)
+      if Trace (pm, 20) then
+        begin
+          write ('   ... receiving a ');
+          case highest_softint of
+            die  : write ('die ');
+            susp : write ('susp ')
+          end;
+          writeln ('soft interrupt.  Hit <ret> to continue.');
+          readln
+        end;
+      (*$ENDC *)
+
+      { handle the soft interrupt }
+      case highest_softint of
+        die  : begin
+                 { Intson (int_level); }
+                 with pcb_ptr^ do
+                   begin
+                     softints := softints - [die];   { clear it }
+
+                     if not terming then
+                       begin  { start termination sequence }
+                         terming := true;
+
+                         sysloc_ptr^.termE_cause := ord(termcause);
+
+                         { force the exception for all but a few term causes }
+                         excep_name := term_excep;
+                         if (termcause <> Killed) and (termcause <> fthr_term) then
+                           Enable_Exception (error, excep_name);
+
+                         exc_info[0] := ord(termcause);
+                         Signal_Exception (error, excep_name, exc_info);
+                         if error <> 0 then
+                           { forget it - we tried }
+                           Expire;
+
+                         { take exception NOW if enabled }
+                       end
+                     else
+                       { all terminations eventually come here }
+                       Expire
+                   end { with pcb_ptr^ }
+               end { die };
+
+
+        susp : begin
+                 with pcb_ptr^ do
+                   softints := softints - [susp];   { clear it }
+
+                 Block_Process (pcb_ptr, [act_call]);
+                 { Intson (int_level) }
+               end
+      end { big case }
+    end { Recv_SoftInt };
+
+
+  procedure ExitSys;  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to return from a system     *)
+        (*   call procedure to user code.  The user's return PC in   *)
+        (*   the SCB is pushed back on the stack and a Trap(1)/255   *)
+        (*   is done to effect the return to user code.              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   This procedure never returns to its caller.  It causes  *)
+        (*   the calling process to be returned to a user domain.    *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is not to be called by anyone directly.  *)
+        (*   The PC for ExitSys is placed on the user's stack by     *)
+        (*   Initiate and by SetSysmode.                             *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  But it assumes the SCB has been set up           *)
+        (*   appropriately.                                          *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+(*$S kr_prims *)
+
+  procedure Initiate;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to begin execution of a process.  This        *)
+        (*   procedure is the 1st code that a process executes.  It  *)
+        (*   performs any initial OS functions that are required     *)
+        (*   before a process can execute user code.                 *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is executed by the new process on its    *)
+        (*   own stack.  It is assumed that the stack has already    *)
+        (*   been correctly set up by Make_Process.                  *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      error : int2;                        { error paramter for various calls }
+      sysloc_ptr : slocal_ptr;             { local syslocal ptr }
+
+    begin
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then
+        begin
+          writeln ('   *** Initiate ***');
+          MACSBUG
+        end;
+      (*$ENDC *)
+
+      { program s-file has an open count that will be decremented when the
+        process terminates (in Unload_Program) so no open is necessary here }
+
+    end { Initiate };
+
+
+ÿ

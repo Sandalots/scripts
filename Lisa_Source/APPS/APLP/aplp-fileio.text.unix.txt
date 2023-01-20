@@ -1,0 +1,2258 @@
+{----------------------------------------------------------------------------}
+{                                                                            }
+{                  Copyright 1983,1984, Apple Computer Inc.                  }
+{                                                                            }
+{----------------------------------------------------------------------------}
+
+{-------------------------------------------------------------------------------
+
+    File save and restore routines.
+
+
+    Notes on implementation:
+
+    I am not saving the current selection stuff.  On the restore nothing
+    will be selected.
+
+    All file I/O is done with sequential reads and writes and with local
+    buffering.  The OS requires that I buffer my disk reads and writes to get
+    any reasonable kind of performance.
+
+    The file format looks roughly like the following:
+
+       information                        its type and length
+       ------------------------------------------------------
+       the password                       integer       -+
+       the version                        integer        !
+       filler                             array of byte -+
+
+       size of TPrPrf                     integer       -+
+       PrPrf printer preference           TPrPrf         !   112 bytes
+       filler                             array of byte -+
+       Pert state data                    PertState record
+       Calendar data                      CalInfo record
+
+       (repeated for each title of four chart titles)
+       current length of text             integer
+       current number of runs             integer
+       text string                        string of curlen bytes
+       run array                          array of curfmts of runs
+
+       Task header record                 THeadRec
+
+          curlen                             integer
+          text string                        array of curlen bytes
+          (repeated for each title line of text in one task)
+
+          duration                           integer
+          remaining                          integer
+          curlen for duration string         integer
+          text string for duration           array of curlen bytes
+          curlen for resource string         integer
+          text string for resource name      array of curlen bytes
+          (repeated for each resource line of text in one task)
+
+          link                                integer
+          (repeated for each back link from task)
+
+        (repeated for each task)
+
+
+ ------------------------------------------------------------------------------}
+
+
+UNIT PEFileIO;
+
+INTERFACE
+USES
+   {$U UnitStd    }  UnitStd,    { The basics }
+   {$U UnitHz     }  UnitHz,
+   {$U LibOs/SysCall    }  SysCall,
+   {$U LibOs/PSysCall   }  PSysCall,
+
+   {$U QuickDraw  }  QuickDraw,
+   {$U FontMgr    }  FontMgr,    { Fonts & LisaGraf }
+   {$U Storage    }  Storage,
+   {$U GrafUtil   }  GrafUtil,
+
+   {$U PmDecl     }  PmDecl,
+   {$U Pmm        }  Pmm,
+
+   {$U WM.Events  }  Events,     { The window manager }
+   {$U WM.Folders }  Folders,
+   {$U WM.Windows }  Windows,
+   {$U WM.Menus   }  Menus,
+   {$U wmlstd     }  WMlstd,
+   {$U wmlsb      }  WMlsb,
+   {$U wmlcrs     }  WMlcrs,
+   {$U wmlgrow    }  WMlGrow,
+
+   {$U PrStdInfo  }  PrStdInfo,
+   {$U PrPublic   }  PrPublic,
+
+   {$U AlertMgr   }  AlertMgr,
+   {$U Dbenv      }  Dbenv,
+   {$U scrap      }  Scrap,
+   {$U fedec      }  fedec,
+   {$U fld        }  fieldEdit,  { Misc managers }
+
+   {$U FilerComm  }  FilerComm,  { and the filer }
+
+   {$U aplp/globals  }  PEGlobals,  { my guys }
+   {$U aplp/general  }  PEgeneral;
+
+{$IFC PESymbols}
+{$D+}
+{$ElseC}
+{$D-}
+{$EndC}
+
+{$S SgPeFile}
+
+
+const
+   ThePassword = 7777;          { my file password number               }
+   TheVersion  = 4;             { my file version number                }
+
+   suspended   = 1;             { file was saved as suspended           }
+   closed      = 2;             { file was saved as closed              }
+
+
+
+
+FUNCTION SaveTheDoc     (var failReason: fReason; var error_code: integer; fileRefNum: integer):BOOLEAN;
+FUNCTION RestTheDoc     (var failreason: fReason; var error_code: integer; fileRefNum: integer):BOOLEAN;
+FUNCTION OpenTheDoc     (filerParams : FilerExt; VAR failReason : FReason; var error_code:integer) : BOOLEAN;
+FUNCTION CloseTheDoc    (closeKind: FilerOp; VAR failReason : FReason) : BOOLEAN;
+FUNCTION CopyTheDoc     (newDocPrefix : Pathname; theOp: FilerOp;
+                         VAR failReason : FReason) : BOOLEAN;
+
+
+
+
+IMPLEMENTATION
+{$IFC fsymok}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+{$IFC fdbgok}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+
+
+const
+    oldMaxHoliday = 20;     { version 1 & 2 have only 20 holidays, version 3 has 40 }
+
+type
+    PStr255 =  ^Str255;
+
+    hTaskHnd = ^pTaskHnd;
+    pTaskHnd = ^TaskHnd;
+    TaskHnd  = array[0..0] of hTask;
+
+
+var
+   buffer: array[1..1024] of byte;
+   BufferPos:  integer;
+   theRefNum: integer;
+   MaxBuffer:  integer;
+
+   { for password and version numbers }
+   passRec:  record
+      case boolean of
+
+         True:(Password,
+               Version:    integer);
+         False:(Filler:    array[1..14] of byte);
+   end;
+
+   { for printer preference record }
+   PrinterRec: record
+      case boolean of
+
+         True:(size:       integer;
+               Pref:       TPrRec);
+         False:(Filler:    array[1..112] of byte);
+   end;
+
+   actual: LongInt;                     { actual number of bytes read or written }
+
+   PertState: record                  { state record info for network -version 1,2,3 }
+      Numtasks,                         { total number of tasks in the network   }
+
+      chartactive,                      { the current active chart               }
+
+      PertHScroll,                      { Pert chart H and V scroll locations    }
+      PertVScroll,
+      RescHScroll,                      { Gantt chart H and V scroll locations   }
+      RescVScroll,
+      TaskHScroll,
+      TaskVScroll:   integer;
+
+      PrintState,                       { were we currently printing?            }
+      PrevState,                        { in preview mode?                       }
+      dispES,
+      dispLS,
+      dispEF,
+      dispLF,
+      UndoState:      boolean;          { is undo valid?                         }
+
+      GridSize:       integer;          { current gantt scale on grid?           }
+      PaperP,                           { paper rect for pert                    }
+      PaperG,
+      PaperT:         rect;             { paper rect for gantt                   }
+
+      FontInfP,                         { font info record for pert              }
+      FontInfG,
+      FontInfT,
+      ReqInfoP,
+      ReqInfoG,
+      ReqInfoT:       FontRec;
+      ScaleP,
+      ScaleG,
+      ScaleT:         ScaleStateRec;
+      dRescP,
+      dRescG,
+      dRescT:         integer;
+   end;
+
+    AdditionalState: record
+      SchedMethod: integer;
+      HScroll: array[rescCost..numCharts] of integer;{ chart H scroll locations }
+      VScroll: array[rescCost..numCharts] of integer;{ chart V scroll locations }
+      Font:    array[rescCost..numCharts] of FontRec;{ font info record for charts }
+      ReqFont: array[rescCost..numCharts] of FontRec;{requested font info for charts }
+   end;
+
+   CalInfo: record
+      CalStrDate:     TDate;            { the calendar start date }
+      endYear:        integer;          { ending year of calendar }
+      DPW:            integer;          { the number of working days per week }
+      HlDates:        array[1..maxholiday] of HoliRec;         { and holidays }
+      DateString:     string4;          { the date format string }
+      DateDefault:    string[30];       { the default date string }
+   end;
+
+   OldCalInfo: record
+      CalStrDate:     TDate;            { the calendar start date                }
+      endYear:        integer;
+      DPW:            integer;          { the number of working days per week    }
+      HlDates:        array[1..Oldmaxholiday] of HoliRec;      { and holidays    }
+   end;
+
+
+   TaskHead: record
+      box:           rect;      { task box record                       }
+      milestone:     boolean;   { task is a milestone                   }
+      maxduration:   integer;   { max duration of all resource durations}
+      dotline:       integer;   { location of dotline in box            }
+      NumTextLines:  integer;   { number of text lines used             }
+      NumRescLines:  integer;   { number of resource lines used         }
+      NumForwLinks:  integer;   { number of forward link pointers       }
+      NumBackLinks:  integer;   { for link pointers                     }
+      start:         integer;   { scheduled start date for task         }
+      finish:        integer;   { scheduled finish date for task        }
+   end;
+
+   TaskPtrs:         hTaskHnd;  { array of task handles for the restore }
+
+
+
+Procedure DateDefaults; external;
+Procedure Calcschedule; external;
+Procedure Unschedule;   external;
+
+{------------------------------------------------------------------------------}
+{                                                                              }
+{   File save and restore buffering routines.                                  }
+{                                                                              }
+{------------------------------------------------------------------------------}
+
+
+Procedure ResetWrite( refnum: integer; var error_code: integer );
+{ resets globals vars for sequential write or read of entire file }
+
+begin { ResetWrite }
+
+   bufferPos := 1;
+   MaxBuffer := 1024;
+   theRefNum := RefNum;
+   error_code := 0;
+   { position file at record 0 }
+   Write_Data( Error_Code, theRefNum, Ord4(@Buffer[BufferPos]), 0, Actual, Absolute, 0);
+
+end; { ResetWrite }
+
+
+{------------------------------------------------------------------------------}
+
+
+Procedure ResetRead( refnum: integer; var error_code: integer );
+{ resets globals vars for sequential write or read of entire file }
+
+begin { ResetRead }
+
+   bufferPos := 1;
+   MaxBuffer := 1024;
+   theRefNum := refnum;
+   error_code := 0;
+   { position file at record 0 }
+   Read_Data( Error_Code, theRefNum, Ord4(@Buffer[BufferPos]), 0, Actual, Absolute, 0);
+
+end; { ResetRead }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function WriteNext( address: PStr255;  length: integer; var error_code: integer): boolean;
+{ writes data to the file, buffers it up to buffer and writes buffer when
+  required }
+
+var copyBytes: integer;
+
+begin { WriteNext }
+
+   repeat
+      { copy data to buffer, dont go over max buffer length }
+      CopyBytes := CMin( maxBuffer - BufferPos + 1, length );
+      MoveLeft( Address^, Buffer[BufferPos], copyBytes);
+      BufferPos := BufferPos + CopyBytes;
+      Address   := pointer(Ord(Address)   + copyBytes);
+      length    := length - CopyBytes;
+
+      { see if at end of buffer, if so write it out to the file }
+      if BufferPos = MaxBuffer + 1 then begin
+         Write_Data( Error_Code, theRefNum, Ord4(@Buffer), MaxBuffer, Actual, Sequential, 0);
+         if error_code > 0 then begin
+            {$IFC peDebug}
+            writeln('error on file write ', error_code);
+            {$EndC}
+            writeNext := false;
+            Exit(WriteNext);
+         end; { if }
+         bufferPos := 1;
+      end; { if }
+   Until Length = 0;
+   WriteNext := True;
+
+end; { WriteNext }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function ReadNext( address: PStr255;  length: integer; var error_code: integer): boolean;
+{ Read data from the file, buffers it up to buffer and reads new buffer when
+  required }
+
+var copybytes: integer;
+
+begin { ReadNext }
+
+   While length <> 0 do begin
+
+      { see if at start of buffer, if so read new buffer from file }
+      if BufferPos = 1 then begin
+         Read_Data( Error_Code, theRefNum, Ord4(@Buffer), Sizeof(Buffer), Actual, Sequential, 0);
+         if (error_code = 848) and (actual > 0) then begin
+            maxBuffer := actual;
+            error_code := 0;
+         end { if }
+         else if (error_code > 0) then begin
+            {$IFC PEDebug}
+            writeln('error on file read ',error_code);
+            {$ENDC}
+            ReadNext := false;
+            Exit(ReadNext);
+         end; { if }
+      end; { if }
+
+      { copy buffer to address, dont go over max buffer length }
+      CopyBytes := CMin( maxBuffer - BufferPos + 1, length );
+      MoveLeft( Buffer[BufferPos], Address^, CopyBytes);
+      BufferPos := BufferPos + CopyBytes;
+      if bufferPos = maxbuffer + 1 then bufferpos := 1;
+      Address    := Pointer(ord(Address)  + copyBytes);
+      length     := length - CopyBytes;
+
+   end; { while }
+   ReadNext := True;
+
+end; { ReadNext }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function FlushWrite(var error_code:integer): boolean;
+{ flushes what is remaining in the output buffer }
+
+begin { FlushWrite }
+
+   Write_Data( Error_Code, theRefNum, Ord4(@Buffer), BufferPos - 1, Actual, Sequential, 0);
+   if error_code <> 0 then begin
+      {$IFC PEDEBUG}
+      writeln('error on write to file ',error_code);
+      {$ENDC}
+      FlushWrite := false;
+      Exit(FlushWrite);
+   end; { if }
+   FlushWrite := true;
+   bufferPos := 1;
+end; { FlushWrite }
+
+
+{------------------------------------------------------------------------------}
+{                                                                              }
+{   File save routines.                                                        }
+{                                                                              }
+{------------------------------------------------------------------------------}
+
+
+Function SaveState(  var error_code: integer): boolean;
+{ save the state of the charts to file }
+
+var curtask:  htask;     { current task in network             }
+    i:        integer;   { loop counter                        }
+
+begin { SaveState }
+
+   saveState := false;
+
+   { the password and the version }
+   with passrec do begin
+      password := thePassword;
+      version  := theVersion;
+   end; { with }
+   if WriteNext( Pointer(Ord(@PassRec)), Sizeof(passrec), Error_Code) then begin
+
+      { printer preference record }
+      with PrinterRec do begin
+         size := SizeOF(PrPrf);
+         Pref := PrPrf;
+      end; { with }
+      if writeNext(Pointer(Ord(@PrinterRec)),  sizeof(PrinterRec),  Error_code) then begin
+
+         { Pert State information }
+         with PertState do begin
+            curtask := head;
+            numtasks := 0;
+            while curtask <> nil do begin
+               numtasks := numtasks + 1;
+               curtask^^.count := numtasks;
+               curtask := curtask^^.flink;
+            end;
+
+            ChartActive  := activeChart;
+
+            PertHScroll  := CThumbPos(hsbH[Pert]);
+            PertVScroll  := CThumbPos(hsbV[Pert]);
+            RescHScroll  := CThumbPos(hsbH[RescGantt]);
+            RescVScroll  := CThumbPos(hsbV[RescGantt]);
+            TaskHScroll  := CThumbPos(hsbH[TaskGantt]);
+            TaskVScroll  := CThumbPos(hsbV[TaskGantt]);
+
+            PrintState :=   Printing;
+            PrevState  :=   Preview;
+            DispES     :=   showES;
+            dispEF     :=   showEF;
+            dispLS     :=   showLS;
+            dispLF     :=   showLF;
+            UndoState  :=   UndoValid;
+
+            GridSize   :=   curGridSize;
+
+            PaperP     :=   PaperRect[Pert];
+            PaperG     :=   PaperRect[RescGantt];
+            PaperT     :=   PaperRect[TaskGantt];
+
+            FontInfP   :=   PertFontInfo[Pert];
+            FontInfG   :=   PertFontInfo[Rescgantt];
+            FontInfT   :=   PertFontInfo[TaskGantt];
+
+            ReqInfoP   :=   ReqfInfo[pert];
+            ReqInfoG   :=   ReqfInfo[RescGantt];
+            ReqInfoT   :=   ReqfInfo[TaskGantt];
+
+            scaleP     :=   Scale[Pert];
+            scaleG     :=   scale[RescGantt];
+            ScaleT     :=   Scale[TaskGantt];
+
+            dRescP     :=   0;
+            dRescG     :=   dRescLine[RescGantt];
+            dRescT     :=   dRescLine[TaskGantt];
+         end; { with }
+
+         { write this state info out to the file }
+         if WriteNext( Pointer(ord(@PertState)), SizeOf(PertState),Error_Code) then begin
+
+            with AdditionalState do begin
+               SchedMethod := ord(limitResources);
+               for i := rescCost to numCharts do begin
+                  HScroll[i]:= CThumbPos(hsbH[i]);
+                  VScroll[i]:= CThumbPos(hsbV[i]);
+                  Font[i]   := PertFontInfo[i];
+                  ReqFont[i]:= ReqfInfo[i];
+               end;
+            end;
+            if WriteNext( Pointer(ord(@AdditionalState)), SizeOf(Additional),Error_Code) then begin
+
+               { save calendar information }
+               with CalInfo do begin
+                  CalStrDate :=   CalStartDate;
+                  endYear    :=   endingYear;
+                  DPW        :=   DaysPerWeek;
+                  for i := 1 to maxholiday do HlDates[i] :=   Holidates[i];
+                  dateString :=   DateFormat;
+                  DateDefault:=   MM_DD_YY;
+                  {calToday   :=   Today;}
+               end;
+               { write calendar info out to the file }
+               if WriteNext( Pointer(ord(@CalInfo)), SizeOf(CalInfo), error_code)
+               then SaveState := true;
+            end; { if }
+         end; { if }
+      end; { if }
+   end; { if }
+end; { SaveState }
+
+
+{------------------------------------------------------------------------------}
+
+
+function SaveTask( curtask: htask; var error_code: integer): boolean;
+{ save the task information at the current location in the file, with version 4 and later
+  I tacked on the fixed cost for the task after the taskhead record  }
+
+begin { SaveTask }
+
+   saveTask := false;
+   if curtask <> nil then
+   with curtask^^ do begin
+      TaskHead.box := box;
+      TaskHead.milestone := milestone;
+      TaskHead.Maxduration  := maxduration;
+      TaskHead.dotline      := dotline;
+      TaskHead.NumTextLines := LineCount(curtask);
+      TaskHead.NumRescLines := RescCount(curtask);
+      TaskHead.start  := SetStart;
+      TaskHead.finish := SetFinish;
+      TaskHead.NumForwLinks := NForward;
+      TaskHead.NumBackLinks := NBackward;
+   end;
+   if WriteNext( Pointer(Ord(@TaskHead)), SizeOf(TaskHead), error_code) then
+      if writeNext(pointer(ord(@curtask^^.fixedCost)), 4, error_code) then
+         SaveTask := true;
+end; { SaveTask }
+
+
+{------------------------------------------------------------------------------}
+
+
+function SaveText( curlen: integer; thedata: hndData;  var error_code: integer): boolean;
+{ save the text information of curlen and the data array }
+
+begin { SaveText }
+
+   saveText := false;
+
+   { write the length of the string }
+   if WriteNext( Pointer(Ord(@curlen)), 2, error_code) then begin
+
+      { and follow with the string }
+      if WriteNext( Pointer(ord(@TheData^^)), curlen, error_code) then
+      saveText := true;
+   end; { if }
+end; { SaveText }
+
+
+{------------------------------------------------------------------------------}
+
+
+function SaveTitles(var error_code: integer):boolean;
+{ save the titles to the file at the current location }
+
+var i,j: integer;
+
+begin { SaveTitles }
+
+   saveTitles := false;
+   for i := Pert to numCharts do
+      for j := 1 to maxtitles do
+         with Titles[i][j] do begin
+
+            { save current text length }
+            if WriteNext( Pointer(Ord(@htitlefield^^.curlen)), 2, error_code ) then begin
+
+               { save current number of format runs }
+               if WriteNext( Pointer(Ord(@htitlefield^^.curfmts)), 2,  Error_Code ) then begin
+
+                  { write the text buffer of current length }
+                  if WriteNext( Pointer(Ord(@htitlefield^^.curvalue^^)), htitlefield^^.curlen, error_code) then begin
+
+                     { write the run array of curfmts length * size of run record }
+                     if WriteNext( Pointer(Ord(@htitlefield^^.fmtinfo^^)),
+                        htitlefield^^.curfmts * sizeof(run), error_code) then
+                     saveTitles := true;
+                  end { if }
+                  else Exit(Savetitles);
+               end { if }
+               else Exit(SaveTitles);
+            end { if }
+            else Exit(Savetitles);
+         end; { with }
+end; { SaveTitles }
+
+
+{------------------------------------------------------------------------------}
+
+
+function SaveResc( curresc: hresc;  var error_code: integer): boolean;
+{ save the resources at the current location in the file.  with version 4 I tacked on
+  unit cost and sortnum for each resource }
+var unitcost: longint;
+    sortnum: integer;
+begin { SaveResc }
+   saveResc := false;
+   if curResc <> nil then
+   with curResc^^ do begin
+      if WriteNext( Pointer(Ord(@duration)), 2, Error_Code ) then begin
+         if WriteNext( Pointer(Ord(@Remaining)), 2, error_code ) then begin
+            { save the duration text }
+            if SaveText(dcurlen, dtext, error_code) then begin
+               if SaveText(rcurlen, rtext, error_code) then begin
+                  if rname <> nil then begin
+                     unitcost := rname^^.unitcost;
+                     sortnum := rname^^.sortnum;
+                  end
+                  else begin
+                     unitcost := 0;
+                     sortnum := 0;
+                  end;
+                  if writeNext( pointer(ord(@unitcost)), 4, Error_code) then begin
+                     if writeNext(pointer(ord(@sortnum)), 2, Error_Code) then begin
+                        saveResc := true;
+                     end; { if }
+                  end; { if }
+               end; { if }
+            end; { if }
+         end; { if }
+      end; { if }
+   end; { with }
+end; { SaveResc }
+
+
+
+{------------------------------------------------------------------------------}
+
+
+function NewSave( var failreason: freason; var error_code: integer; refnum: integer ):boolean;
+{ do the save of the information to a file, assume file is opened already }
+
+var curtask:   htask;
+    curtext:   htext;
+    curresc:   hresc;
+    I, J,
+    count,
+    maxlines:  integer;
+
+
+Procedure FileExit;
+begin
+   if error_code = 848
+   then failreason := noDiskSpace
+   else failreason := cantWrite;
+   exit(newsave);
+end;
+
+
+begin { NewSave }
+
+   NewSave := false;
+
+   ResetWrite( refnum, error_code );
+   if error_code > 0 then FileExit
+
+   else begin
+
+      { fill and save PertState record }
+      if SaveState( error_code ) then begin
+
+         { save the title information }
+         if Savetitles(error_code ) then begin
+
+            { save info for each task }
+            curtask := head;
+            count := 0;
+            while curtask <> nil do begin
+
+               count := count + 1;
+               if count > PertState.numtasks then begin
+                  failReason := internalError;
+                  Exit(Newsave);
+               end
+               else begin
+
+                  { save task header info }
+                  if SaveTask(curtask, error_code) then begin
+
+                     { save all text lines }
+                     curtext := curtask^^.title;
+                     maxlines := linecount(curtask);
+                     for j := 1 to maxlines do begin
+                        if SaveText(curtext^^.curlen, curtext^^.text, error_code) then
+                           curtext := curtext^^.next
+                        else fileExit;
+                     end;
+
+                     { save all resources }
+                     curresc := curtask^^.resource;
+                     maxlines := RescCount(curtask);
+                     for j := 1 to maxlines do begin
+                        if SaveResc(curresc,error_code) then
+                           curresc := curresc^^.next
+                        else fileExit;
+                     end;
+
+                     { save all backward links }
+                     with curtask^^ do begin
+                        for i := NForward to NForward + NBackward - 1 do begin
+                           {$R-}
+                           if writenext(Pointer(Ord(@Link[i]^^.count)), 2, error_code ) then {OK}
+                           else FileExit;
+                           {$R+}
+                        end; { for }
+                     end; { with }
+
+                     curtask := curtask^^.flink;
+                  end { if }
+                  else FileExit;
+               end; { else }
+            end; { while }
+
+            { flush out last buffer }
+            if FlushWrite( error_code ) then error_code := 0
+            else FileExit;
+            NewSave := true;
+         end { if }
+         else FileExit;
+      end { if }
+      else FileExit;
+   end; { else }
+end;  { NewSave }
+
+
+{------------------------------------------------------------------------------}
+procedure InitOneTitle(var OneTitle: titleSet; nilrect: rect);
+const
+   startLen    = 50;
+   growLen     = 0;
+   padding     = 4;
+   ifmts       = 1;
+   gfmts       = 1;
+   protect     = false;
+
+begin
+   with Onetitle[1] do begin
+      hTitlefield := createfield( NilRect, StartLen, growLen, center,
+                                  padding, ifmts, gfmts, p10Tile, protect );
+      MoveLeft(title,hTitleField^^.curvalue^^,Length(title)+1);
+ {$R-} MoveLeft(htitlefield^^.curvalue^^[1], htitlefield^^.curvalue^^, length(title)); {$R+}
+      hTitleField^^.curlen := length(title);
+      SetPt( dx, dTitleH, dTitleV );
+   end; { with }
+   with OneTitle[2] do begin
+      hTitlefield := createfield( NilRect, StartLen, growLen, center,
+                                  padding, ifmts, gfmts, p10Tile, protect );
+      MoveLeft(subtitle,hTitleField^^.curvalue^^,Length(subtitle)+1);
+ {$R-} MoveLeft(htitlefield^^.curvalue^^[1], htitlefield^^.curvalue^^, length(subtitle)); {$R+}
+      hTitleField^^.curlen := length(subtitle);
+      SetPt( dx, dtitleH, dTitleV + d2Title);
+   end; { with }
+end;
+
+
+Function InitTitles( var failReason: freason;  var error_code: integer): boolean;
+{ init the title information }
+
+var
+   i:       integer;
+   nilrect: rect;
+
+begin { InitTitles }
+
+   setrect(nilrect,0,0,0,0);
+   for i := Pert to numCharts do InitOneTitle(titles[i], nilrect);
+   { no way to fail }
+   Inittitles := true;
+end; { InitTitles }
+
+
+{------------------------------------------------------------------------------}
+
+
+function InitState(var failReason: fReason;  var error_code: integer): boolean;
+
+var i:         Integer;
+    {PrInfo:    TPrInfo;}
+    letterQuality,
+    PSOnly:    boolean;
+
+begin
+
+   InitState := false;
+
+   activechart := Pert;
+   limitResources := false;
+
+   for i := pert to numCharts do begin
+      scale[i].factor := 1.0;
+      scale[i].state := scaleReal;
+
+      PertFontInfo[i].myfont := p15Tile;
+      PertFontInfo[i].myface := [];
+
+      ReqFinfo[i].myfont := p15Tile;
+      ReqFInfo[i].myface := [];
+   end;
+   FixActual := Round(65536 * 1.0);
+   FixFactor := FixActual;
+
+   { init the printing code with prprf }
+   PrPrfDefault (prprf);
+   with prprf.PrInfo do begin
+      { figure out my page size in screen resolution }
+      PageH := trunc(((rprintable.right - rprintable.left)/ hres) * 90);
+      PageV := trunc(((rprintable.bottom - rprintable.top)/ vres) * 60);
+      PrintRect := rprintable;
+   end; { with }
+   hRes := prprf.PrInfo.hres;
+   VRes := prprf.PrInfo.vres;
+
+   SetRunFormat( hdrawField, nil, p15tile, SetFont,   error_code);
+   SetRunFormat( htaskfield, nil, p15tile, SetFont,   error_code);
+   SetRunFormat( Hdrawfield, nil, p15tile, SetNormal, error_code);
+   SetRunFormat( HTaskfield, nil, p15tile, Setnormal, error_code);
+
+   { adjust pert drawing size }
+   for i := pert to numCharts do begin
+      SetRect(paperRect[i], 0, 0, pageH, pageV);
+   end;
+
+   { save the requested paper size }
+   ReqPaper := PaperRect[pert].botright;
+
+
+   { init the selection vars }
+   for i := pert to numCharts do With CurSelRec[i] Do Begin
+      Tag := Air;
+      SetPt(CurSelLoc, 0, 0);
+   End;
+
+   { set up initial thumb positions for all the charts }
+   for I := Pert to numCharts do begin
+      SetThumb(hsbV[I], 0);
+      SetThumb(hsbH[I], 0);
+   end;
+
+   Printing := false;
+   Preview  := false;
+   showDates := false;   { Changed from initially starting with dates on      }
+   showES    := false;   { because manuals were written that way.  Preferable }
+   showLS    := false;   { start up state is earlystart on.                   }
+   showEF    := false;
+   showLF    := false;
+   UndoValid := false;
+
+   { my state variables inited }
+   SkipToUp := false;
+   eventDebug:=FALSE;
+   caretTime:=Time+50;
+   msgon := false;
+
+   curGridSize := 1;
+
+   For I := Pert to numCharts do dRescLine[I] := 0;
+   dRescLine[RescGantt] := dInitResc;
+   dRescLine[TaskGantt] := dInitResc;
+
+   docDateFormat := toolDateFormat;
+   docMM_DD_YY := toolMM_DD_YY;
+   SetDateCode(toolDateFormat, toolMM_DD_YY);
+   today := 0;
+   if DfltCalendar then begin
+      InitState := true;
+   end { if }
+   else failReason := noMemory;
+
+end; { InitState }
+
+
+{------------------------------------------------------------------------------}
+
+
+Procedure DisposeData;
+{ currently disposes the field edit data structures, task, text, and resc recs,
+  and chart titles. }
+
+var i,j,
+    sizeofCalendar: integer;
+
+begin { DisposeData }
+
+   { dispose of chart titles }
+   for i := pert to numCharts do
+      for j := 1 to maxtitle do
+         with Titles[i][j] do
+            RemoveField(htitlefield);
+
+   { dispose every allocated task }
+   FreeTaskList(names, head );
+   head := nil;
+   tail := nil;
+   names := nil;
+
+   ChangeSizeH(theHeap, pointer(Ord(calendar)),  2);
+   calsize := 0;
+   sizeofCalendar :=  CBDataofH(theheap,Pointer(ord(calendar)));
+
+end; { DisposeData }
+
+
+{------------------------------------------------------------------------------}
+
+
+function Initialdata( var failReason: freason; var error_code:integer ):boolean;
+{ This procedure fills the task list with just the start and end milestones. }
+
+var newtext:   hText;           { the new text record               }
+    i: integer;
+    startTopLeft,
+    endTopLeft:   point;
+    mywindow:     rect;
+
+begin { InitialData }
+
+   InitialData := false;
+
+   if InitState(failreason, error_code) then begin
+
+      if InitTitles(failreason, error_code) then begin
+
+         { set up the window }
+         mywindow := myfolder^.portrect;
+
+         { remove space for scroll bars from my window }
+         mywindow.right := mywindow.right - dhSbox;
+         mywindow.bottom := mywindow.bottom - dvSbox;
+
+         { normalize origin to 0,0}
+         offsetRect(mywindow, -mywindow.left, -mywindow.top);
+         SetPt(startTopLeft, mywindow.right div 5, mywindow.bottom * 3 div 4);
+         SetPt(endTopLeft,   CMax(mywindow.right * 4 div 5, 275) - 75, mywindow.bottom * 3 div 4);
+
+         { allocate and FillData the start milestone }
+         names := nil;
+         if NewTaskRec(0, head) then begin
+            with head^^ do begin
+
+               SetRect( box, startTopLeft.h, startTopLEft.v, startTopleft.h + 75, startTopLeft.v + 50);
+               dotline := 50;
+               flink := nil;
+               blink := nil;
+               milestone := true;
+               maxduration := 0;
+               SetStart  := maxval;
+               SetFinish := minval;
+               resource := nil;
+               NForward := 0;
+               NBackward := 0;
+               FixedCost := 0;
+            end; { with }
+
+            { set up the text for start }
+            if NewTextRec(20, newtext) then begin
+               newtext^^.next := nil;
+               MoveLeft(StartStr,newtext^^.text^^,Length(startStr)+1);
+         {$R-} MoveLeft(newtext^^.text^^[1], newtext^^.text^^, length(startstr)); {$R+}
+               newtext^^.curlen := length(startStr);
+               newtext^^.maxlen := 20;
+               head^^.title := newtext;
+
+               { and the end box data }
+               if NewTaskRec(0, tail) then begin
+                  with tail^^ do begin
+                     SetRect( box, endTopLeft.h, endTopLeft.v, endTopLeft.h + 75, endTopLEft.v + 50);
+                     dotline := 50;
+                     flink := nil;
+                     blink := nil;
+                     milestone := true;
+                     maxduration := 0;
+                     SetStart  := maxval;
+                     SetFinish := minval;
+                     resource  := nil;
+                     NForward := 0;
+                     NBackward := 0;
+                     FixedCost := 0;
+                  end; { with }
+
+                  { set up the text for the end milestone }
+                  if NewTextRec(20, newtext) then begin
+                     newtext^^.next := nil;
+                     MoveLeft(endStr,newtext^^.text^^,Length(endStr)+1);
+               {$R-} MoveLeft(newtext^^.text^^[1], newtext^^.text^^, length(endstr)); {$R+}
+                     newtext^^.curlen := length(endstr);
+                     newtext^^.maxlen := 20;
+                     tail^^.title := newtext;
+
+                     { link the head and tail together }
+                     head^^.flink := tail;
+                     tail^^.blink := head;
+
+                     { success }
+                     Initialdata := true;
+                  end { if }
+                  else failReason := noMemory;
+               end { if }
+               else failReason := nomemory;
+            end { if }
+            else failReason := Nomemory;
+         end { if }
+         else failReason := NoMemory;
+      end; { if }
+   end; { if }
+end; { InitialData }
+
+
+{------------------------------------------------------------------------------}
+
+
+function RestTitles( var failReason: fReason; var error_code: integer; thisVersion: integer):boolean;
+{ restore chart titles from file,  not currently saving run information with titles }
+
+const
+   startLen    = 50;
+   growLen     = 0;
+   padding     = 4;
+   gfmts       = 1;
+   protect     = false;
+
+var
+   i,j,
+   currentLen,
+   curformats:    integer;
+   nilrect:       rect;
+   ncharts:         integer;
+
+begin { RestTitles }
+
+   RestTitles := false;
+   SetRect(nilrect, 0, 0, 0, 0);
+
+   for i := Pert to numCharts do begin
+      if (thisversion < 4) and (i >= rescCost) then InitOneTitle(titles[i], nilrect)
+      else begin
+         for j := 1 to maxtitle do begin
+            with Titles[i][j] do begin
+               { read in the titles }
+               { read in current text length }
+               if ReadNext( Pointer(Ord(@CurrentLen)), 2, Error_Code ) then begin
+                  { read in current formats length }
+                  if ReadNext( Pointer(Ord(@curformats)), 2, Error_Code ) then begin
+                     { create the field using current text length and current fmts length }
+                     hTitlefield := createfield( NilRect, startLen, growLen, center,
+                                                 padding, curFormats, gfmts, p10Tile, protect );
+                     { read in text, set current length }
+                     if ReadNext( Pointer(Ord(@htitlefield^^.curvalue^^)), currentLen, error_code) then begin
+                        { set up the length value in the field }
+                        htitlefield^^.curlen := currentLen;
+                        { read in formatting runs, set current runs }
+                        if ReadNext( Pointer(Ord(@htitlefield^^.fmtinfo^^)),
+                           sizeof(run)*curformats, error_code) then begin
+                           htitlefield^^.curfmts := curformats;
+                           { set up dx point for title }
+                           SetPt( dx,dTitleH, dTitleV + (j * d2Title));
+                        end { if }
+                        else begin
+                           failreason := cantread;
+                           Exit(RestTitles);
+                        end; { else }
+                     end { if }
+                     else begin
+                        failreason := cantRead;
+                        Exit(RestTitles);
+                     end; { else }
+                  end { if }
+                  else begin
+                     failReason := cantRead;
+                     Exit(RestTitles);
+                  end; { else }
+               end { if }
+               else begin
+                  failreason := cantRead;
+                  Exit(RestTitles);
+               end; { else }
+            end; { with }
+         end; { for }
+      end; { else }
+   end; { for }
+
+   { made it }
+   RestTitles := true;
+
+end; { RestTitles }
+
+
+{------------------------------------------------------------------------------}
+
+
+function RestState( var failreason: freason; var error_code: integer;  State: integer;
+                    var thisversion:integer):boolean;
+{ restore the state of the pert and gantt charts }
+
+var i,
+    mySize,
+    DocState:      integer;
+    {PrInfo:        TPrInfo;}     { printer information record           }
+    letterQuality,
+    PSOnly:        boolean;
+
+   Function Readcalendar: boolean;
+   { two versions of the calendar, old and new, changes made on version 2 and later }
+   var i: integer;
+   begin
+      ReadCalendar := false;
+      if thisversion <= 2 then begin
+         if ReadNext( Pointer(Ord(@OldCalInfo)),  SizeOf(OldCalInfo), error_code) then begin
+            with OldCalInfo do begin
+               { restore calendar start date, real offsets for others }
+               CalStartDate  :=  CalStrDate;
+               daysperweek   :=  DPW;
+               endingYear    :=  endYear;
+               for i := 1  to Oldmaxholiday do
+               Holidates[i]  := HlDates[i];
+               for i := oldMaxHoliday + 1 to maxHoliday do
+               Holidates[i].RD := maxval;
+               docDateFormat := toolDateFormat;
+               docMM_DD_YY   := toolMM_DD_YY;
+               SetDateCode(ToolDateFormat, toolMM_DD_YY);
+               today := 0;
+            end; { with }
+            { create the calendar }
+            if FillCalendar then begin
+               DateDefaults;
+               ReadCalendar := true;
+            end { if }
+            else failreason := noMemory;
+         end { if }
+         else FailReason := cantRead;
+      end { if }
+
+      else begin
+         if ReadNext( Pointer(Ord(@CalInfo)),  SizeOf(CalInfo), error_code) then begin
+            with CalInfo do begin
+               { restore calendar start date, real offsets for others }
+               CalStartDate  :=  CalStrDate;
+               daysperweek   :=  DPW;
+               endingYear    :=  endYear;
+               for i := 1  to maxholiday do Holidates[i]  := HlDates[i];
+               docDateFormat := DateString;
+               docMM_DD_YY   := DateDefault;
+               SetDateCode(DocDateFormat, docMM_DD_YY);
+               today := 0;
+            end; { with }
+            { create the calendar }
+            if FillCalendar then begin
+               DateDefaults;
+               ReadCalendar := true;
+            end { if }
+            else failreason := noMemory;
+         end { if }
+         else failReason := cantRead;
+      end; { else }
+   end;
+
+   Function ReadAdditonal: boolean;
+   { this is the new state information added with version 4 - if this is an earlier version
+     then init the information }
+   var i: integer;
+   begin
+      if thisversion >= 4 then begin
+         if ReadNext( Pointer(Ord(@AdditionalState)), Sizeof(AdditionalState), error_code ) then begin
+            with AdditionalState do begin
+               limitResources := (SchedMethod = 1);
+               for i := resccost to numCharts do begin
+                  if state = suspended then begin
+                     SetThumb(hsbH[i], HScroll[i]);
+                     SetThumb(hsbV[i], HScroll[i]);
+                  end
+                  else begin
+                     SetThumb(hsbH[i], 0);
+                     SetThumb(hsbV[i], 0);
+                  end;
+                  PertFontInfo[i] := Font[i];
+                  ReqFInfo[i] := ReqFont[i];
+                  scale[i].factor := 1.0;
+                  scale[i].state := scaleReal;
+                  dRescLine[i] := 0;
+                  setRect(paperRect[i], 0,0,pageh, pagev);
+               end;
+            end;
+            ReadAdditional := true;
+         end { if }
+         else begin
+            failReason := cantRead;
+            readAdditional := false;
+         end;
+      end
+      else begin
+         { init the additional info }
+         limitResources := true;
+         for i := resccost to numCharts do begin
+            SetThumb(hsbH[i], 0);
+            SetThumb(hsbV[i], 0);
+            PertFontInfo[i].myfont := p15Tile;
+            PertFontInfo[i].myface := [];
+            ReqFinfo[i].myfont := p15Tile;
+            ReqFInfo[i].myface := [];
+            scale[i].factor := 1.0;
+            scale[i].state := scaleReal;
+            dRescLine[i] := 0;
+            setRect(paperRect[i], 0,0,pageh, pagev);
+         end;
+         ReadAdditional := true;
+      end;
+   end;
+
+   Procedure StuffState;
+   var i: integer;
+   begin
+      with PertState do begin
+         if state = suspended then begin
+
+            { set currently active chart }
+            activeChart := chartactive;
+
+            { set old thumb positions }
+            SetThumb(hsbH[Pert], PertHScroll);
+            SetThumb(hsbV[Pert], PertHScroll);
+            SetThumb(hsbH[RescGantt], RescHScroll);
+            SetThumb(hsbV[RescGantt], RescVScroll);
+            SetThumb(hsbH[TaskGantt], TaskHScroll);
+            SetThumb(hsbV[TaskGantt], TaskVScroll);
+
+            { set state vars }
+            Printing     :=  PrintState;
+            Preview      :=  PrevState;
+
+            PertFontInfo[Pert]      := FontInfP;
+            PertFontInfo[RescGantt] := FontInfG;
+            PertFontInfo[TaskGantt] := FontInfT;
+
+            scale[Pert]  := scaleP;
+            scale[Rescgantt] := scaleG;
+            scale[TaskGantt] := scaleT;
+
+         end
+         else begin
+
+            { active chart is pert }
+            activechart := pert;
+
+            { set thumbs to 0 for everybody }
+            for i := pert to TaskGantt do begin
+               SetThumb(hsbH[i], 0);
+               SetThumb(hsbV[i], 0);
+            end; { for }
+
+            { all of these disabled }
+            Printing     :=  false;
+            Preview      :=  false;
+
+            PertFontInfo[Pert]      := FontInfP;
+            PertFontInfo[RescGantt] := FontInfG;
+            PertFontInfo[TaskGantt] := FontInfT;
+
+            { set up as unscaled }
+            for i := pert to taskgantt do begin
+               scale[i].factor := 1.0;
+               scale[i].state := scaleReal;
+            end; { for }
+         end; { else }
+
+         if thisversion = 1 then begin
+            ReqFInfo[pert]      := PertFontInfo[pert];
+            ReqFInfo[RescGantt] := PertFontInfo[RescGantt];
+            ReqFInfo[TaskGantt] := PertFontInfo[TaskGantt];
+         end { if }
+         else begin
+            ReqFInfo[pert]      := ReqInfoP;
+            ReqFInfo[RescGantt] := ReqInfoG;
+            ReqFInfo[TaskGantt] := ReqInfoT;
+         end; { else }
+
+         FixActual := Round(65536 * PertFontInfo[activechart].actual);
+         FixFactor := Round(65536 * Scale[activechart].factor);
+
+         UndoValid    :=  false;
+
+         { set up gantt drawing scale }
+         CurGridSize  :=  GridSize;
+
+         PaperRect[Pert]  := PaperP;
+         PaperRect[RescGantt] := PaperG;
+         PaperRect[TaskGantt] := PaperT;
+
+         { save the requested paper size }
+         ReqPaper := PaperRect[pert].botright;
+
+         { adjust the pert drawing size }
+         AdjustToPrint;
+
+         dRescLine[Pert] := 0;
+         dRescLine[RescGantt] := dRescG;
+         dRescLine[TaskGantt] := dRescT;
+
+         { restore state of date display }
+         showES    :=  dispES;
+         showEF    :=  dispEF;
+         showLS    :=  dispLS;
+         showLF    :=  dispLF;
+         showDates :=  (showES or showEF or showLS or showLF);
+
+         { set up font type and face }
+         with ReqFInfo[Pert] do begin
+            SetRunFormat( hdrawField, nil, myfont, SetFont, error_code);
+            SetRunFormat( htaskfield, nil, myfont, SetFont, error_code);
+            SetRunFormat(Hdrawfield, nil,  myfont, SetNormal, error_code);
+            SetRunFormat(HTaskfield, nil,  myfont, Setnormal, error_code);
+
+            if (UnderLine in myface) then begin
+               SetRunFormat(Hdrawfield, nil,  myfont, SetUnderLine, error_code);
+               SetRunFormat(HTaskfield, nil,  myfont, SetUnderLine, error_code);
+            end; { if }
+            if (Bold in myface) then begin
+               SetRunFormat(Hdrawfield, nil,  myfont, SetBold, error_code);
+               SetRunFormat(HTaskfield, nil,  myfont, SetBold, error_code);
+            end; { if }
+            if (Italic in myface) then begin
+               SetRunFormat(Hdrawfield, nil,  myfont, SetItalic, error_code);
+               SetRunFormat(HTaskfield, nil,  myfont, SetItalic, error_code);
+            end; { if }
+            if (Shadow in myface) then begin
+               SetRunFormat(Hdrawfield, nil,  myfont, SetShadow, error_code);
+               SetRunFormat(HTaskfield, nil,  myfont, SetShadow, error_code);
+            end; { if }
+         end; { with }
+      end; { with }
+   end; { StuffState }
+
+
+begin { RestState }
+   restState := false;
+
+   { the password and the version }
+   if ReadNext( Pointer(Ord(@PassRec)), Sizeof(passRec), error_code ) then begin
+      with passrec do begin
+         if (version > theVersion) or (password <> thePassword) then begin
+            failreason := newerDoc;
+            Exit(RestState);
+         end;
+         thisVersion := version;
+      end; { with }
+
+      { printer preference record }
+      if (thisVersion < 4) then mySize := 112 { old size }
+                           else mySize := SizeOf(PrinterRec); { new Size }
+      if ReadNext( Pointer(Ord(@PrinterRec)), mySize, error_code) then begin
+         with PrinterRec do PrPrf := Pref;
+
+         { fix an old print preference }
+         if (not fPrPrfValid(prprf)) then PrPrfDefault(prprf);
+         with prprf.PrInfo do begin
+
+            { figure out my page size in screen resolution }
+            PageH := trunc(((rprintable.right - rprintable.left)/ hres) * 90);
+            PageV := trunc(((rprintable.bottom - rprintable.top)/ vres) * 60);
+            printrect := rprintable;
+         end; { with }
+         hRes := prprf.PrInfo.hres;
+         VRes := prprf.PrInfo.vres;
+
+         { pert state record }
+         if ReadNext( Pointer(Ord(@PertState)),  SizeOf(PertState), error_code) then begin
+            if readAdditional then begin
+               StuffState;
+
+               { init the selection vars }
+               for i := pert to numCharts do
+               With CurSelRec[i] Do Begin
+                  Tag := Air;
+                  SetPt(CurSelLoc, 0, 0);
+               End;
+
+               { calendar info }
+               if ReadCalendar then RestState := true;
+            end;
+         end { if }
+         else failReason := cantRead;
+      end { if }
+      else failreason := cantRead;
+   end { if }
+   else failreason := cantRead;
+end; { RestState }
+
+
+
+{------------------------------------------------------------------------------}
+
+
+function RestTask( var failreason: freason; var curtask: htask; var error_code: integer;
+                   var numlines: integer;
+                   var numrescs: integer; var TNForward, TNBackward: integer;
+                   thisversion: integer):boolean;
+var fixedCost: longint;
+
+begin { RestTask }
+   RestTask := false;
+   if ReadNext( Pointer(Ord(@TaskHead)), SizeOf(TaskHead), error_code) then begin
+      if NewTaskRec(TaskHead.NumForwLinks + TaskHead.NumBackLinks, curtask) then begin
+         TNForward := TaskHead.NumForwLinks;
+         TNBackward := TaskHead.NumBackLinks;
+
+         with curtask^^ do begin
+            box := TaskHead.box;
+            milestone := TaskHead.milestone;
+            Maxduration := TaskHead.maxduration;
+            numlines := TaskHead.numTextLines;
+            dotline := TaskHead.dotline;
+            NumRescs := TaskHead.NumRescLines;
+
+            NForward := 0;
+            NBackward := 0;
+
+            earlystart := minval;
+            latestart  := maxval;
+            SetStart  := TaskHead.start;
+            SetFinish := TaskHead.finish;
+
+            title := nil;
+            Resource := nil;
+            flink := nil;
+            blink := nil;
+
+            if tail <> nil then begin
+               tail^^.flink := curtask;
+               curtask^^.blink := tail;
+               tail := curtask;
+            end { if }
+            else begin
+               head := curtask;
+               tail := curtask;
+            end; { else }
+         end; { with }
+         if thisversion >= 4 then begin
+            if ReadNext( Pointer(Ord(@FixedCost)), SizeOf(FixedCost), error_code)
+            then begin
+               curtask^^.fixedcost := fixedCost;
+               restTask := true;
+            end
+            else failreason := cantRead;
+         end
+         else begin
+            curtask^^.fixedcost := 0;
+            RestTask := true;
+         end;
+      end { if }
+      else failreason := noMemory;
+   end { if }
+   else failreason := cantRead;
+end; { Resttask }
+
+
+{------------------------------------------------------------------------------}
+
+
+function RestText(var failreason: freason; curtask: htask; var curtext, lastText: htext;
+                  var error_code: integer):boolean;
+
+var curlen: integer;
+    strng:  array[1..50] of byte;
+
+begin { RestText }
+
+   RestText := false;
+
+   { read in current length of string }
+   if ReadNext( Pointer(Ord(@curlen)), 2, error_code) then begin
+
+      { create the record and read in text string }
+      if NewTextRec(curlen, curtext) then begin
+         curtext^^.curlen := curlen;
+         curtext^^.maxlen := curlen;
+         if ReadNext( Pointer(Ord(@strng)), curlen, error_code) then begin
+            { link it in to the list }
+            MoveLeft(strng, curtext^^.text^^, curlen);
+            curtext^^.next := nil;
+            if lastText <> nil then lastText^^.next := curtext
+            else curtask^^.title := curtext;
+            lastText := curtext;
+
+            { success }
+            RestText := true;
+         end { if }
+         else failreason := cantRead;
+      end { if }
+      else failreason := NoMemory;
+   end { if }
+   else failreason := cantRead;
+end; { RestText }
+
+
+{------------------------------------------------------------------------------}
+
+
+function RestResc(  var failreason: freason; curtask: htask; var curresc, lastresc: hresc;
+                    var error_code: integer; thisversion: integer): boolean;
+var duration,
+    remaining,
+    dcurlen,
+    rcurlen:  integer;
+    unitcost: longint;
+    sortnum:  integer;
+    strng:    array [1..50] of byte;
+
+begin { RestResc }
+
+   RestResc := false;
+   { read in the resource duration }
+   if ReadNext( Pointer(Ord(@duration)), 2, error_code) then begin
+      { and the amount remaining }
+      if ReadNext( Pointer(Ord(@remaining)), 2, error_code) then begin
+         { read duration curlen }
+         if Readnext( Pointer(Ord(@dcurlen)), 2, error_code) then begin
+            { read in duration string }
+            if ReadNext( Pointer(Ord(@strng)), dcurlen, error_code) then begin
+               if ReadNext( Pointer(Ord(@rcurlen )), 2, error_code) then begin
+                  { allocate new resource record }
+                  if NewRescRec(dcurlen, rcurlen, curresc) then begin
+                     curresc^^.duration  := duration;
+                     curresc^^.remaining := remaining;
+                     curresc^^.dcurlen   := dcurlen;
+                     curresc^^.dmaxlen   := dcurlen;
+                     curresc^^.rcurlen   := rcurlen;
+                     curresc^^.rmaxlen   := rcurlen;
+                     MoveLeft(strng, curresc^^.dtext^^, dcurlen);
+
+                     { read in resource name string into temp }
+                     if ReadNext( Pointer(Ord(@strng)), rcurlen, error_code) then begin
+
+                        { look for a match on this resource }
+                        MoveLeft(strng, curresc^^.rtext^^, rcurlen);
+                        FindResc(names, curresc);
+
+                        { link in this resource record }
+                        curresc^^.next := nil;
+                        if lastResc <> nil then lastResc^^.next := curresc
+                        else curtask^^.resource := curresc;
+                        lastresc := curresc;
+
+                        if thisversion >= 4 then begin
+                           { read in the resource unit cost }
+                           if ReadNext( Pointer(Ord(@UnitCost)), 4, error_code) then begin
+                              { read in the resource sort number }
+                              if ReadNext( Pointer(Ord(@sortnum)), 2, error_code) then begin
+                                 curresc^^.rname^^.unitcost := unitcost;
+                                 curresc^^.rname^^.sortnum  := sortnum;
+                                 { success }
+                                 RestResc := true;
+                              end
+                              else failreason := cantread;
+                           end
+                           else failreason := cantread;
+                        end
+                        else RestResc := true;
+                     end
+                     else failReason := CantRead;
+                  end { if }
+                  else failReason := NoMemory;
+               end { if }
+               else failReason := cantRead;
+            end { if }
+            else failreason := cantRead;
+         end { if }
+         else failReason := cantRead;
+      end { if }
+      else failReason := cantRead;
+   end { if }
+   else failreason := cantRead;
+end; { RestResc }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function RestLink( var failreason: freason; task: htask; var error_code: integer;
+                   TNForward, TNBackward: integer):boolean;
+var current: htask;
+    i:       integer;
+    linkNum: integer;
+
+begin { RestLink }
+
+   Restlink := false;
+   if ReadNext( Pointer(Ord(@linkNum)), 2, error_code) then begin
+      if (linknum >= 1) and (linknum <= tail^^.count) then begin
+         {$R-}
+         current := TaskPtrs^^[linkNum];
+         {$R+}
+         if current^^.count = linknum then begin
+
+            { add a forward link off current }
+            with current^^ do begin
+               {$R-}
+               Link[NForward] := task;
+               {$R+}
+               NForward := NForward + 1;
+            end; { with }
+
+            { and a backward link off task }
+            with task^^ do begin
+               {$R-}
+               Link[TNForward + NBackward] := current;
+               {$R+}
+               NBackward := NBackward + 1;
+            end; { with }
+            { success }
+            RestLink := true;
+         end { if }
+         else failReason := badData;
+      end { if }
+      else failreason := badData;
+   end { if }
+   else failReason := CantRead;
+end; { RestLink }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function NewRestore(var failReason: FReason;  var error_code: integer;  Refnum, State: integer):boolean;
+
+var
+   curtask:    htask;
+   curtext,
+   lastText:   htext;
+   curresc,
+   lastResc:   hresc;
+   numTasks,
+   I, J:       integer;
+   attributes: fs_Info;
+   numlines,
+   TNForward,
+   TNBackward,
+   numRescs:   integer;
+   thisversion: integer;
+
+
+Procedure ErrorExit;
+begin
+   disposeData;
+   NewRestore := false;
+   FreeH( theHeap, Pointer(Ord(TaskPtrs)));
+   Exit(NewRestore);
+end;
+
+begin { NewRestore }
+   NewRestore := false;
+
+   LookUP(error_code,filename, attributes);
+   if error_code <> 0 then failReason := cantRead
+   else begin
+      if attributes.size < 10 then begin
+         if Initialdata(failreason, error_code) then NewRestore := true;
+      end { if }
+
+      else begin
+
+         { restore the existing file }
+         names := nil;
+         head  := nil;
+         tail  := nil;
+
+         ResetRead( refnum, error_code );
+         if RestState( failreason, error_code, State, thisversion) then {ok}
+         else Exit(NewRestore);
+
+         if RestTitles( failreason, error_code, thisversion) then {ok}
+         else Exit(NewRestore);
+
+         TaskPtrs := Pointer(Ord(HAllocate( theHeap, (PertState.numTasks + 1)* 4 )));
+         if Pointer(ord(TaskPtrs)) = hnil then begin
+            failreason := NoMemory;
+            exit(NewRestore);
+         end; { if }
+
+         For I := 1 to PertState.numTasks do begin
+
+            if RestTask(failreason, curtask, error_code, numlines, numRescs,TNForward, TNBackward, thisversion) then {ok}
+            else errorExit;
+            curtask^^.count := I;
+            {$R-}
+            TaskPtrs^^[I] := curtask;
+            {$R+}
+
+            lastText := nil;
+            for J := 1 to numlines do begin
+               if RestText(failreason, curtask, curtext, lastText, error_code) then {ok}
+               else errorExit;
+            end; { for }
+
+            lastResc := nil;
+            for j := 1 to numrescs do begin
+               if RestResc(failreason, curtask, curresc, lastResc,error_code, thisversion) then {ok}
+               else errorExit;
+            end; { for }
+
+            for J := 1 to TNBackward do begin
+               if RestLinks(failreason, curtask, error_code, TNForward, TNBackward) then {ok}
+               else errorExit;
+            end; { for }
+         end; { for }
+
+         FreeH( theHeap, Pointer(Ord(TaskPtrs)));
+         NewRestore := true;
+      end; { else }
+   end; { else }
+end;  { NewRestore }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function SetFontNumbers: boolean;
+{ sets up the font information records for each chart }
+
+var fInfo:     FontInfo;
+    fid:       TLFntId;
+    cError:    TC;
+    i:         integer;
+    ReqFid,
+    RealFid:   TLFntId;
+    errnum:    integer;
+
+begin { SetFontNumbers }
+
+   { first get numbers for p15tile }
+   fid.fam := p15tile;
+   fid.seteface := [];
+   fid.dev := devScreen;
+   if not FmFontMetrics(fid, fInfo, cError) then begin
+      SetFontNumbers := false;
+      exit(SetFontNumbers);
+   end
+   else begin
+      SetPort(myfolder);
+      TextFont(p15tile);
+      TextFace([]);
+      p15lSpace  := finfo.Ascent+ finfo.Descent+ finfo.Leading;
+      p15mSpace  := CharWidth('m');
+   end;
+
+   { now set up fontrecs for each chart }
+   for i := pert to numcharts do begin
+      with Reqfid do begin
+         fam := Reqfinfo[i].myfont;
+         seteface := Reqfinfo[i].myface;
+         dev := devScreen;
+      end;
+      { now map to printer font that matches up as close as we can }
+      { I have fid to be what the guy asked for }
+      RealFid := Reqfid;
+      { ???RealFid.dev := PrDev(prprf);
+      FmMapFont(RealFid, errnum); ???}
+      RealFid.dev := devScreen;
+
+      { get font size info }
+      if not FmFontMetrics(RealFid,fInfo,Errnum) then {}
+      else begin
+
+         SetPort(myfolder);
+         TextFont(RealFid.fam);
+         TextFace(RealFid.seteface);
+
+         { new font is ok, go for it }
+         with PertFontInfo[i] do begin
+            myfont := Realfid.fam;
+            myface := Realfid.seteface;
+
+            { get the new numbers }
+            ascent  := finfo.Ascent;
+            descent := finfo.Descent;
+            lSpace  := finfo.Ascent+ finfo.Descent+ finfo.Leading;
+            mSpace  := CharWidth('m');
+            lSpTop  := Round((lSpace-ascent-descent)/2);
+            offset  := lSpTop+ascent-Round(lSpace/2);
+            actual  := (finfo.Ascent+ finfo.Descent+ finfo.Leading)/p15lspace;
+            if charWidth('m')/p15mspace > Actual then Actual := charWidth('m')/p15mspace;
+
+         end; { with }
+      end; { else }
+   end; { for }
+   FixActual := Round(65536 * PertFontInfo[activechart].actual);
+
+   SetFontNumbers := true;
+
+end; { SetFontNumbers }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function SetUpFldrDisplay(var failReason: freason; var error_code: integer): boolean;
+{ after the new file is read in, this routine sets up for the
+  display of the data }
+
+var paper:     rect;
+    temprgn:   rgnHandle;
+
+begin { SetUpFldrDisplay }
+
+   SetUpfldrDisplay := false;
+
+   if SetFontNumbers then begin
+
+      SetPort(myfolder);
+
+      { calc schedule, or create the gantt chart }
+      if activechart <> Pert then begin
+         CalcSchedule;
+      end
+      else if showdates then CalcSchedule
+         else UnSchedule;
+
+      { set up the origin according to scroll positions }
+      scalePaper(paper, activeChart);
+      with myfolder^.portrect do
+         SetOrigin(trunc(CThumbPos(hsbH[activeChart])/1000.0 *(paper.right -
+                   paper.left - (right - left - dhsbox)) + paper.left),
+                   trunc(CThumbPos(hsbV[activeChart])/1000.0 * (paper.bottom -
+                   paper.top  - (bottom - top - dvsbox)) + paper.top));
+
+      { save the current origin in a global }
+      MyOrigin := myfolder^.portrect.topleft;
+
+      { show the contents of the folder }
+      ClipRect(myfolder^.portRect);
+      Showscroll(myfolder);
+      showContents(myfolder);
+
+      { validate the portrect to eliminate any update event }
+      TempRgn := newRgn;
+      with myfolder^.portrect do
+      SetRectRgn(temprgn, left, top, right, bottom);
+      ValidRgn(temprgn);
+      DisposeRgn(temprgn);
+
+      { success }
+      setUpfldrDisplay := true;
+
+   end { if }
+   else failReason := badData;
+
+end; { SetUpFldrDisplay }
+
+
+{-------------------------------------------------------------------------------
+
+    File save and restore public routines.
+
+ ------------------------------------------------------------------------------}
+
+
+Function SaveTheDoc{(var failreason: freason; var error_code: integer; FileRefNum: integer): boolean};
+{ save the open file and continue. }
+
+
+begin { SaveTheDoc }
+
+   if NewSave( failreason, Error_code, FileRefNum) then saveTheDoc := true
+   else saveTheDoc := false;
+
+end; { SaveTheDoc }
+
+
+{------------------------------------------------------------------------------}
+
+
+Function RestTheDoc{( var failreason: freason; var error_code: integer; FileRefNum: integer): boolean};
+{ read in the open file again, called when user says revert to previous version. }
+
+
+begin { RestTheDoc }
+
+   RestTheDoc := false;
+
+   { dispose of the old data }
+   DisposeData;
+
+   { read in new data }
+   if NewRestore( failreason, error_code, FileRefNum, closed) then begin
+
+      { got a good file }
+      hideFolder(alertFolder);
+      if SetUpFldrDisplay(failreason, error_code) then RestTheDoc := true;
+      docChangedFlag := false;
+   end; { if }
+
+end; { RestTheDoc }
+
+
+{------------------------------------------------------------------------------}
+
+
+FUNCTION OpenTheDoc{(filerParams : FilerExt; VAR failReason : FReason; var error_code:integer) : BOOLEAN};
+{ Called to handle the filer "open" events.  Returns TRUE if the document
+  was opened successfully; otherwise returns FALSE and "failReason" tells why. }
+
+Var i,
+    err         : INTEGER;
+    bytesRead   : LONGINT;
+    cError:    TC;
+    newname:   pathname;
+    found:     boolean;
+
+
+procedure CloseAndExit;
+begin
+  Close_Object(err,fileRefNum);       { OS might object, but that's ok }
+  exit(OpenTheDoc);
+end;
+
+
+BEGIN { OpentheDoc }
+
+   OpenTheDoc := false;
+   error_code := 0;
+
+   IF docsOpen <> 0 THEN BEGIN
+      { This "application" can only handle one document at a time }
+      failReason := noMoreDocs;
+      EXIT(OpenTheDoc);
+   END;
+
+   filename := filerParams.thePrefix;
+
+   { set up myfolder for the restore }
+   myfolder := theEvent.who;
+
+   CASE filerParams.theFlrOp OF
+
+      fcResume: begin
+         { assume file was suspended, open a $Edits file }
+         newname := Concat(filename,'$Edits');
+         Open_Secure(err,newName, FileRefNum, [dRead, dWrite], pepassword);
+         if (err = 0) or (err = -1173) or (err = -1174) or (err = -1175) or (err= -1293) then begin
+
+            { yes this was a suspend, open the edits file }
+            filename := newname;
+            if NewRestore(failReason, error_code, fileRefnum, suspended) then {OK}
+            else CloseAndExit;
+            docChangedFlag := true;
+         end
+         else if (err = 1294) then begin
+            failReason := wrongpassword;
+            exit(OpenTheDoc);
+         end
+         else begin
+
+            { assume last operation was a close to file, open file without $Edits suffix }
+            Open_Secure(err,FileName,fileRefNum,[dRead,dWrite],pepassword);
+            if (err = 0) or (err = -1173) or (err = -1174) or (err = -1175) or (err = -1293) then begin
+
+               { was a close }
+               if NewRestore(failreason, error_code, FileRefNum,  closed) then {OK}
+               else CloseAndExit;
+               docChangedFlag := false;
+            end
+            else if (err = 1294) then begin
+               failReason := wrongpassword;
+               exit(OpenTheDoc);
+            end
+            else begin
+               { must have old fcNew case }
+               Make_Secure(err,filename, pepassword);
+               Open_Secure(err,filename,fileRefNum,[dRead,dWrite],pepassword);
+               IF (err <> 0) THEN BEGIN
+                  { couldn't create it.  Assume no disk space for now }
+                  failReason := noDiskSpace;
+                  exit(OpenTheDoc);
+               END;
+               if Initialdata(failreason, error_code) then {OK}
+               else CloseAndExit;
+               docChangedFlag := false;
+            end; { else }
+         end; { else }
+      end; { fcResume }
+   end; { case }
+
+   { Attempt to display the document }
+   TakeWindow(theEvent.who);
+   docsOpen := docsOpen + 1;
+   if SetUpFldrDisplay(failreason, error_code) then OpenTheDoc := true
+   else OpenTheDoc := false;
+
+end; { openTheDoc }
+
+
+{------------------------------------------------------------------------------}
+
+
+FUNCTION CopyTheDoc{(newDocPrefix : Pathname; theOp: FilerOp;
+                    VAR failReason : FReason) : BOOLEAN};
+var
+   docWasCopied: boolean;
+   newname:  pathname;
+   newRefNum: integer;
+   err:       integer;
+
+BEGIN
+
+Newname := NewDocPrefix;
+
+docWasCopied := FALSE;
+IF NOT pulledAsTool THEN BEGIN
+   case theOp of
+      fcCopy,
+      fcPut: begin
+         IF DocDirtyFlag THEN BEGIN
+            failReason := dirtyDoc;
+         END
+         ELSE BEGIN
+            { verify the password first }
+            verify_password(err,filename, pepassword);
+            if err = 1294 then begin
+               failreason := wrongpassword;
+               copythedoc := false;
+               exit(copythedoc);
+            end
+            else begin
+               { make new file a suspended save }
+               if pos('$Edits',newname) = 0 then NewName := concat(newname,'$Edits');
+               Make_Secure(err,Newname, pepassword);
+               Open_Secure(err,Newname,NewRefNum,[dRead,dWrite], pepassword);
+               IF err <> 0 THEN
+                  BEGIN          { couldn't create it.  Assume no disk space for now }
+                  {$IFC PEDEBUG}
+                  WRITELN('*** Unable to create new file "',filename,'".  O/S error: ',err:1);
+                  {$ENDC}
+                  failReason := noDiskSpace;
+                  CopyTheDoc := false;
+                  EXIT(CopyTheDoc);
+               END;
+               if not NewSave(failreason, err,NewRefNum) then CopyTheDoc := false
+               else begin
+                  Close_Object(err,NewRefNum);
+                  docWasCopied := TRUE;
+                  if theOp = fcPut then begin
+                     { close old version, kill it, then close this version }
+                     Close_Object(err,FileRefNum);
+                     {$IFC PEDEBUG}
+                     if err <> 0 then  writeln('error on close of old file',err);
+                     {$ENDC}
+                     Kill_Secure(err,filename, pepassword);
+                     {$IFC PEDEBUG}
+                     if err <> 0 then  writeln('error on kill of old file',err);
+                     {$ENDC}
+                     if Pos('$Edits', filename) <> 0 then begin
+                        { strip $Edits from file name and delete this file too }
+                        Delete(filename, Pos('$Edits', filename), 6);
+                        Kill_Secure(err, FileName, pepassword);
+                        {$IFC PEDEBUG}
+                        if err <> 0 then  writeln('error on kill of old file',err);
+                        {$ENDC}
+                     end;
+                     docsopen := docsopen - 1;
+                     DisposeData;
+                  end; { if }
+               end; { else }
+            end; { else }
+         end; { else }
+      end; { fcCopy, fcPut }
+   end; { case }
+end { if }
+ELSE BEGIN
+   docWasCopied := TRUE;
+   pulledAsTool := FALSE;
+END;
+
+CopyTheDoc := docWasCopied;
+
+END;
+
+
+{-------------------------------------------------------------------------}
+
+FUNCTION CloseTheDoc{(closeKind: FilerOp; VAR failReason : FReason) : BOOLEAN};
+
+   { handles the filer "close" events.  Also called if a crash occurs.
+     fcClose makes all changes permanent; otherwise, save changes
+     so they can be backed out via "Undo all changes." }
+
+VAR
+   err:            INTEGER;
+   bytesWritten:   LONGINT;
+   docWasClosed:   BOOLEAN;
+   CopyFileName,
+   NewName:        pathname;
+   CopyRefNum,
+   newRefNum:      integer;
+   newEname:       E_name;
+
+BEGIN
+
+docWasClosed := FALSE;
+IF NOT pulledAsTool THEN BEGIN
+   case closeKind of
+      fcClose,
+      fcShred: begin
+         IF DocDirtyFlag THEN BEGIN
+            failReason := dirtyDoc;
+         END
+         ELSE BEGIN
+            if not DocChangedFlag then begin
+               close_object(err,fileRefNum);
+               if err <> 0 then begin
+                  closeTheDoc := false;
+                  failReason := noDiskSpace;  { assume that for now }
+               end
+               else begin
+                  docWasClosed := true;
+               end; { else }
+            end
+            else begin
+
+               Verify_password(err, filename, pepassword);
+               if err = 1294 then begin
+                  closethedoc := false;
+                  failreason := wrongpassword;
+                  exit(closethedoc);
+               end;
+
+               copyFileName := Concat(fileName,'*');
+               Make_Secure(err, copyFileName, pepassword);
+               { dont check error here, file may already be made }
+               Open_Secure( err, copyFileName, CopyRefNum, [dRead, dWrite], pepassword);
+               if err > 0 then begin
+                  {$IFC PEDEBUG}
+                  writeln('unable to open copy file for backup',err);
+                  {$ENDC}
+                  closeTheDoc := false;
+                  failReason := noDiskSpace;
+                  exit(CloseTheDoc);
+               end;
+               if not NewSave(failreason, err,CopyRefNum) then closeTheDoc := false
+               else begin
+
+                  { close the copy file }
+                  Close_Object(err,CopyRefNum);
+                  IF err <> 0 THEN BEGIN
+                     {$IFC PEDEBUG}
+                     WRITELN('***unable to close copy file.  O/S error: ',err:1);
+                     {$ENDC}
+                     CloseTheDoc := FALSE;
+                     failReason := noDiskSpace;    { assume no disk space }
+                  END
+                  ELSE BEGIN
+                     docWasClosed := TRUE;
+
+                     { close and kill the file we are supposed to be writing }
+                     close_Object(err, fileRefNum);
+                     Kill_Secure(err,filename, pepassword);
+
+                     { if this was a suspended file then kill original file }
+                     if Pos('$Edits', filename) <> 0 then begin
+                        { strip $Edits from file name and delete this file }
+                        Delete(FileName, Pos('$Edits', FileName), 6);
+                        Kill_Secure(err, FileName, pepassword );
+                     end;
+
+                     { strip the volume name from the file and this is the new ename }
+                     while pos('-',FileName) <> 0 do delete(FileName, 1, pos('-', FileName));
+                     newEName := FileName;
+                     Rename_Secure(err, CopyFileName, NewEname, pepassword);
+                  end;
+               end;
+            end;
+         end;
+      end;
+
+      fcSuspend: begin
+         if DocDirtyflag then begin
+            failreason := dirtyDoc;
+         end
+         else begin
+
+            verify_password(err, filename, pepassword);
+            if err = 1294 then begin
+               failreason := wrongpassword;
+               closethedoc := false;
+               exit(closethedoc);
+            end;
+
+            { save current state to a second file with the '$Edits' suffix }
+            close_Object(err,fileRefNum);
+            newname := filename;
+            if pos('$Edits',filename) = 0 then begin
+               NewName := concat(filename,'$Edits');
+               Make_Secure(err,NewName, pepassword);
+            end;
+            Open_Secure(err,NewName,NewRefNum,[dRead,dWrite], pepassword);
+            IF (err <> 0)  and (err <> -1173) and (err <> -1174) and (err <> -1175) and (err <> -1293) THEN BEGIN
+            { couldn't create it.  Assume no disk space for now }
+               {$IFC PEDEBUG}
+               writeln('*** Unable to create new edit file "',newname,'".  O/S error: ',err:1);
+               {$ENDC}
+               failReason := noDiskSpace;
+               closethedoc := false;
+               EXIT(CloseTheDoc);
+            end;
+
+            if not NewSave(failreason, err,NewRefNum) then  closeThedoc := false
+            else begin
+               Close_Object(err,NewRefNum);
+               docWasClosed := TRUE;
+            end;
+         end; { else }
+      end; { fcSuspend }
+
+   end; { case }
+end { if }
+ELSE BEGIN
+   docWasClosed := TRUE;
+   pulledAsTool := FALSE;
+END;
+
+IF NOT docWasClosed AND (closeKind = fcShred)  {*** FL ***}
+THEN BEGIN
+  Close_Object(err,fileRefNum);
+  docWasClosed := TRUE;
+END;
+
+IF docWasClosed
+THEN BEGIN
+  docsOpen := docsOpen - 1;   { can now accept another document }
+  DisposeData;
+END;
+
+CloseTheDoc := docWasClosed;
+
+END;
+
+End.
+ÿ

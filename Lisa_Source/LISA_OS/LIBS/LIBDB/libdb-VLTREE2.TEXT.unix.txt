@@ -1,0 +1,555 @@
+{#F     libdb/vltree2.text }
+{$S access }
+{**************************************************************************
+
+                                deladjust
+
+        ripples a page delete up the levels of the tree.
+
+        Input Parameters
+                state - the way the leaf delete occured:
+                        rotate
+                        coallesce
+                fileid - file id
+                slevel - pagestack level at which lower pages are
+                rpage - page address of right page of sibling pair
+                closestsib - page address of closest sibling to page in
+                        which the delete occurred.  may be to the left
+                        or right of page
+                rbuff - buffer in which the right page of sibling pair
+                        resides - only passed in if state = rotate
+
+        Output Parameters
+                kresult - return result
+
+        Return Results
+                noerr
+                noroom
+                ioerr
+                inconsistent
+
+**************************************************************************}
+
+{$S access }
+procedure deladjust{(var kresult : integer;
+                        state : integer;
+                        fileid : integer;
+                        slevel : integer;
+                        rpage,
+                        closestsib : fileptr;
+                        rbuff : integer)};
+label
+        1,
+        10;
+var
+        pfptr : ptrfileptr;
+        leftsib,
+        rightsib,
+        dumipage,
+        newroot : fileptr;
+        dumiindex,
+        lresult,
+        insresult,
+        tresult,
+        descoff,
+        upprio,
+        lowprio,
+        halfpage,
+        size,
+        upbuff,
+        oldup,
+        newrbuff,
+        lbuff,
+        sibkey : integer;
+        oldps,ps : ptrstackrec;
+        canmove : boolean;
+        po,pol,por : ptroffsets;
+        pd,pdl,pdr : ptrpagedesc;
+        pb,pbl,pbr : ptrdata;
+        prec : ptrdata;
+        plb,prb : ^ buffdesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+
+{$IFC debug }
+            if bdebug then dumpps(fileid);
+{$ENDC }
+
+            descoff := pagesize - sizeof(pagedesc);
+            halfpage := (pagesize-sizeof(pagedesc)) div 2 - sizeof(integer);
+            ps := @pstack^[slevel-1];
+            if slevel = 2 then upprio := isroot
+            else upprio := isnonleaf;
+            if state = rotate then prec := buffpool^[rbuff].pbuff;
+
+            if slevel = depth then
+                begin
+                canmove := false;
+                lowprio := isleaf;
+                if state = rotate then
+                    size := entrysize(firstvfld,lastvsfld,lastvsfld,kvflds,
+                                      pedesc,prec)+sizeof(fileptr);
+                end
+            else
+                begin
+                canmove := true;
+                lowprio := isnonleaf;
+                if state = rotate then
+                    begin
+                    por := pointer(ord(prec)+descoff-sizeof(integer));
+                    size := por^[-1] - por^[0];
+                    end;
+                end;
+
+            getpage(lresult,upbuff,fileid,ps^.page,true);
+            if lresult <> noerr then
+                begin
+                if state = rotate then relbuff(tresult,rbuff,lowprio);
+                goto 1;
+                end;
+            pb := buffpool^[upbuff].pbuff;
+            pd := pointer(ord(pb)+descoff);
+            po := pointer(ord(pd)-sizeof(integer));
+
+
+        {   at each level of the tree we reflect the rotate, delete of empty page
+            or merge done at the previous level (starting with the leaf pages).
+            we stop when we this action doesn't result in underflow or until the
+            root underflows and the tree loses a level (possibly more). }
+
+            repeat
+                if (state <> pageempty) and (closestsib = rpage) then
+                    ps^.index := ps^.index + 1;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'state:',state);
+                    writeln(dumpfile,'cl,rp:',closestsib:14,rpage:14);
+                    writeln(dumpfile,'ps^.index:',ps^.index);
+                    end;
+{$ENDC }
+
+            {   always delete the key for the righthand page }
+
+                delrecord(pb,po,pd,ps^.index);
+                ps^.vact := del;
+                buffpool^[upbuff].state := dirty;
+
+                    {write('force noroom?');readln(tresult);
+                    if tresult = 1 then
+                        begin
+                        lresult := noroom;
+                        relbuff(tresult,upbuff,upprio);
+                        if state = rotate then relbuff(tresult,rbuff,lowprio);
+                        goto 1;
+                        end;}
+
+
+                if state = rotate then
+                    begin
+
+                {   for a rotate we insert the new righthand page key.
+                    if this causes a split, then we we call insert split
+                    to reflect the split to higher pages.  if a rotate
+                    results, then we dont have to check for underflow,
+                    but we must loop to reflect the rotate.  if pageinsert
+                    neither rotates or splits then we must check for underflow  }
+
+                    if quickinsert(fileid,nonleaftype,prec,size,@rpage,canmove,
+                                   ps^.index,upbuff,dumipage,dumiindex) then
+                        begin { have to rotate or split }
+
+                        Creche(lresult,fileid,slevel-1,descoff,rightsib,leftsib);
+                        if lresult <> noerr then
+                            begin
+                            relbuff(tresult,upbuff,upprio);
+                            relbuff(tresult,rbuff,lowprio);
+                            goto 1;
+                            end;
+
+                        insresult :=
+                             splitORrotate(lresult,fileid,nonleaftype,
+                                           prec,size,@rpage,canmove,
+                                           ps^.index,upbuff,
+                                           leftsib,rightsib,
+                                           newrbuff,
+                                           dumipage,dumiindex,
+                                           ps,
+                                           closestsib);
+                        relbuff(tresult,rbuff,lowprio);
+                        if (lresult <> noerr) or (tresult <> noerr) then
+                            begin
+                            if lresult = noerr then
+                                begin
+                                if insresult = isplit then
+                                    relbuff(tresult,upbuff,upprio);
+                                relbuff(tresult,newrbuff,upprio);
+                                end;
+                            if tresult <> noerr then lresult := tresult;
+                            goto 1;
+                            end
+                        else if insresult = isplit then
+                            begin
+                            ps^.vact := split_replace;
+                            insertsplit(lresult,fileid,slevel-1,upbuff,newrbuff);
+                            goto 1;
+                            end
+                        else if insresult = rotate then
+                            begin
+                            ps^.vact := irot_replace;
+                            rpage := ps^.rec_rpage;
+                            rbuff := newrbuff;
+                            prec := buffpool^[rbuff].pbuff;
+                            por := pointer(ord(prec)+descoff-sizeof(integer));
+                            size := por^[-1] - por^[0];
+                            ps := pointer(ord(ps)-sizeof(stackrec));
+                            getpage(lresult,upbuff,fileid,ps^.page,true);
+                            if lresult <> noerr then
+                                begin
+                                relbuff(tresult,rbuff,lowprio);
+                                goto 1;
+                                end;
+                            pb := buffpool^[upbuff].pbuff;
+                            pd := pointer(ord(pb)+descoff);
+                            po := pointer(ord(pd)-sizeof(integer));
+                            canmove := true;
+                            slevel := slevel - 1;
+                            state := rotate;
+                            goto 10;
+                            end;
+                        end;
+
+                    relbuff(lresult,rbuff,lowprio);
+                    if lresult <> noerr then
+                        begin
+                        relbuff(tresult,upbuff,upprio);
+                        goto 1;
+                        end;
+
+                    end;
+
+            {   check for underflow }
+
+                if slevel = 2 then { treat the root specially }
+                    begin
+                    while (pd^.ptype = nonleaftype) and (pd^.nkeys = 1) do
+                        begin
+                        pfptr := @pb^;
+                        newroot := pfptr^;
+                        freepage(lresult,upbuff);
+                        if lresult <> noerr then goto 1;
+                        depth := depth - 1;
+                        root := newroot;
+                        getpage(lresult,upbuff,fileid,newroot,true);
+                        if lresult <> noerr then goto 1;
+                        pb := buffpool^[upbuff].pbuff;
+                        pd := pointer(ord(pb)+descoff);
+                        end;
+                    relbuff(lresult,upbuff,isroot);
+                    goto 1;
+                    end
+                else if halfpage <= (po^[-pd^.nkeys]+
+                                     sizeof(integer)*pd^.nkeys) then
+                    begin
+
+                {   no underflow so exit }
+
+                    relbuff(lresult,upbuff,upprio);
+                    goto 1;
+                    end
+                else
+                    begin
+
+                {   underflow, so we must try to recover.  if this page has no
+                    siblings then:
+                        if the page is not empty then we simply exit.
+                        if this page is empty then we discard it and set a
+                            pageempty state and a vact of NoSibEmpty
+                    else (if the page has a sibling) :
+                         merge with the closest sibling.  if we can't merge then
+                         we do a rotate.  }
+
+                    oldup := upbuff;
+                    lowprio := isnonleaf;
+                    canmove := true;
+                    slevel := slevel-1;
+                    oldps := ps;
+                    ps := pointer(ord(ps)-sizeof(stackrec));
+                    if (ps^.numkeys = 1) and (pd^.nkeys <> 0) then
+                        begin  { no siblings and not empty }
+                        relbuff(lresult,oldup,lowprio);
+                        goto 1;
+                        end;
+                    getpage(lresult,upbuff,fileid,ps^.page,true);
+                    if lresult <> noerr then
+                        begin
+                        relbuff(tresult,oldup,lowprio);
+                        goto 1;
+                        end;
+
+                {   figure out what the closest sibling is }
+
+                    pb := buffpool^[upbuff].pbuff;
+                    pd := pointer(ord(pb)+descoff);
+                    po := pointer(ord(pd)-sizeof(integer));
+                    if ps^.numkeys = 1 then { no siblings and empty }
+                        begin
+
+                    {   note that only possible error is inconsistent, which will
+                        also be signaled by subsequent relbuff of upbuff, so not
+                        to worry about lresult }
+
+                        freepage(lresult,oldup);
+                        oldps^.vact := NoSibEmpty;
+                        state := pageempty;
+                        end
+                    else { have some sibling(s) }
+                        begin
+                        if ps^.index = (ps^.numkeys-1) then
+                            begin
+                            pfptr := pointer(ord(pb)+po^[-ps^.index+1]);
+                            rbuff := oldup;
+                            getpage(lresult,lbuff,fileid,pfptr^,true);
+                            end
+                        else
+                            begin
+                            pfptr := pointer(ord(pb)+po^[-ps^.index-1]);
+                            lbuff := oldup;
+                            getpage(lresult,rbuff,fileid,pfptr^,true);
+                            end;
+                        closestsib := pfptr^;
+                        if lresult <> noerr then
+                            begin
+                            relbuff(tresult,oldup,lowprio);
+                            relbuff(tresult,upbuff,upprio);
+                            goto 1;
+                            end;
+                        plb := @buffpool^[lbuff];
+                        prb := @buffpool^[rbuff];
+                        rpage := prb^.page;
+                        oldps^.rec_lpage := plb^.page;
+                        oldps^.rec_rpage := rpage;
+                        if mergepages(lbuff,rbuff,pagesize) then
+                            begin { pages merged }
+                            freepage(lresult,rbuff);
+                            relbuff(tresult,lbuff,lowprio);
+                            if tresult <> noerr then lresult := tresult;
+                            if state = rotate then oldps^.vact := merge_replace
+                            else oldps^.vact := merge;
+                            state := coallesce;
+                            end
+                        else { do a rotate instead }
+                            begin
+                            pbr := prb^.pbuff;
+                            pdr := pointer(ord(pbr)+descoff);
+                            por := pointer(ord(pdr)-sizeof(integer));
+                            pbl := plb^.pbuff;
+                            pdl := pointer(ord(pbl)+descoff);
+                            sibkey := pdl^.nkeys;
+                            if lbuff = oldup then { rotate to left }
+                                begin
+                                insrotate(pbr,por,0,sibkey,lbuff,descoff);
+                                delrecord(pbr,por,pdr,0);
+                                end
+                            else { rightbuff = oldup, rotate to right }
+                                begin
+                                pol := pointer(ord(pdl)-sizeof(integer));
+                                insrotate(pbl,pol,sibkey-1,0,rbuff,descoff);
+                                delrecord(pbl,pol,pdl,sibkey-1);
+                                end;
+
+                            (*dbif bdebug then
+                                begin
+                                dumpp(fileid,lbuff);
+                                dumpp(fileid,rbuff);
+                                end;*)
+
+                            plb^.state := dirty;
+                            prb^.state := dirty;
+                            prec := pbr;
+                            size := por^[-1] - por^[0];
+                            relbuff(lresult,lbuff,lowprio);
+                            if lresult <> noerr then
+                                begin
+                                relbuff(tresult,upbuff,upprio);
+                                relbuff(tresult,rbuff,lowprio);
+                                end;
+                            if lresult <> noerr then goto 1;
+                            if state = rotate then oldps^.vact := rot_replace
+                            else oldps^.vact := rot;
+                            state := rotate;
+                            end; { rotate }
+                        end; { have siblings }
+                    end;
+            10: { continue  }
+            until false;
+            end; { with }
+1 :     kresult := lresult;
+
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'deladjust ',kresult);
+{$ENDC }
+end;
+{**************************************************************************
+
+                               deletekeyed
+
+        see interface.
+
+
+***************************************************************************}
+
+{$S access }
+procedure deletekeyed{(var kresult : integer;
+                           fileid : integer;
+                           pkey : ptrdata;
+                       var dpage : fileptr;
+                       var dindex : integer)};
+label
+        2,3;
+var
+        pbd : ^ buffdesc;
+        po : ptroffsets;
+        pd : ptrpagedesc;
+        rpage,
+        closestsib : fileptr;
+        ps : ^stackrec;
+        locdepth,
+        stackinvalid,
+        lresult,
+        tresult,
+        lbuff,rbuff,buffer,
+        state  : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'deletekeyed');
+{$ENDC }
+
+    {   note that, as for insertkeyed, we need only call recover if we
+        mucked around with a non leaf page }
+
+        with pfiletable^[fileid]^ do
+            begin
+            find_for_update(lresult,fileid,pkey,buffer,stackinvalid);
+            if lresult = notfound then goto 3
+            else if lresult <> noerr then goto 2;
+
+            {   save info on deleted record for recovery purposes }
+
+            locdepth := depth;
+            ps := @pstack^[locdepth];
+            pbd := @buffpool^[buffer];
+            pd := pointer(ord(pbd^.pbuff)+pagesize-sizeof(pagedesc));
+            po := pointer(ord(pd)-sizeof(integer));
+            ps^.delsize := po^[-ps^.index-1]-po^[-ps^.index];
+            ps^.delrec := pkey;
+
+            fixstack(lresult,stackinvalid,fileid);
+            if lresult <> noerr then goto 3;
+            closestsib := nilptr;
+            if locdepth > 1 then
+                with pstack^[locdepth-1] do
+                    begin
+                    if numkeys > 1 then
+                        begin
+                        if index = (numkeys-1) then
+                            begin
+                            closestsib := pd^.prior;
+                            rpage := pbd^.page;
+                            ps^.rec_rpage := rpage;
+                            ps^.rec_lpage := closestsib;
+                            end
+                        else
+                            begin
+                            closestsib := pd^.next;
+                            rpage := closestsib;
+                            ps^.rec_rpage := rpage;
+                            ps^.rec_lpage := pbd^.page;
+                            end;
+                        end;
+                    end;
+            ps := @pstack^[locdepth];
+            state := pagedelete(lresult,fileid,leaftype,buffer,ps^.index,
+                                closestsib,rbuff,dpage,dindex);
+            if (state >= rotate) and (lresult = noerr) then
+                begin
+                if state = rotate then ps^.vact := rot
+                else if state = coallesce then ps^.vact := merge
+                else { if state = pageempty then } ps^.vact := NoSibEmpty;
+                deladjust(lresult,state,fileid,depth,rpage,closestsib,rbuff);
+                if lresult = noroom then recover(lresult,fileid);
+                end;
+            if lresult = noerr then nrecs := nrecs - 1;
+            end; { with }
+        goto 2;
+
+3 :     relbuff(tresult,buffer,isleaf);
+        if tresult <> noerr then lresult := tresult;
+2 :     kresult := lresult;
+end; { deletekeyed }
+{^E}
+{**************************************************************************
+
+                               findkeyed
+
+         see interface.
+
+***************************************************************************}
+
+{$S access }
+procedure findkeyed{(var kresult : integer;
+                         which : integer;
+                         nsearch : integer;
+                         fileid : integer;
+                         psdesc : ptrecptr;
+                         pkey : ptrdata;
+                     var buffer,
+                         buffindex : integer)};
+var
+        lresult,
+        stackinvalid : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif bdebug then writeln(dumpfile,'findexact');*)
+
+        with pfiletable^[fileid]^ do
+            begin
+            if which = exact then nsearch := nkeys;
+            if psdesc = nil then psdesc := pedesc;
+
+            find(lresult,
+                 which,
+                 nsearch,
+                 fileid,
+                 psdesc,
+                 pkey,
+                 buffer);
+            buffindex := pstack^[depth].index;
+
+            if ((nsort <> nkeys) or (nsearch < nkeys)) and {##}
+               ((lresult = noerr) or (lresult = notfound)) and
+               ((which = exact) or (which = approx))
+            then
+                findduplicate(lresult,
+                              fileid,
+                              pedesc,
+                              psdesc,
+                              nsearch,
+                              false,
+                              which = exact,
+                              pkey,
+                              buffer,
+                              buffindex,
+                              stackinvalid);
+            end; { with }
+        kresult := lresult;
+end; { findkeyed }
+
+
+ÿ

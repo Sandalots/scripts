@@ -1,0 +1,1055 @@
+{#F libdb/lmclose.text }
+{$S lmclose }
+{********************************************************************************
+
+                                MakeFreeList
+
+        makes a free list out of all permanant the pages in the differential
+        file. leaves the file pointer (OS) at the end of these pages (so that a
+        truncate will truncate at the end of the permanant pages.
+
+        Input Parameters
+
+        DiffId - file id of the differential file
+
+        Output Parameters
+
+        lmresult - return code
+
+********************************************************************************}
+
+procedure MakeFreeList(var lmresult : integer;
+                           DiffId : integer);
+label
+        1;
+var
+        forceWrite : boolean;
+        crap,
+        lresult,
+        tresult,
+        fbuff : integer;
+        PageAddr,
+        NextAddr : fileptr;
+        pd : ptrpagedesc;
+begin
+
+        with pfiletable^[DiffId]^ do
+            begin
+            if comp44(LastPermanant,firstpage) = lt then
+                LastPermanant := firstpage;
+            PageAddr := firstpage;
+            forceWrite := comp44(LastPermanent,lastpage) = gt ;
+            freelist := nilptr;
+            lastpage := firstpage;
+            if LastPermanant = firstpage then { first cut is the deepest }
+                begin
+                dowritenon(lresult,DiffId);
+                read_data(lresult,frefno,ord(@crap),sizeof(integer),NextAddr,
+                          absolute,firstpage-sizeof(integer));
+                end
+            else
+                begin
+                while PageAddr <> LastPermanant do
+                    begin
+                    lockbuff(lresult,fbuff);
+                    if lresult <> noerr then goto 1;
+                    pd := pointer(ord(buffpool^[fbuff].pbuff)+
+                                  pagesize-sizeof(pagedesc));
+                    pd^.ptype := freetype;
+                    NextAddr := PageAddr+pagesize;
+                    if PageAddr = firstpage then pd^.free := nilptr
+                    else pd^.free := PageAddr - pagesize;
+                    if forceWrite then
+                        begin
+                        putpage(lresult,fbuff,DiffId,PageAddr);
+                        if lresult <> noerr then
+                            begin
+                            relbuff(tresult,fbuff,isleaf);
+                            goto 1;
+                            end;
+                        end
+                    else
+                        with buffpool^[fbuff] do
+                            begin
+                            pfile := DiffId;
+                            page := PageAddr;
+                            state := dirty;
+                            end;
+                    relbuff(lresult,fbuff,isleaf);
+                    if lresult <> noerr then goto 1;
+                    freelist := PageAddr;
+                    PageAddr := NextAddr;
+                    lastpage := pageaddr;
+                    end;
+                if not forceWrite then
+                    begin
+                    dowritenon(lresult,DiffId);
+                    read_data(lresult,frefno,ord(@crap),sizeof(integer),NextAddr,
+                              absolute,lastpage-sizeof(integer));
+                    end;
+                end;
+
+1:          lmresult := lresult;
+            if lresult <> noerr then fstatus := inconsistent;
+            end;
+end; { MakeFreeList }
+{********************************************************************************
+
+                                diffTruncate
+
+        truncates the differential file.  links the firstpage..lastpermanant
+        pages as the new free list.  resets the difffile's label variables.
+
+        Input Parameters
+
+        diff_file - the index of the differential file
+
+        Output Parameters
+
+        lmresult - return result
+
+                noerr
+                noroom
+
+*******************************************************************************}
+
+procedure diffTruncate(var lmresult : integer;
+                           diff_file : integer);
+label
+        1;
+var
+        lresult : integer;
+begin
+        with pfiletable^[diff_file]^ do
+            begin
+            if (labellist = nilptr) then
+                begin
+{$IFC PRERELEASE }
+                writeln(dumpfile,'prepare to truncate diff file');
+{$ENDC}
+                PageInvalidates(diff_file);
+                MakeFreeList(lresult,diff_file);
+                if lresult <> noerr then goto 1;
+                truncate(lresult,frefno);
+                if lresult <> noerr then goto 1;
+                compact(lresult,frefno);
+                if lresult <> noerr then goto 1;
+                nrecs := 0;
+                root := nilptr;
+                depth := 1;
+                tickets.high := 0;
+                tickets.low := 1;
+                dowritenon(lresult,diff_file);
+{$IFC PRERELEASE }
+                writeln(dumpfile,'diff file truncated');
+{$ENDC}
+                end;
+            end;
+1:      lmresult := lresult;
+end;
+{$S lmcreate }
+{**********************************************************************
+
+                                diffcreate
+
+        see interface
+
+**********************************************************************}
+
+procedure diffcreate{(var lmresult : integer;
+                      var scanid : integer;
+                      var clear : boolean;
+                          pname : ptrpathname;
+                          pdname : ptrpathname;
+                          pnullset : ptrbits;
+                          setsize : integer)};{##}
+label
+        1,2,3,4,10,20,30;{##}
+var
+        tempBoolean,
+        madeDiff : boolean;{##}
+        loc_compact_state : states_de_compact;
+        c_handle : lmhandle; {##}
+        which : integer; {##}
+        pledesc : ptrrecptr;{##}
+        pdtable : ptrdata;
+        pfd : ptrfiledesc;
+        pscan : ptrdiffdesc;
+        pdd : ^ptrdiffdesc;
+        lresult,
+        tresult,
+        realscan,
+        diffscan,
+        iscan : integer;
+
+begin
+        loc_compact_state := init_compact_state;
+        madeDiff := false;{##}
+
+        repeat {compact retry point }{##}
+            pdd := @pdifftable^;
+            for iscan := 0 to ndiffs-1 do
+                begin
+                if pdd^ = nil then goto 10;
+                pdd := pointer(ord(pdd)+sizeof(ptrdiffdesc));
+                end;
+
+        {   expand the difftable }
+
+            lresult := nnew(@czone,(ndiffs+1)*sizeof(ptrdiffdesc),@pdtable);
+            if lresult <> noerr then goto 20;
+            movelf(@pdifftable^,pdtable,ndiffs*sizeof(ptrdiffdesc));
+            ndispose(@czone,@pdifftable^);
+            pdifftable := @pdtable^;
+            pdifftable^[ndiffs] := nil;
+            ndiffs := ndiffs + 1;
+
+    10 :    lresult := nnew(@czone,setsize-sizeof(bits)+sizeof(diffdesc),@pscan);
+            if lresult <> noerr then goto 20;
+            with pscan^ do
+                begin
+                whichway := noway;{##}
+                on := nilval;
+                via := nilval;
+                curhandle.high := nilptr;
+                curhandle.low := nilptr;
+                pkfilter := nil;
+                pdfilter := nil;
+                phigh := nil;
+                plow := nil;
+                nhflds := 0;
+                nlflds := 0;
+                movelf(pnullset,@nullset,setsize);
+                end;
+
+            {   first we see if the scan is open }
+
+            openscan(lresult,pdname,pdname,diffscan,update);{##}
+            if lresult = noerr then
+                begin
+                tempBoolean := retry_compact(lresult,loc_compact_state);
+                goto 30; {break}{##}
+                end;
+
+            if lresult <> NoSuchFile then{##}
+                begin{##}
+                ndispose(@czone,@pscan^);{##}
+                goto 20;{##}
+                end;{##}
+
+            lresult:=nnew(@czone,diff_nfields*sizeof(flddesc),@pledesc);{##}
+            if lresult = nomem then
+                begin
+                ndispose(@czone,@pscan^);
+                goto 20;
+                end;
+
+            lresult := nnew(@czone,sizeof(filedesc),@pfd);
+            if lresult = nomem then
+                begin
+                ndispose(@czone,@pscan^);
+                ndispose(@czone,@pledesc^);{##}
+                end;
+
+        20: {continue }
+        until not retry_compact(lresult,loc_compact_state);{##}
+        if lresult <> noerr then goto 1;
+
+        with pfd^ do {##}
+            begin{##}
+            pedesc := pledesc;{##}
+            USERvers := 0;
+            flags := [];{##}
+            lastpage := 0;{##}
+            nfields := diff_nfields;{##}
+            nkeys := diff_nkeys;{##}
+            nsort := diff_nsort;{##}
+            ticketfld := -1;{##}
+            vflds := sizeof(preamble);{##}
+            kvflds := sizeof(lmhandle);{##}
+            end;{##}
+
+        with pledesc^[0] do{##}
+            begin
+            offset := 0;
+            direction := ascending;
+            ftype := ftypnull;
+            size := sizeof(fint8);
+            end;
+        with pledesc^[1] do{##}
+            begin
+            offset := sizeof(fint8);
+            direction := ascending;
+            ftype := ftyppack2;
+            bo.sbit := diff_sbit;
+            bo.nbits := diff_nbits;
+            end;
+
+        makedescfile(lresult,pdname,pfd);
+        ndispose(@czone,@pfd^);
+        ndispose(@czone,@pledesc^);{##}
+        if lresult <> noerr then
+            begin
+            ndispose(@czone,@pscan^);
+            goto 1;
+            end;
+
+        madeDiff := true;
+        openscan(lresult,pdname,pdname,diffscan,update);{##}
+        if lresult <> noerr then goto 2;{##}
+        MakeFreeList(lresult,pscantable^[diffscan]^.onfile);
+
+30 :    pdifftable^[iscan] := pscan;{##}
+        if lresult <> noerr then goto 3;
+
+        openscan(lresult,pname,pname,realscan,update);{##}
+        if lresult <> noerr then goto 3;{##}
+
+        with pdifftable^[iscan]^ do
+            begin
+            realid := realscan;
+            diffid := diffscan;
+            on := pscantable^[realscan]^.onfile;{##}
+            via := on;{##}
+            end;
+
+        scanid := iscan;
+        clear := getCheckPoint(lresult,scanid,madeDiff);
+        if lresult <> noerr then goto 4;
+
+        c_handle := pdifftable^[iscan]^.curhandle; {##}
+
+        if (c_handle.low = 0) and (c_handle.high = 0) then {##}
+            which := first {##}
+        else if (c_handle.low = nilptr) and (c_handle.high = nilptr) then {##}
+            which := last {##}
+        else which := approx; {##}
+        efetch(lresult,diffscan,which,1,@c_handle); {##}
+        if lresult <= eos then lresult := noerr; {##}
+        if lresult = noerr then goto 1; { normal exit }
+
+    {   error exits }
+
+4 :     closescan(tresult,realscan);
+
+3 :     closescan(tresult,diffscan);{##}
+        ndispose(@czone,@pdifftable^[iscan]^);{##}
+        pdifftable^[iscan] := nil;{##}
+
+2 :     if madeDiff then
+            begin
+            prefix_name(pdname);
+            kill_object(tresult,prefix);
+            end;
+
+1 :     lmresult := lresult; (*clobbered;*)
+end; { diffcreate }
+{$S lmclose }
+{**************************************************************************
+
+                                decr8
+
+        decrements a handle.
+
+**************************************************************************}
+
+procedure decr8(var hand : lmhandle);
+begin
+        if hand.low = 0 then
+            begin
+            hand.low := nilptr;
+            hand.high := hand.high - 1;
+            end
+        else hand.low := hand.low - 1;
+end;
+{**************************************************************************
+
+                                incr8
+
+        increments a handle.
+
+**************************************************************************}
+
+procedure incr8(var hand : lmhandle);
+begin
+        if hand.low = nilptr then
+            begin
+            hand.low := 0;
+            hand.high := hand.high + 1;
+            end
+        else hand.low := hand.low + 1;
+end;
+{**************************************************************************
+
+                             isgap
+
+        returns true iff the length of interval <low,high> is > 1 handles
+
+        assertion: low <= high!
+
+        Input Parameters
+                low - lower of two handles
+                high - higher of two handles
+
+***************************************************************************}
+
+function isgap(low,high : lmhandle) : boolean;
+begin
+        if comphand(low,high) = eq then isgap := false
+        else
+            begin
+            incr8(low);
+            isgap := comphand(low,high) = lt;
+            end;
+end; { isgap }
+{***************************************************************************
+
+                                insert_fyi
+
+        inserts a fyi record for the cos of diff_scan, which is an insert
+        or update record, which conflicted with some record in the real
+        file.  we must fetch the offending record and create a new
+        differential file entry for it.  this involves computing a handle
+        one less than the insert or update record.  we may have to
+        decrement the handles of some preceding records or increment the
+        handles of some following records to open up a hole in the handle
+        sequence.
+
+        Input Parameters
+                dscan - index of scan on differential file (not differential
+                    scan)
+                offender - index of file on which duplicate key violation
+                    occured
+
+        Output Parameters
+                lmresult - return result
+
+        Return Results
+                noerr
+                nomem
+                ioerr
+                noroom
+                inconsistent
+
+
+****************************************************************************}
+
+procedure insert_fyi(var lmresult : integer;
+                         dscan : integer;
+                         on_id,
+                         offender : integer);
+label
+        1,2,20,30,100;
+var
+        loc_compact_state : states_de_compact;
+        stop : boolean;
+        recoff,
+        recsize,
+        buffer,
+        dbuffer,
+        index,
+        offoffset,
+        tresult,
+        lresult : integer;
+        prec,
+        pb : ptrdata;
+        po : ptroffsets;
+        pon,
+        pvia : ptrfiledesc;
+        psdesc : ptrrecptr;
+        pream : preamble;
+        thishandle,
+        oldhandle,
+        newhandle,
+        previous : lmhandle;
+begin
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'>insert_fyi');
+            end;*)
+
+    {   first we compute a newhandle, renumbering as necessary }
+
+        movelf(pscantable^[dscan]^.ptrcos,@oldhandle,sizeof(lmhandle));
+        newhandle := oldhandle;
+
+    {   decrement oldhandle to get newhandle }
+
+        decr8(newhandle);
+
+        previous := oldhandle;
+        (*dbif lmdebug then
+            writeln(dumpfile,'oldh:',oldhandle.high:14,
+                    oldhandle.low:14);*)
+        repeat
+{$IFC debug }
+            if lmdebug then printcos(pscantable^[dscan]);
+{$ENDC }
+            efetch(lresult,dscan,prior,0,nil);
+{$IFC debug }
+            if lmdebug then printcos(pscantable^[dscan]);
+{$ENDC }
+            if lresult = eos then
+                begin
+                thishandle.low := 0;
+                thishandle.high := 0;
+                end
+            else if lresult = noerr then movelf(pscantable^[dscan]^.ptrcos,
+                                                @thishandle,sizeof(lmhandle))
+            else goto 1;
+            if isgap(thishandle,previous) then
+                begin {we have a gap - decrement all handles up to oldhandle}
+                repeat
+                    efetch(lresult,dscan,next,0,nil);
+                    if lresult <> noerr then goto 1;
+                    movelf(pscantable^[dscan]^.ptrcos,@pream,
+                           sizeof(preamble));
+                    if comphand(pream.handle,oldhandle) = eq then goto 20;
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'hand:',pream.handle.high:14,
+                                pream.handle.low:14);*)
+                    decr8(pream.handle);
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'decr:',pream.handle.high:14,
+                                pream.handle.low:14);*)
+                    update_pream(lresult,dscan,@pream);
+                    if lresult <> noerr then goto 1;
+                until false;
+                end;
+            previous := thishandle;
+        until lresult = eos;
+
+   {    no luck in the lower direction.  due to the 64 bit handle, we can
+        rest assured that we will find a gap in the other direction }
+
+        (*dbif lmdebug then writeln(dumpfile,'go left!');*)
+        efetch(lresult,dscan,approx,1,@oldhandle);
+        if lresult <> noerr then goto 1;
+        (*dbif lmdebug then printcos(pscantable^[dscan]);*)
+
+        newhandle := oldhandle;
+        previous := oldhandle;
+        repeat
+            efetch(lresult,dscan,next,0,nil);
+            if lresult = eos then
+                begin
+                thishandle.low := nilptr;
+                thishandle.high := nilptr;
+                end
+            else if lresult = noerr then movelf(pscantable^[dscan]^.ptrcos,
+                                                @thishandle,sizeof(lmhandle))
+            else goto 1;
+            if isgap(previous,thishandle) then
+                begin {we have a gap - increment all handles >= oldhandle}
+                repeat
+                    efetch(lresult,dscan,prior,0,nil);
+
+                    if lresult = eos then goto 30
+                    else if lresult <> noerr then goto 1;
+                    movelf(pscantable^[dscan]^.ptrcos,@pream,
+                           sizeof(preamble));
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'hand:',pream.handle.high:14,
+                                pream.handle.low:14);*)
+                    if comphand(pream.handle,oldhandle) = lt then goto 30;
+
+                    incr8(pream.handle);
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'incr:',pream.handle.high:14,
+                                pream.handle.low:14);*)
+                    update_preamble(lresult,dscan,@pream);
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'pup:',lresult);*)
+                    if lresult <> noerr then goto 1;
+                until false;
+                end;
+            previous := thishandle;
+        until false;
+
+30 :    { success - but we are just before the insert record that caused the
+          clash - so we must fetch next first }
+
+        efetch(lresult,dscan,next,0,nil);
+        if lresult <> noerr then goto 1;
+
+20 :    { success - now retrieve that fyi record and insert it in diff. file }
+
+        (*dbif lmdebug then
+            writeln(dumpfile,'newh:',newhandle.high:14,newhandle.low:14);*)
+        pstack_validate(lresult);
+        if lresult <> noerr then goto 1;
+
+        pon := pfiletable^[on_id];
+        pvia := pfiletable^[offender];
+        offoffset := pon^.pagesize-sizeof(pagedesc)-sizeof(integer);
+        with pvia^ do
+            begin
+            if on_id = offender then psdesc := nil
+            else psdesc := pkdesc;
+            findkeyed(lresult,exact,0,offender,psdesc,
+                      pointer(ord(pscantable^[dscan]^.ptrcos)+sizeof(preamble)),
+                      buffer,index);
+            if lresult = notfound then goto 2
+            else if lresult <> noerr then goto 1;
+
+        {   if necessary, get the on file record }
+
+            if on_id <> offender then  { offender is index }
+                begin
+                pb := buffpool^[buffer].pbuff;
+                po := pointer(ord(pb)+offoffset);
+                findkeyed(lresult,exact,0,on_id,
+                          @pedesc^[nfields-pon^.nkeys],
+                          pointer(ord(pb)+po^[-index]),dbuffer,index);
+                relbuff(tresult,buffer,isleaf);
+                buffer := dbuffer;
+                if lresult = notfound then
+                    begin
+                    lresult := inconsistent;
+                    goto 2;
+                    end
+                else if lresult <> noerr then goto 1;
+                end;
+            end;
+
+    {   offender is in buffer at index - allocate and build the fyi entry
+        for this new sucker }
+
+        pb := buffpool^[buffer].pbuff;
+        po := pointer(ord(pb)+offoffset);
+        recoff := po^[-index];
+        recsize := po^[-index-1]-recoff;
+
+        loc_compact_state := init_compact_state;
+
+100 :   lresult := nnew(@czone,recsize+sizeof(preamble),@prec);
+        if lresult = noerr then
+            begin
+            pream.handle := newhandle;
+            pream.code := 0;
+            deposit(tfyi,@pream.code,diff_nbits,diff_sbit);
+            deposit(offender,@pream.code,idx_nbits,idx_sbit);
+            movelf(@pream,prec,sizeof(preamble));
+            movelf(pointer(ord(pb)+recoff),
+                   pointer(ord(prec)+sizeof(pream)),recsize);
+
+            einsert(lresult,offender,dscan,prec,recsize+sizeof(preamble),
+                    false);
+            ndispose(@czone,@prec^);
+            end;
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+
+2 :     relbuff(tresult,buffer,isleaf);
+        if tresult <> noerr then lresult := tresult;
+
+1 :     lmresult := lresult;
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'insert_fyi>:',lresult);
+            end;*)
+end; { insert_fyi }
+{***************************************************************************
+
+                                diffclose
+
+        see interface.
+
+****************************************************************************}
+
+procedure diffclose{(var ddresult : integer;
+                        scanid : integer)};
+label
+        1,10;
+type
+        passes = (pass1,pass2);
+var
+        any_updates,
+        had_duplicates,
+        had_nullviolations : boolean;
+        diffcode,
+        diff_file,
+        on_id,
+        diff_scan,
+        real_scan,
+        lresult,
+        tresult : integer;
+        pream : preamble;
+        actual :fileptr;
+
+
+        {***********************************************************
+
+                                crossdelete
+
+        deletes from real_scan the record that is cos of diff_scan
+
+        ************************************************************}
+
+        procedure crossdelete;
+        label
+                100;
+        var
+                loc_compact_state : states_de_compact;
+        begin
+                (*dbif lmdebug then
+                    begin
+                    writeln(dumpfile,'>xdelete');
+                    end;*)
+
+                loc_compact_state := init_compact_state;
+        100 :   edelete(lresult,real_scan,exact,0,
+             pointer(ord(pscantable^[diff_scan]^.ptrcos)+sizeof(preamble)));
+                if retry_compact(lresult,loc_compact_state) then goto 100;
+
+                (*dbif lmdebug then
+                    begin
+                    writeln(dumpfile,'xdelete>:',lresult);
+                    printcos(pscantable^[diff_scan]);
+                    end;*)
+        end;
+
+        {***********************************************************
+
+                                crossinsert
+
+        inserts into real_scan the record that is cos of diff_scan
+
+        ************************************************************}
+
+        procedure crossinsert(whichpass : passes;
+                              diffcode : integer);
+        label
+                1,100;
+        var
+                pcos : ptrdata;
+                pream : preamble;
+                offender,
+                loc_result : integer;
+                loc_compact_state : states_de_compact;
+        begin
+                (*dbif lmdebug then
+                    begin
+                    writeln(dumpfile,'>xinsert');
+                    end;*)
+
+            {   check for nulls not allowed violations first }
+
+                pcos := pscantable^[diff_scan]^.ptrcos;
+                movelf(pcos,@pream,sizeof(preamble));
+                if whichpass = pass1 then
+                    begin
+                    if check_nulls(scanid,nil) then
+                        begin
+                        had_nullviolations := true;
+                        deposit(null_error,@pream.code,sub_nbits,sub_sbit);
+                        update_preamble(loc_result,diff_scan,@pream);
+                        goto 1;
+                        end;
+                    end;
+
+            {   passed nulls not allowed - attempt insertion }
+
+                loc_compact_state := init_compact_state;
+        100 :   with pscantable^[diff_scan]^ do
+                    begin
+                    einsert(loc_result,offender,real_scan,
+                        pointer(ord(ptrcos)+sizeof(preamble)),
+                        cossize-sizeof(preamble),
+                        diffcode = tinsert);
+                    end;
+                if retry_compact(loc_result,loc_compact_state) then goto 100;
+                if loc_result = noerr then
+                    begin
+
+                {   on success remove the update or insert record.  if this
+                    is an update, delete the before image record also }
+
+                    edelete(loc_result,diff_scan,current,0,nil);
+                    if (diffcode = tupdate) and (loc_result = noerr) then
+                        edelete(loc_result,diff_scan,next,0,nil);
+                    end
+                else if loc_result = duplkey then
+                    begin
+
+                {   on duplicates not allowed violations, mark the error and
+                    record the offending file.  in pass2, we fetch the
+                    conflicting record fyi  }
+
+                    had_duplicates := true;
+                    deposit(dupl_error,@pream.code,sub_nbits,sub_sbit);
+                    deposit(offender,@pream.code,idx_nbits,idx_sbit);
+                    update_preamble(loc_result,diff_scan,@pream);
+                    if loc_result <> noerr then goto 1;
+                    if whichpass = pass2 then
+                        begin
+                        insert_fyi(loc_result,diff_scan,on_id,offender);
+                        if loc_result = noerr then
+                            efetch(loc_result,diff_scan,next,0,nil);
+                        end;
+                    end;
+        1 :     lresult := loc_result;
+
+                (*dbif lmdebug then
+                    begin
+                    writeln(dumpfile,'xinsert>:',lresult);
+                    printcos(pscantable^[diff_scan]);
+                    end;*)
+        end;
+begin
+
+        (*dbif lmdebug then writeln(dumpfile,'>diffclose');*)
+
+    {   anything that wasn't fetched already won't be }
+
+        with pdifftable^[scanid]^ do
+            begin
+            any_updates := have_an_update and PostUpdates; {##}
+            if nlflds <> 0 then
+                begin
+                ndispose(@czone,@plow^);
+                plow := nil;
+                nlflds := 0;
+                end;
+            if nhflds <> 0 then
+                begin
+                ndispose(@czone,@phigh^);
+                phigh := nil;
+                nhflds := 0;
+                end;
+            if pdfilter <> nil then
+                begin
+                ndispose(@czone,@pdfilter^);
+                pdfilter := nil;
+                end;
+            whichway := noway;
+            diff_scan := diffid;
+            real_scan := realid;
+            curhandle.low := nilptr;
+            curhandle.high := nilptr;
+            on_id := pscantable^[real_scan]^.onfile;
+            end;
+
+    {   in pass 1:
+
+        1) delete all retrieve only entries:tretrieve, tsorted, tfyi,
+        2) perform all delete actions : delete the diff entry afterwards
+           (if delete is part of an tupdate,tdelete pair wait until the
+           whole operation is complete to delete the diff entry)
+        3) attempt all inserts :
+            on success delete diff entry
+            on null violation, mark record with this problem
+            on duplicates not allowed violation, mark record with this problem
+        4) attempt all updates :
+            on success delete diff entry and entry for following delete
+            on null violation, mark record with this problem
+            on duplicates not allowed violation, mark record with this problem }
+
+        had_duplicates := false;
+        had_nullviolations := false;
+        lresult := noerr;
+
+{$IFC PRERELEASE }
+        writeln(dumpfile,'begin posting update');
+{$ENDC }
+        if any_updates then
+            begin
+            efetch(lresult,diff_scan,last,0,nil);
+            if lresult <> eos then goto 1;
+
+            (*dbif lmdebug then writeln(dumpfile,'pass1');*)
+            repeat
+                efetch(lresult,diff_scan,prior,0,nil);
+                if lresult <> noerr then goto 10;
+                movelf(pscantable^[diff_scan]^.ptrcos,@pream,sizeof(preamble));
+                diffcode := extract(@pream.code,diff_nbits,diff_sbit);
+                if diffcode = tdelete then { straight delete }
+                    begin
+                    if extract(@pream.code,sub_nbits,sub_sbit) = noerr then
+                        crossdelete;
+                    if lresult = noerr then
+                        edelete(lresult,diff_scan,current,0,nil);
+                    end
+                else if diffcode = tbefore then { update delete }
+                    begin
+                    if extract(@pream.code,sub_nbits,sub_sbit) = noerr then
+                        begin
+                        crossdelete;
+                        if lresult = noerr then { mark it as posted }
+                            begin
+                            deposit(deleted,@pream.code,sub_nbits,sub_sbit);
+                            update_preamble(lresult,diff_scan,@pream);
+                            end;
+                        end;
+                    end
+                else if diffcode = tinsert then
+                    begin
+                    crossinsert(pass1,diffcode);
+                    end
+                else if diffcode = tupdate then
+                    begin
+                    crossinsert(pass1,diffcode);
+                    end
+                else { various retrieve junk:tretrieve,tsorted,tfyi }
+                    begin
+                    edelete(lresult,diff_scan,current,0,nil);
+                    end;
+            until lresult <> noerr;
+     10 :   if lresult = eos then lresult := noerr
+            else goto 1;
+            end;
+
+    {   if there were duplicates not allowed errors in pass1, we do a second
+        pass to see if we can now insert the offending records:
+
+        1) reattempt all inserts marked with duplicates not allowed
+            on success delete diff entry
+            on duplicates not allowed violation,
+                a) retrieve conflicting record and make a tfyi record
+                   if necessary adjust handles to make room
+
+        2) reattempt the insert part of all updates marked with duplicates not
+           allowed
+            on success delete diff entry and entry for following delete
+            on duplicates not allowed violation,
+                a) retrieve conflicting record and make a tfyi record
+                   if necessary adjust handles to make room }
+
+        (*dbif lmdebug then
+            writeln(dumpfile,'had_d(pass2):',ord(had_duplicates):3);*)
+        if had_duplicates then
+            begin
+            (*dbif lmdebug then writeln(dumpfile,'pass2');*)
+            had_duplicates := false;
+            repeat
+                efetch(lresult,diff_scan,next,0,nil);
+                if lresult = noerr then
+                    begin
+                    movelf(pscantable^[diff_scan]^.ptrcos,@pream,
+                           sizeof(preamble));
+                    diffcode := extract(@pream.code,diff_nbits,diff_sbit);
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'diff:',diffcode);*)
+                    if (extract(@pream.code,sub_nbits,sub_sbit)=dupl_error)
+                                           and
+                       ((diffcode = tupdate) or (diffcode = tinsert))
+                    then crossinsert(pass2,diffcode);
+                    end;
+            until lresult <> noerr;
+            if lresult = eos then lresult := noerr;
+            end;
+
+    {   if there were at most duplicates not allowed and null violation errors
+        do a flushscan on both scans }
+
+        if lresult = noerr then
+            begin
+
+{$IFC PRERELEASE }
+            writeln(dumpfile,'posting complete - flush scans ');
+{$ENDC }
+            flushscan(tresult,real_scan);
+            (*dbif lmdebug then writeln(dumpfile,'after flush:',lresult);*)
+            if tresult <> noerr then lresult := tresult;
+            if (lresult = noerr) then
+                begin
+                if (had_duplicates or had_nullviolations)
+                then lresult := some_violations
+                else { no problems - free those unneeded pages
+                       !! note that we assume no indexes on diff file }
+                    begin
+                    with pscantable^[diff_scan]^ do
+                        begin
+                        diff_file := onfile;
+                        position := first;
+                        touched := touch_by_vltree;
+                        if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+                        ptrcos := nil;
+                        end;
+
+                    with pdifftable^[scanid]^ do
+                        begin
+                        on := on_id;{##}
+                        via := on_id;{##}
+                        have_an_update := false; {!2-25-83}
+                        end;
+
+                    diffTruncate(lresult,diff_file);
+                    end;
+                end;
+            end;
+1 :     lmresult := lresult;
+
+    {   if we ran out of room, convert the diffscan into a  valid diffscan
+        by deleted the retrieval records }
+
+        if lresult = noroom then
+            begin
+            efetch(lresult,diff_scan,last,0,nil);
+            if lresult = eos then lresult := noerr;
+            while lresult = noerr do
+                begin
+                efetch(lresult,diff_scan,prior,0,nil);
+                if lresult = noerr then
+                    begin
+                    movelf(pscantable^[diff_scan]^.ptrcos,@pream,sizeof(preamble));
+                    case extract(@pream.code,diff_nbits,diff_sbit) of
+                    tretrieve,
+                    tsorted,
+                    tfyi :
+                        begin
+                        edelete(lresult,diff_scan,current,0,nil);
+                        end;
+                    end; { case }
+                    end;
+                end;
+            if lresult > eos then lmresult := lresult;
+            end;
+
+        (*dbif lmdebug then writeln(dumpfile,'diffclose>:',lresult);*)
+end; { diffclose }
+{$S lmddest }
+{*********************************************************************
+
+                              diffdestroy
+
+        see inteface
+
+***********************************************************************}
+
+procedure diffdestroy{(var lmresult : integer;
+                           scanid : integer;
+                           pdname : ptrpathname)};
+var
+        tresult : integer;
+begin
+        checkptQuery(lmresult,scanid,true);{##}
+        with pdifftable^[scanid]^ do
+            begin
+            if nlflds <> 0 then
+                begin
+                ndispose(@czone,@plow^);
+                plow := nil;
+                nlflds := 0;
+                end;
+            if nhflds <> 0 then
+                begin
+                ndispose(@czone,@phigh^);
+                phigh := nil;
+                nhflds := 0;
+                end;
+            if pdfilter <> nil then
+                begin
+                ndispose(@czone,@pdfilter^);
+                pdfilter := nil;
+                end;
+            closescan(tresult,realid);{##}
+            if tresult <> noerr then lmresult := tresult;{##}
+            closescan(tresult,diffid);
+            if tresult <> noerr then lmresult := tresult;
+            end;
+        ndispose(@czone,@pdifftable^[scanid]^);
+        pdifftable^[scanid] := nil;
+end; { diffdestroy }
+
+ÿ

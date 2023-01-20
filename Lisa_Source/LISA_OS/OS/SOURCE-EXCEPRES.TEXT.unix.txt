@@ -1,0 +1,503 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+  (* File excepres.text *)
+
+
+  procedure force_term_excep (* excep_data : t_ex_data *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Force the terminate exception to be signalled (regardless the     *)
+    (*   state is enabled or not). It enqueues the data block passed, and  *)
+    (*   sets the terming flag in pcb and raise excep_pending.             *)
+    (*   This routine is to be used for abnormal termination of a process. *)
+    (*   The caller must exit to user code for the exception to take effect*)
+    (*   after calling this routine.                                       *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   excep_data : infomation to be passed to the handler               *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by hard_excep and hard_def_hdl, and def_fline(from pasinit)*)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   system error if can not get syslocal space from sigl_excep.       *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      b_sloc_ptr : ^syslocal;
+      pcb_ptr : ptr_pcb;
+      errnum : integer;
+      ecb_ptr : exctrb_ptr;
+
+    begin
+      pcb_ptr := pointer (c_pcb_ptr);
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      ecb_ptr := pointer (b_sloc_ptr^.abort_ecb_rp + b_syslocal_ptr);
+      if not pcb_ptr^.terming then
+        begin
+          pcb_ptr^.terming := true;
+          setup_state (ecb_ptr, enabled);       (* enable the excep, so excep_prolog
+                                                   can see it *)
+          sigl_excep (errnum, ecb_ptr, excep_data);
+          if errnum <> no_error then system_error (e_force_term);
+        end
+      else      (* if terminate exception handler has been entered, no need to
+                   signal it again, just terminate the process *)
+        send_softint (pcb_ptr, die);
+    end;  (* force_term_excep *)
+
+
+
+
+
+  procedure pmacsbug;    external;
+            (* alternate macsbug entry point, the caller must set up $238 before call,
+               the register display format, 0 for bus or address error, 1 for other *)
+
+
+  procedure OSQuit;  external;
+    { procedure to cause the operating system to shut down as neatly as possible }
+
+
+  procedure hard_excep (* superstack : boolean; excep_kind : integer;
+                          save_info_ptr : p_term_ex_data *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Handles the hardware exception. If fatal error (bus error etc)    *)
+    (*   type occurs in system code, just call system_error, and force     *)
+    (*   terminate if in user code. Non-fatal error type will cause the    *)
+    (*   predefined exception to be signalled. It enqueues data block and  *)
+    (*   raise excep_pending. Spurious interrupt will always cause system  *)
+    (*   error.                                                            *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   superstack : state before exception occurred - false if user stack*)
+    (*           true if supervisor stack.                                 *)
+    (*   excep_kind : kind of hardware exception. See the constant section.*)
+    (*                greater than 10000 if trap E occurs, and index =     *)
+    (*                excep_kind - 10000.                                  *)
+    (*   save_info_ptr : points to the information saved on stack by trap  *)
+    (*                   handler (points to sr or fc).                     *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   Called by hardware exception trap handler only. It executes on    *)
+    (*   supervisor stack. The caller must set up system's a4 and a5 first.*)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   System error if not enough space in syslocal area for data block. *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label
+      9;
+
+    var
+      excep_data : t_ex_data;
+      term_ptr : p_term_ex_data;
+      hard_ptr, hard1_ptr : p_hard_ex_data;
+      rel_ptr : relptr;
+      ecb_ptr : exctrb_ptr;
+      b_sloc_ptr : ^syslocal;
+      pcb_ptr : ptr_pcb;
+      index, errnum : integer;
+      indexname : string [20];
+
+    procedure showregs (systemcode : boolean);
+
+      const
+        adr_displayformat = $23a;               (* low memory for comm with macsbug *)
+        adr_regptr        = $23c;
+
+      type
+        logicaladr = record
+                       mmu2 : integer;
+                       offset1 : integer;
+                     end;
+      var
+        termptr : p_term_ex_data;
+        ac : logicaladr;
+        aptr : ^longint;
+        mmu : integer;
+        offset : longint;
+        segname : string [20];
+        iptr : ^integer;
+
+      begin
+        termptr := pointer (ord (save_info_ptr) - 4);
+        iptr := pointer (adr_displayformat);
+        if (excep_kind = bus_error) or (excep_kind = addr_error) then
+            with termptr^, ac do
+              begin
+                aptr := @ac;
+                aptr^ := access_adr;
+                mmu := mmu2 div 2;
+                offset := offset1 + (mmu2 mod 2)* $10000;
+                segname := '';
+                if (mmu >= ldsn1mmu) and (mmu <= ldsn7mmu) then
+                  segname := '(data seg)'
+                else case mmu of
+                       stackmmu   :  segname := '(stack seg)';
+                       shrsegmmu  :  segname := '(share seg)';
+                       screenmmu  :  segname := '(screen)';
+                       iospacemmu :  segname := '(iospace)';
+                       127        :  segname := '(prom)';
+                     end;
+                if systemcode then
+                  case mmu of
+                    superstkmmu : segname := '(superstack)';
+                    sysglobmmu  :  segname := '(sysglobal)';
+                    syslocmmu   :  segname := '(syslocal)';
+                  end;
+                writeln ('access address = ', access_addr, ' = mmu# ', mmu, '  ',
+                         segname, ',   offset ', offset);
+                writeln (' inst reg =', inst_register, ' sr =', sr_error, '  pc =',
+                         pc_error);
+                iptr^ := 0;     (* display registers in bus, address error format *)
+              end
+        else
+          with termptr^ do
+            begin
+              writeln ('sr = ', sr, '  pc = ', pc);
+              iptr^ := 1;       (* display registers in other exception format *)
+            end;
+        writeln (' saved registers at ', ord (save_info_ptr)-15*4);
+        aptr := pointer (adr_regptr);
+        aptr^ := ord (save_info_ptr) - 15*4;    (* set up pointer to saved registers *)
+        write ('Going to Lisabug, ');
+        if systemcode then writeln('use OSQUIT.')
+                      else writeln('type g to continue.');
+        pmacsbug;       (* alternate macsbug entry procedure to display registers *)
+      end;  (* showregs *)
+
+
+    begin
+                        (* For debug version :
+                           Note that this routine uses writelns, if hardware exceptions
+                           occurs while main line code is doing writelns, because of
+                           the non-reentrant nature of writelns, it will cause
+                           bus error. Hopefully, this can be corrected some day. *)
+
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+          writeln ('e hard_excep : superstack =', superstack, ' excep_kind =',
+                   excep_kind);
+      (*$ENDC*)
+      if LB_ENABLED then                 (* LISABUG loaded *)
+        begin
+          writeln;
+          case excep_kind of
+            bus_error      : write ('BUS ERROR');
+            addr_error     : write ('ADDRESS ERROR');
+            illg_inst      : write ('ILLEGAL INSTRUCTION');
+            priv_violation : write ('PRIVILEGE VIOLATION');
+            line_1010      : write ('LINE 1010 EMULATOR');
+            line_1111      : write ('LINE 1111 EMULATOR');
+            spur_intr      : write ('SPURIOUS INTERRUPT');
+            unexpected_ex  : write ('UNEXPECTED EXCEPTION');
+            div_zero       : write ('ZERO DIVIDE');
+            value_oob      : write ('CHK RANGE ERROR');
+            ovfw           : write ('OVERFLOW');
+            end;
+        end;
+
+      pcb_ptr := pointer (c_pcb_ptr);
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+
+      if (superstack) or (pcb_ptr^.domain = 0) or (excep_kind = spur_intr)  then
+                                     (* if in supervisor stack or in system mode
+                                        before exception or spurrious intr occurs *)
+        begin                               (* then system error *)
+          if not LB_Enabled then
+            System_Error (e_hardsyscode)
+          else
+            begin
+              writeln (' in system code !');
+              showregs (true);
+              OSQuit
+            end
+        end
+      else
+        begin                       (* else, signal the specific exception *)
+          hard_ptr := @excep_data;
+          hard1_ptr := pointer (ord (save_info_ptr) - 4);
+                                        (* to copy info pointed by save_info_ptr to
+                                           excep_data [1], bypass the first field *)
+          hard_ptr^ := hard1_ptr^;
+          hard_ptr^.excep_kind := excep_kind;
+          (* put the excep kind in syslocal so it can be sent
+             in son_term event text [0]*)
+          b_sloc_ptr^.terme_cause := excep_kind - 20;   { adjusted for default }
+          if LB_ENABLED then
+            begin
+              writeln (' in process of gid', pcb_ptr^.glob_id);
+              if (excep_kind = div_zero) or (excep_kind = value_oob)
+                  or (excep_kind = ovfw)
+              then          (* going to exception handler, print nothing *)
+              else
+                writeln ('Process is about to be terminated.');
+              showregs (false);
+            end;
+          case excep_kind of
+            bus_error, addr_error :
+              begin
+                term_ptr := @excep_data;
+                save_info_ptr := pointer (ord (save_info_ptr) - 4);
+                                        (* to copy info pointed by save_info_ptr to
+                                           excep_data [1], bypass the first field *)
+                term_ptr^ := save_info_ptr^;    (* set up data block *)
+                term_ptr^.excep_kind := excep_kind;
+                force_term_excep (excep_data);
+                                      (* force termination on current process *)
+                goto 9;
+              end;
+            div_zero : rel_ptr := b_sloc_ptr^.divz_ecb_rp;
+            value_oob : rel_ptr := b_sloc_ptr^.oob_ecb_rp;
+            ovfw : rel_ptr := b_sloc_ptr^.ovfw_ecb_rp;
+
+            otherwise begin
+                        force_term_excep (excep_data);
+                                      (* force termination on current process *)
+                        goto 9;
+                      end;
+          end;  (* case *)
+          ecb_ptr := pointer (rel_ptr + b_syslocal_ptr);
+          sigl_excep (errnum, ecb_ptr, excep_data);
+                                          (* enq data block and raise exception *)
+          (*$IFC DEBUG2*)
+          if errnum <> no_error then
+            system_error (e_hard_sigl)
+          (*$ENDC*)
+        end;
+
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('l hard_excep :');
+      (*$ENDC*)
+
+    end;  (* procedure hard_excep *)
+
+
+
+
+
+
+  procedure get_caller (var pc, a6 : longint);  external;
+                     (* assembly routine to return caller's stack info, pc, and a6 *)
+
+
+  procedure rangeerror (* valuecheck, lowerbound, upperbound : integer;
+                          rangekind : boolean *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Handles the value range and string index error. If called by      *)
+    (*   system, it results in system error. If called by user, value oob  *)
+    (*   exception is signaled.                                            *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   valuecheck : value to check, to be passed to the exception handler*)
+    (*   lowerbound : lower bound,    to be passed to the exception handler*)
+    (*   upperbound : upper bound,    to be passed to the exception handler*)
+    (*   rangekind  : true if value range error, false if string index err.*)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   Called by %_RCHCK and %_SRCHK in PASLIB only. It is entered via   *)
+    (*   trap 1.                                                           *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   System error if not enough space in syslocal area for data block. *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      excep_data : t_ex_data;
+      hard_ptr : p_hard_ex_data;
+      ecb_ptr : exctrb_ptr;
+      b_sloc_ptr : ^syslocal;
+      pcb_ptr : ptr_pcb;
+      errnum : integer;
+      cpc, a6 : longint;
+
+    procedure showvalue(systemcode: boolean);
+
+      begin
+        writeln ('value to check =', valuecheck, '  lower bound =', lowerbound,
+                 '  upper bound =', upperbound);
+        writeln ('return pc =', cpc, '  caller a6 =', a6);
+        write ('Going to Lisabug, ');
+        if systemcode then writeln('use OSQUIT.')
+                      else writeln('type g to continue.');
+        macsbug;
+      end;  (* showvalue *)
+
+    begin       (* rangeerror *)
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+          writeln ('e rangeerror : rangekind =', rangekind);
+      (*$ENDC*)
+
+      if LB_ENABLED then
+        begin
+          writeln;
+          if rangekind then
+            write ('VALUE RANGE ERROR')
+          else
+            write ('ILLEGAL STRING INDEX');
+        end;
+      pcb_ptr := pointer (c_pcb_ptr);
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      get_caller (cpc, a6);                       (* get caller's pc, and link *)
+
+      if sys_called then                        (* in system code *)
+        begin
+          if LB_ENABLED then
+            begin
+              writeln (' in system code');
+              showvalue(true);
+            end;
+          system_error (e_hardsyscode);
+        end
+      else                                              (* in user code, signal excep *)
+        begin
+          if LB_ENABLED then
+            begin
+              writeln (' in process of gid', pcb_ptr^.glob_id);
+              showvalue(false);
+            end;
+          hard_ptr := @excep_data;
+          with hard_ptr^ do
+            begin
+              if rangekind then
+                excep_kind := value_range
+              else
+                excep_kind := str_index;
+              value_check := valuecheck;
+              lower_bound := lowerbound;
+              upper_bound := upperbound;
+              return_pc := cpc;
+              caller_a6 := a6;
+            end;
+          ecb_ptr := pointer (b_sloc_ptr^.oob_ecb_rp + b_syslocal_ptr);
+          sigl_excep (errnum, ecb_ptr, excep_data);
+          if errnum <> no_error then system_error (e_rangeerror);
+        end;
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+          writeln ('l rangeerror :');
+      (*$ENDC*)
+    end;  (* procedure rangeerror *)
+
+
+
+{ This has to wait until break facility is further defined.
+  function nmi_excep (* superstack : boolean;
+                        save_info_ptr : p_hard_ex_data) : boolean *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Handles the NMI key exception. If it is in system code, it does   *)
+    (*   not do anything, except going to Macsbug for debug version. If it *)
+    (*   is in user code, it signals nmi key exception to the current user *)
+    (*   process.                                                          *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   superstack : stack before exception occurred - false if user stack*)
+    (*                true if supervisor stack.                            *)
+    (*   save_info_ptr : points to the information saved on stack by trap  *)
+    (*                   handler (points to sr).                           *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   nmi_excep : true if to RTE back to origin execution (if in system *)
+    (*               code), and false if to go to scheduler (in user code  *)
+    (*               and signaled nmi exception) after this function call. *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   Called by NMI handler only when nmi key pressed is detected. It   *)
+    (*   executes on supervisor stack. The caller must set up system's a4  *)
+    (*   and a5 first.                                                     *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   System error if not enough space in syslocal area for data block. *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      excep_data : t_ex_data;
+      hard_ptr : p_hard_ex_data;
+      ecb_ptr : exctrb_ptr;
+      b_sloc_ptr : ^syslocal;
+      pcb_ptr : ptr_pcb;
+      errnum : integer;
+      return_f : boolean;
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+          writeln ('e nmi_excep : superstack =', superstack);
+      (*$ENDC*)
+      pcb_ptr := pointer (c_pcb_ptr);
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      if pcb_ptr <> nil then            (* signal exception except when it is in
+                                           scheduler loop - no process running *)
+        begin
+          hard_ptr := @excep_data;
+          save_info_ptr := pointer (ord (save_info_ptr) - 4);
+                                    (* to copy info pointed by save_info_ptr to
+                                       excep_data [1], bypass the first field *)
+          hard_ptr^ := save_info_ptr^;
+          hard_ptr^.excep_kind := nmi_key;
+          ecb_ptr := pointer (b_sloc_ptr^.nmik_ecb_rp + b_syslocal_ptr);
+          sigl_excep (errnum, ecb_ptr, excep_data);
+          if errnum <> no_error then system_error (e_nmi_excep);
+        end;
+
+      if (not superstack) and (pcb_ptr^.domain <> 0) then    (* in user code *)
+          return_f := false         (* go to scheduler *)
+      else return_f := true;                         (* in system code, just RTE *)
+      nmi_excep := return_f;
+
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+          writeln ('e nmi_excep : return_f =', return_f);
+      (*$ENDC*)
+    end;   (* function nmi_excep *)
+}
+
+
+
+
+
+ÿ

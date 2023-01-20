@@ -1,0 +1,1042 @@
+{#F     libdb/recfile.text }
+{$S frecovseg   }
+{**************************************************************************
+
+                                SchlepNewToOld
+
+        We have found that the destination file already exists so we assume
+        that we died in the middle of recovery.  The information for the
+        file may be distributed between the old and new file.  So we copy
+        all the data and label pages from the old file to the new file and
+        then delete the new file.
+
+        Input Parameters
+
+        recoverId - OS refno of file being recovered
+        firstpage - address of first page of file
+        pagesize - size of pages
+        pnewname - as per FileRecover
+
+        Output Paramters
+
+        ddresult - return result
+
+        noerr
+        nobuffs
+        ioerr
+        noroom
+        OS(open,info,close_object,kill_object)
+
+**************************************************************************}
+
+{$S frecovseg   }
+procedure SchlepNewToOld(var ddresult : integer;
+                             recoverId : integer;
+                             firstpage : fileptr;
+                             pagesize : integer;
+                             pnewname : ptrpathname);
+label
+        1,
+        2,
+        3,
+        10;
+var
+        result,
+        tresult,
+        locbuffer,
+        NewId : integer;
+        pb  : ptrdata;
+        pd : ptrpagedesc;
+        actual,
+        OldEnd,
+        NewEnd : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        prefix_name(pnewname);
+{af}    open_secure(result,prefix,NewId,[DRead,DWrite,Private],password);
+       {open(result,prefix,NewId,[DRead,DWrite,Private]);}
+
+{$IFC debug }
+        writeln(dumpfile,'opening ',prefix,' result: ',result);
+{$ENDC }
+
+        if result < noerr then result := noerr;
+        if (result <> noerr) and (result <> Scavenged) and
+           (result <> ScavChanged) and
+           (result <> OSClosed) and (result <> OSCrashed) then goto 1;
+
+        lockbuff(result,locbuffer);
+        if result <> noerr then goto 2;
+        pb := buffpool^[locbuffer].pbuff;
+        pd := pointer(ord(pb)+pagesize - sizeof(pagedesc));
+
+        OldEnd := FindEof(result,recoverId,firstpage,pagesize,pb);
+        if OldEnd = 0 then goto 3;
+
+        NewEnd := FindEof(result,NewId,firstpage,pagesize,pb);
+        while NewEnd <> 0 do
+            begin
+            if result <> noerr then
+                begin
+
+{$IFC debug }
+                writeln(dumpfile,'error on page ',firstpage:14,result);
+{$ENDC }
+
+                goto 10;
+                end;
+            if (pd^.ptype = leaftype) or (pd^.ptype = labeltype) then
+                begin
+                OldEnd := OldEnd + pagesize;
+                write_data(result,recoverId,ord(pb),pagesize,actual,
+                           Absolute,OldEnd);
+                if result <> noerr then
+                    begin
+                    if no_room(result) then result := noroom
+                    else result := ioerr;
+                    goto 3;
+                    end;
+                end;
+        10: if NewEnd = firstpage then
+                begin
+                NewEnd := 0;
+                read_data(tresult,NewId,ord(pb),512,actual,Absolute,
+                          firstpage-512);
+                if ((tresult = DAltered) or (tresult = DMaybeAltered)) and
+                   (actual = 512) then tresult := noerr;
+                end
+            else
+                begin
+                NewEnd := NewEnd -  pagesize;
+                read_data(tresult,Newid,ord(pb),pagesize,actual,Absolute,NewEnd);
+                if ((tresult = DAltered) or (tresult = DMaybeAltered)) and
+                   (actual = pagesize) then tresult := noerr;
+                end;
+            flush(result,recoverId);
+            if result <> noerr then goto 3;
+            truncate(result,NewId);
+            compact(result,NewId);
+            result := tresult;
+            end;
+{af}    kill_secure(result,prefix,password);
+       {kill_object(result,prefix);}
+
+3:      relbuff(tresult,locbuffer,0);
+        if tresult <> noerr then result := tresult;
+2:      close_object(tresult,NewID);
+        if tresult <> noerr then result := tresult;
+1:      ddresult := result;
+end;
+
+{**************************************************************************
+
+                                SalvByDesc
+
+        Checks if recoverId's lowlevel schema is ok, if it is, then
+        if uses it to create the new file.  If the lowlevel schema is bad,
+        it tries to use the Redundant copy.
+
+        Input Parameters
+
+        recoverId - OS refno of file being recovered
+        oldprefix,
+        newprefix,
+        pnewname,
+        precname - as per FileRecover
+
+        Output Paramters
+
+        ddresult - return result
+
+        noerr
+        BadFileDesc
+        nomem
+        nobuffs
+        ioerr
+        noroom
+        inconsistent
+        OS(make_file,open,info,close_object)
+
+        Function result -
+            true iff the file we're recovering was created by an old version of DBI
+
+**************************************************************************}
+
+{$S frecovseg   }
+function SalvByDesc(var ddresult : integer;
+                         recoverId : integer;
+                         oldprefix,
+                         newprefix,
+                         pnewname,
+                         precname : ptrpathname) : boolean;
+label
+        1,
+        10,
+        20;
+var
+        haveRedundant : boolean;
+        loc_compact_state : states_de_compact;
+        actual : fileptr;
+        fl : filedesc;
+        pfd : ptrfiledesc;
+        tresult,
+        result : integer;
+        descsize : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        haveRedundant := false;
+        repeat
+            read_data(result,recoverId,ord(@fl),sizeof(filelabel),actual,
+                  absolute,0);
+            if ((result = DAltered) or (result = DMaybeAltered)) and
+               (actual = sizeof(filelabel)) then result := noerr;
+            if result <> noerr then
+                begin
+                result := BadFileDesc;
+                goto 20;
+                end;
+
+            if not haveRedundant then { make sure original is marked bad }
+                begin
+                clearbit(@fl.flags,ffileok);
+                write_data(tresult,recoverId,ord(@fl),sizeof(filelabel),actual,
+                    absolute,0);
+                flush(tresult,recoverId);
+                end;
+
+            result := BadFileDesc;
+            if (fl.pagesize > 0) and (fl.pagesize <= psize) and
+               (fl.check_1_it = leaftype) and
+               (fl.check_2_it = nonleaftype) and
+               ((fl.dbvers = myprod_vers) or
+                (fl.dbvers = V0myprod_vers)) and
+               (fl.nsort > 0) and (fl.nkeys >= fl.nsort) and
+               (fl.nfields >= fl.nkeys) and (fl.kvflds > 0) and
+               (fl.vflds >= fl.kvflds) and (fl.vflds <= maxrsize) and
+               (fl.firstpage = ((fl.nfields*sizeof(flddesc)+sizeof(filelabel)
+                             +511) div 512 * 512)) then
+                begin
+                SalvByDesc := false;
+                if fl.dbvers <> myprod_vers then { OldVersion?}
+                    begin
+                    SalvByDesc := true;
+                    fl.dbvers := myprod_vers;
+                    end;
+                descsize := fl.firstpage;
+
+                loc_compact_state := init_compact_state;
+                repeat
+                    result := nnew(@czone,descsize,@pfd);
+                    if result = noerr then
+                        begin
+                        read_data(result,recoverId,ord(pfd),descsize,
+                                  actual,absolute,0);
+                        if ((result = DAltered) or (result = DMaybeAltered)) and
+                            (actual = descsize) then result := noerr;
+                        if result <> noerr then
+                            begin
+                            result := BadFileDesc;
+                            goto 10;
+                            end;
+
+                        fl.pedesc := pointer(ord(pfd) + sizeof(filelabel));
+                        result := checkFileDesc(fl);
+                        if result <> noerr then goto 10;
+
+                        fl.lastpage := fl.firstpage;
+                        fl.flags := fl.flags + [ffileok];
+                        fl.updateversion := 0;
+
+                        setprefix(newprefix);
+                        makefile(result,pnewname,@fl);
+
+{$IFC debug }
+                        writeln(dumpfile,'make ',pnewname^, ' result:',result);
+{$ENDC }
+
+                        if result = AlreadyExists then
+                            begin
+                            SchlepNewToOld(result,recoverID,descsize,
+                                           fl.pagesize,pnewname);
+                            if result = noerr then makefile(result,pnewname,@fl);
+                            end;
+
+                        if result = noerr then
+                            begin
+                            close_object(result,fl.frefno);
+{af}                        if result <> noerr then kill_secure(tresult,prefix,
+                                                                password);
+                           {if result <> noerr then kill_object(tresult,prefix);}
+                            end;
+
+                    10: ndispose(@czone,@pfd^);
+                        end;
+                until not retry_compact(result,loc_compact_state);
+                end;
+        20: if (result <> BadFileDesc) or haveRedundant then goto 1;
+            setprefix(oldprefix);
+            prefix_name(precname);
+{af}        open_secure(tresult,prefix,recoverId,[DRead,DWrite,Private],password);
+           {open(tresult,prefix,recoverId,[DRead,DWrite,Private]);}
+
+{$IFC debug }
+            writeln(dumpfile,'opening ',prefix,' tresult: ',tresult);
+{$ENDC }
+
+            if tresult < noerr then tresult := noerr;
+            if (tresult <> noerr) and (tresult <> Scavenged) and
+               (tresult <> ScavChanged) and
+               (tresult <> OSClosed) and (tresult <> OSCrashed) then goto 1;
+            haveRedundant := true;
+        until false;
+
+1:      if haveRedundant then close_object(tresult,recoverId);
+        ddresult := result;
+end; { SalvByDesc }
+
+{****************************************************************************
+
+                                BadStr
+
+        Checks if a string in a DBField is okay.  As a sideeffect, it resets
+        the upper bound for the next variable length thing in the DBField
+        to the start of the string.  Note that if the off is fnilval, then
+        the string doesn't exist.
+
+        Input Parameters
+
+        off - offset in DBField for the string, fnilval -> nonexistence
+        pdbf - pts to DBField
+        bnd - first byte of next variable length thing in the DBField (we may
+            not overlap this)
+
+        Output Parameters
+
+        bnd - if string exists, then we set bnd to off
+
+****************************************************************************}
+
+{$S frecovseg   }
+function BadStr(    off : integer;
+                    pdbf : ptrdbfield;
+                var bnd : integer) : boolean;
+var
+        pstr : ptrpathname;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if off = fnilval then BadStr := false
+        else
+            begin
+            pstr := pointer(ord(pdbf) + off);
+            BadStr := odd(off) or (off > (bnd - length(pstr^) - 1));
+            bnd := off;
+            end;
+end; {BadStr}
+
+{****************************************************************************
+
+                                BadVal
+
+        Checks if a field value in a DBField is okay.  Similar to BadStr,
+        except has to check that the data value fits within its area.
+
+        Input Parameters
+
+        off - offset in DBField for the value, fnilval -> nonexistence
+        pdbf - pts to DBField
+        bnd - first byte of next variable length thing in the DBField (we may
+            not overlap this)
+
+        Output Parameters
+
+        bnd - if value exists, then we set bnd to off
+
+
+****************************************************************************}
+
+{$S frecovseg   }
+function BadVal(off : integer;
+                pdbf : ptrdbfield;
+                var bnd : integer) : boolean;
+label
+        1;
+var
+        rsize : integer;
+        pvf :
+           record case integer of
+           0:( l : ptrvfld);
+           1:( s : ptrsvfld);
+           end;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        writeln(dumpfile,'badval ',off,bnd);
+{$ENDC }
+
+        if off = fnilval then BadVal := false
+        else
+            with pdbf^ do
+                begin
+                BadVal := true;
+                if odd(off) then goto 1;
+                rsize := size;
+                if reptype = ftyppack2 then rsize := 2;
+                if off > (bnd - rsize) then goto 1;
+                if reptype >= ftypvstr then
+                    begin
+                    pvf.s := pointer(ord(pdbf) + off);
+                    if reptype <= ftypvnull then
+                        begin
+                        rsize := pvf.l^.size;
+
+{$IFC debug }
+                        writeln(dumpfile,'rsize ',rsize);
+{$ENDC }
+
+                        if pvf.l^.offset <> sizeof(vfld) then goto 1;
+                        BadVal := (rsize < 0) or
+                                  (rsize > (bnd - off - sizeof(vfld)));
+                        end
+                    else
+                        begin
+                        rsize := pvf.s^.size;
+                        if pvf.s^.offset <> sizeof(svfld) then goto 1;
+                        BadVal := (rsize < 0) or
+                                  (rsize > (bnd - off - sizeof(svfld)));
+                        end;
+                    end
+                else BadVal := false;
+            1:  bnd := off;
+                end;
+end; {BadVal}
+
+{*************************************************************************
+
+                               CheckSchema
+
+        checks the dbfield array (in memory) to see that it conforms to the low
+        level schema and is internally consistent.
+
+        Input Parameters
+
+        pschema - points to array of dbfields in memory
+        ssize - size of dbfield array
+        lfile - index of file descriptor (for low level schema)
+        ECheck - an edit check routine, as per FileRecover
+        CheckEChecks - true if the edit checks (and therefore reptypes) are to be
+            checked.  if the tools market code differs from that of the schema,
+            the edit checks are not checked.
+
+        OutPut Parameters
+
+        ddresult - return result
+
+        noerr
+        BadFileSchema
+
+**************************************************************************}
+
+{$S frecovseg   }
+procedure CheckSchema(var ddresult : integer;
+                          pschema : ptrdata;
+                          ssize : integer;
+                          lfile : integer;
+                          procedure ECheck(    EC : ecstr;
+                                               ftype : integer;
+                                           var Check : checkinfo;
+                                           var result : integer);
+                          CheckEChecks : boolean);
+label
+        1;
+var
+        pN : ptrpathname;
+        pES : ^ ecstr;
+        LECStr : ecstr;
+        NewInfo : checkinfo;
+        fd : flddesc;
+        pdbf : ptrdbfield;
+        enum : integer;
+        temp,
+        base,
+        i,
+        soff,
+        lresult : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        lresult := BadFileSchema;
+        soff := 0;
+        pdbf := @pschema^;
+        with pfiletable^[lfile]^ do
+            begin
+            for i := 0 to nfields-1 do
+                begin
+                fd := pedesc^[i];
+                pdbf := pointer(ord(pschema) + soff);
+                with pdbf^ do
+                    begin
+
+{$IFC debug }
+                    writeln(dumpfile,'field #',i);
+                    writeln(dumpfile,fldsize,defval,lowval,highval,display,name);
+{$ENDC }
+
+                    if name <> fnilval then
+                        begin
+                        pN := pointer(ord(pdbf)+name);
+
+{$IFC debug }
+                        writeln(dumpfile,pN^);
+{$ENDC }
+                        end;
+                    if soff > (ssize - sizeof(dbfield)) then goto 1;
+
+{$IFC debug }
+                    writeln(dumpfile,'f,r,s ',Fldtype,reptype,size);
+{$ENDC }
+
+                    base := fldsize;
+                    if odd(base) or
+                       (reptype <> fd.ftype) or
+                       (offset <> fd.offset) or
+                       (size <> fd.size) then goto 1;
+
+                {   !!!! Note that the following BadVal and BadStr
+                         calls must be in the order of the corresponding
+                         fields in the dbfield record, due to the computation
+                         of successive base's }
+
+                    if BadVal(defval,pdbf,base) then goto 1;
+                    if BadVal(lowval,pdbf,base) then goto 1;
+                    if BadVal(highval,pdbf,base) then goto 1;
+                    if BadStr(display,pdbf,base) then goto 1;
+                    if BadStr(name,pdbf,base) then goto 1;
+                    if (soff > (ssize - fldsize)) or
+                       (display = fnilval) or
+                       (fldtype <= none) or
+                       (fldtype > tick) then goto 1;
+
+                {   Check that String is smaller than ECstr and if so
+                    copy into a local string }
+
+                    pES := pointer(ord(pdbf) + display);
+
+{$IFC debug }
+                    writeln(dumpfile,pES^);
+{$ENDC }
+
+                    if length(pES^) > ecstrBnd then goto 1;
+                    movelg(@pES^,@LECStr,length(pES^)+1);
+
+                    if CheckEChecks then
+                        begin
+                        ECheck(LECStr,fldtype,NewInfo,enum);
+
+    {$IFC debug }
+                        writeln(dumpfile,enum);
+    {$ENDC }
+
+                        if enum <> noerr then goto 1;
+                        for temp := 1 to 5 do
+                            begin
+
+    {$IFC debug }
+                            write(dumpfile,NewInfo[temp],
+                                             EditCheck[temp]);
+    {$ENDC }
+
+                            if NewInfo[temp] <>
+                                EditCheck[temp] then goto 1;
+                            end;
+
+    {$IFC debug }
+                        writeln(dumpfile);
+    {$ENDC }
+
+                        ValidRepType(temp,fldtype,NewInfo,reptype,size);
+                        if temp <> 0 then goto 1;
+                        end{ if };
+                    soff := soff+fldsize;
+                    end;
+                end;
+            lresult := noerr;
+            end;
+1:      ddresult := lresult;
+end; { CheckSchema }
+
+{******************************************************************************
+
+                                 DelSchema
+
+        deletes the schema whose entry number in enum. returns enum of next
+        schema in label (if one exists) else nilptr.
+
+        Input Parameters
+
+        ReLabel - label scan id
+        enum - entry number of schema to delete
+
+        Output Parameters
+
+        ddresult - return result
+
+        noerr
+        nobuffs
+        ioerr
+        inconsistent
+        nomem
+
+        enum - the entry number of the next schema in the label, if it exists
+                else nilptr
+
+*****************************************************************************}
+
+{$S frecovseg   }
+function DelSchema(var ddresult : integer;
+                       ReLabel : integer;
+                       enum : fileptr) : fileptr;
+label
+        1;
+var
+        lresult : integer;
+        labentry : labelentry;
+        plab : ptrlabelentry;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        DelSchema := nilptr;
+        labentry.ltype := fileschema;
+        labentry.enum := enum;
+        lfetch(lresult,ReLabel,approx,2,@labentry);
+        while lresult = noerr do
+            begin
+            plab := @pscantable^[ReLabel]^.ptrcos^;
+            if plab^.ltype <> fileschema then goto 1;
+            if plab^.enum = enum then
+                begin
+
+{$IFC debug }
+                writeln(dumpfile,'delete ',plab^.enum,plab^.seq);
+{$ENDC }
+
+                ldelete(lresult,ReLabel,current,0,nil)
+                end
+            else
+                begin
+                DelSchema := plab^.enum;
+                goto 1;
+                end;
+            lfetch(lresult,ReLabel,next,0,nil);
+            end;
+1:      if lresult <= eos then lresult := noerr;
+        ddresult := lresult;
+end;
+
+{*************************************************************************
+
+                               SchemaRecover
+
+        Attempts to recover a valid schema.  If one can't be obtained from
+        ReLabel, the redundant file is tried.  Guarantees that at most one
+        schema, and that one valid remain in the label.  Accepts the first
+        valid schema it uncovers.  If no schema can be found the warning
+        WarnNoSchema is added to warnings.  Only returns BadFileSchema if an
+        invalid schema was found.
+
+        Input Parameters
+
+        ReLabel - label scan on new file
+        ECheck - edit check routines, as per FileRecover
+        ToolsMarketCode - market code of tool
+
+        Output Parameters
+
+        Function Result - returns true iff no schema was found
+        ddresult - return result
+
+        noerr
+        BadFileSchema
+        nobuffs
+        ioerr
+        inconsistent
+        nomem
+
+
+**************************************************************************}
+
+{$S frecovseg   }
+function SchemaRecover(var ddresult : integer;
+                            ReLabel : integer;
+                            procedure ECheck(    EC : ecstr;
+                                                 ftype : integer;
+                                             var Check : checkinfo;
+                                             var result : integer);
+                            ToolsMarketCode : integer) : boolean;
+label
+        1,
+        2,
+        10;
+var
+        loc_compact_state : states_de_compact;
+        noSchema : boolean;
+        head : header;
+        lpage,
+        curpage,
+        nextEnum,
+        curEnum : fileptr;
+        offoff,
+        lbuffer,
+        totalread,
+        curseq,
+        lindex,
+        lfile,
+        lresult,
+        tresult : integer;
+        labentry : labelentry;
+        po : ptroffsets;
+        pb,
+        pschema : ptrdata;
+        plab : ptrlabelentry;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        noSchema := true;
+        labentry.ltype := fileschema;
+        lfetch(lresult,ReLabel,approx,1,@labentry);
+
+{$IFC debug }
+        writeln(dumpfile,'SchemaRecover ',lresult);
+{$ENDC }
+
+        if lresult <> noerr then
+            begin
+            if lresult <= eos then lresult := noerr;
+            goto 1;
+            end;
+
+  {     Plan:
+
+        1) Read next schema from label into memory (but make sure it's the
+           same size as it's header record claims
+
+        2) Check the schema
+
+        3) If any thing went wrong, delete the current schema (if it exists),
+           if there are no more schemas in the label then return else goto 1
+
+        }
+
+        repeat
+            nextEnum := nilptr;
+            lresult := noerr;
+            with pscantable^[ReLabel]^ do
+                begin
+                plab := @ptrcos^;
+                lpage := keypage;
+                lindex := keyindex;
+                lfile := onfile;
+                end;
+            offoff :=  pfiletable^[lfile]^.pagesize-
+                       (sizeof(pagedesc)+sizeof(integer));
+            curEnum := plab^.enum;
+            if (plab^.seq <> 0) or
+               (plab^.varfld.size < sizeof(header)) then
+                lresult := BadFileSchema
+            else
+                 begin
+                 movelf(pointer(ord(plab) + sizeof(labelentry)),
+                        @head,
+                        sizeof(header));
+
+{$IFC debug }
+                 writeln(dumpfile,head.space,head.nfields,
+                         head.nkeys,head.nsort,head.keybytes,
+                         head.recsize);
+{$ENDC }
+
+                 with pfiletable^[lfile]^ do
+                     if (head.space <=0) or
+                        (odd(head.space)) or
+                        (head.nfields <> nfields) or
+                        (head.nkeys <> nkeys) or
+                        (head.nsort <> nsort) or
+                        (head.keybytes <> kvflds) or
+                        (head.recsize <> vflds) then
+                            lresult := BadFileSchema;
+                 end;
+            if lresult <> noerr then goto 2;
+
+        {   allocate space for schema & read in the rest of the fileschema  }
+
+            loc_compact_state := init_compact_state;
+            repeat
+               lresult := nnew(@czone,head.space,@pschema);
+            until not retry_compact(lresult,loc_compact_state);
+            if lresult <> noerr then goto 2;
+
+            totalread := 0;
+            curseq := 1;
+            getpage(lresult,lbuffer,lfile,lpage,true);
+            if lresult <> noerr then goto 10;
+            repeat
+                lindex := lindex + 1;
+                nextprior(lresult,lfile,lbuffer,lindex,next);
+                if lresult <> noerr then goto 10;
+                pb := buffpool^[lbuffer].pbuff;
+                po := pointer(ord(pb) + offoff);
+                plab := pointer(ord(pb)+po^[-lindex]);
+                if plab^.ltype <> fileschema then goto 10;
+                if plab^.enum <> curEnum then
+                    begin
+                    nextEnum := plab^.enum;
+                    goto 10;
+                    end;
+                lresult := BadFileSchema;
+                if (plab^.seq <> curseq) or
+                   ((head.space - plab^.varfld.size) < totalread) then goto 10;
+                movelf(pointer(ord(plab)+sizeof(labelentry)),
+                       pointer(ord(pschema)+totalread),
+                       plab^.varfld.size);
+                curseq := curseq + 1;
+                totalread := totalread + plab^.varfld.size;
+            until false;
+       10 : if lresult = eos then lresult := noerr;
+            if lresult = noerr then
+                begin
+                relbuff(tresult,lbuffer,0);
+                if tresult <> noerr then lresult := tresult;
+                end;
+
+{$IFC debug }
+            writeln(dumpfile,'totalread ',totalread);
+{$ENDC }
+
+            if (lresult = noerr) and (totalread <> head.space) then
+                lresult := BadFileSchema;
+
+            if lresult = noerr then
+                CheckSchema(lresult,pschema,head.space,lfile,ECheck,
+                            Head.MarketCode = ToolsMarketCode);
+            ndispose(@czone,@pschema^);
+
+
+    2:      if lresult = BadFileSchema then { delete }
+                begin
+                nextEnum := delSchema(tresult,ReLabel,curEnum);
+                if tresult <> noerr then lresult := tresult;
+                end
+            else
+                begin
+                noSchema := lresult <> noerr;
+
+            {   we're cheap - we'll take the first one }
+
+                while (lresult = noerr) and (nextEnum <> nilptr) do
+                    nextEnum := delSchema(lresult,ReLabel,nextEnum);
+                end;
+        until (lresult <> BadFileSchema) or (nextEnum = nilptr);
+
+1:      ddresult := lresult;
+        SchemaRecover := noSchema;
+end; { SchemaRecover }
+{****************************************************************************
+
+                        dummyindexmake
+
+        always returns an error status.
+
+****************************************************************************}
+
+{$S frecovseg   }
+procedure dummyindexmake(var ddresult : integer;
+                         ifilename,
+                         filename,
+                         tempdir1,
+                         tempdir2 : ptrpathname;
+                         temp_ldsn : integer;
+                         nisort,
+                         nikeys : integer;
+                         piflds : ptridesc;
+                         duplok : boolean);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        ddresult := ioerr;
+end; { dummyindexmake }
+
+
+{***************************************************************************
+
+                                FileRecover
+
+        See interface.
+
+***************************************************************************}
+
+{$S frecovseg   }
+procedure FileRecover{(var ddresult : integer;
+                       var warnings : elemset;
+                           pfname,
+                           pnewname,
+                           precname : ptrpathname;
+                 procedure ECheck(EC : ecstr;
+                                  ftype : integer;
+                                  var Check : checkinfo;
+                                  var result : integer);
+                 procedure indexmake(var ddresult : integer;
+                                        ifilename,
+                                        filename,
+                                        tempdir1,
+                                        tempdir2 : ptrpathname;
+                                        temp_ldsn : integer;
+                                        nisort,
+                                        nikeys : integer;
+                                        piflds : ptridesc;
+                                        duplok : boolean);
+                 procedure MarksRevenge(var result : integer;
+                                       var warnings : elemset;
+                                       lsid : integer);
+                 ToolsMarketCode : integer)};
+
+label
+        1,
+        2,
+        3,
+        4;
+var
+        RedundantId : integer;
+        pb : ptrdata;
+        SizePage,
+        recoverBuff : integer;
+        recoverId : integer;
+        nada,
+        EndPage,
+        nextSchema,
+        fpage: fileptr;
+        result,
+        tresult : integer;
+        ReLabel,
+        ReData : integer;
+        OldVersion : boolean;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        warnings := [];
+
+        setprefix(oldprefix);
+        prefix_name(pfname);
+{af}    open_secure(result,prefix,recoverId,[DRead,DWrite,Private],password);
+       {open(result,prefix,recoverId,[DRead,DWrite,Private]);}
+
+{$IFC debug }
+        writeln(dumpfile,'opening ',prefix,' result: ',result);
+{$ENDC }
+
+        if result < noerr then result := noerr;
+        if (result <> noerr) and (result <> Scavenged) and
+           (result <> ScavChanged) and
+           (result <> OSClosed) and (result <> OSCrashed) then goto 1;
+
+        OldVersion := SalvByDesc(result,recoverId,oldprefix,newprefix,pnewname,precname);
+        if result <> noerr then goto 2;
+
+        setprefix(oldprefix);
+        prefix_name(pfname);
+        recoverDelete(result);
+        if result <> noerr then goto 2;
+
+        lockbuff(result,recoverBuff);
+        if result <> noerr then
+            begin
+
+{$IFC debug }
+            writeln(dumpfile,'couldn''t get recover buff ',result);
+{$ENDC }
+
+            goto 2;
+            end;
+
+        setprefix(newprefix);
+        openscan(result,pnewname,pnewname,ReLabel,labelupdate);
+        if result <> noerr then
+            begin
+
+{$IFC debug }
+            writeln(dumpfile,'couldn''t open ',pnewname^,' result:',result);
+{$ENDC }
+
+            goto 3;
+            end;
+
+        openscan(result,pnewname,pnewname,ReData,update);
+        if result <> noerr then
+            begin
+
+{$IFC debug }
+            writeln(dumpfile,'couldn''t open ',pnewname^,' result:',result);
+{$ENDC }
+
+            goto 4;
+            end;
+
+        pb := buffpool^[recoverBuff].pbuff;
+        with pfiletable^[pscantable^[ReData]^.onfile]^ do
+            begin
+            fpage := firstpage;
+            SizePage := pagesize;
+            end;
+
+
+        labelRecover(result,warnings,true,OldVersion,recoverId,ReLabel,SizePage,
+                     fpage,EndPage,pb,pnewname,indexmake);
+        if result = noerr then
+            begin
+            if SchemaRecover(result,ReLabel,ECheck,ToolsMarketCode) then { try the redundant copy }
+                begin
+                warnings := warnings + [WarnNoSchema];
+                setprefix(oldprefix);
+                prefix_name(precname);
+{af}            open_secure(tresult,prefix,RedundantId,
+                            [DRead,DWrite,Private],password);
+               {open(tresult,prefix,RedundantId,[DRead,DWrite,Private]);}
+
+{$IFC debug }
+                writeln(dumpfile,'opening ',prefix,' tresult: ',tresult);
+{$ENDC }
+
+                if (tresult = noerr) or (tresult = Scavenged) or
+                   (tresult <> ScavChanged) and
+                   (tresult = OSClosed) or (tresult = OSCrashed) then
+                    begin
+                    labelRecover(result,warnings,false,OldVersion,RedundantId,
+                                 ReLabel,SizePage,fpage,nada,pb,nil,dummyindexmake);
+                    if result = noerr then
+                        if not SchemaRecover(result,ReLabel,ECheck,ToolsMarketCode) then
+                            begin
+                            warnings := warnings + [WarnOldSchema];
+                            warnings := warnings - [WarnNoSchema];
+                            end;
+                    close_object(tresult,RedundantId);
+                    end;
+                end;
+
+{           and here we call Mark's Bag of Tricks }
+
+            if result = noerr then MarksRevenge(result,warnings,ReLabel);
+
+            if result = noerr then
+                dataRecover(result,recoverId,ReData,SizePage,fpage,EndPage,pb);
+            end;
+
+{       and what about recreating the redundant copy? }
+
+        closescan(tresult,ReData);
+        if tresult <> noerr then result := tresult;
+
+4:      closescan(tresult,ReLabel);
+        if tresult <> noerr then result := tresult;
+
+3:      relbuff(tresult,recoverBuff,0);   { empty buffer -> no error possible }
+
+2:      close_object(tresult,recoverId);
+        if tresult <> noerr then result := tresult;
+1:      ddresult := result;
+end; { FileRecovery }
+
+ÿ

@@ -1,0 +1,458 @@
+Unit DBConvert;
+{Copyright 1983,1984, Apple Computer Inc.}
+
+Interface
+{$SETC SAMPCALLS := FALSE}
+
+Uses
+{$IFC SAMPCALLS}
+     {$U  apll/tracecalls.obj}  tracecalls,
+{$ENDC}
+     {$U  libos/syscall}   SysCall,
+     {$U  international} International,
+     {$U  apll/qiunit}    QIUnit,
+     {$U  unitstd}   unitStd,
+     {$U  dbenv}     dbenv,
+     {$U  dbdecl1}   dbdecl1,
+     {$U  unitHz}    unitHz,
+     {$U  Storage}   Storage,
+     {$U  QuickDraw} QuickDraw,
+     {$U  FontMgr}   FontMgr,
+     {$U  WM.Events} Events,
+     {$U  WM.Menus}  Menus,
+     {$U  AlertMgr}  AlertMgr;
+
+{$SETC DEBUG := true }
+{$SETC DBCSYM := true }
+{$SETC DEBUG := FDBGOK }
+{$SETC DBCSYM := FDBGOK }
+
+Const   {$IFC NOT DEBUG }
+        dbcTest = false;
+        {$ENDC }
+
+        { error numbers }
+        dspTooSmall = 3100;
+        recTooSmall = 3101;
+
+        { special chars }
+        sterling='£';      { pound sterling symbol; ascii 163 (option 3) }
+        yen='´';           { yen symbol; ascii 180 (option Y) }
+        reqSpace='Ê';      { required space (non-breaking space) }
+
+Type    filltype = (zerofill, blankfill, nofill);  { Fill types for numerics }
+
+{$IFC DEBUG }
+Var     dbcTest:    boolean;                       { Flag for tracing info }
+{$ENDC }
+
+
+procedure SetDbcTest (testOn:boolean);
+
+procedure InitConvert(dbcAlerts: TAlertFile); { get customization info from
+                                                        alert file }
+
+procedure NullEditCheck (var ec:ecstr; fldtype:integer);
+
+procedure LegalEditCheck (ec:ecstr; fldtype:integer; var ecinfo:checkinfo;
+    var errnum:integer);
+
+procedure ReplaceEditCheck (curEcInfo:checkInfo; fldType:integer;
+              repType:integer; newEc:ecStr; var newEcInfo:checkInfo;
+              var errNum:integer);
+
+procedure ConstructEditCheck(fldtype:integer;
+                             VAR ecinfo: checkinfo;
+                             VAR ec: ecstr;
+                             VAR errnum: integer);
+    { given a fldtype (ss..tick), AND an OLD ecinfo array,
+        this returns an editcheck string and NEW ecinfo array that
+        is compatible with the fldtype; errnum is set to the error
+        returned by LegalEditCheck on that editcheck string;
+
+        (the old editcheck array is used only to determine the correct
+            number of digits for money and number datatypes }
+
+procedure Pack (stripflag:integer; dbf:ptrdbfield; dsp:ptrdata; dsplen:integer;
+                db:ptrdata; dblen:integer; var rsize:integer; var rdelta:integer;
+                var errnum:integer);
+
+procedure Legal (dbf:ptrdbfield; dsp:ptrdata; dsplen:integer;
+    var errnum:integer);
+
+procedure IntToAscii (dsp:ptrdata; var dsplen:integer; value:integer;
+    fill:filltype; digits:integer);
+
+procedure Unpack (dbf:ptrdbfield; dsp:ptrdata; maxdsplen:integer;
+    var dsplen:integer; db:ptrdata; var errnum:integer);
+
+Implementation
+
+{$R-}
+
+{$IFC DBCSYM}
+{$D+}
+{$ELSEC }
+{$D-}
+{$ENDC }
+
+{$S DBCUnPk}
+
+
+Const   kwJanuary    = 1;
+        kwFebruary   = 2;
+        kwMarch      = 3;
+        kwApril      = 4;
+        kwMay        = 5;
+        kwJune       = 6;
+        kwJuly       = 7;
+        kwAugust     = 8;
+        kwSeptember  = 9;
+        kwOctober    = 10;
+        kwNovember   = 11;
+        kwDecember   = 12;
+
+        kwCurrent    = 13;
+        kwC          = 14;  { abbreviation for current }
+        kwDate       = 15;
+        kwTime       = 16;
+        kwCR         = 17;
+        kwDR         = 18;
+        kwAM         = 19;
+        kwPM         = 20;
+        countKW      = 20;
+
+        tkwHX   =   1;  { hours delimiter }
+        tkwMX   =   2;  { minutes delimiter }
+        tkwSX   =   3;  { seconds delimiter }
+        tkwTD   =   4;  { time delimiter }
+
+        tkwHH   =   1;  { 2*tkwHX-1 }
+        tkw0H   =   2;  { 2*tkwHX }
+        tkwMM   =   3;  { 2*tkwMX-1 }
+        tkw0M   =   4;  { 2*tkwMX }
+        tkwSS   =   5;  { 2*tkwSX-1 }
+        tkw0S   =   6;  { 2*tkwSX }
+        tkwAM   =   7;  { 2*tkwTD-1 }
+        tkwPM   =   8;  { 2*tkwTD }
+
+        dkwMM   =   1;
+        dkw0M   =   2;
+        dkwDD   =   3;
+        dkw0D   =   4;
+
+        keyLen = 12;        { keyword length: full months/current/...
+                                should be largest of keyLen, abbrLen, compLen }
+        abbrLen = 7;        { month abbr length }
+        compLen = 10;       { format components length }
+
+        unknownChar='?';       { used below to indicate that no character
+                                 was chosen }
+
+        openString = '"';       { delims for text pattern field }
+        wild1Char= 'x';         { first wild card in pattern field }
+        wild2Char= 'X';         { second wild card in pattern field }
+
+type    timeValues = array[1..3] of integer; { hh/mm/ss }
+        dateValues = array[1..3] of integer; { mm/dd/yyyy }
+        nptrrec = record
+            case { number precision } integer of
+                0:  (bp: ptrdata);
+                1:  (ip: ^integer);
+                2:  (lp: ^longint);
+                3:  (qp: ^quadint);
+            end;
+
+        ptrLongStr = ^longStr;
+        keyStr  = string[keyLen];
+        abbrStr = string[abbrLen];
+        dbcCompStr = string[compLen];
+
+        keyList  = array[1..countKW] of keyStr;
+        abbrList = array[kwJanuary..kwDecember] of abbrStr;
+
+        asciiSet = set of 0..255;
+
+Var     keyword:    keyList;    { Months & date/time keywords (tool lang) }
+        monthAbbr:  abbrList;   { month abbreviations}
+                                    { format components }
+
+        timeComps: array[tkwHH..tkwPM] of dbcCompStr;
+        timeDelims: array[tkwHX..tkwTD] of dbcCompStr;
+
+        dateComps: array[dkwMM..dkw0D] of dbcCompStr;
+
+        yearCH:     CHAR;       { character used for year formats }
+
+        maxAMPM:    INTEGER;    { max length of AM & PM strings }
+        maxCRDR:    INTEGER;    { max length of CR & DR strings }
+        maxMon:     INTEGER;    { max month name length }
+        maxAbbr:    INTEGER;    { max month abbr string }
+
+        nullECs: array[ss..tick] of ecstr;
+
+        spcl:    asciiSet;                      { Punctuation characters }
+        alphaSet:asciiSet;                      { alphabetic chars }
+        UCalpha: asciiSet;                      { upper case alpha chars }
+        LCalpha: asciiSet;                      { lower case alpha chars }
+
+
+        { flags for parsing numbers}
+        prefPeriod:boolean;     { flag for parsing number formats: true
+                                  if period preferred as fraction mark;
+                                  only used if input format is ambiguous
+                                  (like 1,000) }
+
+        { the following indicate the characters used for digit
+          separators and fraction markers; if either is "unknownChar"
+          then the separator/fraction char will be figured out in
+          each instance }
+        cSeparator:char;         { should be "unknownChar",
+                                        <space>, <comma>,  or <period> }
+        cFraction:char;          { should be "unknownChar", <comma>,
+                                        or <period> }
+
+{$S DBCInit}
+procedure SetDbcTest {testOn:boolean};
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+{$IFC DEBUG }
+dbcTest := testOn;
+{$ENDC }
+end; { of SetDbcTest }
+
+
+{$S DBCInit}
+procedure InitConvert{(dbcAlerts: TAlertFile)};
+
+{*****************************************************************************
+
+Function: Initializes month names, date/time keywords, and punctuation
+          characters set for use by the database conversion unit.  Must be
+          called before other procedures in the unit are used.
+
+*****************************************************************************}
+
+VAR x:          INTEGER;
+    str:        Str255;
+    part:       Str255;
+    ch:         char;
+PROCEDURE GetPart(str:TPStr255; VAR part:Str255);
+VAR chPos:      INTEGER;
+BEGIN
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+chPos := POS('/', str^);
+IF chPos = 0 THEN
+    BEGIN
+    part := str^;
+    str^ := '';
+    END
+ELSE
+    BEGIN
+    part := COPY(str^, 1, chPos-1);
+    DELETE(str^, 1, chPos);
+    END;
+END;
+
+BEGIN
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+{$IFC DEBUG}
+WRITELN;
+WRITELN('ORD(dbcTest)=',ORD4(@dbcTest):1);
+{$ENDC}
+
+maxMon := 0;
+maxAbbr := 0;
+
+x := kwJanuary;
+while x <= kwDecember do
+    BEGIN
+    GetAlert(dbcAlerts, x+1000, @str);
+    GetPart(@str, part);
+    keyword[x] := part;
+    monthAbbr[x] := str;
+
+    IF LENGTH(part) > maxMon THEN
+        maxMon := LENGTH(part);
+    IF LENGTH(str) > maxAbbr THEN
+        maxAbbr := LENGTH(str);
+    x := x+1;
+    END;
+
+{ do current/c/date/time }
+GetAlert(dbcAlerts, 1013, @str);
+GetPart(@str, part);
+keyword[kwCurrent] := part;
+GetPart(@str, part);
+keyword[kwC] := part;
+GetPart(@str, part);
+keyword[kwDate] := part;
+keyword[kwTime] := str;
+
+{ do CR/DR }
+GetAlert(dbcAlerts, 1014, @str);
+GetPart(@str, part);
+keyword[kwCR] := part;
+keyword[kwDR] := str;
+IF LENGTH(keyword[kwCR]) > LENGTH(keyword[kwDR]) THEN
+    maxCRDR := LENGTH(keyword[kwCR])
+ELSE
+    maxCRDR := LENGTH(keyword[kwDR]);
+
+{ do date components }
+x := 1;
+while x <= 2 do
+    BEGIN
+    GetAlert(dbcAlerts, 1014+x, @str);  { 1015 is for month components }
+    GetPart(@str, part);
+    dateComps[2*x-1] := part;
+    dateComps[2*x] := str;
+    x := x+1;
+    END;
+
+{ year }
+GetAlert(dbcAlerts, 1017, @str);
+yearCH := str[1];
+
+{ do time components }
+x := tkwHX;
+while x <= tkwTD do
+    BEGIN
+    GetAlert(dbcAlerts, 1017+x, @str);  { 1018 is for hours }
+    GetPart(@str, part);
+    timeComps[2*x-1] := part;   { blank-filled component (or AM) }
+    GetPart(@str, part);
+    timeComps[2*x] := part;     { zero-filled component (or PM) }
+    timeDelims[x] := str;      { delimiter (or time string) }
+    x := x+1;
+    END;
+{ duplicate AM/PM in other array }
+keyword[kwAM] := timeComps[tkwAM];
+keyword[kwPM] := timeComps[tkwPM];
+
+IF LENGTH(keyword[kwAM]) > LENGTH(keyword[kwPM]) THEN
+    maxAMPM := LENGTH(keyword[kwAM])
+ELSE
+    maxAMPM := LENGTH(keyword[kwPM]);
+
+{ number parser }
+GetAlert(dbcAlerts, 1022, @str);
+ch := str[1];
+IF (ch = '.') or (ch = ',') or (ch = ' ') THEN cSeparator := ch
+ELSE IF ch = reqSpace THEN cSeparator := ' '
+     ELSE cSeparator := unknownChar;
+
+ch := str[2];
+IF (ch = '.') or (ch = ',') THEN cFraction := ch
+ELSE cFraction := unknownChar;
+
+ch := str[3];
+IF ch = ',' THEN prefPeriod := FALSE
+ELSE prefPeriod := TRUE;
+
+x := ss;
+while x <= tick do
+    BEGIN
+    GetAlert(dbcAlerts, x-ss+1031, @str);
+    IF str = '/' THEN nullECs[x] := ''
+    ELSE nullECs[x] := str;
+    x := x+1;
+    END;
+
+UCalpha := [ 65.. 90, 128..134,174..175];
+LCalpha := [ 97..122, 135..159,167,187..188,190..191];
+alphaSet := UCalpha+LCalpha;
+spcl := [0..255]-alphaSet-
+        { the digits }[48..57]; {MUST INCLUDE the spaces as special characters}
+
+end; { of InitConvert }
+
+
+{$S ECExcept}
+procedure NullEditCheck {var ec:ecstr; fldtype:integer};
+
+{******************************************************************************
+
+Function: Sets ec to the appropriate default editcheck string depending on the
+          data type.
+
+******************************************************************************}
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+
+ec := nullECs[fldtype];
+
+end; { of NullEditCheck }
+
+{$S ECExcept}
+function keyMatch(ec:ptrdata;startEC,endEC:integer;k:keystr):boolean;
+        { returns true if ec contains the keyStr k, starting at startEC,
+          upto endEC (both relative to 0)
+          0-length strings never match }
+
+var
+klen:integer;
+kmval : boolean;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+IF dbcTest THEN
+    WRITELN('keyMatch on "', k, '"');
+klen := length(k);
+if (klen>endEC-startEC+1) OR (klen=0) then
+    BEGIN
+    kmval := false;
+    END
+else
+  kmval := CompChrIdentity(POINTER(ORD(@k) + 1{skip the string length}),
+                              POINTER(ORD(ec) + startEC),
+                              klen, klen, CompVeryWeak);
+if dbctest then writeln(kmval);
+KeyMatch := kmval;
+end;
+
+{$IFC DEBUG}
+{$S DBCInit}
+procedure PrintDbRec (r: ptrdata; rsize:integer);
+
+var i,j: integer;
+    hexdigits: packed array[1..16] of char;
+    c: char;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+EXIT(PrintDbRec);       { &&& }
+hexdigits := '0123456789ABCDEF';
+writeln ('Data record: ');
+i := 0;
+while i < rsize do
+    begin
+    j := r^[i];
+    c := hexdigits[extract(@j,4,4)+1];
+    write (c);
+    c := hexdigits[extract(@j,4,0)+1];
+    write (c);
+    if ((i mod 32) = 31) and (i <> rsize-1) then
+        begin
+        writeln;
+        end
+    else write (' ');
+    i := i+1;
+    end;
+
+writeln;
+end;
+{$ENDC}
+
+{$I apll/dsptoval.text }
+{$I apll/echeck.text }
+{$I apll/dsptodb.text }
+{$I apll/legal.text }
+{$I apll/dbtodsp.text }
+
+end. { of DBConvert }
+
+
+ÿ

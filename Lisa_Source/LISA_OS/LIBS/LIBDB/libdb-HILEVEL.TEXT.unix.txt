@@ -1,0 +1,464 @@
+{#f     libdb/hilevel.text }
+{******************************************************************************
+
+                                makeformfile
+
+        see interface.
+
+*******************************************************************************}
+
+{$S swapaccs }
+procedure makeformfile{(var ddresult : integer;
+                            pform : ptrdata;
+                            pfname : ptrpathname;
+                            needtomakefile : boolean)};
+label
+        1,2,3,100;
+const
+        infosize = 100;
+var
+        has_schema : boolean;
+        loc_compact_state : states_de_compact;
+        bytes_left,
+        lresult,
+        tresult,
+        scanid,
+        rsize,
+        i : integer;
+        oldenum : fileptr;
+        loclab :
+           record
+               lab : labelentry;
+               info: array[1..infosize] of byte;
+           end;
+        plab : ptrlabelentry;
+        pfld : ptrdbfield;
+        pdesc : ptrflddesc;
+        pedesc : ptrrecptr;
+        pfd : ptrfiledesc;
+        head : header;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        movelf(pform,@head,sizeof(header));
+        if needtomakefile then
+            begin
+            loc_compact_state := init_compact_state;
+
+100:    { compact retry point }
+
+            lresult := nnew(@czone,sizeof(filedesc),@pfd);
+            if lresult <> nomem then
+                begin
+                lresult:=nnew(@czone,head.nfields*sizeof(flddesc),@pedesc);
+                if lresult = nomem then ndispose(@czone,@pfd^);
+                end;
+            if retry_compact(lresult,loc_compact_state) then goto 100;
+            if lresult <> noerr then goto 1;
+
+            pfd^.pedesc := pedesc;
+            pfd^.USERvers := head.version;
+            pfd^.flags := head.flags;
+            pfd^.lastpage := 0;
+            pfd^.nfields := head.nfields;
+            pfd^.nkeys := head.nkeys;
+            pfd^.nsort := head.nsort;
+            pfd^.ticketfld := -1;
+            pfd^.vflds := head.recsize;
+            pfd^.kvflds := head.keybytes;
+            pdesc := @pedesc^;
+            pfld := pointer(ord(pform)+sizeof(header));
+            for i := 0 to head.nfields-1 do
+                begin
+                pdesc^.size := pfld^.size;
+                pdesc^.offset := pfld^.offset;
+                pdesc^.ftype := pfld^.reptype;
+                pdesc^.direction := ord(inpset(@pfld^.options,dbdescend));
+                if pfld^.reptype = ftyptick then pfd^.ticketfld := i;
+                pdesc := pointer(ord(pdesc)+sizeof(flddesc));
+                pfld := pointer(ord(pfld)+pfld^.fldsize);
+                end;
+            makedescfile(lresult,pfname,pfd);
+            ndispose(@czone,@pfd^);
+            ndispose(@czone,@pedesc^);
+            if lresult <> noerr then goto 1;
+            end;
+
+    {   1) open a labelupdate scan on pfname
+        2) write the header of the schema as the first record
+        3) write the rest of the form as a sequence of 100 byte records
+           (the last record is <= 100 bytes, as needed) }
+
+        openscan(lresult,pfname,pfname,scanid,labelupdate);
+        if lresult <> noerr then goto 2;
+
+        if inpset(@pfiletable^[pscantable^[scanid]^.onfile]^.flags,fdata)
+            then begin
+            loclab.lab.ltype := fileschema;
+            loclab.lab.seq := 0;
+            loclab.lab.varfld.offset := sizeof(labelentry);
+            loclab.lab.varfld.size := sizeof(header);
+            movelf(@head,@loclab.info,sizeof(header));
+            lfetch(lresult,scanid,approx,1,@loclab);
+            if lresult = noerr then
+                begin
+                has_schema := true;
+                plab := @pscantable^[scanid]^.ptrcos^;
+                oldenum := plab^.enum;
+                end
+            else
+                begin
+                has_schema := false;
+                if lresult > eos then goto 3;
+                end;
+
+            linsert(lresult,scanid,@loclab,
+                    sizeof(labelentry)+sizeof(header),true);
+            if lresult <> noerr then goto 3;
+            bytes_left := head.space;
+            rsize := sizeof(header);
+            while bytes_left > 0 do
+                begin
+                pform := pointer(ord(pform)+rsize);
+                if bytes_left > infosize then rsize := infosize
+                else rsize := bytes_left;
+                bytes_left := bytes_left - rsize;
+                loclab.lab.varfld.size := rsize;
+                loclab.lab.seq := loclab.lab.seq + 1;
+                movelf(pform,@loclab.info,rsize);
+                linsert(lresult,scanid,@loclab,
+                        sizeof(labelentry)+rsize,false);
+                if lresult <> noerr then
+                    begin
+                    schemadelete(lresult,scanid,loclab.lab.enum);
+                    goto 3;
+                    end;
+                end;
+
+        {  successfull insert of new form - delete the old one }
+
+            if has_schema then schemadelete(lresult,scanid,oldenum);
+            end
+        else lresult := notdbfile;
+
+3 :     closescan(tresult,scanid);
+        if tresult <> noerr then lresult := tresult;
+2 :     if needtomakefile and (lresult <> noerr) then
+{af}        kill_secure(tresult,prefix,password);
+           {kill_object(tresult,prefix);}
+1 :     ddresult := lresult;
+end; {makeformfile}
+{******************************************************************************
+
+                                    quick_label_scan
+
+        see interface.
+
+******************************************************************************}
+
+{$S openclose }
+procedure quick_label_scan{(var ddresult : integer;
+                               scanid : integer;
+                               sintent : integer;
+                           var lscanid : integer)};{##}
+
+label
+        1,10,100,200;
+var
+        loc_compact_state : states_de_compact;
+        psd : ^ ptrscandesc;
+        pstable : ptrdata;
+        pscan : ptrscandesc;
+        lresult,
+        sonfile,
+        iscan : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if scanidbad(scanid) then
+            begin
+            lresult := badscanid;
+            goto 1;
+            end;
+
+        with pscantable^[scanid]^ do
+            begin
+            if not inpset(@pfiletable^[onfile]^.flags,fdata) then
+                begin
+                lresult := badscanid;
+                goto 1;
+                end;
+            sonfile := onfile;
+            end;
+
+        {  make the scan descriptor }
+
+        psd := @pscantable^;
+        for iscan := 0 to nscans-1 do
+            begin
+            if psd^ = nil then goto 10;
+            psd := pointer(ord(psd)+sizeof(ptrscandesc));
+            end;
+
+        { expand the scantable }
+
+        loc_compact_state := init_compact_state;
+200:    lresult := nnew(@czone,(nscans+1)*sizeof(ptrscandesc),@pstable);
+        if retry_compact(lresult,loc_compact_state) then goto 200;
+        if lresult <> noerr then goto 1;
+        movelf(@pscantable^,pstable,nscans*sizeof(ptrscandesc));
+        ndispose(@czone,@pscantable^);
+        pscantable := @pstable^;
+        pscantable^[nscans] := nil;
+        nscans := nscans + 1;
+
+
+10:     loc_compact_state := init_compact_state;
+
+100:     { compact retry point }
+
+        lresult := nnew(@czone,sizeof(scandesc),@pscan);
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+        if lresult <> noerr then goto 1;
+
+        with pscan^ do
+            begin
+            onfile := sonfile;
+            viafile := sonfile;
+            with pfiletable^[sonfile]^ do
+                begin
+                intent := sintent;
+                if sintent = labelreadonly then readers := readers + 1{##}
+                else writers := writers + 1;{##}
+                fnext := scans;
+                scans := iscan;
+                end;
+            ptrcos := nil;
+            touched := touch_by_vltree;
+            position := first;
+            end;
+        pscantable^[iscan] := pscan;
+        lscanid := iscan;
+
+1 :     ddresult := lresult;
+end; { quick_label_scan }
+{*************************************************************************
+
+                               get_header
+
+        see interface for description.
+
+**************************************************************************}
+
+{$S openclose }
+procedure get_header{(var ddresult : integer;
+                         scanid : integer;
+                      var head   : header)};
+var
+        lresult,
+        tresult,
+        lscanid : integer;
+        labentry : labelentry;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+    {   open a quick labelreadonly scan and read in the first record of
+        the fileschema (the header) }
+
+        quick_label_scan(lresult,scanid,labelreadonly,lscanid);{##}
+        if lresult = noerr then
+            begin
+            labentry.ltype := fileschema;
+            lfetch(lresult,lscanid,approx,1,@labentry);
+            if lresult = noerr then
+                 movelf(@pscantable^[lscanid]^.ptrcos^[sizeof(labelentry)],
+                        @head,
+                        sizeof(header))
+            else if lresult = eos then lresult := notfound;
+            closescan(tresult,lscanid);
+            if tresult <> noerr then lresult := tresult;
+            end;
+        ddresult := lresult;
+end; { get_header }
+{*************************************************************************
+
+                            getform
+
+        see interface for description.
+
+*************************************************************************}
+
+{$S openclose }
+procedure getform {(var ddresult : integer;
+                        scanid : integer;
+                        pdesc : ptrdata)};
+label
+        2;
+var
+        lresult,
+        tresult,
+        lscanid : integer;
+        labentry : labelentry;
+        plab : ptrlabelentry;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+    {   open a quick labelreadonly scan on the file and read in the
+        rest of the fileschema (records 1..n) }
+
+        quick_label_scan(lresult,scanid,labelreadonly,lscanid);{##}
+        if lresult = noerr then
+            begin
+            labentry.ltype := fileschema;
+            lfetch(lresult,lscanid,approx,1,@labentry);
+            if lresult = noerr then
+                 begin
+                 repeat
+                     lfetch(lresult,lscanid,next,0,nil);
+                     if lresult <> noerr then goto 2;
+                     plab := @pscantable^[lscanid]^.ptrcos^;
+                     if plab^.ltype <> fileschema then goto 2;
+                     movelf(pointer(ord(plab)+sizeof(labelentry)),
+                            pdesc,
+                            plab^.varfld.size);
+                     pdesc := pointer(ord(pdesc)+plab^.varfld.size);
+                 until false;
+            2 :  if lresult = eos then lresult := noerr;
+                 end
+            else if lresult = eos then lresult := notfound;
+            closescan(tresult,lscanid);
+            if tresult <> noerr then lresult := tresult;
+            end;
+        ddresult := lresult;
+end; { getform }
+{**************************************************************************
+
+                          zapindexes
+
+        note : all names are appended to the prefix first
+
+        this routine deletes one or all of the indexes for a given data
+        file.  if ifilename is nil, then all indexes are deleted, else
+        only the one that matches ifilename.
+
+        Input Parameters
+                datafile - name of data file whose indexes are to be
+                    zapped
+                ifilename - if only one index is to be zapped, this is
+                    the name
+
+
+        Output Parameters
+                ddresult - return result
+
+        Return Results
+                noerr
+                nomem
+                ioerr
+                inconsistent
+                eos
+                OS(kill_object,open,info,close_object)
+
+***************************************************************************}
+
+{$S swapaccs }
+procedure zapindexes(var ddresult : integer;
+                         datafile,
+                         ifilename : ptrpathname);
+label
+        10,11;
+var
+        tresult,
+        scanid : integer;
+        labentry : labelentry;
+        ppath : ptrpathname;
+        pi : ptrientry;
+        pscan : ptrscandesc;
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{       take note that we are letting the all routines relocate out
+        from under us.  thus we must be careful with ptrs like pi and
+        ppath }
+
+    {   1) open a scan on the label of the data file
+        2) either search out that one index or all indexes
+        3) delete the index and if only one particular index is involved
+           delete labelentry for that index }
+
+        openscan(ddresult,datafile,datafile,scanid,labelupdate);
+        if ddresult = noerr then begin
+            labentry.ltype := indexfile;
+            lfetch(ddresult,scanid,approx,1,@labentry);
+            while ddresult = noerr do begin
+                pi := @pscantable^[scanid]^.ptrcos^;
+                if pi^.lab.ltype <> indexfile then goto 10;
+                ppath:=pointer(ord(@pi^.iflds)+pi^.ikeys*sizeof(isegment));
+                if ifilename <> nil then
+                    if ifilename^ <> ppath^ then goto 11; { continue }
+                prefix_name(ppath);
+{af}            kill_secure(ddresult,prefix,password);
+               {kill_object(ddresult,prefix);}
+                if ddresult <> noerr then goto 10;
+                if ifilename <> nil then
+                    begin
+                    ldelete(tresult,scanid,current,0,nil);
+                    if tresult <> noerr then ddresult := tresult;
+                    goto 10;
+                    end;
+            11: lfetch(ddresult,scanid,next,0,nil);
+            end;
+10:         closescan(tresult,scanid);
+            if tresult <> noerr then ddresult := tresult;
+        end;
+end; { zapindexes }
+{^T20}
+{*********************************************************************
+
+                           deletefile
+
+        see interface.
+
+**********************************************************************}
+
+{$S swapaccs }
+procedure deletefile{(var ddresult : integer;
+                          pfname : ptrpathname)};
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{       be carefull - zapindexes may rellocate, thus pfname
+        had better not be in the same heap }
+
+        zapindexes(ddresult,pfname,nil);
+        if ddresult <= fileempty then begin
+            prefix_name(pfname);
+{af}        kill_secure(ddresult,prefix,password);
+           {kill_object(ddresult,prefix);}
+        end;
+
+end; { deletefile }
+{^T20}
+{*********************************************************************
+
+                           deleteindex
+
+        see interface.
+
+**********************************************************************}
+
+{$S swapaccs }
+procedure deleteindex{(var ddresult : integer;
+                          piname,
+                          pfname : ptrpathname)};
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{       be carefull - zapindexes may rellocate, thus piname and pfname
+        had better not be in the czone heap }
+
+
+        zapindexes(ddresult,pfname,piname);
+        if ddresult = eos then ddresult := notfound;
+
+end; { deletefile }
+ÿ

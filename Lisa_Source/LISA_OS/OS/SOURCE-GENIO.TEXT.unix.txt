@@ -1,0 +1,815 @@
+UNIT genio;
+                     (*general I/O driver*)
+
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+      (*  Modified 4/2/83 by Wendell Henry *)
+      (*           Add CALLDRIVER interface*)
+
+INTERFACE
+
+  USES
+    (*$Uobject/driverdefs.obj*)
+       driverdefs,
+    (*$Uobject/hwint.obj*)
+      hwint,
+    (*$Uobject/sysglobal.obj*)
+      globalda,
+    (*$Uobject/procprims.obj*)
+      proc_prims,
+    (*$Uobject/mmprim.obj*)
+       mmprimitives,
+    (*$Uobject/asynctr.obj*)
+      asynctr;
+
+    TYPE
+      drvrec = record
+                driver_id: longint;     (* as a debugging aid*)
+                version: integer;       (* driver's version number*)
+                sem: semaphore;         (* locks access to drvrec*)
+                drvname: e_name;        (* for loading driver *)
+                nusers: 0..32767;       (* use count for driver - 0 if unloaded*)
+                e_pt: absptr;           (* driver address - undefined if nusers=0*)
+                kres_addr: absptr;      (* driver address if kernel-resident. nil
+                                           if requires loading off disk*)
+               end;
+
+    procedure LINK_TO_PCB (req_ptr: reqptr_type);
+
+    procedure CALLDRIVER (var errnum: integer; config_ptr: ptrdevrec;
+                                               parameters: param_ptr);
+
+    procedure UP (var errnum: integer; config_ptr: ptrdevrec;
+                     callers_config_ptr: ptrdevrec);
+
+    procedure DOWN (var errnum: integer; config_ptr: ptrdevrec;
+                     callers_config_ptr: ptrdevrec; enter_at: integer);
+
+    procedure ALARM_ASSIGN (var alarm: integer; pdr: ptrdevrec;
+                            status: intson_type);
+
+    procedure ALARM_FIRES (alarm: integer);
+
+    procedure CANCEL_REQ (req: reqptr_type);
+
+    procedure DRIVERCALL (var errnum: integer; dev_index: integer; parameters:
+                          param_ptr);
+
+    procedure SEQENTIO (var errnum:integer; dev_index: integer; io_buff_addr:
+                        absptr; length: longint; read_f: boolean;
+                        var req_ptr: reqptr_type);
+
+    procedure DISKIO (var errnum: integer; dev_index: integer; var header: pagelabel;
+                    extra_link: int4; extra_data_used: integer; io_buff_addr: absptr;
+                    length: integer; block_no: int4; read_f: boolean;
+                    mode: disk_io_type; var req_ptr: reqptr_type);
+
+    function CHAIN_FORWARD (current: linkage): reqptr_type;
+
+    function BADCALL (parameters: param_ptr): integer;
+
+    function KEYBD (parameters: param_ptr): integer;
+
+    function SCC (parameters: param_ptr): integer;
+
+  IMPLEMENTATION
+
+    (*$S krgenio*)
+
+    (*$IFC not debug2*)
+    (*$R-*) (*rangecheck off unless debug mode*)
+    (*$ENDC*)
+
+
+
+    CONST
+      errbase = 600;
+      syserrbase = 10600;
+
+    TYPE
+      ptrpathname = ^pathname; (*s/b USES*)
+
+    VAR {Yes, it's global.}
+      alarm_table: array [0..25] {keyed to # of alarms in HWINT} of record
+                     cfg_ptr: ptrdevrec;
+                     intstat: intson_type;
+                     filler: integer (*makes record a power of 2 - fast subscripts*)
+                   end;
+
+    procedure LOAD_DRIVER (var err: integer; var add: absptr; name: e_name);
+                          external; (*s/b USES*)
+
+    procedure UNLOAD_DRIVER (var err: integer; add: absptr); external; (*s/b USES*)
+
+    procedure CALLDRIVER; external;
+
+    procedure ALRM; external;
+
+    procedure TWIGIO (var er: integer; var req:reqblk; addr: int4); external;
+
+    procedure CANCEL_REQ(*req: reqptr_type*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Dispose of request block & unlink from PCB  *)
+       (*                                                           *)
+       (* Input Parameters:  Pointer to request block               *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  none                                       *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+
+    VAR
+      pblk_in_pcb: ptrblk_type;
+
+    begin
+      WITH req^ do
+      begin
+        pblk_in_pcb := @blk_in_pcb;
+        if pblk_in_pcb^ = [i_o] then
+          WITH cfigptr^ do
+            if permreq_ptr = req then
+            begin
+              preq_avail := true;
+              EXIT(cancel_req) (*permanent request doesn't get deleted*)
+            end
+      end;
+      RELSPACE (ord(req), b_sysglobal_ptr)
+    end; (*cancel_req*)
+
+
+    procedure DISKIO;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start up or queue a disk read or write      *)
+       (*                                                           *)
+       (* Input Parameters:  You wouldn't believe it if I told you. *)
+       (*                                                           *)
+       (*                                                           *)
+       (*                                                           *)
+       (* Output Parameters:  Req_ptr is the address of the newly   *)
+       (*   created request block.                                  *)
+       (*                                                           *)
+       (* Side Effects:  Device dependent driver is invoked.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        p: params;
+        d_ptr: absptr;
+        ext_ptr: extdptr_type;
+        pblk_in_pcb: ptrblk_type;
+        ext_config: ^ext_diskconfig;
+        leftlink: link_ptr;
+        bytes: longint;
+        prevints: intson_type;
+
+      begin
+        errnum := 0;
+        ext_config:=pointer(configinfo[dev_index]^.ext_addr);
+        if (block_no < 0) or (length <= 0) or
+           ( (block_no + length) > ext_config^.num_bloks ) or
+           ( (mode = chained_hdrs) and not read_f ) or
+           (read_f and (mode = with_header)) then
+          errnum := errbase + 8 (*illegal mode, start addr or transfer length*)
+        else
+        if not GETSPACE(sizeof(reqblk)+sizeof(disk_extend), b_sysglobal_ptr, d_ptr)then
+          errnum := errbase + 10;
+
+        if errnum = 0 then
+        begin
+          req_ptr := pointer (d_ptr);  (*point to the request*)
+          ext_ptr := pointer (d_ptr + sizeof(reqblk));  (*point to the extension area*)
+
+          (* initialize the request block *)
+
+          WITH req_ptr^ do
+          begin
+            pcb_chain.headr := ord(nil);
+            pcb_chain.kind := reqblk_type;
+            reqstatus.reqsrv_f := active;
+            reqstatus.reqabt_f := false;
+            pblk_in_pcb := @blk_in_pcb;
+            pblk_in_pcb^ := [i_o];
+            hard_error := 0;
+            operatn := ord(read_f);
+            cfigptr := configinfo[dev_index];
+            req_extent := ord(ext_ptr); (*point the request block to the extensn*)
+          end;
+
+          (* transfer parameters to disk extension data block *)
+
+          WITH ext_ptr^ do
+          begin
+            if (mode = without_header) and not read_f then
+              WITH soft_hdr do
+              begin (*zero out the header when writing w/o headers*)
+                version := 0;
+                datastat := dataok;
+                filler := 0;
+                volume := 0;
+                fileid := 0;
+                dataused := 0;
+                abspage := 0;
+                relpage := 0;
+                fwdlink := 0;
+                bkwdlink:= 0
+              end
+            else
+              soft_hdr := header;
+            last_fwd_link := extra_link;
+            last_data_used := extra_data_used;
+            read_flag := read_f;
+            blkno:= block_no + ext_config^.strt_blok;
+            io_mode := mode;
+            num_chunks := length;
+            xfer_count := 0;
+            if io_mode = raw_io then
+              bytes := 536
+            else
+              bytes := 512;
+            CVT_BUFF_ADDR (errnum, read_f, io_buff_addr, bytes*num_chunks,
+                             buff_rdb_ptr, buff_offset);
+          end;
+
+          if errnum > 0 then
+            RELSPACE (ord(req_ptr), b_sysglobal_ptr)
+          else
+          begin  (*continue if no errs yet*)
+            ADJ_IO_CNT (true, ext_ptr^.buff_rdb_ptr);  (*prevent swapout*)
+
+            (* call appropriate disk driver*)
+
+            p.fnctn_code := dskio;
+            p.req := req_ptr;
+            CALLDRIVER (errnum, req_ptr^.cfigptr, @p);  (* call dskio *)
+            if errnum > 0 then
+            begin
+              ADJ_IO_CNT (false, ext_ptr^.buff_rdb_ptr);  (* allow swapout on errors*)
+              CANCEL_REQ (req_ptr);
+            end
+          end
+        end
+      end;  (*diskio*)
+
+
+
+    procedure DRIVERCALL(*var errnum: integer; dev_index: integer; parameters:
+                          param_ptr*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Device-independent driver call              *)
+       (*                                                           *)
+       (* Input Parameters:  Index into configinfo, and call-       *)
+       (*       specific parameter block.                           *)
+       (*                                                           *)
+       (* Output Parameters:  Only through pointers in parameter blk*)
+       (*                                                           *)
+       (* Side Effects:  Driver routine dependent                   *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+    begin
+      CALLDRIVER (errnum, configinfo[dev_index], parameters)
+    end; (*drivercall*)
+
+
+    procedure LINK_TO_PCB (* req_ptr: reqptr_type*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  link passed request to current process's    *)
+       (*        ctrl blk and initialize all but reqspec_info fields*)
+       (*                                                           *)
+       (* Input Parameters:  Pointer to request block               *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+       VAR
+         prevints: intson_type;
+         leftlink: reqptr_type;
+         pblk_in_pcb: ptrblk_type;
+
+       begin
+         WITH req_ptr^ do
+         begin
+            pcb_chain.headr := ord(nil);
+            pcb_chain.kind := reqblk_type;
+            reqstatus.reqsrv_f := active;
+            reqstatus.reqabt_f := false;
+            pblk_in_pcb := @blk_in_pcb;
+            pblk_in_pcb^ := [i_o];
+            hard_error := 0;
+         end
+       end; (*link_to_pcb*)
+
+
+    (*$S fs3*)
+
+     procedure DOWN (*var errnum: integer; config_ptr: ptrdevrec;
+                     callers_config_ptr: ptrdevrec; enter_at: integer*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Undo what UP did.                           *)
+       (*                                                           *)
+       (* Input Parameters:  pointer to configinfo record of device *)
+       (*  to be DOWNed; pointer to heirarchically lower configinfo *)
+       (*  (or nil if none lower); enter_at allows for several entry*)
+       (*  points (0 is standard value except when called from UP   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  UNLOAD_DRIVER, dunatttach and ddown may be *)
+       (*   called.  Semaphore is cleared when enter_at > 1.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:  only error is: I/O still in progress   *)
+       (*                                                           *)
+       (*************************************************************)
+
+     LABEL
+       1,2,3;
+
+     VAR
+       err2: integer;
+       p: params;
+       pdrvrec: ^drvrec;
+
+     begin
+       WITH config_ptr^ do
+       begin
+         errnum := 0;
+         pdrvrec := pointer(drvrec_ptr);
+         if pdrvrec = nil then
+           EXIT (DOWN); (*only until all configinfos are configurable*)
+
+         (*test for branch to internal entry points for backing out of UP on errors*)
+
+         if enter_at > 0 then
+         begin
+           if enter_at = 1 then goto 1;
+           if enter_at = 2 then goto 2;
+           if enter_at = 3 then goto 3;
+         end;
+
+         if entry_pt = ord(nil) then
+           EXIT (DOWN);  (*device not currently "upped"*)
+
+         p.still_inuse := false;
+         if callers_config_ptr <> nil then
+         begin
+           p.fnctn_code := dunattach;
+           p.o_configptr := callers_config_ptr;
+           CALLDRIVER (err2, config_ptr, @p)  (*un-attach the sub_driver*)
+         end;
+         if permanent or p.still_inuse then
+           EXIT (DOWN);  (*keep device "up"*)
+
+  1:     WAIT_SEM (pdrvrec^.sem, []);
+         p.fnctn_code := ddown;
+         CALLDRIVER (err2, config_ptr, @p);  (*down the device*)
+         if enter_at = 0 then
+           if err2 > 0 then
+           begin
+             errnum := err2;
+             SIGNAL_SEM (pdrvrec^.sem);
+             EXIT (DOWN)  (*I/O still in progress*)
+           end;
+
+  2:     entry_pt := ord(nil);
+         WITH pdrvrec^ do
+         begin
+           nusers := nusers - 1;
+           if nusers = 0 then (*driver no longer in use*)
+             if kres_addr = ord(nil) then
+               UNLOAD_DRIVER (err2, e_pt)
+         end;
+
+  3:     SIGNAL_SEM (pdrvrec^.sem);
+         if required_drvr <> nil then
+           DOWN (err2, required_drvr, config_ptr, 0)
+       end
+     end; (*down*)
+
+
+
+    (*$S krgenio*)
+
+     procedure UP (*var errnum: integer; config_ptr: ptrdevrec;
+                     callers_config_ptr: ptrdevrec*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Up drivers "above" this, load driver,       *)
+       (*   initialize driver, and attach "lower" drivers.          *)
+       (*                                                           *)
+       (* Input Parameters:  pointer to configinfo record of device *)
+       (*  to be UPped; pointer to heirarchically lower configinfo  *)
+       (*  (or nil if none lower).                                  *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  may call LOAD_DRIVER, dinit and dattach    *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+
+     VAR
+       err2: integer;
+       p: params;
+       pdrvrec: ^drvrec;
+
+
+     begin
+       WITH config_ptr^ do
+       begin
+         errnum := 0;
+
+         pdrvrec := pointer(drvrec_ptr);
+         if pdrvrec = nil then
+           EXIT (UP); (*for non-configurable devices*)
+
+         if entry_pt <> ord(nil) then
+         begin (*already upped*)
+           if callers_config_ptr <> nil then
+           begin
+             p.fnctn_code := dattach;
+             p.n_configptr := callers_config_ptr;
+             CALLDRIVER (errnum, config_ptr, @p)  (*attach the sub_driver*)
+           end;
+           EXIT (UP)
+         end;
+
+         if required_drvr <> nil then
+         begin  (*bring up the required driver before this one*)
+           UP (errnum, required_drvr, config_ptr);
+           if errnum > 0 then EXIT (UP)
+         end;
+
+         WITH pdrvrec^ do
+         begin
+           WAIT_SEM (sem, []);
+           if self_ident = $7FFF then (*no card in slot*)
+             errnum := errbase + 9
+           else
+             if nusers = 0 then
+             begin
+               if kres_addr <> ord(nil) then
+                 e_pt := kres_addr  (*kernel resident driver, no need to load*)
+               else
+                 LOAD_DRIVER (errnum, e_pt, drvname);
+             end;
+
+           if errnum > 0 then
+           begin
+             DOWN (err2, config_ptr, callers_config_ptr, 3); (*back out & clear sem*)
+             EXIT (UP)
+           end;
+
+           entry_pt := e_pt;
+           nusers := nusers + 1;
+
+           p.fnctn_code := dinit;
+           CALLDRIVER (errnum, config_ptr, @p); (*initialize the driver*)
+           if errnum > 0 then
+           begin
+             DOWN (err2, config_ptr, callers_config_ptr, 2); (*back out & clear semaphore*)
+             EXIT (UP)
+           end;
+           SIGNAL_SEM (sem)
+         end;
+
+         if callers_config_ptr <> nil then
+         begin
+           p.fnctn_code := dattach;
+           p.n_configptr := callers_config_ptr;
+           CALLDRIVER (errnum, config_ptr, @p);  (*attach the sub_driver*)
+           if errnum > 0 then
+             DOWN (err2, config_ptr, callers_config_ptr, 1) (*back out*)
+         end
+       end
+
+     end; (*up*)
+
+
+     procedure ALARM_FIRES (*alarm: integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  driver alarms call ALRM, which calls this   *)
+       (*                                                           *)
+       (* Input Parameters:  alarm number is in alarm on entry.     *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+     VAR
+       errnum: integer;
+       p: params;
+
+     begin
+       WITH alarm_table[alarm] do
+       begin
+         INTSON (intstat);
+         p.fnctn_code := dalarms;
+         p.intpar := alarm;
+         CALLDRIVER (errnum, cfg_ptr, @p)
+       end
+     end;  (*alarm_fires*)
+
+     procedure ALARM_ASSIGN (*var alarm: integer; pdr: ptrdevrec;
+                              status: intson_type*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Call ALARMASSIGN while providing for correct*)
+       (*               driver to be called when alarm fires.       *)
+       (*                                                           *)
+       (* Input Parameters:  pointer to this devices configinfo rec.*)
+       (*       and desired interrupt priority during alarm execution*)
+       (*                                                           *)
+       (* Output Parameters:  alarm number  (=0 when none available)*)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:                                *)
+       (*                                                           *)
+       (* Error Conditions:  none available when alarm = 0          *)
+       (*                                                           *)
+       (*************************************************************)
+
+     begin
+       ALARMASSIGN (alarm, ord(@ALRM));
+       WITH alarm_table[alarm] do
+       begin
+         cfg_ptr := pdr;
+         intstat := status
+       end
+     end;  (*alarm_assign*)
+
+    function BADCALL (*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Illegal driver.                             *)
+       (*                                                           *)
+       (* Input Parameters:  standard parameter record              *)
+       (*                                                           *)
+       (* Output Parameters:  errnum returned as function result    *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions: Always causes an error                  *)
+       (*                                                           *)
+       (*************************************************************)
+
+    begin
+      if parameters^.fnctn_code = dinterrupt then
+        SYSTEM_ERROR (syserrbase+9);  (*interrupts would ignore returned errnum*)
+      badcall := errbase+9;
+    end;
+
+
+    function CHAIN_FORWARD (*current: linkage): reqptr_type*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Use forward link of relptr to point to next *)
+       (*                request block                              *)
+       (*                                                           *)
+       (* Input Parameters:  linkage pointing to next request block *)
+       (*                                                           *)
+       (* Output Parameters:  pointer to the request block          *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  callable from drivers         *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+    begin
+      CHAIN_FORWARD := pointer(current.fwd_link+b_sysglobal_ptr-sizeof(Rb_headT))
+    end;
+
+
+    function SCC (*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Driver for 2-port SCC                       *)
+       (*                                                           *)
+       (* Input Parameters:  standard parameter record              *)
+       (*                                                           *)
+       (* Output Parameters:  errnum returned as function result    *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  only for initialization of scc*)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+   CONST
+     ebase = 680;
+
+   begin (*scc*)
+     case parameters^.fnctn_code of
+
+     dinit,ddown: SCC := 0; (*no errors**)
+
+     dattach: WITH parameters^ do
+         begin
+           if n_configptr^.iochannel = 0 then
+             port_cb_ptrs.rs232a := ord(n_configptr)
+           else
+             port_cb_ptrs.rs232b := ord(n_configptr);
+           SCC := 0;
+     end;  (*scattach*)
+
+
+     dunattach:
+     with parameters^ do
+     begin
+         if o_configptr^.iochannel = 0 then
+           port_cb_ptrs.rs232a := 0
+         else
+           port_cb_ptrs.rs232b := 0;
+
+         still_inuse := ( (port_cb_ptrs.rs232a <> 0) or (port_cb_ptrs.rs232b <> 0) );
+     end;  (*scunattach*)
+
+
+     otherwise
+       SCC := ebase + 2; (*no other functions allowed for 2-line SCC*)
+
+     end (*case*)
+   end; (*SCC*)
+
+    function KEYBD (*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Driver for 2  console screens               *)
+       (*                                                           *)
+       (* Input Parameters:  standard parameter record              *)
+       (*                                                           *)
+       (* Output Parameters:  errnum returned as function result    *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  only for initialization of kbd*)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+   begin (*keyboard demultiplexor*)
+     case parameters^.fnctn_code of
+
+       dinit,ddown,dattach: KEYBD := 0;
+
+       dunattach: parameters^.still_inuse := false;
+
+       otherwise  KEYBD := 656;
+
+     end (*case*)
+   end; (*keybd*)
+
+
+    (*$S fs1*)
+
+    procedure SEQENTIO(*var errnum:integer; dev_index: integer; io_buff_addr:
+                         absptr; length: longint; read_f: boolean;
+                         var req_ptr: reqptr_type*);
+
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start up or queue a sequential read/write.  *)
+       (*                                                           *)
+       (* Input Parameters:  configinfo index, memory address,      *)
+       (*   length in bytes, read/write flag, process's pcb_ptr.    *)
+       (*                                                           *)
+       (* Output Parameters:  Req_ptr is the address of the newly   *)
+       (*   created request block.                                  *)
+       (*                                                           *)
+       (* Side Effects:  Device dependent driver is invoked.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+
+    VAR
+      d_ptr: absptr;
+      ext_ptr: seqextptr_type;
+      prevints: intson_type;
+      leftlink : link_ptr;
+      p: params;
+      pblk_in_pcb: ptrblk_type;
+
+    begin
+      errnum := 0;
+      WITH configinfo[dev_index]^ do
+        if preq_avail then
+        begin (*use pre-allocated request_block*)
+          preq_avail := false;
+          d_ptr := ord(permreq_ptr)
+        end
+        else
+          if not GETSPACE (sizeof(reqblk)+sizeof(seq_extend), b_sysglobal_ptr, d_ptr) then
+            errnum := errbase + 10;
+      if errnum = 0 then
+      begin
+        req_ptr := pointer (d_ptr);  (*return pointer to the request*)
+        ext_ptr := pointer (d_ptr + sizeof(reqblk));  (* point to extension area*)
+
+        (* initialize the request block *)
+
+        WITH req_ptr^ do
+        begin
+          pcb_chain.headr := ord(nil);
+          pcb_chain.kind := reqblk_type;
+          reqstatus.reqsrv_f := active;
+          reqstatus.reqabt_f := false;
+          pblk_in_pcb := @blk_in_pcb;
+          pblk_in_pcb^ := [i_o];
+          hard_error := 0;
+          operatn := ord(read_f);
+          cfigptr := configinfo[dev_index];
+          req_extent := ord(ext_ptr); (*point the request block to the extensn*)
+        end;
+
+        (* initialize the extension data block *)
+
+        WITH ext_ptr^ do
+        begin
+          read_flag := read_f;
+          num_bytes := length;
+          xfer_count := 0;
+          CVT_BUFF_ADDR (errnum, read_f, io_buff_addr, length, buff_rdb_ptr,
+                         buff_offset);
+        end;
+        if errnum > 0 then
+          WITH configinfo[dev_index]^ do
+          if permreq_ptr = req_ptr then
+            preq_avail := true
+          else
+            RELSPACE (ord(req_ptr), b_sysglobal_ptr)
+        else
+        begin  (*continue if no errs yet*)
+          ADJ_IO_CNT (true, ext_ptr^.buff_rdb_ptr);  (*prevent swapout*)
+
+          (* call driver to start the request *)
+
+          p.fnctn_code := seqio;
+          p.req := req_ptr;
+          CALLDRIVER (errnum, req_ptr^.cfigptr, @p);  (* call seqio *)
+          if errnum > 0 then
+          begin
+            ADJ_IO_CNT (false, ext_ptr^.buff_rdb_ptr);  (* allow swapout on errors*)
+            CANCEL_REQ (req_ptr);
+          end
+        end
+      end
+    end; (*seqentio*)
+
+  end.
+
+ÿ

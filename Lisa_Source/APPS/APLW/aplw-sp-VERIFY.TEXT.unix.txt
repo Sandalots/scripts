@@ -1,0 +1,1507 @@
+{$i aplw/compflags}
+unit SpVerify;
+
+{ gdf  2/24/84 -- insert trace calls for segmentation  }
+
+(* Copyright 1983, 1984, Apple Computer Inc. *)
+{'Houghton Mifflin Spelling Verification-Correction Copyright
+  © Houghton Mifflin 1983. All rights strictly reserved.
+  Unpublished. Restricted and confidential proprietary programs
+  of Houghton Mifflin. Licenced for use solely in licensee's
+  software pursuant to written agreement with Houghton Mifflin
+  Company. Reproduction, disclosure, or re-creation of
+  embodied computer programs or algorithms is prohibited .'}
+
+interface
+
+uses      {$IFC sampcalls}                                               {gdf 2/24/84}
+             {$U aplw/tracecalls.obj} tracecalls,
+          {$ENDC}
+          {$u libos/syscall }      syscall,
+          {$u libos/psyscall }     psyscall,
+          unitstd,
+          unithz,
+          storage,
+          {$ifc fSpring}
+          QuickDraw,
+          fontmgr,
+          {$elsec}
+          fontmgr,
+          QuickDraw,
+          {$endc}
+          international,
+          hwint,    {end of libraries}
+          {$u aplw/sp/spelling.obj }    spelling,
+          {$u aplw/sp/locate.obj }      locate,
+          {$u aplw/sp/ramver.obj }      ramver;
+
+function SpInitialize (rootVolumeName, userFileName: PathName; var foundDictName: PathName;
+                        spLsdn: integer; newVersion: Boolean): TSpReturn;
+     {initializes the spelling corrector.
+      rootVolumeName is the volume name upon which to look for the dictionary: {D=Dict.data.
+      userFileName is the user dictionary OS name. If there is no existing user dictionary, one is created.
+      spLsdn is the lsdn number to use for the spelling data segment.
+      newVersion = true   creates a new user dictionary, for use if the version number is too old or file bad.
+      returns 'ok' unless there is a problem.
+      SpStatus is set accordingly otherwise (see sp/spelling).
+      userFileName is set to the main dictionary file name if found.
+      N.B.   SpStatus := notInitialized;   should be performed when initializing the CALLING program}
+
+function SpTerminate (term: TermCode): TSpReturn;
+     {TermCode controls the action as follows:
+       unbindSegment:    unbinds the segment (e.g. after verify loop is completed)
+       closeFile:        closes the file (e.g. deactivation of document)
+       cleanUp:          terminates spelling, closing the files and removing the data segment.}
+
+function VerifyWord (var spWord: TSpWord): TSpReturn;
+     {verifies that a given word (first field in spWord) is in the dictionaries.
+      spWord.word should be set to the given word.
+      The return is 'wordExists' if the given word is valid but not capitalized properly,
+      and 'ok' if it is BOTH valid and has the correct capitalization.
+      In the former case, a correctly capitalized word is entered in the corrected words list.
+      The word is unchanged.
+      The hyphens are set correctly if verified.
+      The capitalization is set as for the ORIGINAL word.}
+
+function ZapUser: TSpReturn;
+     {clears the user dictionary
+      returns 'ok' or an error code}
+
+function GetUserWord (var spWord: TSpWord; var byteNum: Longint): TSpReturn;
+     {gets a word from the user dictionary.
+      wordIndex should be initially set to userStartByte.
+       It is reset to the next word position automatically,
+      returns 'ok', 'limitExceeded' or an error code}
+
+function AddUserWord (spWord: TSpword; start: Boolean; var numOfWords: Integer): TSpReturn;
+     {adds word to user dictionary.
+      spWord.word should be set.
+      Start must be true at the beginning of a set of undoable words, ow false.
+      numOfWords should return the number of words currently in the user dictionary (doesn't work now).
+      returns 'ok' if the word has been inserted, 'wordExists' if it already exists, or an error code}
+
+function DelUserWord (SpWord: TSpword; start: Boolean; var numOfWords: Integer): TSpReturn;
+     {deletes a word from the user dictionary.
+      spWord.word should be set.
+      Start must be true at the beginning of a set of undoable words, ow false.
+      numOfWords should return the number of words currently in the user dictionary (doesn't work now).
+      returns 'ok' if the word has been inserted, 'notFound' if it doesn't exist, or an error code}
+
+function UndoUserWord (remove: Boolean; var numOfWords: Integer): TSpReturn;
+     {undoes (or redoes) last addUserWords or delUserWords.
+      remove is set to remove (or unremove)
+      numOfWords should return the number of words currently in the user dictionary (doesn't work now).
+      returns ok or an error code}
+
+{internal use only}
+
+function UserVerify (indxfn, codefn: TLongBits; var spWord: TSpWord): TSpReturn;
+procedure ClearCache;
+function CantFixStatus: Boolean;
+
+implementation
+
+{$ifc fDbgOk}
+{$r+ Range Checking On }
+{$d+ Debugging On}
+{$elsec}
+{$r- Range Checking Off }
+{$d- Debugging Off}
+{$endc}
+
+{$S LWSpell}
+
+const     scavangeRestored =  -1176;
+          noFileFound =         948;
+          OSok =                  0;
+
+
+{$S LWMiscSpell}
+
+function ReadUserWord (var letters: TSpLetters; var byteNum: Longint; LimitLocation: Longint;
+                       var location: Integer): TSpReturn;
+     label 999;
+     var  tmpReturn:     TSpReturn;
+          i:             Integer;
+          len,
+          bytesDone:     Longint;
+          readIn:        StoredUserWord;
+     begin
+         {$IFC sampcalls}  ALogCall;  {$ENDC}
+         {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('ReadUserWord');
+               writeln (testLine, 'byteNum: ', byteNum);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          if byteNum < userStartByte then tmpReturn := limitExceeded
+          else if byteNum >= LimitLocation then tmpReturn := limitExceeded
+          else with globals^ do begin
+               tmpReturn := unableToLoad;
+               len := 3;
+              {$ifc fDbgOk}
+               letters := '';
+               {$endc}
+               Read_Data (SpErrNum, userDictionary, ord4 (@readIn), len,
+                          bytesDone, absolute, byteNum);
+              {$ifc fDbgOk}
+               if testSpell then if tUser in testOptions then begin
+                    writeln (testLine, 'Read1: ', SpErrNum, ' bytesdone: ', bytesdone,
+                             ' len: ', length (readIn.str));
+               end;
+               {$endc}
+               if (SpErrNum <= OSok) then if (bytesDone = len) then begin
+                    len := length (readIn.str);
+                    Read_Data (SpErrNum, userDictionary, ord4 (@readIn) + 3, len,
+                               bytesDone, absolute, byteNum + 3);
+                   {$ifc fDbgOk}
+                    if testSpell then if tUser in testOptions then begin
+                         writeln (testLine, 'Read2: ', SpErrNum, ' bytesdone: ', bytesdone);
+                    end;
+                    {$endc}
+                    if (SpErrNum <= OSok) then if (bytesDone = len) then begin
+                         tmpReturn := ok;
+                         byteNum := len + byteNum + 3;
+                         location := readIn.int;
+                         letters := readIn.str;
+                    end;
+               end;
+          end;
+          999: {exit}
+          ReadUserWord := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^, ' word: ', letters,
+                        ' bytenum: ', byteNum);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+procedure ClearCache;
+     var  i: integer;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          with globals^ do with usertab do begin
+               for i := 0 to cacheInterval do cache [i] := emptyMask;
+          end;
+     end;
+
+Procedure MungUser;
+     var  i: integer;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          with globals^ do with usertab do begin
+               with userCore do begin
+                    version := curVersion;
+                    header := userCode;
+                    userCurrentByte := userStartByte;
+                    userUndoPosition := userStartByte;
+               end;
+               {$ifc fDbgOk}
+               if testSpell then if tInit in testOptions then begin
+                    with userCore do writeln ('Header: ', header, ' Version: ', version);
+               end;
+               {$endc}
+               size := userLength - 1;
+               hyp_caps := size div 16;
+               if hyp_caps > 255 then hyp_caps := 255;
+               indexLimit := size - hyp_caps - 7;
+               maxFill := userLength div 2 + userLength div 4;
+               numElements := 0;
+               for i := 6 to indexLimit do codes [i].bits := bCodeMask;
+               for i := indexLimit + 1 to userLength do begin
+                    codes [i].bits := bEmptyMask;
+                    deleted [i] := false;
+               end;
+          end;
+     end;
+
+{$S LWSpFind}
+function CantFixStatus {: Boolean};
+     {call only when SpStatus <> SpellReady. return true if }
+     var  allowed: boolean;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tInit in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('CantFixStatus');
+               writeln (testLine, 'SpStatus: ', ShowStatus (ord (SpStatus))^);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          CantFixStatus := true;
+          if SpStatus >= closedFile then begin
+               Bind_DataSeg (SpErrNum, SpSegRefNum);
+               if SpErrNum <= OSok then begin
+                    if SpStatus <> closedFile then begin
+                         CantFixStatus := false;
+                         SpStatus := SpellReady;
+                    end
+                    else with globals^ do begin
+                         POpen (SpErrNum, userCore.LastDictionaryName, RAMFile, [Dread, Private], allowed);
+                         if (SpErrNum > OSok) or (SpErrNum = scavangeRestored)
+                          then Unbind_DataSeg (SpErrNum, SpSegRefNum)
+                         else begin
+                              CantFixStatus := false;
+                              SpStatus := SpellReady;
+                         end;
+                    end;
+               end;
+          end;
+          {$ifc fDbgOk}
+          if testSpell then if tInit in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'SpStatus: ', ShowStatus (ord (SpStatus))^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+{$S LWActive}
+
+function SpTerminate {(term: TermCode): TSpReturn};
+     label 10;
+     var  bytesDone:     Longint;
+          tmpReturn:     TSpReturn;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          tmpReturn := unableToLoad;
+          with globals^ do begin
+               case term of
+               closeFile: begin
+                         if SpStatus > closedFile then begin
+                              if SpStatus = SpellReady then begin
+                                   Unbind_DataSeg (SpErrNum, SpSegRefNum);
+                                   if SpErrNum <= OSok then SpStatus := unboundSegment
+                                   else begin
+                                        {$ifc fDbgOk}
+                                        if testSpell then  if tInit in testOptions then begin
+                                             writeln (' unbind: ', SpErrNum);
+                                        end;
+                                        {$endc}
+                                   end;
+                              end;
+                              Close_Object (SpErrNum, RAMFile);
+                              {$ifc fDbgOk}
+                              if testSpell then if SpErrNum > OSok then if tInit in testOptions then begin
+                                   writeln (' close: ', SpErrNum);
+                              end;
+                              {$endc}
+                              SpStatus := closedFile;
+                         end;
+                         tmpReturn := ok;
+                    end;
+               unbindSegment: begin
+                         if SpStatus = SpellReady then begin
+                              Unbind_DataSeg (SpErrNum, SpSegRefNum);
+                              if SpErrNum <= OSok then SpStatus := unboundSegment
+                              else begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then  if tInit in testOptions then begin
+                                        writeln (' unbind: ', SpErrNum);
+                                   end;
+                                   {$endc}
+                              end;
+                         end;
+                         tmpReturn := ok;
+                    end;
+               cleanUp: begin
+                         if SpStatus > noUserDictionary then begin {do user dictionary}
+                              if (SpStatus = closedFile) or (SpStatus = unboundSegment) then begin
+                                   Bind_DataSeg (SpErrNum, SpSegRefNum);
+                                   if SpErrNum > OSok then begin
+                                        {$ifc fDbgOk}
+                                        if testSpell then if tInit in testOptions then begin
+                                             writeln (' Cant fix user binding: ', SpErrNum);
+                                        end;
+                                        {$endc}
+                                        goto 10;{we lose user dictionary}
+                                   end;
+                                   if SpStatus = unboundSegment then SpStatus := SpellReady
+                                   else SpStatus := boundSegment;
+                              end;
+                              userBlock.info := userCore;
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   writeln ('Header: ', userBlock.info.header,
+                                            ' Version: ', userBlock.info.version);
+                              end;
+                              {$endc}
+                              Write_Data (SpErrNum, userDictionary, ord4 (@userBlock), userSave,
+                                          bytesDone, absolute, 0);
+                              {$ifc fDbgOk}
+                              if testSpell then if (SpErrNum > OSok) or (bytesDone <> userSave)
+                               then if tInit in testOptions then begin
+                                   writeln (' UserDictionary Write_Data: ', SpErrNum);
+                              end;
+                              {$endc}
+                               {set logical position to end of file}
+                              Write_Data (SpErrNum, userDictionary, ord4 (@userBlock), 0,
+                                          bytesDone, absolute, userCore.userCurrentByte);
+                              {$ifc fDbgOk}
+                              if testSpell then if (SpErrNum > OSok) or (bytesDone <> 0)
+                               then if tInit in testOptions then begin
+                                   writeln (' UserDictionary Set LEOF: ', SpErrNum);
+                              end;
+                              {$endc}
+                              Truncate (SpErrNum, userDictionary);
+                              {$ifc fDbgOk}
+                              if testSpell then if (SpErrNum > OSok)
+                               then if tInit in testOptions then begin
+                                   writeln (' UserDictionary Truncate: ', SpErrNum);
+                              end;
+                              {$endc}
+                              Compact (SpErrNum, userDictionary);
+                              {$ifc fDbgOk}
+                              if testSpell then if (SpErrNum > OSok)
+                               then if tInit in testOptions then begin
+                                   writeln (' UserDictionary Compact: ', SpErrNum);
+                              end;
+                              {$endc}
+                              Close_Object (SpErrNum, userDictionary);
+                              {$ifc fDbgOk}
+                              if testSpell then if SpErrNum > OSok then if tInit in testOptions then begin
+                                   writeln (' UserDictionary Close: ', SpErrNum);
+                              end;
+                              {$endc}
+                         end;
+                         10: {skip user due to problem}
+                         if SpStatus > noMainDictionary then if SpStatus <> closedFile then begin
+                              Close_Object (SpErrNum, RAMFile);
+                              {$ifc fDbgOk}
+                              if testSpell then if SpErrNum > OSok then if tInit in testOptions then begin
+                                   writeln (' RAMFile close: ', SpErrNum);
+                              end;
+                              {$endc}
+                         end;
+                         if SpStatus > noSegment
+                          then if (SpStatus < closedFile) or (SpStatus = SpellReady) then begin
+                              Close_DataSeg (SpErrNum, SpSegRefNum);
+                              {$ifc fDbgOk}
+                              if testSpell then if SpErrNum > OSok then if tInit in testOptions then begin
+                                   writeln (' Close_DataSeg: ', SpErrNum);
+                              end;
+                              {$endc}
+                         end;
+                         tmpReturn := ok;
+                         SpStatus := uninitialized; {now not init'ed}
+                    end;
+               end;
+          end;
+          SpTerminate := tmpReturn;
+     end;
+
+{$S LWSpInit}
+
+function SpInitialize {(rootVolumeName, userFileName: PathName; var foundDictName: PathName;
+                        spLsdn: integer; newVersion: Boolean): TSpReturn};
+     label 999;
+     const
+          bytes_record = 256;
+          bytes_longint = 4;
+     var
+          i:             Integer;
+          b:             Boolean;
+          ct:            CorType;
+          bytesDone:     Longint;
+          junkReturn,
+          tmpReturn:     TSpReturn;
+          ch:            Char;
+          newWord:       TSpWord;
+          cvtStr:        String [32];
+          segName:       PathName;
+          segPtr,
+          size:          Longint;
+          sizeVTab,
+          sizeGlob:      Longint;
+          mainFileName,
+          prefix:        E_Name;
+          allowed:       Boolean;
+
+     {$ifc fDbgOk}
+     procedure TestConstant (var i: Integer; m1: LongInt; bm1: SetLongInt);
+          Var  t:   BrokenLong;
+          begin
+               writeln (i : 3, ' ', ShowHex (m1)^);
+               t.bits := bm1;
+               if t.long <> m1 then writeln (testLine, 'constant #', i : 1, ' wrong: ',  ShowHex (t.long)^);
+               i := i + 1;
+          end;
+     procedure TestHex (var i: Integer; m1: LongInt);
+          begin
+               writeln (i: 3, ' ', m1: 6, ' ', ShowHex (m1)^);
+          end;
+     {$endc}
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tInit in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('SpInitialize');
+               writeln (testLine, 'rootVolumeName: ', rootVolumeName, ' userFileName: ', userFileName,
+                        ' spLsdn: ', spLsdn : 3);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          tmpReturn := unableToLoad;
+          if SpStatus < boundSegment then begin
+               if SpStatus <= noSegment then begin {allocate storage}
+                    SpStatus := noSegment;
+                    segName := '{t1}SpellingSegment';
+                    sizeVTab := 4 * ((SizeOf (VerTabData) - 1) div 4 + 1);
+                    sizeGlob := 4 * ((SizeOf (GlobalData) - 1) div 4 + 1);
+                    size := sizeVTab + sizeGlob;
+                    Make_Dataseg (SpErrNum, segName, size, size, SpSegRefNum, segPtr, spLsdn, ds_private);
+                    if SpErrNum > OSok then begin
+                         {$ifc fDbgOk}
+                         if testSpell then if tInit in testOptions then begin
+                              writeln ('Seg result: ', SpErrNum);
+                         end;
+                         {$endc}
+                         goto 999;
+                    end;
+                    vertabs := pointer (segPtr);
+                    globals := pointer (segPtr + sizeVTab);
+               end;
+               with globals^, vertabs^ do begin
+                    if SpStatus <= badUserDictionary then begin {get user dictionary}
+                         SpStatus := noUserDictionary;
+                         {$ifc fDbgOk}
+                         if testSpell then if tInit in testOptions then begin
+                              writeln ('spword size: ', sizeof (TspWord), ' block: ', sizeof (userBlock),
+                                       ' head: ', sizeof (userBlock), ' max: ', ord4 (@userBlock) - ord4 (@userBlock));
+                         end;
+                         {$endc}
+
+                         if newVersion then begin
+                              Kill_Object (SpErrNum, userFileName);
+                              if (SpErrNum > OSok) then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Killing User: ', SpErrNum);
+                                   end;
+                                   {$endc}
+                              end;
+                         end;
+
+                         Open (SpErrNum, userFileName, userDictionary, [Dread, Dwrite, Private]);
+
+                         if (SpErrNum <= OSok) and (SpErrNum <> scavangeRestored) then begin {pre-existing}
+                              SpStatus := badUserDictionary;
+                              Read_Data (SpErrNum, userDictionary, ord4 (@userBlock), userSave,
+                                          bytesDone, absolute, 0);
+                              if (SpErrNum > OSok) or (bytesDone <> userSave) then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Existing User--SpErrNum, bytes done: ', SpErrNum, bytesDone);
+                                   end;
+                                   {$endc}
+                                   Close_Object (SpErrNum, userDictionary);
+                                   goto 999;
+                              end;
+                              if userBlock.info.header <> userCode then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Bad user code: ', userBlock.info.header);
+                                   end;
+                                   {$endc}
+                                   Close_Object (SpErrNum, userDictionary);
+                                   goto 999;
+                              end;
+                              if userBlock.info.version < curVersion then begin
+                                   SpStatus := oldUserDictionary;
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Old user code: ', userBlock.info.version);
+                                   end;
+                                   {$endc}
+                                   Close_Object (SpErrNum, userDictionary);
+                                   goto 999;
+                              end;
+                              userCore := userBlock.info;
+                         end else if (SpErrNum <> noFileFound) then begin
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   writeln ('Bad user, error: ', SpErrNum);
+                              end;
+                              {$endc}
+                              Close_Object (SpErrNum, userDictionary);
+                              goto 999;
+                         end else begin {no pre-existing}
+                              Make_File (SpErrNum, userFileName, 0); {no label}
+                              if SpErrNum > OSok then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Make User Dictionary: ', userDictionary, SpErrNum);
+                                   end;
+                                   {$endc}
+                                   goto 999;
+                              end;
+                              Open (SpErrNum, userFileName, userDictionary, [Dread, Dwrite, Private]);
+                              if (SpErrNum > OSok) or (SpErrNum = scavangeRestored) then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Open New User Dictionary: ', userDictionary, SpErrNum);
+                                   end;
+                                   {$endc}
+                                   goto 999;
+                              end;
+                              {Initialize user specific dictionary table}
+                              SpStatus := badUserDictionary;
+                              ClearCache;
+                              MungUser; {sets usercore}
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   with userCore do writeln ('Header: ', header, ' Version: ', version);
+                              end;
+                              {$endc}
+                              userCore.LastDictionaryName := ''; {no name entered}
+                              userBlock.info := userCore;
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   with userBlock.info do writeln ('Header: ', header, ' Version: ', version);
+                              end;
+                              {$endc}
+                              Write_Data (SpErrNum, userDictionary, ord4 (@userBlock), userSave,
+                                          bytesDone, absolute, 0);                        {make sure it's saved}
+                              if (SpErrNum > OSok) or (bytesDone <> userSave) then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('Write new user--SpErrNum, bytes done: ', SpErrNum, bytesDone);
+                                   end;
+                                   {$endc}
+                                   Close_Object (SpErrNum, userDictionary);
+                                   goto 999;
+                              end;
+                         end;
+                    end;
+
+                    if SpStatus <= badMainDictionary then begin
+                         SpStatus := noMainDictionary;
+                         POpen (SpErrNum, userCore.LastDictionaryName, RAMFile, [Dread, Private], allowed);
+                         if (SpErrNum > OSok) or (SpErrNum = scavangeRestored) then begin
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   writeln ('Saved RAM ioresult: ', SpErrNum, ',', mainFileName);
+                              end;
+                              {$endc}
+                              {search for MAIN file}
+                              reset_catalog (SpErrNum, rootVolumeName);
+                              if SpErrNum > OSok then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('search init: ', SpErrNum);
+                                   end;
+                                   {$endc}
+                                   goto 999;
+                              end;
+                              prefix := '{D';
+                              repeat begin
+                                   get_next_entry (SpErrNum, prefix, mainFileName);
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('search: ', SpErrNum, ',', mainFileName);
+                                   end;
+                                   {$endc}
+                                   if SpErrNum > OSok then goto 999;
+                              end until pos ('Dict.data', mainFileName) <> 0;
+                              userCore.LastDictionaryName := concat (rootVolumeName, mainFileName);
+                              {open file with ram tables}
+                              POpen (SpErrNum, userCore.LastDictionaryName, RAMFile, [Dread, Private], allowed);
+                              if (SpErrNum > OSok) or (SpErrNum = scavangeRestored) then begin
+                                   {$ifc fDbgOk}
+                                   if testSpell then if tInit in testOptions then begin
+                                        writeln ('RAM open: ', SpErrNum, ',', userCore.LastDictionaryName);
+                                   end;
+                                   {$endc}
+                                   goto 999;
+                              end;
+                         end; {of search}
+
+                         SpStatus := badMainDictionary;
+                         Read_Data (SpErrNum, RAMFile, ord4 (@TopOfFile), bytes2Read,
+                                    bytesDone, absolute, 0);
+                         if (SpErrNum > OSok) or (bytesDone <> bytes2Read) then begin
+                              {$ifc fDbgOk}
+                              if testSpell then if tInit in testOptions then begin
+                                   writeln ('RAM read SpErrNum, bytes to read, read: ',
+                                            SpErrNum, bytes2Read, bytesDone,
+                                            ',', userCore.LastDictionaryName);
+                              end;
+                              {$endc}
+                              Close_Object (SpErrNum, RAMFile);
+                              goto 999;
+                         end;
+                    end;
+
+                    setLast := 0; {init for verify}
+                    {$ifc fDbgOk}
+                    if testSpell then if tInit in testOptions then begin
+                         i := 0; {start constant}
+                         TestConstant (i, emptyMask, bEmptyMask);
+                         TestConstant (i, sMask, bSMask);
+                         TestConstant (i, bothMask, bBothMask);
+                         TestConstant (i, codeMask, bCodeMask);
+                         TestConstant (i, delMask, bDelMask);
+                         TestConstant (i, indMask, bIndMask);
+                         TestConstant (i, rehashMask, bRehashMask);
+                         TestConstant (i, hyphenMask, bHyphenMask);
+                         TestConstant (i, byteMask, bByteMask);
+                         TestConstant (i, cacheMask, bCacheMask);
+                         TestConstant (i, topByteMask, bTopByteMask);
+                         TestConstant (i, bottomWordMask, bBottomWordMask);
+                         TestConstant (i, hyphen2Mask, bHyphen2Mask);
+                         TestConstant (i, hyphen3Mask, bHyphen3Mask);
+                         TestConstant (i, sevenMask, bSevenMask);
+                         TestConstant (i, hyphen4Mask, bHyphen4Mask);
+                         TestConstant (i, smapMask, bSmapMask);
+                         TestConstant (i, capMask, bCapMask);
+                         TestConstant (i, tabIndMask, bTabIndMask);
+                         TestConstant (i, cCapMask, bcCapMask);
+                         TestConstant (i, cLskMask, bcLskMask);
+                         TestConstant (i, cLwoMask, bcLwoMask);
+                         TestConstant (i, cdlskMask, bcdLskMask);
+                         TestConstant (i, cSufMask, bcSufMask);
+                         TestConstant (i, cdLwoMask, bcdLwoMask);
+                         TestConstant (i, nCapMask, bnCapMask);
+                         TestConstant (i, nLskMask, bnLskMask);
+                         TestConstant (i, ndLskMask, bndLskMask);
+                         TestConstant (i, ndLwoMask, bndLwoMask);
+                         TestConstant (i, h0_4Mask, b0_4Mask);
+                         TestConstant (i, h1Mask, b1Mask);
+
+                         i := 0;
+                         TestHex (i, two_0th);
+                         TestHex (i, two_1st);
+                         TestHex (i, two_2nd);
+                         TestHex (i, two_3rd);
+                         TestHex (i, two_4th);
+                         TestHex (i, two_5th);
+                         TestHex (i, two_6th);
+                         TestHex (i, two_7th);
+                         TestHex (i, two_8th);
+                         TestHex (i, two_9th);
+                         TestHex (i, two_10th);
+                         TestHex (i, two_11th);
+                         TestHex (i, two_12th);
+                         TestHex (i, two_13th);
+                         TestHex (i, two_14th);
+                         TestHex (i, two_15th);
+
+                         writeln (' char7t5: ', sizeof (Tchar7t5), ': ');
+                         for i := 0 to 127 do write (char7t5 [i] : 4);
+                         writeln;
+
+                         writeln (' switchTry: ', sizeof (TswitchTry), ':');
+                         for b := false to true do
+                          for ct := lTranspose to lDone do
+                           write (ShowCorType (switchTry [b, ct])^, ', ');
+                         writeln;
+
+                         writeln (' charspc: ', sizeof (Tcharspc), ':');
+                         for i := 0 to 31 do write (charspc [i]);
+                         writeln;
+
+                         writeln (' lstring, rstring: ', sizeof (TrlString), ':');
+                         for i := 0 to strInterval do writeln (i: 3, ' "', lstring [i], '" => "', rstring [i], '"');
+                    end;
+                    {$endc}
+                    foundDictName := userCore.LastDictionaryName;
+               end;
+          end;
+          tmpReturn := ok;
+          SpStatus := SpellReady;
+          999: {main exit}
+          SpInitialize := tmpReturn;
+          if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end;
+          {$ifc fDbgOk}
+          if testSpell then if tInit in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('SpInitialize');
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+{$S LWSpell}
+function VerifyWord {(var spWord: TSpWord): TSpReturn};
+     label 800, 999;
+     var
+          letters:       TSpLetters;
+          tmpReturn,
+          userReturn:    TSpReturn;
+          codefn,
+          indxfn,
+          indcach:       longint;
+          codcach,
+          cacheEntry,
+          smap,
+          hypind:        BrokenLong;
+          notOnDisk:     boolean;
+          skeleton:      TSpSkeleton;
+          setsuf:        Byte;
+          oldCapCode:    TCapCode;
+          newSpWord:     TSpWord;
+          numberFlag:    boolean;
+
+     begin {VERIFYWORD!}
+
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          with globals^ do with newSpWord do begin
+               test_WordFreq := test_WordFreq + 1;
+               if testSpell then if tVerify in testOptions then begin
+                    (* start timing!!! lastTime := MicroTimer - lastTime - 135; *)
+                    TestHeader ('VerifyWord');
+                    writeln (testLine, 'word: ', ShowWord(spWord)^);
+                    lastTime := MicroTimer;
+               end;
+          end;
+          {$endc}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          with globals^ do with newSpWord do begin
+               with spWord do begin
+                    {$ifc fDbgOk}
+                    if testSpell then if tShift in testOptions then begin
+                         lastTime := MicroTimer - lastTime - 135;
+                         writeln (testLine, 'ready time: ', lastTime div 100 : 1, ' ms');
+                         lastTime := MicroTimer - lastTime - 135;
+                    end;
+                    {$endc}
+                    ReplaceChar (chr (208), '-', @word);
+                    {$ifc fDbgOk}
+                    if testSpell then if tShift in testOptions then begin
+                         lastTime := MicroTimer - lastTime - 135;
+                         writeln (testLine, 'replace1 time: ', lastTime div 100 : 1, ' ms');
+                         lastTime := MicroTimer - lastTime - 135;
+                    end;
+                    {$endc}
+                    ReplaceChar (chr (213), '''', @word);
+                    {$ifc fDbgOk}
+                    if testSpell then if tShift in testOptions then begin
+                         lastTime := MicroTimer - lastTime - 135;
+                         writeln (testLine, 'replace2 time: ', lastTime div 100 : 1, ' ms');
+                         lastTime := MicroTimer - lastTime - 135;
+                    end;
+                    {$endc}
+                    cap.code := FindCase (word, numberFlag);
+                    if numberFlag then begin
+                         tmpReturn := ok;
+                         goto 999;
+                    end;
+               end;
+               { initialize}
+               newSpWord := spWord;
+               oldCapCode := cap.code;
+               setlast := 0;
+               hyphens := emptyMask;
+               {$ifc fDbgOk}
+               if testSpell then if tShift in testOptions then begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, 'init time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+               { if non-standard capitalization, check word as is in user dic}
+               if oldCapCode > initialAndHyphen then begin
+                    Hash (codefn, indxfn, word);
+                    tmpReturn := UserVerify (indxfn, codefn, newSpWord);
+                    if tmpReturn = wordExists then goto 800;
+               end;
+               { reduce word to lower case}
+               if oldCapCode <> lowerCase then begin
+                    DownStrShift (@word);
+               end;
+               { look for word in in-Ram verification table}
+               tmpReturn := RamVerify (newSpWord, indxfn, codefn, notOnDisk);
+               codcach.long := codefn;
+               indcach := indxfn;
+               {$ifc fDbgOk}
+               if testSpell then if tShift in testOptions then begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, 'ram time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+               if tmpReturn = wordExists then begin
+                    if cap.code = oldCapCode   { catch high probability case here }
+                    then goto 800;
+               end;
+               { look for word in the user specific dictionary}
+               if word [length (word)] = 's' then Hash (codefn, indxfn, word);
+               userReturn := UserVerify (indxfn, codefn, newSpWord);
+               {$ifc fDbgOk}
+               if testSpell then if tShift in testOptions then begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, 'user time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+               if (userReturn = wordExists) then begin
+                    tmpReturn := userReturn;
+                    goto 800;
+               end;
+               if tmpReturn = wordExists then goto 800; {RAM ok, wrong cap code}
+               if notOnDisk then goto 999;
+               { calculate skeleton for input word and search the disk file}
+               MakeSkeleton (word, skeleton);
+               {$ifc fDbgOk}
+               test_DiskFreq := test_DiskFreq + 1;
+               {$endc}
+               tmpReturn := LocateWord (skeleton, newSpWord, verifyMode);
+               if tmpReturn < ok then goto 999;
+               { if skeleton not on disk or none of the corresponding words match, then word is misspelled}
+               if length (word) > 21 then begin
+                    tmpReturn := notFound;
+                    goto 999;
+               end;
+               smap.long := ClipS (word, false);
+               hypind.long := hyphenMask; { in case word misspelled, set to indicate so and enter in cache }
+               if tmpReturn = wordExists then begin
+                    { word found on disk.  supply hyphen map and capitalization}
+                    (*
+                    {$ifc fHyphens}
+                    hyphens := setStore [1]. hyphens;
+                    {$endc}
+                    cap := setStore [1]. cap;
+                    *)
+                    {$ifc fHyphens}
+                    hyphens := setHyphens;
+                    {$endc}
+                    cap := setCap;
+                    { supply 's' map for insertion into cache table. convert from 1 byte disk format to 4 bytes,
+                     shift to proper location}
+                    smap.byte2 := setsuf;
+                    {$ifc fDbgOk}
+                    if testSpell then if tCache in testOptions then begin
+                         write (testLine, 'cache parts1: ', indcach,
+                                ' setsuf: ', ShowHex (smap.long)^);
+                         write (' smapMask: ', ShowHex (smapMask)^);
+                         writeln;
+                    end;
+                    {$endc}
+                    smap.bits := smap.bits * bSmapMask;
+                    smap.long := smap.long * two_6th;
+                    (* smap.long := Bitshift (BitAnd (smap.long, smapMask), 6); *)
+                    {$ifc fDbgOk}
+                    if testSpell then if tCache in testOptions then begin
+                         write (testLine, 'cache parts2: ', indcach,
+                                ' setsuf: ', ShowHex (smap.long)^);
+                         writeln;
+                    end;
+                    {$endc}
+                    {$ifc fHyphens}
+                    if cap.code <> lowercase then goto 800; {skip if word was not all lower case}
+                    if BitAnd (hyphens, hyphen4Mask) <> 0
+                     then goto 800; {skip if hyphen point past ninth letter}
+                    hypind.long := hyphens;
+                    {$elsec}
+                    hypind.long := emptyMask;
+                    hypind.byte1 := cap.num;
+                    {$endc}
+               end;
+               { insert in cache table}
+               {$ifc fDbgOk}
+               if testSpell then if tCache in testOptions then begin
+                    write (testLine, 'cache parts: ', indcach,
+                           ' code: ', ShowHex (BitAnd (codcach.long, codeMask))^);
+                    write (' hyphens: ', ShowHex (hypind.long)^);
+                    write (' smap: ', ShowHex (smap.long)^);
+                    writeln;
+               end;
+               {$endc}
+               cacheEntry.bits := codcach.bits * bCodeMask;
+               cacheEntry.bits := cacheEntry.bits + smap.bits + hypind.bits;
+
+               (* cacheEntry.long := BitOr (BitAnd (codcach.long, codeMask), BitOr (smap.long, hypind.long)); *)
+               indcach := BitAnd (indcach, cacheMask);
+               {$ifc fDbgOk}
+               if cache [indcach] <> 0
+                then if cache [indcach] <> cacheEntry.long
+                 then begin
+                    test_OverwriteFreq := test_OverwriteFreq + 1;
+                    if testSpell then if tCache in testOptions
+                     then writeln (testLine, 'overwriting!: ', indcach,
+                                   ' code: ', BitAnd (cache [indcach], codeMask) : 7,
+                                   ' hyphens: ', BitAnd (cache [indcach], hyphenMask) : 7,
+                                   ' sboth: ', BitAnd (cache [indcach], bothMask) <> 0,
+                                   ' smap: ', BitAnd (cache [indcach], sMask) <> 0,
+                                   ' Hex: ', ShowHex (cache [indcach])^);
+               end;
+               {$endc}
+               cache [indcach] := cacheEntry.long;
+               {$ifc fDbgOk}
+               if testSpell then if tCache in testOptions
+                then writeln (testLine, 'cache write: ', indcach,
+                              ' code: ', BitAnd (cacheEntry.long, codeMask) : 7,
+                              ' hyphens: ', BitAnd (cacheEntry.long, hyphenMask) : 7,
+                              ' sboth: ', BitAnd (cacheEntry.long, bothMask) <> 0,
+                              ' smap: ', BitAnd (cacheEntry.long, sMask) <> 0,
+                              ' Hex: ', ShowHex (cache [indcach])^,
+                              ' "', spWord.word, '"');
+               {$endc}
+               {$ifc fDbgOk}
+               if testSpell then if tShift in testOptions then begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, 'disk time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+               800:
+               setlast := 0;
+               if tmpReturn = wordExists then begin
+                    {$ifc fHyphens}
+                    spWord.hyphens := hyphens;
+                    {$endc}
+                    tmpReturn := ok;
+                    if cap.code <> oldCapCode   { catch high probability case here }
+                     then if oldCapCode <> allCaps
+                       then if cap.code > oldCapCode then tmpReturn := wordExists
+                       else if (cap.code > allCaps) <> (oldCapCode > allCaps) then tmpReturn := wordExists
+                       else if oldCapCode = otherCaps then tmpReturn := wordExists;
+                    if tmpReturn = wordExists then begin
+                         tmpReturn := AddToSetList (word, hyphens, cap, spWord, false);
+                    end;
+               end;
+               {$ifc fDbgOk}
+               if testSpell then if tShift in testOptions then begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, 'case time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+               spWord.cap := cap;
+               999: {exit}
+               VerifyWord := tmpReturn;
+               (* not for verify!
+                    if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end;
+               *)
+               {$ifc fDbgOk}
+               if testSpell then if tVerify in testOptions then with spWord do begin
+                    lastTime := MicroTimer - lastTime - 135;
+                    writeln (testLine, ShowWord (spWord)^,
+                             ' return: ', ShowReturn (ord(tmpReturn))^,
+                             ' time: ', lastTime / 1000.0 : 1 : 1, ' ms');
+                    TestFooter;
+                    lastTime := MicroTimer - lastTime - 135;
+               end;
+               {$endc}
+          end;
+     end;
+
+{$S LWMiscSpell}
+function ZapUser {: TSpReturn};
+     label 999;
+     var  tmpReturn:  TSpReturn;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          MungUser;
+          tmpReturn := ok;
+          999: {exit}
+          ZapUser := tmpReturn;
+          if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end;
+     end;
+
+function GetUserWord {(var spWord: TSpWord; var byteNum: Longint): TSpReturn};
+     label     999;
+     var  tmpReturn:     TSpReturn;
+          userIndex:      Integer;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          with globals^, usertab do while true do begin
+               tmpReturn := ReadUserWord (spWord.word, byteNum, userCore.userCurrentByte, userIndex);
+               if tmpReturn <> ok then goto 999
+               else if not deleted [userIndex] then begin
+                    ReplaceChar ('-', chr (208), @spWord.word);
+                    ReplaceChar ('''', chr (213), @spWord.word);
+                    goto 999;
+               end;
+          end;
+          999: {exit}
+          GetUserWord := tmpReturn;
+          if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end;
+     end;
+
+{$S LWSpell}
+function FindUserWord (indxfn, codefn: TLongBits; var userIndex: longint; var code: TLongBits): TSpReturn;
+     label 999;
+     var  size,
+          (* lastPlace, *)
+          maxIndx,
+          maxRehash,
+          rehash,
+          a,
+          ind:     longint;
+          q,
+          bTmp:          BrokenLong;
+          match:         BrokenLong;
+          tmpReturn:     TSpReturn;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('FindUserWord');
+               writeln (testLine, 'indxfn: ', indxfn, 'codefn: ', codefn,
+                        ' userIndex: ', userIndex, ' code: ', code);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          with globals^.usertab do begin
+               {initialize}
+               size := size;
+               maxIndx := indexlimit;
+               maxRehash := BitShift (size, -6);
+               rehash := 0;
+               bTmp.long := codefn;
+               bTmp.bits := bTmp.bits * bCodeMask;
+               code := bTmp.long;
+               (* code := BitAnd (codefn, codeMask); *)
+
+               if code >= delMask then code := code - 2;
+               ind := BitAnd (indxfn, size);
+               if ind > maxIndx then ind := ind - maxIndx;
+
+               q.long := code;
+               q.bits := q.bits * bSevenMask;
+               (* q.long := BitAnd (code, sevenMask); *)
+               a := 3 - q.long;
+               (* lastPlace := -1; *)
+               {if location 'userIndex' of usertab is unused, word is not found}
+               while true do begin
+                    userIndex := ind + 5;
+                    match.bits := codes [userIndex].bits * bCodeMask;
+                    (* match.long := BitAnd (codes [userIndex].long, codeMask); *)
+                    if match.bits = bCodeMask then begin
+                         (* if lastPlace <> -1 then userIndex := lastPlace; *)
+                         tmpReturn := notFound; goto 999;
+                    end;
+                    {look for code in location 'userIndex' of usertab}
+                    if match.long = code then if not deleted [userIndex] then
+                         begin tmpReturn := wordExists; goto 999; end;
+                    {try next location if rehash < maxrsh}
+                    if rehash > maxRehash then begin tmpReturn := limitExceeded; goto 999; end;
+                    (* if deleted [userIndex] then lastPlace := userIndex; *)
+                    rehash := rehash + 1;
+                    a := a + q.long + q.long;
+                    ind := ind + a;
+                    {watch for table wrap around}
+                    while ind >= maxIndx do ind := ind - maxIndx;
+               end;
+          end;
+          999: {main exit}
+          FindUserWord := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'indxfn: ', indxfn, 'codefn: ', codefn,
+                        ' userIndex: ', userIndex, ' code: ', code);
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+function UserVerify {(indxfn, codefn: TLongBits; var spWord: TSpWord): TSpReturn};
+     label 999;
+     var  userIndex: longint;
+          tmpReturn: TSpReturn;
+          code: TLongBits;
+          fudge: integer;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('UserVerify');
+               writeln (testLine, 'word: ', ShowWord (spWord)^);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          with spWord do begin
+               hyphens := EmptyMask;
+               tmpReturn := FindUserWord (indxfn, codefn, userIndex, code);
+               if tmpReturn = wordExists then with globals^.usertab do begin
+                    if deleted [userIndex] then tmpReturn := notFound
+                    else begin
+                        {word found. supply hyphen map and capitalization}
+                        cap.num := (BitShift (BitAnd (codes [userIndex].long, capMask), -22));
+                        {$ifc fHyphens}
+                        hyphens := BitAnd (codes [userIndex].long, hyphenMask);
+                        if (length (word) > 9) and (hyphens <> EmptyMask) then begin
+                             fudge := size - BitShift (hyphens, -24); {kludge for generator error}
+                             hyphens := codes [fudge].long;
+                        end;
+                        if cap.code > allCaps then cap.code := otherCaps;
+                        {$endc}
+                   end
+               end
+               else if tmpReturn = limitExceeded then tmpReturn := notFound;
+          end;
+          999: {main exit}
+          UserVerify := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^,
+                        ' word: ', ShowWord (spWord)^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+{$S LWMiscSpell}
+
+function CheckTabWord (var spWord: TSpword; var userIndex: longint; var code: TLongBits): TSpReturn;
+     label 999;
+     var  tmpReturn:     TSpReturn;
+          codefn,
+          indxfn:        TLongBits;
+          numberflag:    Boolean;
+          letters:       TSpLetters;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('CheckTabWord');
+               writeln (testLine, 'word: ', spWord.word, ' userIndex: ', userIndex, ' code: ', code);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          with globals^.usertab do with spWord do begin
+               {check for not initialized}
+               if hyp_caps <> BitShift (size, -4)
+                    then begin tmpReturn := notInitialized; goto 999; end;
+               {check for user table full}
+               if numElements > maxFill then begin tmpReturn := userMemoryFull; goto 999; end;
+               {initialize}
+               letters := word;
+               if length (letters) = 0 then begin tmpReturn := illegalString; goto 999; end;
+               cap.code := FindCase (letters, numberFlag);
+               if cap.code <> lowerCase then begin
+                    {$ifc fHyphens}
+                    if cap.code <= allCaps then DownStrShift (@letters)
+                    else cap.code := allCaps;
+                    {$elsec}
+                    if cap.code < otherCaps then DownStrShift (@letters);
+                    {$endc}
+               end;
+               Hash (codefn, indxfn, letters);
+               tmpReturn := FindUserWord (indxfn, codefn, userIndex, code);
+          end;
+          999: {main exit}
+          CheckTabWord := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'word: ', spWord.word, ' userIndex: ', userIndex, ' code: ', code);
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+function AddInUserWord (spWord: TSpword): TSpReturn;
+     label 800, 999;
+     var  tmpReturn:     TSpReturn;
+          len,
+          userIndex,
+          j,
+          bytesDone:     Longint;
+          code,
+          entry:         TLongBits;
+          mi:            TLongBits;
+          writeOut:      StoredUserWord;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('AddInUserWord');
+               writeln (testLine, 'word: ', ShowWord (spWord)^);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+         {$endc}
+          with globals^ do with spWord do begin
+               tmpReturn := CheckTabWord (spWord, userIndex, code);
+               if (tmpReturn >= ok) then with usertab do begin
+
+                    {insert code and capitalization into location 'userIndex'}
+
+                    entry := BitOr (code, BitShift (ord4 (cap.num), 22));
+
+                    {$ifc fHyphens}
+                    {insert hyphenation into location 'userIndex'}
+                    if length (word) >= 10 then if hyphens <> emptyMask then begin
+                         mi := BitOr (hyphens, BitShift (hyphens, length (word) - 33));
+                         mi := BitShift (BitAnd (mi, hyphen2Mask), -13)
+                              + BitAnd (mi, hyphen3Mask);
+                         if mi >= 8191 then mi := mi - 8191;
+                         mi := BitAnd (mi, hyp_caps);
+                         for j := mi to mi+2 do begin
+                              if codes [size - mi].long = emptyMask then codes [size - mi] := hyphens;
+                              if codes [size - mi].long = hyphens then begin
+                                   entry := BitOr (entry, BitShift (mi, 24));
+                                   goto 800;
+                              end;
+                         end;
+                         hyphens := emptyMask;
+                    end;
+                    entry := BitOr (entry, BitAnd (hyphens, hyphenMask)); {if we fall thru}
+                    {$endc}
+
+                    800: {set codes for last item}
+                    with usercore do begin
+                         numElements := numElements + 1;
+                         len := length (word) + 3;
+                         with writeOut do begin
+                              int := userIndex;
+                              str := spWord.word;
+                         end;
+                         Write_Data (SpErrNum, userDictionary, ord4 (@writeOut), len,
+                                    bytesDone, absolute, userCurrentByte);
+                        {$ifc fDbgOk}
+                         if testSpell then if tUser in testOptions then begin
+                              writeln (testLine, 'Write1: ', SpErrNum,
+                                       ' bytesdone: ', bytesdone,
+                                       ' userCurrentByte: ', userCurrentByte);
+                         end;
+                         {$endc}
+                         if (SpErrNum > 0) or (bytesDone <> len) then tmpReturn := unableToLoad
+                         else begin
+                              codes [userIndex].long := entry;
+                              deleted [userIndex] := false;
+                              tmpReturn := ok;
+                              userCurrentByte := userCurrentByte + len;
+                         end;
+                    end;
+               end;
+          end;
+          999: {main exit}
+          AddInUserWord := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'word: ', ShowWord (spWord)^);
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+function AddUserWord {(spWord: TSpword; start: Boolean; var numOfWords: Integer): TSpReturn};
+     label     700, 999;
+     var  tmpReturn:     TSpReturn;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          tmpReturn := VerifyWord (spWord);   {sets cap code}
+          with globals^ do begin
+               if start then with usercore do userUndoPosition := userCurrentByte;
+               700: {restart if period}
+               if tmpReturn = ok then tmpReturn := wordExists
+               else if (tmpReturn = notFound) or (tmpReturn = wordExists)
+                then with spWord do begin
+                    if length (word) > 1 then if word [length (word)] = '.' then begin
+                         delete (word, length (word), 1);
+                         tmpReturn := VerifyWord (spWord);
+                         goto 700; {retest}
+                    end;
+                    tmpReturn := AddInUserWord (spWord);
+               end;
+               (* blows up ???
+               numOfWords := usertab.numElements;
+               *)
+          end;
+          999: {main exit}
+          AddUserWord := tmpReturn;
+          (* if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end; *)
+     end;
+
+function DelOutUserWord (SpWord: TSpword): TSpReturn;
+     label 999;
+     var  tmpReturn:     TSpReturn;
+          len,
+          j,
+          bytesDone:     Longint;
+          capdic:        TCap;
+          userIndex:     Longint;
+          code:          TLongBits;
+          writeOut:      StoredUserWord;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('DelOutUserWord');
+               writeln (testLine, 'word: ', ShowWord (spWord)^);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          with spWord do begin
+               tmpReturn := CheckTabWord (spWord, userIndex, code);
+               if tmpReturn = wordExists
+                then with globals^ do with usertab do begin
+
+                    {if code and capitalization match ,word can be deleted}
+                    capdic.num := (BitShift (BitAnd (codes [userIndex].long, capMask), -22));
+                    {compare case of input word with dictionary}
+                    if capdic.code <> cap.code then tmpReturn := notFound
+                    else with usercore do begin
+                         {delete code from location 'userIndex'}
+                         numElements := numElements - 1;
+                         len := length (word) + 3;
+                         with writeOut do begin
+                              int := userIndex;
+                              str := spWord.word;
+                         end;
+                         Write_Data (SpErrNum, userDictionary, ord4 (@writeOut), len,
+                                    bytesDone, absolute, userUndoPosition);
+                        {$ifc fDbgOk}
+                         if testSpell then if tUser in testOptions then begin
+                              writeln (testLine, 'Write1: ', SpErrNum,
+                                       ' bytesdone: ', bytesdone,
+                                       ' userCurrentByte: ', userCurrentByte);
+                         end;
+                         {$endc}
+                         if (SpErrNum > 0) or (bytesDone <> len) then tmpReturn := unableToLoad
+                         else begin
+                              deleted [userIndex] := true;
+                              tmpReturn := ok;
+                              userUndoPosition := userUndoPosition + len;
+                         end;
+                    end;
+               end;
+          end;
+          999: {main exit}
+          DelOutUserWord := tmpReturn;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'word: ', ShowWord (spWord)^);
+               writeln (testLine, 'return: ', ShowReturn (ord(tmpReturn))^);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+
+function DelUserWord {(SpWord: TSpword; start: Boolean; var numOfWords: Integer): TSpReturn};
+     label 999;
+     var  tmpReturn: TSpReturn;
+          capdic: TCap;
+          userIndex: longint;
+          code: TLongBits;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          with globals^ do begin
+               if start then with usercore do userUndoPosition := userCurrentByte;
+               tmpReturn := DelOutUserWord (spWord);
+               (* blows up ???
+               numOfWords:= usertab.numElements;
+               *)
+          end;
+          999: {main exit}
+          DelUserWord := tmpReturn;
+          (* if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end; *)
+     end;
+
+function UndoUserWord {(remove: Boolean, var numOfWords: Integer): TSpReturn};
+     label 999;
+     var  tmpReturn:     TSpReturn;
+          undoIndex,
+          undoEnd,
+          tmp:           Longint;
+          spWord:        TSpWord;
+          UserIndex,
+          count:         Integer;
+     begin
+          {$IFC sampcalls}  ALogCall;  {$ENDC}
+          if SpStatus <> SpellReady then if CantFixStatus then begin
+               tmpReturn := notInitialized;
+               goto 999;
+          end;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               TestHeader ('UndoUserWord');
+               writeln (testLine, 'remove: ', remove);
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+          tmpReturn := ok;
+          with globals^ do with userCore do begin
+               if userUndoPosition < userCurrentByte then begin
+                    undoIndex := userUndoPosition;
+                    undoEnd := userCurrentByte;
+               end
+               else if  userCurrentByte < userUndoPosition then begin
+                    undoIndex := userCurrentByte;
+                    undoEnd := userUndoPosition;
+               end
+               else goto 999;
+               {$ifc fDbgOk}
+               writeln (testLine, 'userUndoPosition: ', userUndoPosition,
+                        ' userCurrentByte: ', userCurrentByte,
+                        ' undoIndex: ', undoIndex,
+                        ' undoEnd: ', undoEnd);
+               {$endc}
+               count := 0;
+               with usertab do while undoIndex < undoEnd do begin
+                    tmpReturn := ReadUserWord (spWord.word, undoIndex, undoEnd, userIndex);
+                    if tmpReturn <> ok then goto 999;
+                    deleted [userIndex] := remove;
+                    count := count + 1;
+               end;
+               with usertab do begin
+                    if remove then numElements := numElements - count
+                    else numElements := numElements + count;
+                    numOfWords:= numElements;
+               end;
+          end;
+          999: {exit}
+          UndoUserWord := tmpReturn;
+          if tmpReturn = SpTerminate (unbindSegment) then begin {nop} end;
+          {$ifc fDbgOk}
+          if testSpell then if tUser in testOptions then begin
+               lastTime := MicroTimer - lastTime - 135;
+               writeln (testLine, 'numOfWords: ', numOfWords);
+               TestFooter;
+               lastTime := MicroTimer - lastTime - 135;
+          end;
+          {$endc}
+     end;
+end.
+
+ÿ

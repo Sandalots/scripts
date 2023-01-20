@@ -1,0 +1,1314 @@
+                                   {Copyright 1983, 1984, Apple Computer Inc.}
+UNIT UVT100; INTRINSIC;
+
+INTERFACE
+
+USES
+    {$U tklib}             UObject,
+    {$U sys1lib}           QuickDraw,
+    {$U tklib}             UDraw,
+    {$U tklib}             UABC,
+    {$U tklib}             UTKUniversalText,
+
+    {$U tklib}             UText,
+    {$U tklib}             UDialog,
+
+    {$U iospaslib}         Blkiointr,                  {paslib's unit, should not be before UObject,
+                                                        needed to compile UStdTerm}
+    {$U libqp/UStdTerm}    UStdTerm;
+
+
+
+CONST
+   maxp = 5;        {maximum number of numeric parameters in control sequence}
+   maxI = 5;        {maximum number of intermediate characters in an escape sequence}
+   bmarg = 23;      {bottom margin}
+   tmarg = 0;       {top margin}
+
+TYPE
+   states =  (q0,q1,q2,q3,q4,q5,q6,q7);           {States in FSA(Finite State Acceptor) }
+   Plist =   array[1..maxp] OF Tstr255;           {numeric Parameters                   }
+   Ilist =   array[1..maxI] OF CHAR;              {Intermediate characters              }
+   padtype = (ansiAppl,vt52Appl,normal);          {keypad modes                         }
+   curskeymodes = (ansiSet,ansiReset,vt52set);    {cursor key modes                     }
+   smallstr = string[10];                         {string for misc. uses                }
+   typeStyle   = (GR,US,UK);                      {graphics,United States,United Kingdom}
+   fontStuff = record                             {cursor position and attributes       }
+                   vcursorXY : TCoordinate;       {x and y cursor position relative to home}
+                   charInfo : TRAttributes;       {Font and character attributes     }
+                   currType : typestyle;          {current type style}
+   END;
+
+
+   TVT100 = SUBCLASS OF TStdTerm
+       state            : states;      {current state of FSA                   }
+       P                : Plist;       {Numeric parameters                     }
+       I                : Ilist;       {Intermediate characters                }
+       newline,                        {newline mode?                          }
+       ansi, vt52,                     {ansi or vt52 mode?                     }
+       LetHerScroll,                   {Let std. term. handle scrolling?       }
+       ukPound,                        {United Kingdom or U.S. pound sign?     }
+       origabs          : BOOLEAN;     {origin mode absolute or relative?      }
+       params,                         {number of parameters                   }
+       pos,                            {misc. string index                     }
+       top,bottom,rmarg : INTEGER;     {top, bottom, right margins             }
+       charAttr         : fontStuff;   {cursor position and attributes         }
+       vReadBuff        : TString;     {VRead buffer }
+       S1Font,S0Font,                  {character sets selected by S0,S1       }
+       currentFont      : typeStyle;   {current font                           }
+       TILE12VTS,                      {twelve pitch graphics font             }
+       TILE20VTS        : INTEGER;     {twenty pitch graphics font             }
+       CursorKeyMode    : curskeymodes;{Defines result of cursor key stroke    }
+       keyPad           : padtype;     {Defines which keypad mapping to use    }
+
+       FUNCTION  {TVT100.}CREATE (object : TObject; heap : Theap) : TVT100;
+                                        {All subclass create must have these two parameters.}
+      {PROCEDURE  TVT100. VWrite (VAR str : Tstr255);}
+      {PROCEDURE  TVT100. VRead (VAR ach: char; VAR keycap : Byte; VAR applekey, shiftkey,
+                                                                       optionkey : BOOLEAN);}
+                                        {All terminal emulator subclass must have at least these 2 methods.}
+      END;
+
+
+
+IMPLEMENTATION
+
+{$IFC fRngQP}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC fSymQP}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+
+{$S sQPortTE}
+
+{*********************************************************************************}
+
+
+
+
+METHODS OF TVT100;
+FUNCTION  {TVT100.}CREATE {(object : TObject; heap : Theap) : TVT100};
+{initialize all parameters for TVT100}
+VAR
+   astring : TString;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF object = NIL THEN
+       object := NewObject (heap, THISCLASS);
+   SELF := TVT100 (TStdTerm.CREATE (object, heap));
+
+   astring := TString.CREATE (NIL, heap, 20);
+
+   WITH SELF DO
+   BEGIN
+      TILE12VTS := fIDLT12Graphics;
+      TILE20VTS := fIDLT20Graphics;
+
+      cursorKeyMode := vt52set;    {start with VT52 cursor key mode   }
+      keyPad := normal;            {keypad in numeric mode            }
+      vReadBuff := astring;        {init read buffer                  }
+      params := 0;                 {no parameters yet                 }
+      rmarg := 79;                 {80 column output                  }
+      top := tmarg;                {default top margin                }
+      bottom := bmarg;             {default bottom margin             }
+      LetHerScroll := TRUE;        {When there is no scrolling region, let std term DO scrolling.}
+      WITH charAttr DO             {default cursor attributes         }
+      BEGIN
+         vcursorXY.y := top;       {cursor to start at home position  }
+         vcursorXY.x := 0;
+         charInfo.charStyle := []; {plain text -- no attributes       }
+         charInfo.charFont := fIDLT12Text;  {sort of average twelve pitch }
+      END;
+      S0Font := US;                {SO selects U.S. character set     }
+      S1Font := US;                {S1 selects U.S. character set     }
+      currentFont := S1Font;       {current font U.S. character set   }
+      ukPound := FALSE;
+      origabs := TRUE;             {origin mode absolute              }
+      params := 0;                 {zero parameters encountered       }
+      state := q0;                 {Starting state for FSA            }
+      wrapAround := TRUE;          {Wrap around at the end of a line. }
+      newline := TRUE;             {Line feed WITH carriage return.   }
+      ansi := FALSE;               {DO not expect ANSI sequences      }
+      vt52 := TRUE;                {Expect VT52 sequences             }
+
+      {Initialize variables in tstdterm}
+      {NOTE: THE FOLLOWING VARIABLES MAY ONLY BE SET DIRECTLY HERE!!}
+      maxColumns := 80;            {maximum number of colums 80       }
+      maxlines := 24;              {maximum number of lines 24        }
+      cursorXY.x := 0;             {cursor at origin                  }
+      cursorXY.y := 0;
+      defltAttr := charAttr.charInfo;
+      currAttr := defltAttr;       {current attributes same as default}
+   END;              {WITH SELF DO...}
+   {$IFC fTrace}EP;{$ENDC}
+END;           {Create}
+
+
+{*********************************************************************************}
+
+PROCEDURE {TVT100.}VWrite {(VAR str : Tstr255)};
+const
+   BS     =  8;     {Back space             }
+   CR     = 13;     {Carriage return        }
+   LF     = 10;     {Line feed              }
+   VT     = 11;     {Vertical Tab           }
+   FF     = 12;     {Form Feed              }
+   ESC    = 27;     {Escape                 }
+   SUB    = 26;     {Cancel current sequence}
+   CAN    = 24;     {Cancel current sequence}
+   S0     = 14;     {Select character set G1}
+   S1     = 15;     {Select Character set G0}
+   XOFF   = 19;
+   XON    = 17;
+   maxp   = 5;      {maximum number of numeric parameters in control sequence        }
+   maxI   = 5;      {maximum number of intermediate characters in an escape sequence }
+
+VAR
+   len,                            {length of input string}
+   n,                              {input string index}
+   a,                              {loop control variable}
+   m                : INTEGER;     {output string index}
+   outstr           : Tstr255;     {Output string (nonescape, noncontrol characters)}
+   OptimalCase      : BOOLEAN;     {Optimal case string?}
+   ch               : CHAR;
+
+{*********************************************************************************}
+
+PROCEDURE Push (str:smallstr; ch:CHAR; addchar:BOOLEAN);
+{Insert the elements of str then, if addchar, also insert ch onto the FIFO stack.  }
+
+VAR
+   pstr : TPString;
+BEGIN
+   pstr := @str;
+   SELF.vReadBuff.InsPStrAt (SELF.vReadBuff.size+1, pstr);
+
+   IF addchar THEN
+      SELF.vReadBuff.InsLast(ch);
+END;                {Push}
+
+{*********************************************************************************}
+
+FUNCTION FeChar(ch : CHAR) : BOOLEAN;
+{Returns TRUE iff ch is an element of the set of escape sequence terminators.}
+
+const
+   first = '0';
+   last = '~';
+
+BEGIN
+   FeChar := (ch <= last) AND (ch >= first)
+END;                {FeChar}
+
+{*********************************************************************************}
+
+FUNCTION XChar(ch : CHAR):BOOLEAN;
+{Returns TRUE iff ch is a member of the set {chr(32)..chr(126)}
+BEGIN
+   XChar := (ch >= chr(32)) AND (ch <= chr(126))
+END;                {XChar}
+
+{*********************************************************************************}
+
+FUNCTION IChar(ch : CHAR):BOOLEAN;
+{Returns TRUE iff ch is an element of the set of intermediate escape characters.}
+
+const
+   first = ' ';
+   last = '/';
+
+BEGIN
+   IChar := (ch <= last) AND (ch >= first)
+END;     {IChar}
+
+{*********************************************************************************}
+
+FUNCTION FcChar(ch : CHAR):BOOLEAN;
+{Return TRUE iff ch is an element of the set of control sequence terminators.}
+
+const
+   first = '@';
+   last = '~';
+
+BEGIN
+   FcChar := (ch <= last) AND (ch >= first)
+END;     {FcChar}
+
+{*********************************************************************************}
+
+PROCEDURE GetChar(str : Tstr255; VAR ch : CHAR; VAR indx : INTEGER);
+{IF indx < length(string) Increment indx and return str[indx] in ch, o.w. return nul}
+BEGIN
+   indx := indx + 1;
+   IF (indx <= length(str)) THEN
+      ch := str[indx]
+   ELSE ch := chr(0);
+END;      {GetChar}
+
+{*********************************************************************************}
+
+PROCEDURE InvokeFont(newFont : typeStyle);
+{Invoke a new font.  Keep same character attributes.}
+VAR
+   tempfont : INTEGER;
+
+BEGIN
+   WITH SELF DO
+   BEGIN
+     currentFont := newFont;
+     IF (newFont = US) THEN
+     BEGIN
+        ukPound := FALSE;
+        IF (rmarg = 79) THEN
+           tempfont := fIDLT12Text                {twelve pitch character set}
+        ELSE tempfont := fIDLT20Text;             {twenty pitch character set}
+ {$H-}  ChangeFont (tempfont);                    {tell Std Term to change font.}
+     END
+     ELSE IF (newFont = GR) THEN
+     BEGIN
+        IF (rmarg = 79) THEN
+           tempfont := TILE12VTS                  {twelve pitch graphics set}
+        ELSE tempfont := TILE20VTS;               {twenty pitch graphics set}
+        ChangeFont (tempfont);     {$H+}          {tell Std Term to change font.}
+     END
+     ELSE IF (newFont = UK) THEN
+        ukPound := TRUE;
+   END;
+END;                {InvokeFont}
+
+{*********************************************************************************}
+
+PROCEDURE VT52_FSA(VAR state : states; ch : CHAR);
+{This is a state machine built to recognize all two character escape sequences
+and the cludge sequence which the VT52 video terminal uses to allow direct
+cursor addressing.  The accepting state for normal escape sequences is q6 and
+the accepting state for the cludge sequence is q4.}
+BEGIN
+   CASE state OF
+      q0 : IF (ch = chr(ESC)) THEN
+              state := q1;              {BEGIN escape sequence}
+      q1 : IF (ch = 'Y') THEN
+              state := q2               {Must be the cludge}
+           ELSE IF FeChar(ch) THEN
+              state := q6               {Valid format escape sequence}
+           ELSE state := q0;            {Trap to initial state}
+      q2 : IF XChar(ch) THEN
+              state := q3               {Sure looks like the cludge}
+           ELSE state := q0;            {Trap to initial state}
+      q3 : IF XChar(ch) THEN
+              state := q4               {It was!  It was the cludge!}
+           ELSE state := q0;            {Trap to initial state}
+      END;               {CASE}
+END;           {VT52_FSA}
+
+{*********************************************************************************}
+
+FUNCTION Digit(ch : CHAR) : BOOLEAN;
+{Returns TRUE iff ch is a digit.  Assume that digits 0..9 are consecutive and there
+are no other characters stored in the range 0..9.}
+BEGIN
+   Digit := (ch <= '9') AND (ch >= '0')
+END;
+
+{*********************************************************************************}
+
+PROCEDURE Ansi_FSA(VAR state:states;ch:CHAR);
+{This is a state machine built to accept ANSI control or escape sequences.
+The accepting states are: q4 for control sequences, q6 for escape sequences.}
+
+BEGIN
+   CASE state OF
+      q0 : IF (ch = chr(ESC)) THEN
+              state := q1;              {BEGIN escape or control sequence}
+      q1 : IF (ch = '[') THEN
+              state := q2               {Must be a control sequence}
+           ELSE IF IChar(ch) THEN
+              state := q5               {Must be an escape sequence}
+           ELSE IF FeChar(ch) THEN
+              state := q6               {Two character escape sequence}
+           ELSE state := q0;            {Trap to initial state}
+      q2 : IF FcChar(ch) THEN
+              state := q4               {Three character control sequence}
+           ELSE IF Digit(ch) THEN
+              state := q3               {Numeric parameter}
+           ELSE IF (ch <> '?') THEN
+              state := q0;              {Trap to initial state}
+      q3 : IF (ch = ';') THEN
+              state := q7               {Expect another numeric parameter}
+           ELSE IF FcChar(ch) THEN
+              state := q4               {Four or more character control sequence}
+           ELSE IF Digit(ch) THEN
+              {remain in this state}
+           ELSE state := q0;            {Trap to initial state}
+      q7 : IF Digit(ch) THEN
+              state := q3               {Numeric parameter}
+           ELSE state := q0;            {Trap to initial state}
+      q5 : IF FeChar(ch) THEN
+              state := q6               {Three or more character escape seq.}
+           ELSE IF NOT IChar(ch) THEN
+              state := q0;              {Trap to initial state}
+      END;               {CASE state OF...}
+
+END;                {Ansi_FSA}
+
+{*********************************************************************************}
+
+PROCEDURE MyMoveCursor(vert,scroll:BOOLEAN;distance:INTEGER);
+{Overwrite of the version which exists in standard terminal unit.  This PROCEDURE
+is overwritten so that I can take care of all scrolling situations, i.e. all vertical
+movement.}
+
+VAR
+   toBeScrolled : INTEGER;
+   line : Tstr255;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF vert THEN
+   WITH SELF DO
+   BEGIN
+      IF (cursorXY.y < top) OR (cursorXY.y > bottom) THEN
+      BEGIN        {$H-}                               {outside scrolling region}
+         IF (distance < 0) THEN
+         BEGIN                                         {cursor up}
+            IF (cursorXY.y + distance >= tmarg) THEN
+              VGotoXY (cursorXY.x, cursorXY.y + distance)
+            ELSE VGotoXY (cursorXY.x, tmarg)
+         END
+         ELSE IF (distance > 0) THEN
+         BEGIN
+            IF (cursorXY.y + distance <= bmarg) THEN
+               VGotoXY (cursorXY.x, cursorXY.y + distance)
+            ELSE VGotoXY (cursorXY.x, bmarg)
+         END
+      END                                              {outside scrolling region}
+      ELSE BEGIN                                       {inside scrolling region}
+         IF (distance < 0) THEN                        {cursor up}
+         BEGIN
+            toBeScrolled := top - (cursorXY.y + distance);
+            IF (toBeScrolled > 0) THEN
+            BEGIN
+               VGotoXY (cursorXY.x, top);
+               IF scroll THEN
+               REPEAT                                     {scroll down}
+                  VGetLine (tmarg - 1,line,TRUE);      {get most recently inserted line from buffer}
+                  VPutLine (SELF.top,line,TRUE);       {put the line at the top of the scrolling region}
+                  VGetLine (SELF.bottom,line,TRUE);    {get rid of the bottom line}
+                  toBeScrolled := toBeScrolled - 1;
+               UNTIL (toBeScrolled = 0);
+            END
+            ELSE VGotoXY (cursorXY.x, cursorXY.y + distance);
+         END
+         ELSE BEGIN                                       {cursor down}
+            toBeScrolled := cursorXY.y + distance - bottom;
+            IF (toBeScrolled > 0) THEN
+            BEGIN
+               VGotoXY (cursorXY.x, bottom);
+               IF scroll THEN
+               repeat                                     {scroll up}
+                  VGetLine (SELF.top,line,TRUE);      {get line from top of scrolling region}
+                  VPutLine (tmarg - 1,line,TRUE);     {and put it in buffer}
+                  line := '';
+                  VPutline (SELF.bottom,line,TRUE);   {Insert blank line}
+                  toBeScrolled := toBeScrolled - 1;
+               until (toBeScrolled = 0);
+            END
+            ELSE VGotoXY (cursorXY.x, cursorXY.y + distance);   {$H+}
+         END        {ELSE BEGIN}
+      END           {inside scrolling region}
+   END              {IF vert}
+   ELSE             {let stdterm handle horiz. moves}
+      MoveCursor (scroll,distance, 0);
+   {$IFC fTrace}EP;{$ENDC}
+END;                {MyMoveCursor}
+
+{*********************************************************************************}
+
+PROCEDURE ToString(num : INTEGER; VAR str : smallstr);
+{Convert the INTEGER 'num' to a string 'str'.  Assume num <= 999.}
+
+VAR
+   temp,indx,nonsig,powerten : INTEGER;
+   insig : BOOLEAN;
+
+BEGIN
+   str := 'XXX';              {Ye ol' placebo  }
+   powerten := 10;            {ten to the first}
+   nonsig := 0;
+   FOR indx := 3 DOWNTO 1 DO
+   BEGIN
+      temp := num mod powerten div (powerten div 10);
+      str[indx] := chr(temp + 48);
+      nonsig := temp;
+      powerten := powerten * 10;
+   END;
+   indx := 0;
+   repeat
+      indx := indx + 1;
+      insig := (str[indx] = '0')
+   until (NOT insig) OR (indx = 3);
+   str := Copy(str,indx,3-indx+1)
+END;                {ToString}
+
+{*********************************************************************************}
+
+PROCEDURE DoVT52(F : CHAR;I : Ilist;count : INTEGER);
+{Interpret valid VT52 escape sequences and make calls to standard terminal unit
+in order to emulate the effect of sequences supported.}
+VAR
+   line, col : INTEGER;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF (count = 0) THEN
+      CASE F OF
+             'A' : MyMoveCursor(TRUE,FALSE,-1);     {Cursor up one row, no scroll.     }
+             'B' : MyMoveCursor(TRUE,FALSE,1);      {Cursor down one row, no scroll.   }
+             'C' : MyMoveCursor(FALSE,FALSE,1);     {Cursor right one column.          }
+             'D' : MyMoveCursor(FALSE,FALSE,-1);    {Cursor left one column.           }
+             'F' : InvokeFont(GR);                  {Select CHAR set, graphics.        }
+             'G' : InvokeFont(US);                  {Select CHAR set, US ascii.        }
+             'H' : VGotoXY(0, SELF.top);            {Go to abs/rel home position       }
+             'I' : MyMoveCursor(TRUE,TRUE,-1);      {Reverse Index                     }
+             'J' : ClearScreen (sclearEScreen);     {Erase to end of screen.           }
+             'K' : ClearScreen (sclearELine);       {Erase to end of line.             }
+             'Z' : BEGIN                            {Identify}
+                      Push('',chr(ESC),TRUE);
+                      Push('/Z',' ',FALSE)
+                   END;
+             '=' : SELF.keyPad := vt52Appl;         {keypad application mode }
+             '>' : SELF.keyPad := normal;           {keypad normal mode      }
+             '<' : WITH SELF DO
+                   BEGIN                            {Switch to ANSI mode     }
+                     ansi := TRUE;
+                     vt52 := FALSE;
+                     IF (keyPad = vt52Appl) THEN
+                        keyPad := ansiAppl;
+                     cursorKeyMode := ansiReset
+                   END;
+       OTHERWISE  ;                        {Invalid VT52 two character escape seq.}
+       END        {CASE F OF...}
+   ELSE CASE F OF                          {three or more character esc sequences}
+                  'Y' : IF (count = 3) THEN
+                        WITH SELF DO
+                        BEGIN                {Direct cursor addressing}
+                           line := ord(I[2]) - 32;
+                           col := ord(I[3]) - 32;
+                           IF (line > bottom) THEN
+                              line := cursorXY.y;      {value out of range ignored}
+                           IF (col > rmarg) THEN
+                              col := cursorXY.x;       {value out of range ignored}
+                     {$H-} VGotoXY (col, line);  {$H+}
+                        END;
+          OTHERWISE  ;  {Invalid vt52 escape seq.}
+        END;             {CASE F}
+   {$IFC fTrace}EP;{$ENDC}
+END;      {DoVT52}
+
+{*********************************************************************************}
+
+PROCEDURE DoAnsiEsc(F : CHAR;I : Ilist;count : INTEGER);
+{Interpret valid ANSI escape sequences and emulate those which are impemented by
+making appropriate calls to the standard terminal unit.}
+VAR
+   line,col : INTEGER;
+   tempAttr : TRAttributes;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF (count = 0) THEN
+      CASE F OF
+               'c' : BEGIN                   {Reset to initial state}
+                        {restore all parameters to their 'power up' state}
+                        WITH SELF, charAttr DO
+                        BEGIN
+                           cursorKeyMode := vt52set;   {VT52 cursor key sequences    }
+                           keyPad := normal;           {Numeric keypad               }
+                           rmarg := 79;                {80 column output             }
+                           top := tmarg;               {default top margin           }
+                           bottom := bmarg;            {default bottom margin        }
+                           LetHerScroll := TRUE;       {Let std term DO vert scroll  }
+                           S0Font := US;               {SO selects U.S. character set}
+                           S1Font := S0Font;           {S1 selects U.S. character set}
+                           currentFont := S1Font;      {current font U.S.            }
+                           vcursorXY.y := top;          {default cursor attributes    }
+                           vcursorXY.x := 0;
+                           charInfo.charStyle := [];
+                           charInfo.charFont := fIDLT12Text;
+
+                           origabs := TRUE;            {origin mode absolute}
+                           params := 0;                {Zero parameters encountered so far in current seq.}
+                           state := q0;                {Starting state of FSA. }
+                           wrapAround := TRUE;         {Wrap around at the end of a line}
+                           newline := TRUE;            {Line feed generated WITH carriage return}
+                           ansi := FALSE;              {DO not recognize ANSI sequences.}
+                           vt52 := TRUE;               {Recognize VT52 sequences.}
+                        END;            {WITH SELF DO...}
+                        IF (SELF.maxColumns <> 80) THEN
+                           ChangeMaxColumns (80);                          {set eighty column output}
+                        ChangeCharStyle (SELF.charAttr.charInfo.charStyle);
+                        ChangeFont (SELF.charAttr.charInfo.charFont);      {set character attributes & font}
+                        ClearScreen(sclearScreen);                         {clear entire screen}
+                        VGotoXY(0, SELF.top)                               {cursor home}
+                     END;                              {Reset}
+               'D' : MyMoveCursor(TRUE,TRUE,1);        {Index.}
+               'E' : BEGIN                             {New line}
+                        MyMoveCursor(TRUE,TRUE,1);
+                        SELF.CtrKeyWrite(chr(13));     {carrage return}
+                     END;
+               'M' : MyMoveCursor(TRUE,TRUE,-1);       {Reverse index}
+               '7' : WITH SELF, charAttr DO
+                     BEGIN                             {save cursor and attributes}
+                        vcursorXY.x := cursorXY.x;
+                        vcursorXY.y := cursorXY.y;
+                        charInfo := currAttr;
+                     END;
+               '8' : WITH SELF, charAttr DO
+                     BEGIN                             {restore cursor and attributes}
+                  {$H-} IF (vcursorXY.x <= rmarg) THEN
+                           VGotoXY (vcursorXY.x, vcursorXY.y)
+                        ELSE VGotoXY(rmarg, vcursorXY.y);
+                        charInfo.charFont := currAttr.charFont; {keep the font the same}
+                        ChangeCharStyle (charInfo.charStyle);  {$H+}
+                     END;
+               'H' : SetTab (-1);                      {Set tab here}
+               '=' : SELF.keyPad := ansiappl;          {ansi application keypad}
+               '>' : SELF.keyPad := normal;            {Normal keypad mode}
+         OTHERWISE  ;                                  {Unimplemented}
+      END           {CASE F...}
+   ELSE IF (count = 1) THEN                            {Three character esc sequences}
+      CASE F OF
+(*
+              '3' : IF (I[1] = '#') THEN ;             {Double heigth line, top half. Unimplemented}
+              '4' : IF (I[1] = '#') THEN ;             {Double heigth line, bottom half. Unimplemented}
+              '5' : IF (I[1] = '#') THEN ;             {Single width line, keep character attributes}
+              '6' : IF (I[1] = '#') THEN ;             {Double width line, unimplemented}
+*)
+              'A' : BEGIN
+                      IF (I[1] = '(') THEN             {Select character set G0,UK}
+                        SELF.S1Font:= UK
+                      ELSE IF (I[1] = ')') THEN        {Select character set G1,UK}
+                        SELF.S0Font := UK;
+                      InvokeFont(UK);
+                    END;
+          'B','1' : BEGIN
+                      IF (I[1] = '(') THEN             {Select character set G0,US}
+                        SELF.S1Font := US
+                      ELSE IF (I[1] = ')') THEN        {Select character set G1,US}
+                        SELF.S0Font := US;
+                      InvokeFont(US);
+                    END;
+          '0','2' : BEGIN
+                      IF (I[1] = '(') THEN             {Select character set G0,Graphics}
+                        SELF.S1Font := GR
+                      ELSE IF (I[1] = ')') THEN        {Select character set G1,Graphics}
+                        SELF.S0Font := GR;
+                      InvokeFont(GR);
+                    END;
+
+        OTHERWISE  ;                                   {not implemented}
+      END;            {CASE F}
+      {ELSE IF (count = ???)  ----> accomidate longer escape sequences}
+   {$IFC fTrace}EP;{$ENDC}
+END;     {DoAnsiEsc}
+
+{*********************************************************************************}
+
+FUNCTION value(str : Tstr255):INTEGER;
+{Return the INTEGER value represented by str.  Assume resultant value can be represented
+ as an INTEGER}
+
+VAR
+   rslt,len,a,b,tens : INTEGER;
+
+BEGIN
+   rslt := 0;
+   len := length(str);                  {number of digits in string}
+   b := len - 1;                        {highest power of ten in string}
+   tens := 1;
+   FOR a := 1 TO b DO
+      tens := tens * 10;
+   FOR a := 1 TO len DO
+   BEGIN
+      rslt := rslt + (ord(str[a]) - 48) * tens;
+      tens := tens div 10
+   END;
+   value := rslt;
+END;                {value}
+
+
+{*********************************************************************************}
+
+PROCEDURE DoAnsiCtrl(F:CHAR; P:Plist; count: INTEGER);
+{Interpret valid ANSI control sequences and, for those sequences implemented,
+call the appropriate PROCEDURE(s) in the standard terminal unit in order to
+emulate the effect(s) of the given control sequence on a VT100 video terminal.}
+
+VAR
+   a,b,line,col : INTEGER;
+   ok : BOOLEAN;
+   linestr,colstr : smallstr;
+   CSI : string[2];                {Control sequence inducer}
+
+{*********************************************************************************}
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   CASE F OF
+            'A' : {Cursor up, no scroll.}
+                  IF (count = 1) THEN
+                     MyMoveCursor(TRUE,FALSE,-value(P[1]))
+                  ELSE IF (count = 0) THEN
+                     MyMoveCursor(TRUE,FALSE,-1);          {default = 1}
+            'B' : {Cursor down, no scroll.}
+                  IF (count = 1) THEN
+                     MyMoveCursor(TRUE,FALSE,value(P[1]))
+                  ELSE IF (count = 0) THEN
+                     MyMoveCursor(TRUE,FALSE,1);           {default = 1}
+            'C' : {Cursor right}
+                  IF (count = 1) THEN
+                     MyMoveCursor(FALSE,FALSE,value(P[1]))
+                  ELSE IF (count = 0) THEN
+                     MyMoveCursor(FALSE,FALSE,1);          {default = 1}
+            'D' : {Cursor left}
+                  IF (count = 1) THEN
+                     MyMoveCursor(FALSE,FALSE,-value(P[1]))
+                  ELSE IF (count = 0) THEN
+                     MyMoveCursor(FALSE,FALSE,-1);         {default = 1}
+        'f','H' : {Horizontal and vertical posn.}
+                  WITH SELF DO  {$H-}
+                  IF origabs THEN                           {origin mode absolute}
+                     IF (count > 0) THEN
+                     BEGIN
+                        line := value(P[1]);
+                        IF (count > 1) THEN
+                           col := value(P[2])
+                        ELSE col := 0;
+                        IF (line <> 0) THEN
+                           line := line - 1;
+                        IF (col <> 0) THEN
+                           col := col - 1;
+                        IF (line > bmarg) THEN        {check boundries}
+                           line := bmarg
+                        ELSE IF (line < tmarg) THEN
+                           line := tmarg;
+                        IF (col > rmarg) THEN
+                           col := rmarg;
+                        VGotoXY (col, line)
+                     END
+                        ELSE VGotoXY (0,0)
+                  ELSE                                 {origin mode relative}
+                     IF (count > 0) THEN
+                     BEGIN
+                        line := value(P[1]) + top;
+                        IF (count > 1) THEN
+                           col := value(P[2])
+                        ELSE col := 0;
+                        IF (line <> 0) THEN
+                           line := line - 1;
+                        IF (col <> 0) THEN
+                           col := col - 1;
+                        IF (line > bottom) THEN        {check boundries}
+                           line := bottom
+                        ELSE IF (line < top) THEN
+                           line := top;
+                        IF (col > rmarg) THEN
+                           col := rmarg;
+                        VGotoXY(col, line)
+                     END
+                        ELSE VGotoXY (0, top);  {$H+}
+            'm' : {Set character attributes}
+                  WITH SELF.charAttr DO
+                  BEGIN  {$H-}
+                     IF (count = 0) THEN
+                        charInfo.charStyle := []            {turn all character attributes off}
+                     ELSE
+                        FOR a := 1 TO count DO
+                           CASE value(P[a]) OF
+                           0 : {Turn all attribute off}
+                               charInfo.charStyle := [];
+                           1 : {Bold on}
+                               charInfo.charStyle :=([bold]+charInfo.charStyle);
+                           4 : {Underscore on}
+                               charInfo.charStyle :=([underline]+charInfo.charStyle);
+                           5 : {blinking};
+                           7 : {Highlight on}    {faking it WITH shadow}
+                               charInfo.charStyle :=([shadow]+charInfo.charStyle);
+                           END;       {CASE}
+                     ChangeCharStyle (charInfo.charStyle);  {$H+}
+                  END;             {character attributes}
+            'K' : {Line oriented erasure}
+                  BEGIN
+                     IF (count = 0) THEN
+                        ClearScreen (sclearELine)                {from cursor to end of line.}
+                     ELSE FOR a := 1 TO count DO
+                        CASE value(P[a]) OF
+                            0 : ClearScreen (sclearELine)        {from cursor to end of line.};
+                            1 : ClearScreen (sclearBLine)        {beginning of line to cursor.};
+                            2 : ClearScreen (sclearLine)         {entire line containing cursor.};
+                        END;
+                  END;
+            'J' : {Screen oriented erasure}
+                  BEGIN
+                     IF (count = 0) THEN
+                        ClearScreen (sclearEScreen)              {From cursor to end of screen.}
+                     ELSE FOR a := 1 TO count DO
+                        CASE value(P[a]) OF
+                            0 : ClearScreen (sclearEScreen);     {from cursor to end of screen.}
+                            1 : ClearScreen (sclearBScreen);     {from beginning of screen}
+                            2 : ClearScreen (sclearScreen);      {entire screen.}
+                        END;       {CASE}
+                  END;
+            'r' : {Set top and bottom margin}
+                  BEGIN
+                     ok := TRUE;
+                     a := tmarg;             {Set to default top margin}
+                     b := bmarg;             {Set to default bottom margin}
+                     IF (count > 0) THEN
+                     BEGIN                   {IF there is a param. for top margin}
+                        a := value(P[1]);
+                        IF (a > 0) THEN
+                           a := a - 1
+                        ELSE IF (a <> 0) THEN
+                           ok := FALSE
+                        {Note IF P[1] < 0 THEN marg is unchanged}
+                     END;
+                     IF (count > 1) THEN
+                     BEGIN                   {IF there is a param. for bottom margin}
+                        b := value(P[2]);
+                        IF (b > 0) THEN
+                           b := b - 1
+                        ELSE IF (b <> 0) THEN
+                           ok := FALSE
+                     END;
+                     IF ok AND (b > a) AND (b <= bmarg) THEN  {a must >= 0}
+                     WITH SELF DO  {$H-}
+                     BEGIN
+                        IF (b <> bmarg) THEN         {IF setting up a scrolling region}
+                           LetHerScroll := FALSE     {I'll handle the vertical scrolling}
+                        ELSE
+                           LetHerScroll := TRUE;     {Let standard terminal unit DO vertical scrolling}
+                        bottom := b;
+                        top := a;
+                        IF origabs THEN         {go to new home position}
+                           VGotoXY (0,0)
+                        ELSE VGotoXY (0, top)
+                     END  {$H+}
+                  END;
+            'q' : {Load LEDs};
+            'g' : {clear tabs}
+                  IF (count > 0) THEN
+                     FOR a := 1 TO count DO
+                     BEGIN
+                        IF (P[a] = '3') THEN
+                           ClearTab (TRUE,0)           {clear all tabs}
+                        ELSE IF (P[a] = '0') THEN
+                           ClearTab (FALSE,-1)         {clear tab here}
+                     END
+                  ELSE ClearTab (FALSE,-1);            {clear tab here}
+            'h' : {Set mode}
+                  IF (P[1] = '?') THEN {private control sequence}
+                     FOR a := 2 TO count DO
+                        CASE value(P[a]) OF
+                            1 : SELF.cursorKeyMode := ansiSet;
+                            3 : {132 column mode}
+                                BEGIN
+                                   ClearScreen (sclearScreen);   {clear the screen   }
+                                   WITH SELF DO
+                                     BEGIN
+                                     top := tmarg;               {defualt top margin }
+                                     rmarg := 131;               {132 columns        }
+                                     bottom := bmarg;            {default bottom marg}
+                                     LetHerScroll := TRUE;       {let std term scroll}
+                                     END;
+                                   ChangeMaxColumns(132);        {132 column output  }
+                                   InvokeFont(SELF.currentFont); {Get correct font   }
+                                   VGotoXY(0, SELF.top)          {home               }
+                                END;
+                            6 : {Origin mode relative}
+                                BEGIN
+                                   SELF.origabs := FALSE;
+                                   VGotoXY(0, SELF.top)          {relative home}
+                                END;
+                            7 : {Wraparound on}
+                                SELF.wrapAround := TRUE;
+                            OTHERWISE  ;
+                        END            {CASE}
+                  ELSE IF (count = 1) THEN
+                       BEGIN                           {Non private modes}
+                          IF (P[1] = '20') THEN
+                            SELF.newline := TRUE
+                       END;
+            'n' : BEGIN       {Reports}
+                     CSI := 'XX';                      {placebo to set length}
+                     CSI[1] := chr(ESC);
+                     CSI[2] := '[';
+                     IF (Value(P[1]) = 6) THEN                   {Cursor position report}
+                     BEGIN
+                        WITH SELF DO  {$H-}
+                        BEGIN
+                          line := cursorXY.y;
+                          col := cursorXY.x;
+                          ToString (cursorXY.x,colstr);          {get col number}
+                          IF origabs THEN
+                            ToString (cursorXY.y,linestr)        {get line number}
+                          ELSE   {origin relative}
+                           IF (cursorXY.y >= top) AND (cursorXY.y <= bottom) THEN
+                              ToString (cursorXY.y - top,linestr);      {within scrolling region}
+                        END;  {$H+}
+                        Push(CSI,' ',FALSE);
+                        Push(linestr,';',TRUE);
+                        Push(colstr,'n',TRUE);
+                     END              {IF P[1] = 6}
+                     ELSE IF (P[1] = '5') THEN       {Status report}
+                     BEGIN
+                        Push(CSI,' ',FALSE);
+                        Push('5n',' ',FALSE)
+                     END
+                  END;             {reports}
+            'c' : BEGIN       {Status report}
+                     CSI := 'XX';                 {placebo to set length}
+                     CSI[1] := chr(ESC);
+                     CSI[2] := '[';
+                     Push(CSI,' ',FALSE);
+                     Push('?1;2c',' ',FALSE);
+                  END;        {Status report}
+            'l' : {Reset mode}
+                  IF (P[1] = '?') THEN            {private control sequence}
+                     FOR a := 2 TO count DO
+                        CASE value(P[a]) OF
+                            1 : SELF.cursorKeyMode := ansiReset;
+                            2 : WITH SELF DO
+                                BEGIN            {Set VT52 mode}
+                                    vt52 := TRUE;
+                                    ansi := FALSE;
+                                    cursorKeyMode := vt52Set;
+                                    IF (keyPad = ansiAppl) THEN
+                                       keyPad := vt52Appl
+                                 END;
+                            3 : {80 column mode}
+                                BEGIN
+                                   ClearScreen (sclearScreen);   {clear the screen}
+                                   WITH SELF DO
+                                     BEGIN
+                                     top := tmarg;            {defualt margins}
+                                     bottom := bmarg;
+                                     LetHerScroll := TRUE;    {Let std term scroll}
+                                     rmarg := 79;
+                                     END;
+                                   InvokeFont(SELF.currentFont); {change font}
+                                   ChangeMaxColumns(80);
+                                   VGotoXY (0, SELF.top)         {home}
+                                END;
+                            6 : BEGIN                            {Origin mode absolute}
+                                   SELF.origabs := TRUE;
+                                   VGotoXY(0, tmarg)             {absolute home}
+                                END;
+                            7 : SELF.wrapAround := FALSE;        {Wraparound off}
+                            OTHERWISE  ;
+                        END        {CASE}
+                  ELSE IF (count = 1) THEN
+                  BEGIN                                          {non pvt. sequence(s)}
+                     IF (P[1] = '20') THEN
+                        SELF.newline := FALSE;                   {set line feed mode}
+                  END;
+                  OTHERWISE  {NOOP};
+   END;           {CASE}
+   {$IFC fTrace}EP;{$ENDC}
+END;                {DoAnsiCtrl}
+
+{*********************************************************************************}
+
+
+PROCEDURE Purge(str : Tstr255;VAR size : INTEGER);
+{Assure that the length field of str has the same value as size.  Pass str to
+VWrite}
+VAR
+   a : INTEGER;
+   tempstr : Tstr255;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   str [0] := CHR (size);
+   IF SELF.LetHerScroll THEN
+      VStrWrite (str)
+   ELSE
+   REPEAT
+      a := SELF.rmarg - SELF.cursorXY.x + 1;         {number of columns left on this line}
+      IF (length(str) > a) THEN
+      BEGIN                             {IF there are more characters than columns left}
+         IF NOT SELF.wrapAround THEN
+         BEGIN
+            str[a] := str[length(str)];
+            str [0] := CHR (a);
+            VStrWrite (str);
+            str := '';
+         END
+         ELSE BEGIN
+            tempstr := copy(str,1,a);
+            Delete(str,1,a);
+            VStrWrite (tempstr);
+            MyMoveCursor(TRUE,TRUE,1);              {line feed}
+            SELF.CtrKeyWrite(chr(CR));
+         END        {ELSE BEGIN}
+      END
+      ELSE BEGIN
+         VStrWrite (str);
+         str := '';
+      END
+   until (str = '');
+   size := 0;
+   {$IFC fTrace}EP;{$ENDC}
+END;           {purge}
+
+{*********************************************************************************}
+
+     {Look at characters one at a time, putting them into outstr.  Purge outstr
+      when:  1)  All charcters in str have been looked at.  2)  A control character
+      is encountered.  IF the escape character is encountered use one of the two
+      (ANSI/VT52) finite state acceptors to determine whether the characters to
+      come form a sequence of ANSI/VT52 form.  IF the form of a sequence is correct
+      THEN send the parameters (numeric and intermediate characters) along WITH the
+      final character to the appropriate PROCEDURE (DoVT52, DoAnsiCtrl, or DoAnsiEsc).
+      IF the sequence would be responded to by a VT100 and IF the action which the
+      sequence should produce is implemented appropriate calls to the standard term.
+      unit are made in order to simulate said action in the window.  Optimal CASE is
+      when standard terminal is doing the scrolling and there are no escape characters
+      in the input string.}
+
+BEGIN                    {VWrite}
+   {$IFC fTrace}BP(30);{$ENDC}
+   OptimalCase := SELF.LetHerScroll;
+   len := length(str);
+   FOR a := 1 TO len DO            {Test for optimal CASE input string}
+      IF (ord(str[a]) <= 31) THEN  {Any control characters?}
+         OptimalCase := FALSE;
+   IF OptimalCase AND (SELF.state = q0) THEN
+     BEGIN
+       IF SELF.ukPound THEN
+         BEGIN
+           outstr := str;
+           FOR a := 1 TO len DO
+             IF outstr[a] = '#' THEN BEGIN ch := '£'; outstr[a] := ch; END;
+           VStrWrite (outstr);
+         END
+       ELSE VStrWrite (str);
+     END
+   ELSE
+   IF (len = 1) AND (ord(str[1]) = CR) then   {Handle Just a carrage return}
+   BEGIN
+      SELF.CtrKeyWrite (chr(CR));
+      IF SELF.newLine THEN
+        IF SELF.LetHerScroll THEN SELF.CtrKeyWrite (CHR (LF))
+        ELSE MyMoveCursor(TRUE,TRUE,1);
+   END
+   ELSE
+   BEGIN                         {Deal with any escape/control sequences}
+      n := 0;                    {Index for input string to zero}
+      m := 0;                    {Index for output string to zero}
+      WHILE (n < len) DO
+      BEGIN
+         n := n + 1;                  {Get next character}
+         ch := str[n];
+         IF (ord(ch) <= 31) THEN      {character is a control character}
+         BEGIN                        {Respond to a control character right away}
+            IF (m > 0) THEN           {purge output string}
+               Purge(outstr,m);
+            CASE ord(ch) OF
+               ESC     : BEGIN                       {start a new sequence}
+                            SELF.state := q1;
+                            SELF.params := 0
+                         END;
+               CAN,SUB : BEGIN                       {Cancel the current sequence}
+                            SELF.state := q0;
+                            SELF.params:= 0;
+                         END;
+               S0      : InvokeFont(SELF.S0Font);    {select CHAR set G1};
+               S1      : InvokeFont(SELF.S1Font);    {select CHAR set G0};
+               CR      : BEGIN
+                            SELF.CtrKeyWrite(ch);
+                            IF SELF.newline THEN
+                               MyMoveCursor(TRUE,TRUE,1)    {move cursor down one line}
+                         END;
+               LF, VT, FF : MyMoveCursor(TRUE,TRUE,1);         {move cursor down one line}
+               BS       : MyMoveCursor(FALSE,FALSE,-1);      {Move cursor back one character}
+               OTHERWISE SELF.CtrKeyWrite(ch);
+            END       {CASE}
+         END           {character is a control character}
+         ELSE IF (SELF.state <> q0) THEN
+         BEGIN
+            IF SELF.ansi THEN
+            BEGIN
+         {$H-} ANSI_FSA(SELF.state,ch);  {$H+}
+               CASE SELF.state OF
+                  q1 : IF (m > 0) THEN                    {purge output string}
+                          Purge(outstr,m);
+                  q2 : WITH SELF DO
+                       IF (ch = '?') THEN
+                          IF (params <> 0) THEN      {invalid sequence}
+                          BEGIN
+                             params := 0;
+                             state := q0
+                          END
+                          ELSE BEGIN                      {DEC private}
+                             params := params + 1;
+                             P[params][1] := ch;
+                             P[params][0] := CHR (1);
+                          END;
+                  q3 : BEGIN                       {store numeric parameters}
+                          IF (SELF.params = 0) OR ((SELF.params = 1) AND (SELF.P[1][1] = '?')) THEN
+                          BEGIN              {first numeric parameter}
+                             SELF.params := SELF.params + 1;
+                             SELF.pos := 1
+                          END
+                          ELSE           {continue building numeric parameter}
+                             SELF.pos := SELF.pos + 1;
+                          IF SELF.params <= maxp THEN   {Accept only a limited number of params}
+                             SELF.P[SELF.params][SELF.pos] := ch;
+                          GetChar(str,ch,n);
+                          WHILE Digit(ch) DO
+                          BEGIN
+                             SELF.pos := SELF.pos + 1;
+                             IF (SELF.params <= maxp) THEN
+                                SELF.P[SELF.params][SELF.pos] := ch;
+                             GetChar(str,ch,n);
+                          END;
+                          IF (SELF.params <= maxp) THEN
+                            SELF.P[SELF.params][0] := CHR (SELF.pos);
+                          n := n - 1;
+                       END;      {q3}
+                  q5 : BEGIN     {store intermediate parameters}
+                          SELF.params := SELF.params + 1;
+                          IF (SELF.params <= maxI) THEN
+                             SELF.I[SELF.params] := ch;
+                       END;
+                  q7 : BEGIN             {expect another numeric parameter}
+                          SELF.params := SELF.params + 1;
+                          SELF.pos := 0
+                       END;
+                  q4 : BEGIN     {accepting state for control sequence}
+                          IF (SELF.params > maxp) THEN
+                             SELF.params := maxp;
+                          DoAnsiCtrl(ch,SELF.P,SELF.params);
+                          SELF.params := 0;
+                          SELF.state := q0;
+                       END;
+                  q6 : BEGIN     {accepting state for escape sequence}
+                          IF (SELF.params > maxI) THEN
+                             SELF.params := maxI;
+                          DoAnsiEsc(ch,SELF.I,SELF.params);
+                          SELF.params := 0;
+                          SELF.state := q0
+                       END;
+                  END;      {CASE state OF...}
+            END   {IF SELF.ansi}
+            ELSE IF SELF.vt52 THEN
+            BEGIN
+              {$H-} VT52_FSA(SELF.state,ch); {$H+}
+               CASE SELF.state OF
+                  q1 : IF (m > 0) THEN                    {purge output string}
+                          Purge(outstr,m);
+               q2,q3 : BEGIN
+                          SELF.params := SELF.params + 1; {record parameter}
+                          SELF.I[SELF.params] := ch;
+                       END;
+                  q4 : BEGIN       {valid vt52 escape format}
+                          SELF.params := SELF.params + 1;
+                          SELF.I[SELF.params] := ch;
+                          DoVT52(SELF.I[1],SELF.I,SELF.params);
+                          SELF.params := 0;
+                          SELF.state := q0;
+                       END;
+                  q6 : BEGIN       {valid vt52 escape format}
+                          DoVT52(ch,SELF.I,SELF.params);
+                          SELF.state := q0;
+                       END
+                  END        {CASE state OF...}
+            END          {ELSE IF SELF.vt52}
+         END           {IF (SELF.state <> q0)}
+         ELSE BEGIN         {build output string}
+            m := m + 1;
+            IF (ch = '#') AND SELF.ukPound THEN ch := '£';
+            outstr[m] := ch;
+         END
+      END;      {WHILE (n <> len)}
+      IF (m <> 0) THEN    {purge output string}
+         IF SELF.LetHerScroll THEN
+         BEGIN
+            outstr[0] := chr(m);                  {Set length of string}
+            VStrWrite (outstr)
+         END
+         ELSE
+            Purge(outstr,m);
+   END;      {ELSE}
+   {$IFC fTrace}EP;{$ENDC}
+END;         {VWrite}
+
+{*********************************************************************************}
+
+PROCEDURE {TVT100.}Vread {(VAR ach: char; VAR keycap : Byte; VAR applekey, shiftkey, optionkey : BOOLEAN)};
+VAR
+   str : smallstr;
+   indx : INTEGER;
+
+{*********************************************************************************}
+
+PROCEDURE Push (str:smallstr; ch:CHAR; addchar:BOOLEAN);
+{Insert the elements of str then, if addchar, also insert ch onto the FIFO stack.  }
+
+VAR
+   pstr : TPString;
+BEGIN
+   pstr := @str;
+   SELF.vReadBuff.InsPStrAt (SELF.vReadBuff.size+1, pstr);
+
+   IF addchar THEN
+      SELF.vReadBuff.InsLast(ch);
+END;                {Push}
+
+{*********************************************************************************}
+
+
+PROCEDURE Pop (VAR ch:CHAR);
+{Return the data from the first node on the FIFO stack}
+BEGIN
+   ch := SELF.vReadBuff.First;
+   SELF.vReadBuff.DelFirst;
+END;                {Pop}
+
+{*********************************************************************************}
+
+
+BEGIN                    {VRead}
+   {$IFC fTrace}BP(30);{$ENDC}
+   str := '';
+   IF (SELF.vReadBuff.size > 0) THEN
+      Pop (ach)
+   ELSE
+      BEGIN
+         SUPERSELF.VRead (ach,keycap,appleKey,shiftKey,optionkey);
+         IF (keycap >= $20) AND (keycap <= $2f) THEN
+         BEGIN                {the key is on the keyPad}
+            IF ((ord(ach) = 28) OR (ord(ach) = 29) OR (ord(ach) = 27) OR (ord(ach) = 45) OR (ord(ach) = 43) OR (ord(ach) = 42)) THEN
+            BEGIN             {key is on the top row}
+               IF applekey THEN
+                  CASE ach OF             {not PF1 -- PF4}
+                    { 32 : ach := chr(127);  }
+                     '-' : IF shiftkey THEN
+                             ach := '-'
+                          ELSE ach := chr(0);
+                     '+' : IF shiftKey THEN
+                             ach := '+'
+                          ELSE ach := chr(28);
+                     '*' : IF shiftKey THEN
+                             ach := '*'
+                  END             {CASE}
+               ELSE
+                  BEGIN            {PF1 -- PF4}
+                     str := 'XX';       {two character escape sequence}
+                     indx := 2;
+                     IF SELF.ansi THEN
+                     BEGIN
+                        str := 'XXX';   {three character secape sequence}
+                        str[indx] := 'O';
+                        indx := indx + 1
+                     END;
+                     str[1] := chr(27);
+                     CASE ord(ach) OF
+                        27 : str[indx] := 'P';
+                        45 : str[indx] := 'Q';
+                        43 : str[indx] := 'R';
+                        42 : str[indx] := 'S'
+                     END;           {CASE}
+                     ach := chr(0);
+                  END         {PF1 -- PF4}
+            END       {top row}
+            ELSE
+               BEGIN            {Not on the top row}
+                  IF NOT appleKey AND (SELF.keyPad <> normal) THEN
+                  BEGIN         {application keypad mode}
+                     str := 'XXX';        {three character escape sequence}
+                     str[1] := chr(27);
+                     IF (SELF.keyPad = ansiAppl) THEN
+                        str[2] := 'O'
+                     ELSE str[2] := '?';
+                     CASE ord(ach) OF
+                        55 : str[3] := 'w';
+                        56 : str[3] := 'x';
+                        57 : str[3] := 'y';
+                        47 : str[3] := 'm';
+                        52 : str[3] := 't';
+                        53 : str[3] := 'u';
+                        54 : str[3] := 'v';
+                        44 : str[3] := 'l';
+                        46 : str[3] := 'n';
+                        50 : str[3] := 'r';
+                        51 : str[3] := 's';
+                        0  : str[3] := 'M';
+                        48 : str[3] := 'p';
+                        49 : str[3] := 'q'
+                    END;              {CASE ord(ach)}
+                    ach := chr(0);
+                 END;            {application keypad}
+              END;         {not on the top row}
+              IF ((ord(ach) >= 28) AND (ord(ach) <= 31)) THEN
+              BEGIN                  {cursor key}
+                 str := 'XXX';
+                 indx := 2;
+                 IF (SELF.cursorKeyMode = ansiReset) THEN
+                 BEGIN          {ansi cursor key mode reset}
+                    str[indx] := '[';
+                    indx := 3
+                 END
+                 ELSE IF (SELF.cursorKeyMode = ansiSet) THEN
+                 BEGIN          {ansi cursor key mode set}
+                    str[indx] := 'O';
+                    indx := 3;
+                 END
+                 ELSE IF (SELF.cursorKeyMode = vt52Set) THEN
+                    str := 'XX';     {two character escape sequence}
+                 str[1] := chr(27);
+                 CASE ord(ach) OF
+                    28 : str[indx] := 'D';
+                    29 : str[indx] := 'C';
+                    30 : str[indx] := 'A';
+                    31 : str[indx] := 'B'
+                 END
+              END               {cursor key}
+        END;              {on key pad}
+        IF (ord(ach) = 126) OR (ord(ach) = 96) THEN
+        BEGIN            {this key maps to the escape key without the appleKey}
+           IF NOT appleKey THEN
+              ach := chr(27)
+           ELSE IF shiftKey THEN
+              ach := '~'
+           ELSE ach := '`'
+        END
+        ELSE IF (ach = '#') AND SELF.ukPound THEN
+           ach := '£'
+     END;            {ELSE BEGIN}
+     IF (str <> '') THEN
+     BEGIN
+        Push(str,' ',FALSE);
+        Pop (ach)
+     END;
+   {$IFC fTrace}EP;{$ENDC}
+END;                {VRead}
+
+{*********************************************************************************}
+
+BEGIN    {TVT100 init routine}
+    Consterm := TVT100.CREATE (NIL, mainHeap);       {Terminal subclass has to assign its own CREATE to
+                                                      Consterm in its class init routine like this.}
+END;      {METHODS OF TVT100}
+END.      {OF UNIT}
+ÿ

@@ -1,0 +1,1703 @@
+        ;PROFASM:  PROFILE DRIVER ASSEMBLY LANGUAGE
+
+;       By Dave Offen.
+;       Copyright 1983, 1984, Apple Computer Inc.
+
+;       By Wendell Henry 1/83
+;       Modified to interface with new generic hard disk driver
+
+;       By Wendell Henry 8/83
+;       Modified to support widget drive
+
+        .INCLUDE        SOURCE/PASCALDEFS.TEXT
+
+;VIA 6522 OFFSETS
+
+IRB     EQU     0
+ORB     EQU     0
+IRA     EQU     8
+ORA     EQU     8
+DDRB    EQU     $10
+DDRA    EQU     $18
+T2CL    EQU     $40
+T2CH    EQU     $48
+ACR     EQU     $58
+PCR     EQU     $60
+IFR     EQU     $68
+IER     EQU     $70
+PORTA   EQU     $78
+RESETC  EQU     $580 ;location to reset controller
+
+RDTIME          .EQU    $000C0000       ;READ TIMEOUT.  ABOUT 8 SECONDS
+RSPTIME         .EQU    $0050           ;RESPONSE TIMEOUT = ABOUT 0.5 MS
+COUNTLIMIT      .EQU    100             ;TIMEOUT LIMIT
+
+;ERROR CODES RETURNED
+
+WAIT_INT EQU    1                ;WAIT FOR NEXT INTERRUPT TO PROCEED
+
+ROMERRBASE EQU  1800             ;BASE ADDR FOR ROM ERRORS
+BADRSP  EQU     ROMERRBASE+82    ;SAME AS ERROR FROM ROM.  BAD RESPONSE FROM PROFILE
+TMOUT   EQU     ROMERRBASE+85    ;SAME AS ERROR FROM ROM.  TIMEOUT.
+
+ERRBASE EQU     650
+
+WRONGDEV EQU    651
+
+HD_ERR  EQU     ERRBASE+4        ;HARD ERROR FROM PROFILE STATUS
+DISCERR EQU     ERRBASE+10       ;CABLE DISCONNECT ERROR
+IGNORERR EQU    ERRBASE+11       ;IGNORE INTERRUPT ERROR
+PRTYERR EQU     ERRBASE+12       ;PARITY ERROR
+CSERR   EQU     -663             ;CHECKSUM OR CRC OR DATA PARITY WARNING
+FMTERR  EQU     618       ;WIDGET DISK IS IN WRONG FORMAT
+
+;WIDGET SPARE TABLE OFFSETS
+FMT_INTL  EQU   9                ;OFFSET TO DISK INTERLEAVE
+INTL_MAP  EQU   454              ;OFFSET TO SOFT INTERLEAVE MAP
+
+;WIDGET SOFT INTERLEAVE
+W_IMAP    EQU   $000C0511        ;FIRST PART OF INTERLEAVE TABLE FOR 5:1
+
+;PORT_PTR (HDISK_CB) OFFSETS
+CONFIG_ADDR     EQU     0
+EXT_PTR         EQU     CONFIG_ADDR+4
+RAW_DATA_PTR    EQU     EXT_PTR+4
+RAW_HEADER_PTR  EQU     RAW_DATA_PTR+4
+X_LENG          EQU     RAW_HEADER_PTR+4
+SECT_LEFT       EQU     X_LENG+4
+V_FLAG          EQU     SECT_LEFT+2
+PAD1            EQU     V_FLAG+1
+RESTRT_COUNT    EQU     PAD1+1
+RESTRT_LIMIT    EQU     RESTRT_COUNT+2
+TOTAL_RESTARTS  EQU     RESTRT_LIMIT+2
+SOFT_HEADER     EQU     TOTAL_RESTARTS+4
+INT_PRIO        EQU     SOFT_HEADER+24
+CUR_INFO_PTR    EQU     INT_PRIO+2
+REQ_HD_PTR      EQU     CUR_INFO_PTR+4
+DUMMY_REQ_PTR   EQU     REQ_HD_PTR+4
+CUR_NUM_REQUESTS EQU    DUMMY_REQ_PTR+4
+WORSTWARNING    EQU     CUR_NUM_REQUESTS+2
+
+;PORT EXTENSION (EXT_DRIVE_CB) OFFSETS
+HWBASE          EQU     0
+HWSTATUS        EQU     HWBASE+4
+REMAP_INTERLEAVE EQU    HWSTATUS+4
+COMMAND_BUFFER  EQU     REMAP_INTERLEAVE+2
+CHECKSUM        EQU     COMMAND_BUFFER+6   ;IN LEFT BYTE.  RIGHT BYTE CLOBBERED.
+EXPECT_HS       EQU     CHECKSUM+2
+DRIVETYPE       EQU     EXPECT_HS+1
+ASM_STATE       EQU     DRIVETYPE+1
+ERRSTAT         EQU     ASM_STATE+2
+ASMERR          EQU     ERRSTAT+4
+LAST_HARD_ERROR EQU     ASMERR+2
+COUNTER         EQU     LAST_HARD_ERROR+4
+DISCSIZE        EQU     COUNTER+2
+CXFERCNT        EQU     DISCSIZE+4
+CSUM_VALID      EQU     CXFERCNT+1
+NESTED_BDR      EQU     CSUM_VALID+1
+ACCSTAT         EQU     NESTED_BDR+2
+CMD_BUF         EQU     ACCSTAT+4
+CNTRESETS       EQU     CMD_BUF+8
+
+PSECTOR         EQU     COMMAND_BUFFER
+
+
+        .PROC   PROFASM
+        ;---------------------------------------------------------------------
+        ;PROFILE STATE MACHINE
+        ;
+        ;  PROCEDURE PROFASM (PORT_PTR: ABSPTR);
+        ;
+        ;  Upon return, asmerr=0 means finished without error; asmerr=wait_int
+        ;     means wait for an interrupt before calling again (asm_state already
+        ;     set up for next call);  asmerr>wait_int means fatal error, and retry
+        ;     is suggested by calling START_DISK in HDISK.  When asmerr=hd_err
+        ;     the hard disk error bytes are contained in errstat.
+
+        ; Register usage:
+        ;  D0-D3 - SCRATCH
+        ;  D4    - PORT PTR
+        ;  D5-D7 - UNUSED
+        ;
+        ;  A0    - SCRATCH
+        ;  A1    - SCRATCH
+        ;  A2    - PORT EXTENSION
+        ;  A3    - HWSTATUS
+        ;  A4    - HWBASE
+        ;  A5,A6 - UNUSED
+
+        .REF            OKXFERNEXT
+
+        MOVEM.L D3-D4/A2-A4,-(SP)  ;SAVE PASCAL REGS USED
+        MOVE.L  24(SP),A0          ;PORT PTR
+        MOVE.L  A0,D4              ;KEEP PORT PTR IN D4
+        MOVE.L  EXT_PTR(A0),A2     ;KEEP PORT EXTENSION PTR IN A2
+        MOVE.L  HWSTATUS(A2),A3    ;KEEP HWSTATUS IN A3
+        MOVE.L  HWBASE(A2),A4      ;KEEP HWBASE IN A4
+
+        CLR     ASMERR(A2)         ;ZERO THE ERROR RETURN CODE INITIALLY
+LP1     MOVE    ASM_STATE(A2),D0   ;PICK UP STATE TABLE OFFSET
+        MOVE    STATE_TABLE(D0),D0
+        JSR     STATE_TABLE(D0)    ;CALL ROUTINE, WHICH MUST PRESERVE D4-D7,A2-A6,
+        TST     D0                 ; AND RETURN WITH D0 <> 0 IFF CALL ANOTHER STATE
+        BNE.S   LP1                ;CALL ANOTHER ROUTINE IF D0 <> 0
+        MOVEM.L (SP)+,D3-D4/A2-A4  ;RESTORE REGS
+        MOVE.L  (SP)+,A0           ;RETURN ADDR
+        ADDQ    #4,SP
+        JMP     (A0)               ;RETURN
+
+STATE_TABLE
+        .WORD   S0-STATE_TABLE  ;starting point for new I/O request
+NEW_CMD                         ;USE SINGLE-BLOCK COMMAND
+        .WORD   S1-STATE_TABLE          ;do handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S3-STATE_TABLE          ;send command to disk
+        .WORD   S1A-STATE_TABLE ;CONTINUE READING
+        .WORD   S200-STATE_TABLE        ;do 2nd handshake, always wait for interrupt
+        .WORD   S6-STATE_TABLE          ;read profile status
+        .WORD   S7-STATE_TABLE          ;read data
+
+WRT     .WORD   S1A-STATE_TABLE ;CONTINUE WRITING
+        .WORD   S8-STATE_TABLE          ;do 2nd handshake and compute checksum
+        .WORD   S10-STATE_TABLE         ;write data
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S200-STATE_TABLE        ;do 2nd handshake, always wait for interrupt
+        .WORD   S6-STATE_TABLE          ;read profile status
+        .WORD   S13-STATE_TABLE         ;return, or start re-read to verify
+        .WORD   S1-STATE_TABLE  ;READ-BACK TO VERIFY AFTER WRITE
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S3-STATE_TABLE          ;send read command to disk
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S200-STATE_TABLE        ;do 2nd handshake, always wait for interrupt
+        .WORD   S6-STATE_TABLE          ;read profile status
+        .WORD   S20-STATE_TABLE         ;compute checksum on data
+
+HS      .WORD   S1-STATE_TABLE  ;EXTRA HANDSHAKE TO UPDATE SPARE TABLE
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S30-STATE_TABLE         ;send illegal command
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S2-STATE_TABLE          ; send 55 regardless of response
+        .WORD   S31-STATE_TABLE         ;return
+
+BDR     .WORD   S40-STATE_TABLE ;BAD RESPONSE FROM HANDSHAKE
+        .WORD   S1-STATE_TABLE          ;continue if widget - do handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S41-STATE_TABLE         ;send 'read status' command
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S42-STATE_TABLE         ;read status - return bad response
+;---------------------------------------------------------------------------------
+MULTI_CMD                       ;USE MULTI-BLOCK COMMAND
+        .WORD   S1-STATE_TABLE          ;do handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S50-STATE_TABLE         ;send command to disk
+
+RD_NEXT                         ;READ NEXT BLOCK IN MULTI-BLOCK COMMAND
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S200-STATE_TABLE        ;do 2nd handshake, always wait for interrupt
+        .WORD   S6-STATE_TABLE          ;read profile status
+        .WORD   S51-STATE_TABLE         ;read data - loop to RD_NEXT for more blks
+        .WORD   S1A-STATE_TABLE         ;Do handskake to free device
+        .WORD   S2A-STATE_TABLE         ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S52-STATE_TABLE         ;If needed start new multi_block request
+
+WRT_NEXT                        ;WRITE NEXT BLOCK IN MULTI-BLOCK COMMAND
+        .WORD   S10A-STATE_TABLE        ;write data
+        .WORD   S1A-STATE_TABLE         ;Do first handshake
+        .WORD   S53-STATE_TABLE         ;loop to WRT_NEXT for more blocks
+        .WORD   S1A-STATE_TABLE         ;Do first handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+WRT_STATUS
+        .WORD   S6-STATE_TABLE          ;Read status
+        .WORD   S1-STATE_TABLE          ;Do handskake to free device
+        .WORD   S2A-STATE_TABLE         ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S52-STATE_TABLE         ;If needed start new multi_block request
+;-----------------------------------------------------------------------
+FMTCMD                          ;Format a Widget
+        .WORD   S60-STATE_TABLE         ;Issue Read Spare table Command
+        .WORD   S1A-STATE_TABLE         ;Do first handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S6-STATE_TABLE          ;read status
+        .WORD   S61-STATE_TABLE         ;Read Spare table
+        .WORD   S1-STATE_TABLE          ;Do first handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S62-STATE_TABLE         ;Issue Write Spare table command
+        .WORD   S1A-STATE_TABLE         ;Do first handshake
+        .WORD   S2-STATE_TABLE          ;do 2nd handshake; poll for 1ms -
+                                        ;                  wait for int if longer
+        .WORD   S63-STATE_TABLE         ;Write Spare table
+        .WORD   S1A-STATE_TABLE         ;do handshake
+        .WORD   S200-STATE_TABLE        ;do 2nd handshake, always wait for interrupt
+        .WORD   S6-STATE_TABLE          ;read status
+        .WORD   S64-STATE_TABLE         ;Finish Format of Widget
+
+        ;---------------------------------------------------------------
+        ;INITIALIZE VARIABLES FOR FIRST HANDSHAKE
+        ;  return: continue at next state
+
+S0      MOVEQ   #1,D0                   ; advance to next state immediately
+        CMPI.B  #2,DRIVETYPE(A2)        ; Controller support system commands?
+        BLT.S   @1                      ; No - Go issue single block command
+        MOVE.W  #MULTI_CMD-STATE_TABLE,ASM_STATE(A2) ; Next state for multi-block
+        RTS                                          ; command
+@1      ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        RTS
+
+        ;---------------------------------------------------------------
+        ; ASSERT "CMD" AND WAIT FOR "BSY"
+        ;   return: continue at next state now, or wait for interrupt first
+S1      MOVE.B  #1,EXPECT_HS(A2)        ; Expected response
+S1A     ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        ANDI.B  #$FE,PCR(A4)            ; interrupt on falling edge
+        MOVE.B  #$02,IFR(A4)            ; clear pending ints
+        ORI.B   #$08,ORB(A4)            ; set dir = in
+        ANDI.B  #$EF,ORB(A4)            ; set cmd=true
+        CLR.B   DDRA(A4)                ; set port A bits to input
+        MOVE    #RSPTIME,D0             ; set response timeout to about 1 ms
+WFB1    BTST    #1,IFR(A4)              ; wait for busy
+        BNE.S   GETRSP                  ; skip if OK
+        DBF     D0,WFB1                 ; else loop until timeout
+        MOVE    #WAIT_INT,ASMERR(A2)    ; wait for interrupt -- parking head now
+        MOVE.B  #$FF,T2CH(A4)           ;START TIMER FOR DISCON ERROR CHECK
+        MOVEQ   #0,D0
+        RTS
+
+GETRSP  MOVE.B  #$02,IFR(A4)            ; clear interrupt flag
+        MOVEQ   #1,D0                   ; continue at next state
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;GET RESPONSE, WAIT FOR BSY FOR 1MS THEN RESORT TO WAIT FOR INTERRUPT
+        ;  return: continue at next state or BDR state after interrupt
+S2A     MOVE.B  #$69,D2                 ;Respond with free device reply
+        BRA.S   S2_GO
+S2      MOVE.B  #$55,D2                 ;Respond with standard reply
+S2_GO   BSR.S   RESPOND
+        MOVE    #RSPTIME,D0             ;Response timeout of 1ms
+@1      BTST    #1,IFR(A4)              ;Wait for not busy
+        BNE.S   @2                      ;Skip if OK
+        DBF     D0,@1                   ;Else loop till timeout
+        MOVE    #WAIT_INT,ASMERR(A2)    ;Wait for interrupt
+        MOVE.B  #$FF,T2CH(A4)           ;START TIMER FOR DISCON ERROR CHECK
+        MOVEQ   #0,D0
+        RTS
+@2      ;Controller not busy
+        MOVE.B  #$02,IFR(A4)            ;Clear interrupt flag
+        MOVEQ   #1,D0                   ;Continue at next state
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;GET RESPONSE, ALWAYS WAIT FOR INTERRUPT
+        ;  return: continue at next state or BDR state after interrupt
+S200    MOVE.B  #$55,D2                 ;Respond with standard reply
+        BSR.S   RESPOND
+        MOVE    #WAIT_INT,ASMERR(A2)    ;Wait for interrupt
+        MOVE.B  #$FF,T2CH(A4)           ;START TIMER FOR DISCON ERROR CHECK
+        MOVEQ   #0,D0
+        RTS
+
+
+        ;
+        ;RESPOND TO PROFILE HANDSHAKE -- SUBROUTINE USED BY S2, S8.
+        ;
+        ;  Input:  D2 = Reply to be sent to controller if response OK
+        ;  Output: D1 = response from controller
+        ;          D2 = Final reply sent to controller
+        ;  UPDATES ASM_STATE FOR ERROR OR "NEXT" STATE.
+        ;
+
+RESPOND ORI.B   #$01,PCR(A4)            ; restore to interrupt on rising edge
+        MOVE.B  PORTA(A4),D1            ; get response in D1
+        CMP.B   EXPECT_HS(A2),D1        ; did pippin return state requested ?
+        BEQ.S   RSPOK                   ; skip if yes
+        TST.B   EXPECT_HS(A2)
+        BPL.S   BAD_RSP                 ; <0 IS WILD CARD ON INPUT
+RSPOK   ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+SNDR1   ANDI.B  #$E7,ORB(A4)            ; set dir=out, cmd=true
+        MOVE.B  #$FF,DDRA(A4)           ; set port A bits to output
+        MOVE.B  D2,PORTA(A4)            ; send reply w/o handshake
+        MOVE.B  #$02,IFR(A4)            ; clear interrupt flag
+        ORI.B   #$10,ORB(A4)            ; set cmd=false
+        RTS
+BAD_RSP MOVE    #BDR-STATE_TABLE,ASM_STATE(A2);NEXT STATE - FLAGS BAD RESP ERROR
+        MOVE.B  #0,D2                   ; Negative reply for Profile/Seagate
+        CMPI.B  #2,DRIVETYPE(A2)        ; Widget?
+        BLT.S   SNDR1
+        MOVE.B  #$69,D2                 ; Negative reply for Widget
+        BRA.S   SNDR1                   ; and go send reply
+
+
+
+        ;TABLES OF INTERLEAVE REMAPPINGS FOR LOW 4 BITS OF BLOCK NUMBER
+        ;9:1 INTERLEAVE ON TOP OF 5:1 FOR PROFILE
+INT1TAB .BYTE 0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11
+        ;9:1 INTERLEAVE ON TOP OF 5:1 FOR SEAGATE
+INT2TAB .BYTE 0,5,10,15,4,9,14,3,8,13,2,7,12,1,6,11
+
+        ;---------------------------------------------------------------
+        ; SEND COMMAND BYTES OUT AND INITIALIZE VARIABLES FOR NEXT HANDSHAKE
+        ;  return: continue at next state (read), continue at WRT state,
+        ;          or return with parity error
+
+S3      ANDI.B  #$DF,ORB(A3)            ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+        LEA     COMMAND_BUFFER(A2),A1   ; INITIALIZE REGS NEEDED
+        MOVE.B  (A1)+,ORA(A4)           ; send a command byte
+        MOVE.B  (A1)+,ORA(A4)           ; send a command byte
+        MOVE.B  (A1)+,ORA(A4)           ; send a command byte
+        MOVE.B  (A1)+,D0
+        TST.B   REMAP_INTERLEAVE(A2)    ; SHOULD INTERLEAVE BE REMAPPED?
+        BEQ.S   @8
+        MOVEQ   #$0F,D1                 ;DO THE REMAPPING
+        AND     D0,D1                   ;MASK LOW 4 BITS
+        AND.B   #$F0,D0                 ;MASK HIGH 4 BITS
+        TST.B   DRIVETYPE(A2)           ;Profile?
+        BNE.S   @1                      ;Skip if no
+        ADD.B   INT1TAB(D1),D0          ;Add in remapped low 4 bits for Profile
+        BRA.S   @8
+@1      ADD.B   INT2TAB(D1),D0          ;Add in remapped low 4 bits for Seagate
+@8      MOVE.B  D0,ORA(A4)              ; send a command byte
+        MOVE.B  (A1)+,ORA(A4)           ; send a command byte
+        MOVE.B  (A1)+,ORA(A4)           ; send a command byte
+        TST.B   COMMAND_BUFFER(A2)      ;Write command?
+        BNE.S   @9                      ;Skip if yes
+        ADDQ    #2,ASM_STATE(A2)        ;Continue with read state next
+        MOVE.B  #2,EXPECT_HS(A2)        ;Expected response
+        BRA     S3FINI                  ;Go finish state
+@9      MOVE.W  #WRT-STATE_TABLE,ASM_STATE(A2) ;Go to write state next
+        MOVE.B  #3,EXPECT_HS(A2)        ;Expected response
+S3FINI  ;finish off sending request
+        MOVEQ   #1,D0                   ;Advance to next state now
+        BTST    #3,IFR(A4)              ;PARITY ERROR?
+        BEQ.S   @9                      ;Skip if no
+        MOVE    #PRTYERR,ASMERR(A2)
+        MOVEQ   #0,D0                   ;RETURN NOW
+@9      ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        RTS
+
+
+RD_STATUS
+        ;---------------------------------------------------------------
+        ; Read the status and check parity
+        ; Output - status bytes in errstat(A2)
+        ;        - A1 = ERRSTAT(A2)
+        ;        - D0 = 0 if status valid
+        ;             = 1 if parity error reading status - status invalid
+        ;
+        CLR.B   DDRA(A4)        ;SET PORT A TO INPUT (=0)
+        ORI.B   #$18,ORB(A4)    ;SET DIR = IN
+        ANDI.B  #$DF,ORB(A3)    ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+        LEA     ERRSTAT(A2),A1  ;GRAB ADDRESS OF ESTAT
+        MOVE.B  IRA(A4),(A1)    ;READ 4 ERROR STATUS BYTES FROM DISK
+        MOVE.B  IRA(A4),1(A1)
+        MOVE.B  IRA(A4),2(A1)
+        MOVE.B  IRA(A4),3(A1)
+        BTST    #3,IFR(A4)      ;PARITY ERROR?
+        BNE.S   @1
+        MOVEQ   #0,D0           ;Valid status
+        RTS
+@1      MOVEQ   #1,D0           ;Invalid status
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;READ DISK STATUS
+        ;  return:  continue at next state, or return with parity err or hard err
+
+S6      BSR     RD_STATUS       ;Read status
+        TST     D0              ;Status valid?
+        BNE.S   @10
+        CMPI.B  #$09,(A1)
+        BEQ.S   @3              ;JUST CONTINUE IF GOT CRC ERROR ON READ
+        MOVE.L  #$C140C000,D0
+        AND.L   (A1),D0         ;SEE IF FATAL ERROR PRESENT
+        BEQ.S   @3
+        MOVE    #HD_ERR,ASMERR(A2) ; YES
+        MOVEQ   #0,D0
+        RTS
+@10     MOVE    #PRTYERR,ASMERR(A2)   ;status not valid
+        MOVEQ   #0,D0
+        RTS
+@3      ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        MOVEQ   #1,D0                   ; do it now
+        RTS
+
+        ;RDHDR     READ HEADER FROM PROFILE
+        ;          A0 = SCRATCH
+        ;          A1 = HEADER ADDRESS
+        ;          A2 = HARDWARE READ ADDRESS
+        ;          D0,D2,D3
+        ;          D1 = CHECKSUM, UPDATED WITH THIS DATA
+RDHDR   MOVE.L  A0,-(SP)        ;SAVE CONTENTS OF A0
+        MOVEQ   #7,D2
+        MOVE.L  A1,A0
+        BSR.S   READLP          ;READ 1ST 8 BYTES OF HEADER
+        CLR.B   (A0)+           ;PACK ZERO INTO UPPER BYTE
+        MOVEQ   #2,D2
+        BSR.S   READLP          ;READ 3-BYTE QUANTITY
+        CLR.B   (A0)+           ;PACK ZERO INTO UPPER BYTE
+        MOVEQ   #2,D2
+        BSR.S   READLP          ;READ 3-BYTE QUANTITY
+        MOVEQ   #1,D3           ;READ LAST 2 SIGN-EXTENDED QUANTITIES
+RD4     MOVE.B  (A2),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        EXT.W   D0              ;SIGN-EXTEND IT
+        MOVE.W  D0,(A0)+        ;AND STORE IT IN BUFFER
+        MOVEQ   #1,D2
+        BSR.S   READLP          ;READ 2-BYTE QUANTITY
+        DBF     D3,RD4          ;REPEAT
+        MOVE.L  (SP)+,A0        ;RESTORE A3 CONTENTS
+@2      RTS
+
+
+
+        ;READLP    READ BYTES FROM PROFILE, KEEPING RUNNING CHECKSUM
+        ;          A0 = DATA ADDRESS(CLOBBERED ON RETURN)
+        ;          A2 = HARDWARE READ ADDRESS,
+        ;          D0 = SCRATCH
+        ;          D1 = CHECKSUM, UPDATED WITH THIS DATA,
+        ;          D2 = BYTE COUNT - 1 (CLOBBERED ON RETURN)
+
+READLP  MOVE.B  (A2),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        MOVE.B  D0,(A0)+        ;AND STORE IT IN BUFFER
+        DBF     D2,READLP       ;REPEAT UNTIL DONE
+        RTS
+
+
+        ;RD_WHDR   READ HEADER FROM WIDGET
+        ;          A0 = SCRATCH
+        ;          A1 = HEADER ADDRESS
+        ;          A2 = HARDWARE READ ADDRESS
+        ;          D0,D2,D3
+        ;          D1 = CHECKSUM, UPDATED WITH THIS DATA
+RD_WHDR
+        MOVE.L  A1,A0
+        MOVE.B  (A2),D0         ;Get flags and version
+        EOR.B   D0,D1           ;Add to checksum
+        MOVE.B  D0,D2
+        ANDI.B  #$0F,D0         ;Extract version
+        MOVE.B  D0,(A0)+        ;Store 1st byte of header
+        MOVE.B  (A2),D0         ;Get 2nd byte of version
+        EOR.B   D0,D1           ;Add to checksum
+        MOVE.B  D0,(A0)+        ;Store 2nd byte of header
+        ANDI.B  #$F0,D2         ;Extract flags
+        MOVE.B  D2,(A0)+        ;Store 3rd byte of header
+        CLR.B   (A0)+           ;Skip volume for now
+        MOVEQ   #3,D2           ;Read next 4 bytes and store in header
+        BSR     READLP
+        MOVEQ   #1,D3           ;Loop thru next 2 longints
+@1      CLR.B   (A0)+           ;Upper byte of longint
+        MOVEQ   #2,D2           ;Read next 3 bytes and store in header
+        BSR     READLP
+        DBF     D3,@1
+        MOVEQ   #1,D3           ;Loop thru next 2 longints and sign extend
+@10     MOVE.B  (A2),D0         ;Get high byte
+        EOR.B   D0,D1           ;Add to checksum
+        EXT.W   D0              ;Sign extend
+        MOVE.W  D0,(A0)+        ;Store both bytes in header
+        MOVEQ   #1,D2           ;Read next 2 bytes and store in header
+        BSR     READLP
+        DBF     D3,@10
+        MOVE.B  (A2),D0         ;Get volume
+        EOR.B   D0,D1           ;Add to checksum
+        MOVE.B  D0,3(A1)        ;Store in header
+        MOVE.B  (A2),D0         ;Get checksum value
+        EOR.B   D0,D1           ;Add to checksum
+        RTS
+
+
+        ;RDDATA    READ DATA FROM PROFILE/WIDGET, AND UPDATE CHECKSUM
+        ;          A0 = DATA ADDRESS(CLOBBERED ON RETURN)
+        ;          A2 = I/O ADDRESS,
+        ;          D0,D2 = SCRATCH
+        ;          D1 = CHECKSUM, UPDATED WITH THIS DATA
+        ;
+        ;  NOTE:  OPTIMAL READ RATE HAS 14-21 CPU CYCLES BETWEEN BYTES (INCLUDING
+        ;            THE READ OPERATION ITSELF).  ANY FEWER CYCLES, AND THE PULSE
+        ;            HANDSHAKE IS NOT GUARANTEED TO BEAT THE NEXT READ.
+
+RDDATA  MOVEQ   #63,D2         ;DO FAST READ, BY PROCESSING 8 AT A TIME
+@3      MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        MOVE.B  (A2),D0
+        EOR.B   D0,D1           ;EXCLUSIVE-OR
+        MOVE.B  D0,(A0)+        ;SAVE DATA IN BUFFER
+        DBF     D2,@3           ;REPEAT
+        RTS
+
+
+
+        ;---------------------------------------------------------------
+        ;READ DATA
+        ;  Used by devices that must issue single-block commands
+        ;  return: continue in HS state, or return without error or with parity
+        ;          or checksum error
+
+S7      MOVE.L  D4,A1                 ;Get Port ptr
+        MOVE.L  RAW_DATA_PTR(A1),A0   ;DATA ADDRESS
+        ADD.L   X_LENG(A1),A0
+        MOVE.L  RAW_HEADER_PTR(A1),A1 ;HEADER ADDRESS
+
+        MOVE.L  A2,-(SP)              ;SAVE A2 ON STACK
+        LEA     IRA(A4),A2            ;SET UP ADDRESS FOR DATA TRANSFER
+        MOVEQ   #0,D1                 ;INIT CHECKSUM VALUE
+        BSR.S   RDHDR                 ;READ HEADER FIRST
+        BSR.S   RDDATA                ;THEN DATA
+        MOVE.L  (SP)+,A2              ;Restore A2
+
+        ;Error conditions
+        ; Checksum error, parity error, crc error - return immediately with cserr
+        ; Error from OKXFERNEXT - return immediately with the error
+        ; Sparing occurred - if profile then do extra sparing handshake
+
+        MOVEQ   #0,D0           ;SET UP TO RETURN TO PASCAL
+        TST.B   6(A1)           ;IS THERE A CHECKSUM IN THIS HEADER
+        BGE.S   CS_OK           ;NOPE
+        CLR.B   13(A1)          ;YES, SO CLEAR CHECKSUM FROM REL PAGE FIELD
+        ANDI.B  #$7F,6(A1)      ;AND CLEAR DRIVER BITS FROM DATAUSED
+        TST.B   D1              ;NOW SEE IF CHECKSUM IS ZERO
+        BEQ.S   CS_OK
+CER     MOVE    #CSERR,ASMERR(A2) ;NON-ZERO CHECKSUM ERROR
+        RTS                     ;RETURN WITH D0=0
+
+CS_OK   BTST    #3,IFR(A4)
+        BNE.S   CER             ;PARITY ERROR?
+        CMPI.B  #$09,ERRSTAT(A2)
+        BEQ.S   CER             ;now RETURN WITH CHECKSUM ERROR IF GOT CRC ERROR
+        ;Verify sector is OK and we can continue with next sector
+        CLR.W   -(SP)                ;Error return
+        MOVE.L  D4,-(SP)
+        JSR     OKXFERNEXT           ;Error:=OKXFERNEXT(portptr)
+        MOVE.W  (SP)+,ASMERR(A2)
+        BEQ.S   @20                  ;Skip if no error
+        MOVEQ   #0,D0                ;Return immediately
+        RTS
+        ;Issue new command to continue request (sect_left > 0)
+        ;Exit (sect_left = 0)
+@20     ADDQ.L  #1,PSECTOR(A2)       ;Increment sector number for next command
+        MOVE.L  D4,A0                ;Get port ptr
+        TST.W   SECT_LEFT(A0)        ;More sectors to transfer?
+        BEQ.S   @40                  ;Skip if no more sectors
+        MOVE.W  #NEW_CMD-STATE_TABLE,ASM_STATE(A2) ;Issue new command
+        MOVEQ   #1,D0                ;Advance to next state now
+        RTS
+        ;Test sparing on last sector
+@40     BTST    #2,ERRSTAT+1(A2)     ;Sparing occur?
+        BNE.S   @41                  ;skip if yes
+        MOVEQ   #0,D0                ;return immediately
+        RTS
+@41     MOVE    #HS-STATE_TABLE,ASM_STATE(A2) ;DO ONE MORE HANDSHAKE IF SPARING
+        MOVEQ   #1,D0                ;Do it now
+        RTS
+
+
+C_SUM   ;Precompute the checksum before writing the sector
+        MOVE.L  D4,A1                   ;Get Port ptr
+        MOVE.L  RAW_DATA_PTR(A1),A0     ; DATA ADDRESS
+        ADD.L   X_LENG(A1),A0
+        MOVE.L  RAW_HEADER_PTR(A1),A1   ;HEADER ADDRESS
+        MOVE.L  (A1)+,D1        ;ACCUMULATE CHECKSUM IN D1, STARTING WITH HEADER
+        MOVEQ   #4,D2           ;REPEAT 4 BYTES 5 TIMES FOR 24 BYTE HEADER
+@1      MOVE.L  (A1)+,D0
+        EOR.L   D0,D1           ;FOUR-BYTE CHECKSUM UPDATE FOR HEADER
+        DBF     D2,@1           ;REPEAT
+
+        MOVEQ   #127,D2         ;NEXT INCLUDE 512 BYTES OF DATA
+        MOVE    A0,D0           ;CHECK FOR ODD ADDRESS
+        AND     #1,D0
+        BEQ.S   @4              ;SKIP IF EVEN
+        MOVE.B  511(A0),D0      ;ODD, SO INCLUDE LAST 1 AND FIRST 3 BYTES NOW
+        EOR.B   D0,D1
+        MOVE.B  (A0)+,D0
+        EOR.B   D0,D1
+        MOVE.W  (A0)+,D0
+        EOR.W   D0,D1
+        SUBQ    #1,D2           ;AND GO THRU LOOP 4 AT A TIME ONE FEWER ITERATIONS
+@4      MOVE.L  (A0)+,D0
+        EOR.L   D0,D1
+        DBF     D2,@4           ;REPEAT
+        MOVE.W  D1,D0           ;XOR 4 CHECKSUM BYTES TOGETHER
+        SWAP    D1
+        EOR.W   D0,D1
+        MOVE.W  D1,CHECKSUM(A2)
+        EOR.B   D1,CHECKSUM(A2) ;RETURN THE CHECKSUM BYTE
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;GET RESPONSE, & PRE-COMPUTE CHECKSUM
+        ;  return: continue at next state or BDR state, now or after interrupt
+
+S8      MOVE.B  #$55,D2                 ;Respond with standard reply
+        BSR.S   RESPOND
+        CMPI.B  #$55,D2                 ;Did reply get changed?
+        BNE.S   @5                      ;YES, bad response, wait for interrupt
+        BSR.S   C_SUM                   ;Precompute the sector's checksum
+        BTST    #1,IFR(A4)              ; interrupt pending yet?
+        BEQ.S   @5                      ; no - wait for the interrupt
+        MOVE.B  #1,CSUM_VALID(A2)       ; precomputed checksum is valid
+        MOVE.B  #$02,IFR(A4)            ; clear interrupt flag
+        MOVEQ   #1,D0                   ; do it now
+        RTS
+@5      MOVE.B  #0,CSUM_VALID(A2)       ; precomputed checksum is invalid
+        MOVE    #WAIT_INT,ASMERR(A2)    ; wait for interrupt
+        MOVE.B  #$FF,T2CH(A4)           ;START TIMER FOR DISCON ERROR CHECK
+        MOVEQ   #0,D0
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ; WRITE DATA - Header followed by User Data
+        ;  return: continue at next state, or return with parity error
+
+S10     TST.B   CSUM_VALID(A2)             ;precomputed checksum valid?
+        BNE.S   @10                        ;skip if yes
+        BSR     C_SUM                      ;compute the checksum
+@10     MOVE.B  CHECKSUM(A2),D1 ;PREVIOUSLY-COMPUTED CHECKSUM
+        MOVE.L  D4,A1                      ;Get Port ptr
+        MOVE.L  RAW_DATA_PTR(A1),A0        ;DATA ADDRESS
+        ADD.L   X_LENG(A1),A0
+        MOVE.L  RAW_HEADER_PTR(A1),A1      ;HEADER ADDRESS
+        ANDI.B  #$F7,ORB(A4)               ;SET DIR=OUT
+        MOVE.B  #$FF,DDRA(A4)              ;SET PORT A BITS TO OUTPUT
+        ANDI.B  #$DF,ORB(A3)               ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+
+        MOVE.L  A2,-(SP)        ;Save A2
+        LEA     ORA(A4),A2      ;GET HARDWARE DATA OUTPUT ADDRESS
+        BSR     WRHDR           ;write header
+        BSR.S   WRDATA          ;write data
+        MOVE.L  (SP)+,A2        ;Restore A2
+        BRA     FINI_WRITE      ;Go complete write
+
+        ;---------------------------------------------------------------
+        ; WRITE DATA - User Data followed by Header
+        ;  return: continue at next state, or return with parity error
+
+S10A    MOVE.L  D4,A1                      ;Get Port ptr
+        MOVE.L  RAW_DATA_PTR(A1),A0        ;DATA ADDRESS
+        ADD.L   X_LENG(A1),A0
+        MOVE.L  RAW_HEADER_PTR(A1),A1      ;HEADER ADDRESS
+        ANDI.B  #$F7,ORB(A4)               ;SET DIR=OUT
+        MOVE.B  #$FF,DDRA(A4)              ;SET PORT A BITS TO OUTPUT
+        ANDI.B  #$DF,ORB(A3)               ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+
+        MOVE.L  A2,-(SP)        ;Save A2
+        LEA     ORA(A4),A2      ;GET HARDWARE DATA OUTPUT ADDRESS
+        BSR.S   WR_WDATA        ;write data
+        BSR     WR_WHDR         ;write header
+        MOVE.L  (SP)+,A2        ;Restore A2
+FINI_WRITE  ;Finish Write
+        BTST    #3,IFR(A4)      ;CHECK PARITY ERROR BIT
+        BEQ.S   @1              ;SKIP IF NO ERROR
+        CLR.B   DDRA(A4)        ;SET PORT A TO INPUT
+        ORI.B   #$08,ORB(A4)    ;SET DIR=IN (ALSO CLEARS PARITY ERR FLAG)
+        MOVE    #PRTYERR,ASMERR(A2)
+        MOVEQ   #0,D0                   ;RETURN NOW
+        RTS
+
+@1      CLR.B   DDRA(A4)            ;SET PORT A TO INPUT
+        ORI.B   #$08,ORB(A4)        ;SET DIR=IN (ALSO CLEARS PARITY ERR FLAG)
+        ;Verify sector is OK and we can continue with next sector
+        CLR.W   -(SP)                ;Error return
+        MOVE.L  D4,-(SP)
+        JSR     OKXFERNEXT           ;Error:=OKXFERNEXT(portptr)
+        MOVE.W  (SP)+,ASMERR(A2)     ;Cannot get error on write
+        MOVE.B  #6,EXPECT_HS(A2);EXPECT 6 IN NEXT HANDSHAKE
+        ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        MOVEQ   #1,D0                   ; CONTINUE
+        RTS
+
+
+        ;WRDATA   WRITE DATA BUFFER TO PROFILE
+        ;A0 = DATA BUFFER (CLOBBERED ON RETURN)
+        ;A2 = HARDWARE OUTPUT ADDRESS
+        ;D0 = SCRATCH
+        ;
+        ;  SEQUENTIAL WRITES MUST OPTIMALLY TAKE 14-21 CPU
+        ;    CYCLES, INCLUDING THE WRITE INSTRUCTION ITSELF
+
+WRDATA  MOVEQ   #127,D0         ;WRITE 4 BYTES, 128 TIMES (512 BYTES TOTAL)
+@1      MOVE.B  (A0)+,(A2)      ;WRITE 1ST BYTE OUT
+        NOP
+        MOVE.B  (A0)+,(A2)      ;WRITE 2ND BYTE OUT
+        NOP
+        MOVE.B  (A0)+,(A2)      ;WRITE 3RD BYTE OUT
+        NOP
+        MOVE.B  (A0)+,(A2)      ;WRITE 4TH BYTE OUT
+        DBF     D0,@1           ;REPEAT
+        RTS
+
+
+        ;WR_WDATA   WRITE DATA BUFFER TO WIDGET - COMPUTE CHECKSUM ON FLY
+        ;Input -
+        ;      A0 = DATA BUFFER (CLOBBERED ON RETURN)
+        ;      A2 = HARDWARE OUTPUT ADDRESS
+        ;      D0 = SCRATCH
+        ;Output -
+        ;      D1 = Computed checksum
+        ;
+        ;  SEQUENTIAL WRITES MUST OPTIMALLY TAKE 14-21 CPU
+        ;    CYCLES, INCLUDING THE WRITE INSTRUCTION ITSELF
+
+WR_WDATA
+        MOVEQ   #0,D1           ;Start of checksum
+        MOVEQ   #127,D0         ;WRITE 4 BYTES, 128 TIMES (512 BYTES TOTAL)
+@1      MOVE.B  (A0)+,D2        ;Get 1st byte
+        EOR.B   D2,D1           ;Include in checksum
+        MOVE.B  D2,(A2)         ;Write 1st byte
+        MOVE.B  (A0)+,D2        ;Get 2nd byte
+        EOR.B   D2,D1           ;Include in checksum
+        MOVE.B  D2,(A2)         ;Write 2nd byte
+        MOVE.B  (A0)+,D2        ;Get 3rd byte
+        EOR.B   D2,D1           ;Include in checksum
+        MOVE.B  D2,(A2)         ;Write 3rd byte
+        MOVE.B  (A0)+,D2        ;Get 4th byte
+        EOR.B   D2,D1           ;Include in checksum
+        MOVE.B  D2,(A2)         ;Write 4th byte
+        DBF     D0,@1           ;REPEAT
+        RTS
+
+
+        ;WRHDR    WRITE HEADER TO PROFILE
+        ;A1 = HEADER BUFFER OF 24 BYTES (A1 CLOBBERED ON RETURN),
+        ;A2 = HARDWARE OUTPUT ADDRESS, D1 = CHECKSUM BYTE, D2 = SCRATCH
+
+WRHDR   MOVE.B  8(A1),D2        ;CANCEL UPPER BYTE OF THE LONGINTS FROM CHECKSUM
+        EOR.B   D2,D1
+        MOVE.B  12(A1),D2
+        EOR.B   D2,D1
+        MOVE.B  16(A1),D2
+        EOR.B   D2,D1
+        MOVE.B  20(A1),D2
+        EOR.B   D2,D1
+        MOVEQ   #5,D2           ;COPY FIRST 6 HEADER BYTES TO DISK
+@1      MOVE.B  (A1)+,(A2)
+        DBF     D2,@1
+        MOVE.B  (A1)+,D2
+        BLT.S   @2
+        EORI.B  #$80,D1         ;ADD SIGN BIT TO CHECKSUM COMPUTATION
+        ORI.B   #$80,D2         ;FLAG HI BYTE OF DATAUSED WITH CHECKSUM-PRESENT BIT
+@2      MOVE.B  D2,(A2)
+        NOP
+        NOP
+        MOVE.B  (A1)+,(A2)      ;COPY LOW BYTE OF DATAUSED
+        BSR.S   WRITE3          ;WRITE OUT 3 ABSPAGE BYTES
+        MOVE.W  (A1)+,D2        ;READ 1ST WD OF RELPAGE; TO BECOME CHECKSUM BYTE
+        EOR.B   D2,D1           ;CANCEL BITS 16-23 OF RELPAGE FROM CHECKSUM(SB=0)
+        MOVE.B  D1,(A2)         ;FINALLY TRANSFER UPDATED CHECKSUM
+        NOP
+        NOP
+        MOVE.B  (A1)+,(A2)      ;THEN WRITE 2 LOW BYTES OF RELPAGE
+        NOP
+        MOVE.B  (A1)+,(A2)
+        BSR.S   WRITE3          ;WRITE 3
+        BSR.S   WRITE3          ;AND 3 MORE
+        RTS
+
+
+        ;WRITE3  WRITE OUT THE 3 LEAST SIGNIFICANT BYTES OF LONGINT
+        ;A1 = POINTER TO LONGINT (UPDATED ON RETURN
+        ;A2 = ADDRESS OF HARDWARE REGISTER
+
+WRITE3  ADDQ    #1,A1           ;SKIP 1 HEADER BYTE
+        MOVE.B  (A1)+,(A2)      ;AND TRANSFER 3
+        NOP                     ;REQUIRED DELAY
+        MOVE.B  (A1)+,(A2)
+        NOP
+        MOVE.B  (A1)+,(A2)
+        RTS
+
+
+        ;WR_WHDR    WRITE HEADER TO WIDGET - COMPUTE CHECKSUM ON FLY
+        ; Input -
+        ;       A1 = HEADER BUFFER OF 24 BYTES (A1 CLOBBERED ON RETURN),
+        ;       A2 = HARDWARE OUTPUT ADDRESS
+        ;       D0 = SCRATCH
+        ;       D1 = CHECKSUM BYTE
+        ;       D2 = SCRATCH
+WR_WHDR
+        MOVE.B  (A1)+,D2        ;1st byte ov Version
+        ANDI.B  #$0F,D2         ;Keep low 4 bits
+        MOVE.B  1(A1),D0        ;Flags
+        ANDI.B  #$F0,D0         ;Extract flags
+        OR.B    D0,D2           ;Combine flags and version
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 1st header byte
+        MOVE.B  (A1)+,D2        ;2nd byte of Version
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 2nd header byte
+        MOVE.B  (A1)+,D0        ;Skip flag byte
+        MOVE.B  (A1)+,D0        ;Save volume byte for later
+        MOVE.B  (A1)+,D2        ;1st byte of fileid
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 3rd header byte
+        MOVE.B  (A1)+,D2        ;2nd byte of fileid
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 4th header byte
+        MOVE.B  (A1)+,D2        ;1st byte of data used
+        ORI.B   #$80,D2         ;Set checksum present flag
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 5th header byte
+        MOVE.B  (A1)+,D2        ;2nd byte of data used
+        EOR.B   D2,D1           ;Add to checksum
+        MOVE.B  D2,(A2)         ;Write 6th header byte
+        BSR.S   W_WRITE3        ;Write low 3 bytes of abspage
+        BSR.S   W_WRITE3        ;Write low 3 bytes of relpage
+        BSR.S   W_WRITE3        ;Write low 3 bytes of fwdlink
+        BSR.S   W_WRITE3        ;Write low 3 bytes of bkwdlink
+        EOR.B   D0,D1           ;Add Volume to checksum
+        MOVE.B  D0,(A2)         ;Write 19th header byte
+        NOP
+        NOP
+        MOVE.B  D1,(A2)         ;Write checksum as 20th header byte
+        RTS
+
+
+        ;W_WRITE3  WRITE OUT THE 3 LEAST SIGNIFICANT BYTES OF LONGINT - COMPUTE
+        ;          CHECKSUM ON FLY
+        ; Input -
+        ;       A1 = POINTER TO LONGINT (UPDATED ON RETURN
+        ;       A2 = ADDRESS OF HARDWARE REGISTER
+        ;       D1 = CHECKSUM BYTE
+        ;       D2 = SCRATCH
+
+W_WRITE3
+        ADDQ    #1,A1           ;SKIP 1 HEADER BYTE
+        MOVE.B  (A1)+,D2        ;AND TRANSFER 3
+        EOR.B   D2,D1
+        MOVE.B  D2,(A2)
+        MOVE.B  (A1)+,D2
+        EOR.B   D2,D1
+        MOVE.B  D2,(A2)
+        MOVE.B  (A1)+,D2
+        EOR.B   D2,D1
+        MOVE.B  D2,(A2)
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;WRITE SUCCEEDED, SEE IF NEED TO VERIFY
+        ;  Used only be devices that do not support multi-block commands
+        ;  return: continue at next state (read) or at HS state, or return successful
+S13     MOVE.L  D4,A0                   ;Get Port ptr
+        TST.B   V_FLAG(A0)
+        BEQ.S   @20                     ;SKIP IF NO VERIFY NEEDED
+        ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        CLR.B   COMMAND_BUFFER(A2)      ; CHANGE COMMAND TO READ
+        MOVEQ   #1,D0                   ; CONTINUE
+        RTS
+
+        ;Issue new command to continue request (sect_left > 0)
+        ;Exit (sect_left = 0)
+@20     ADDQ.L  #1,PSECTOR(A2)       ;Increment sector number for next command
+        MOVE.L  D4,A0                ;Get port ptr
+        TST.W   SECT_LEFT(A0)        ;More sectors to transfer?
+        BEQ.S   @40                  ;Skip if no more sectors
+        MOVE.W  #NEW_CMD-STATE_TABLE,ASM_STATE(A2) ;Issue new command
+        MOVEQ   #1,D0                ;Advance to next state now
+        RTS
+        ;Test sparing on last sector
+@40     BTST    #2,ERRSTAT+1(A2)     ;Sparing occur?
+        BNE.S   @41                  ;skip if yes
+        MOVEQ   #0,D0                ;return immediately
+        RTS
+@41     MOVE    #HS-STATE_TABLE,ASM_STATE(A2) ;DO ONE MORE HANDSHAKE IF SPARING
+        MOVEQ   #1,D0                ;Do it now
+        RTS
+
+        ;---------------------------------------------------------------
+        ;READ DATA TO COMPUTE CHECKSUM ONLY
+        ;  return: continue in HS state, or return without error or with parity
+        ;          or checksum error
+
+S20     LEA     IRA(A4),A0            ;SET UP ADDRESS FOR DATA TRANSFER
+        MOVEQ   #0,D1                 ;INIT CHECKSUM VALUE
+        CMPI.B  #2,DRIVETYPE(A2)      ;WIDGET?
+        BEQ.S   @10                   ;SKIP IF YES
+        ;Profile/Seagate
+        BSR.S   RHDR                  ;READ HEADER FIRST
+        MOVE    #511,D2               ;READ DATA
+@3      MOVE.B  (A0),D0
+        EOR.B   D0,D1                 ;EXCLUSIVE-OR
+        DBF     D2,@3                 ;REPEAT
+        BRA.S   @20
+@10     ;Widget
+        MOVE    #511,D2               ;READ DATA
+@11     MOVE.B  (A0),D0
+        EOR.B   D0,D1                 ;EXCLUSIVE-OR
+        DBF     D2,@11                ;REPEAT
+        BSR.S   R_WHDR                ;READ HEADER
+@20     TST.B   D3              ;IS THERE A CHECKSUM IN THIS HEADER
+        BGE.S   CS_OK2          ;NOPE
+        TST.B   D1              ;NOW SEE IF CHECKSUM IS ZERO
+        BEQ.S   CS_OK2
+CER2    MOVE    #CSERR,ASMERR(A2) ;NON-ZERO CHECKSUM OR PARITY ERROR IN DATA
+        MOVEQ   #0,D0
+        RTS                     ;RETURN TO PASCAL CALLER
+
+CS_OK2  BTST    #3,IFR(A4)
+        BNE.S   CER2            ;PARITY ERROR?
+        CMPI.B  #$09,ERRSTAT(A2)
+        BEQ.S   CER2            ;now RETURN WITH CHECKSUM ERROR IF CRC READ ERR
+
+        ;Issue new command to continue request (sect_left > 0)
+        ;Exit (sect_left = 0)
+@20     ADDQ.L  #1,PSECTOR(A2)       ;Increment sector number for next command
+        MOVE.L  D4,A0                ;Get port ptr
+        TST.W   SECT_LEFT(A0)        ;More sectors to transfer?
+        BEQ.S   @30                  ;Skip if no more sectors
+
+        MOVE.B  #1,COMMAND_BUFFER(A2); Change command back to write
+        MOVE.W  #NEW_CMD-STATE_TABLE,ASM_STATE(A2) ;Issue new command
+        MOVEQ   #1,D0                ;Advance to next state now
+        RTS
+
+@30     BTST    #2,ERRSTAT+1(A2)     ;TEST "SPARING OCCURRED" BIT
+        BNE.S   @40                  ;skip if set SET
+        MOVEQ   #0,D0
+        RTS                          ;EXIT
+
+@40     MOVE    #HS-STATE_TABLE,ASM_STATE(A2) ;SET TO DO ONE MORE HANDSHAKE IF SPARING
+        MOVEQ   #1,D0
+        RTS
+
+
+        ;RHDR     READ HEADER FROM PROFILE
+        ;          A0 = HARDWARE READ ADDRESS
+        ;          D0,D2= SCRATCH, D1 = CHECKSUM, UPDATED WITH THIS DATA
+        ;          D3 = CHECKSUM-PRESENT FLAG BYTE (7TH BYTE OF HEADER) RETURNED
+
+RHDR    MOVEQ   #5,D2           ;GET 1ST 6 BYTES
+@1      MOVE.B  (A0),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        DBF     D2,@1           ;REPEAT UNTIL DONE
+        MOVE.B  (A0),D3         ;READ CHECKSUM PRESENT FLAG BYTE IN D3
+        EOR.B   D3,D1           ;EXCLUSIVE-OR
+        MOVEQ   #12,D2          ;GET LAST 13 BYTES
+@2      MOVE.B  (A0),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        DBF     D2,@2           ;REPEAT UNTIL DONE
+        RTS
+
+        ;R_WHDR     READ HEADER FROM WIDGET
+        ;          A0 = HARDWARE READ ADDRESS
+        ;          D0,D2= SCRATCH, D1 = CHECKSUM, UPDATED WITH THIS DATA
+        ;          D3 = CHECKSUM-PRESENT FLAG BYTE (7TH BYTE OF HEADER) RETURNED
+
+R_WHDR  MOVEQ   #3,D2           ;GET 1ST 4 BYTES
+@1      MOVE.B  (A0),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        DBF     D2,@1           ;REPEAT UNTIL DONE
+        MOVE.B  (A0),D3         ;READ CHECKSUM PRESENT FLAG BYTE IN D3
+        EOR.B   D3,D1           ;EXCLUSIVE-OR
+        MOVEQ   #14,D2          ;GET LAST 15 BYTES
+@2      MOVE.B  (A0),D0         ;GET BYTE FROM DISK
+        EOR.B   D0,D1           ;INCLUDE IN RUNNING CHECKSUM
+        DBF     D2,@2           ;REPEAT UNTIL DONE
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;DO EXTRA HANDSHAKE WHEN SPARING OCCURRED, BY SENDING ILLEGAL COMMAND
+        ;  return: continue at next state
+
+S30     MOVE.B  #$FF,ORA(A4)            ; send ILLEGAL command byte
+        ORI.B   #$18,ORB(A4)            ; reset dir=in
+        CLR.B   DDRA(A4)                ;  and set port A bits to input
+        MOVE.B  #$FF,EXPECT_HS(A2)      ; MATCH ANYTHING ON NEXT HANDSHAKE
+        ADDQ    #2,ASM_STATE(A2)        ; advance to next state
+        MOVEQ   #1,D0                   ; CONTINUE
+        RTS
+
+        ;---------------------------------------------------------------
+        ;EXIT AFTER EXTRA HANDSHAKE
+        ;  return: return successful
+
+S31     ORI.B   #$18,ORB(A4)            ; reset dir=in
+        CLR.B   DDRA(A4)                ;  and set port A bits to input
+        MOVEQ   #0,D0
+        RTS                     ;EXIT
+
+        ;---------------------------------------------------------------
+        ;POLL UNTIL DEVICE IS NOT BUSY FOR 32 CHECKS IN A ROW
+        ;Output - D0 = 0 OK to continue
+        ;            = 1 Timeout
+
+WAIT_NOTBUSY
+        MOVEQ   #1,D0                   ;TIMEOUT
+@2      RTS
+
+        ;---------------------------------------------------------------
+        ;BAD RESPONSE FROM HANDSHAKE
+        ;  return: return with bad-response error
+
+S40     CMPI.B  #2,DRIVETYPE(A2)        ; Profile or Seagate device?
+        BLT.S   @10
+        ;Widget device
+        TST.B   NESTED_BDR(A2)          ; Bad response while handling bad response?
+        BNE.S   @10
+        MOVE.B  #1,NESTED_BDR(A2)       ; Start processing bad response
+        MOVE.L  #RDTIME,D0              ; Wait for controller not busy
+@1      BTST    #1,IRB(A3)
+        BNE.S   @2
+        DBF     D0,@1
+        BRA.S   @10
+@2      ADDQ    #2,ASM_STATE(A2)        ; Go to next state
+        MOVEQ   #1,D0                   ; Do it now
+        RTS
+@10     CLR.B   NESTED_BDR(A2)          ; Nested error - give up
+        MOVE    #BADRSP,ASMERR(A2)
+        CLR.B   DDRA(A4)                ; IN
+        ORI.B   #$18,ORB(A4)            ; dir = in, cmd false
+        MOVEQ   #0,D0                   ; return
+        RTS
+
+        ;---------------------------------------------------------------
+        ;SEND "READ CONTROLLER ABORT STATUS" COMMAND
+
+S41     ANDI.B  #$DF,ORB(A3)            ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+        MOVE.B  #$13,ORA(A4)            ;Diagnostic command
+        NOP
+        MOVE.B  #$01,ORA(A4)            ;Read status instruction
+        NOP
+        MOVE.B  #$05,ORA(A4)            ;Read state registers
+        NOP
+        MOVE.B  #$E6,ORA(A4)            ;Check byte
+        ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        BTST    #3,IFR(A4)              ;PARITY ERROR?
+        BNE.S   @1                      ;Skip if yes
+        ADDQ    #2,ASM_STATE(A2)        ;Go to next state
+        MOVE.B  #$3,EXPECT_HS(A2)       ;Expected response
+        MOVEQ   #1,D0                   ;Advance to next state now
+        RTS
+@1      MOVE    #PRTYERR,ASMERR(A2)
+        MOVEQ   #0,D0                   ;RETURN NOW
+        RTS
+
+        ;---------------------------------------------------------------
+        ;READ CONTROLLER'S STATUS
+
+S42     CLR.B   DDRA(A4)                ;SET PORT A TO INPUT (=0)
+        ORI.B   #$18,ORB(A4)            ;SET DIR = IN
+        LEA     ERRSTAT(A2),A1          ;Address of error status field
+        MOVEQ   #3,D0                   ;Read 4 status bytes
+@1      MOVE.B  IRA(A4),(A1)+           ;Read a byte
+        DBF     D0,@1
+        MOVE.L  ERRSTAT(A2),D0
+        OR.L    D0,ACCSTAT(A2)          ;accumulate state register status
+        ;reset controller
+        ANDI.B  #$F7,ORB(A4)            ;Dir = out
+        ANDI.B  #$7F,RESETC(A4)         ;Toggle reset line
+        MOVEQ   #39,D0                  ;(wait 100 mic sec)
+@2      DBF     D0,@2
+        ORI.B   #$80,RESETC(A4)
+        MOVEQ   #127,D0                 ;(wait 1MS)
+@3      DBF     D0,@3
+        ADDI.W  #1,CNTRESETS(A2)        ;Increment reset counter
+        MOVE.B  #0,NESTED_BDR(A2)
+        MOVE.L  #$180000,D0             ;Wait for not busy - about 16 seconds
+@10     BTST    #1,IRB(A4)
+        BNE.S   @11
+        SUBQ.L  #1,D0
+        BNE.S   @10
+@11     CMPI.W  #16,CNTRESETS(A2)
+        BGT.S   @12
+        MOVE.W  #MULTI_CMD-STATE_TABLE,ASM_STATE(A2)
+        MOVEQ   #1,D0
+        RTS
+@12     MOVE    #BADRSP,ASMERR(A2)
+        CLR.B   DDRA(A4)                ; IN
+        ORI.B   #$18,ORB(A4)            ; dir = in, cmd false
+        MOVEQ   #0,D0                   ; return
+        RTS
+
+SEND_CMD ;Send Widget command
+         ;Input
+         ; CMD_BUF = command type, command, and any parameters
+         ;Output
+         ; A0 = scratch
+         ; D0 = result of issue = 0 OK ; =1 Parity error during send
+         ; D1 = scratch
+         ;
+        ANDI.B  #$DF,ORB(A3)            ;CLEAR PARITY
+        ORI.B   #$20,ORB(A3)
+        MOVE.B  #$08,IFR(A4)
+        LEA     CMD_BUF(A2),A0
+        MOVE.B  CMD_BUF(A2),D0          ;Command type and length
+        EXT     D0
+        ANDI    #$000F,D0                ;Extract length
+        SUBQ    #1,D0
+        MOVEQ   #0,D1                   ;Start of checkbyte
+@1      MOVE.B  (A0),ORA(A4)            ;Send byte
+        ADD.B   (A0)+,D1                ;Add to checkbyte
+        DBF     D0,@1
+        EORI.B  #$FF,D1
+        MOVE.B  D1,ORA(A4)              ;Check byte
+        BTST    #3,IFR(A4)              ;PARITY ERROR?
+        BNE.S   @2                      ;Skip if yes
+        MOVEQ   #0,D0                   ;Flag as OK
+        RTS
+@2      MOVEQ   #1,D0                   ;Flag as bad
+        RTS
+
+        ;---------------------------------------------------------------
+        ; FOR DEVICES THAT SUPPORT MULTI-BLOCK COMMANDS
+        ; SEND COMMAND BYTES OUT AND INITIALIZE VARIABLES FOR NEXT HANDSHAKE
+        ;  return: continue at next state (rd_next or wrt_next),
+        ;          or return with parity error
+
+S50     CMPI.B  #2,COMMAND_BUFFER(A2)   ;Non-I/O request?
+        BGE     S50NONIO
+
+        ;Send Multi-block I/O transfer request
+        MOVE.L  D4,A0                   ;Port ptr
+        MOVE.W  SECT_LEFT(A0),D0        ;Transfer count
+        CMPI.W  #127,D0                 ;Max multi-block count
+        BLE.S   @1
+        MOVEQ   #127,D0
+@1      MOVE.B  D0,CXFERCNT(A2)         ;Current sector count
+        MOVE.B  #$26,CMD_BUF(A2)        ;command and length
+        MOVE.B  COMMAND_BUFFER(A2),CMD_BUF+1(A2) ; Command
+        MOVE.L  COMMAND_BUFFER(A2),CMD_BUF+2(A2) ; Command and sector
+        MOVE.B  D0,CMD_BUF+2(A2)        ;block count over command
+        BSR     SEND_CMD                ;Issue Widget command
+        TST     D0                      ;Parity error during issue?
+        BNE.S   @30
+        TST.B   COMMAND_BUFFER(A2)      ;Write command?
+        BNE.S   @10                     ;Skip if yes
+        MOVE.W  #RD_NEXT-STATE_TABLE,ASM_STATE(A2)  ;Continue with read state next
+        MOVE.B  #$22,EXPECT_HS(A2)      ;Expected response
+        ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        BRA.S   @20                     ;Go finish state
+@10     MOVE.W  #WRT_NEXT-STATE_TABLE,ASM_STATE(A2) ;Go to write state next
+        MOVE.B  #$23,EXPECT_HS(A2)      ;Expected response
+@20    ;finish off sending request
+        MOVEQ   #1,D0                   ;Advance to next state now
+        RTS
+@30     MOVE    #PRTYERR,ASMERR(A2)
+        ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        MOVEQ   #0,D0                   ;RETURN NOW
+        RTS
+S50NONIO ;A non-I/O request is desired
+        MOVE    #FMTCMD-STATE_TABLE,ASM_STATE(A2)
+        MOVEQ   #1,D0                   ;Next state now
+        RTS
+
+
+        ;---------------------------------------------------------------
+        ;READ DATA - FROM MULTI-BLOCK COMMAND
+        ;  return: continue in HS state, or return without error or with parity
+        ;          or checksum error
+
+S51     MOVE.L  D4,A1                 ;Get Port ptr
+        MOVE.L  RAW_DATA_PTR(A1),A0   ;DATA ADDRESS
+        ADD.L   X_LENG(A1),A0
+        MOVE.L  RAW_HEADER_PTR(A1),A1 ;HEADER ADDRESS
+        MOVE.L  A2,-(SP)              ;SAVE A2 ON STACK
+        LEA     IRA(A4),A2            ;SET UP ADDRESS FOR DATA TRANSFER
+        MOVEQ   #0,D1                 ;INIT CHECKSUM VALUE
+        BSR     RDDATA                ;READ DATA FIRST
+        BSR     RD_WHDR               ;THEN HEADER
+        MOVE.L  (SP)+,A2              ;Restore A2
+        TST.B   6(A1)                 ;IS THERE A CHECKSUM IN THIS HEADER
+        BGE.S   S51CS_OK              ;NOPE
+        ANDI.B  #$7F,6(A1)            ;CLEAR DRIVER BITS FROM DATAUSED
+        TST.B   D1                    ;NOW SEE IF CHECKSUM IS ZERO
+        BNE     S51CS_BAD
+S51CS_OK
+        BTST    #3,IFR(A4)
+        BNE     S51PE                ;PARITY ERROR?
+        CMPI.B  #$09,ERRSTAT(A2)
+        BEQ     S51CRC               ;RETURN WITH CHECKSUM ERROR IF GOT CRC ERROR
+        ;Verify sector is OK and we can continue with next sector
+        CLR.W   -(SP)                ;Error return
+        MOVE.L  D4,-(SP)
+        JSR     OKXFERNEXT           ;Error:=OKXFERNEXT(portptr)
+        MOVE.W  (SP)+,ASMERR(A2)
+        BNE     S51HDR_BAD           ;Soft header error
+        ;Continue with next block in current request (cxfercnt >= 0)
+        ;advance to next state (cxfercnt = 0)
+        MOVEQ   #1,D0                ;Advance to next state now
+        ADDQ.L  #1,PSECTOR(A2)       ;Increment sector number for next command
+        SUBQ.B  #1,CXFERCNT(A2)      ;Decrement current transfer count
+        BEQ.S   @30                  ;Skip if no more blocks in current request
+        TST.L   ERRSTAT(A2)          ;Any error at all on last transfer?
+        BNE.S   @31                  ;Skip if yes
+        MOVE.W  #RD_NEXT-STATE_TABLE,ASM_STATE(A2) ;Read next block
+        MOVE.B  #$22,EXPECT_HS(A2)   ;Expected response
+        RTS
+@30     ;Current command completed
+        ADDQ    #2,ASM_STATE(A2)     ;Next state to free device
+        MOVE.B  #1,EXPECT_HS(A2)
+        RTS
+@31     ;Current command stopped by firmware due to non-fatal error (reissue cmd)
+        MOVE    #MULTI_CMD-STATE_TABLE,ASM_STATE(A2) ; next state
+        RTS
+
+        ;Handle various read errors
+S51PE   ;Parity error
+        MOVE    #PRTYERR,ASMERR(A2)
+        BRA     S51QUIT
+S51CRC  ;CRC error
+        MOVE    #CSERR,ASMERR(A2)
+S51QUIT MOVEQ   #0,D0
+        RTS
+        ;These errors require the firmware to be stopped
+S51CS_BAD  ;Software checksum is bad
+        MOVE    #CSERR,ASMERR(A2)
+S51HDR_BAD ;Header error - error code is already in ASMERR
+        MOVE.B  #0,CXFERCNT(A2)         ;Clear current transfer count
+        MOVE.L  D4,A0
+        MOVE.W  #0,SECT_LEFT(A0)        ;Clear sectors left to transfer
+        ADDQ    #2,ASM_STATE(A2)        ;Next state
+        MOVEQ   #1,D0                   ;NOW
+        MOVE.B  #$FF,EXPECT_HS(A2)      ;Any response is OK
+        RTS
+
+        ;----------------------------------------------------------------
+        ;ISSUE NEW MULTI-BLOCK COMMAND IF NECESSARY
+        ;  return: sect_left = 0 - return immediately
+        ;          sect_left <>0 - next state = NEW_CMD immediately
+
+S52     MOVE.L  D4,A0                   ;Get port ptr
+        TST.W   SECT_LEFT(A0)           ;Sectors still to transfer?
+        BEQ.S   @1                      ;Skip if no
+        MOVE    #MULTI_CMD-STATE_TABLE,ASM_STATE(A2) ; next state
+        MOVEQ   #1,D0                   ;Do it now
+        RTS
+@1      MOVEQ   #0,D0                   ;Return immediately
+        RTS
+
+        ;-----------------------------------------------------------------
+        ;CHECK RESPONSE DURING MULTI-BLOCK WRITE
+        ;  return: cxfercnt < 0 - advance to next state after interrupt
+        ;          cxfercnt >=0 - next state = WRT_NEXT after interrupt
+        ;          response = $A3 - next state = WRT_STATUS after interrupt
+        ;          response <>$A3 - next state = BDR immediately
+
+S53     MOVE.B  PORTA(A4),D1            ;Read response
+        ANDI.B  #$E7,ORB(A4)            ;Dir=out; cmd=true
+        MOVE.B  #$FF,DDRA(A4)           ;Port A bits to output
+        MOVE.B  #$55,PORTA(A4)          ;Send reply
+        ORI.B   #$01,PCR(A4)            ;Interrupt on rising edge
+        MOVE.B  #$02,IFR(A4)            ;Clear interrupt flag
+        ORI.B   #$10,ORB(A4)            ;Cmd = false
+        ;Determine next state
+        CMPI.B  #$23,D1                 ;Expected response?
+        BNE.S   @20                     ;Skip if no
+        ADDQ.L  #1,PSECTOR(A2)          ;Increment sector number for next command
+        SUBQ.B  #1,CXFERCNT(A2)         ;Decrement current transfer count
+        BEQ.S   @10                     ;Skip if no more sectors
+        MOVE.W  #WRT_NEXT-STATE_TABLE,ASM_STATE(A2) ;next state
+@6      MOVE    #WAIT_INT,ASMERR(A2)    ; wait for interrupt
+        MOVE.B  #$FF,T2CH(A4)           ;START TIMER FOR DISCON ERROR CHECK
+        MOVEQ   #0,D0
+        RTS
+@10     ;no more blocks in current request
+        MOVE.B  #$27,EXPECT_HS(A2)      ;Expected response
+        ADDQ    #2,ASM_STATE(A2)        ;advance to next state
+        BRA.S   @6                      ;wait for interrupt
+@20     ;not expected response
+        CMPI.B  #$A3,D1                 ;Error response?
+        BNE.S   @30                     ;skip if no
+        MOVE.W  #WRT_STATUS-STATE_TABLE,ASM_STATE(A2) ; next state
+        BRA.S   @6                      ;wait for interrupt
+@30     ;bad response
+        MOVE.W  #BDR-STATE_TABLE,ASM_STATE(A2) ;next state
+        MOVEQ   #1,D0                   ;do it now
+        RTS
+
+        ;--------------------------------------------------------------------
+        ; START OF WIDGET FORMAT COMMAND
+        ; Issue Read Spare Table Command
+S60     MOVE    #$120D,CMD_BUF(A2)      ;Diag command, read spare table
+        BSR     SEND_CMD                ;Issue command
+        TST     D0                      ;Parity error?
+        BNE     @1
+        MOVE.B  #$0F,EXPECT_HS(A2)      ;Expected response
+        ADDQ    #2,ASM_STATE(A2)        ;Next state
+        MOVEQ   #1,D0                   ;now
+        RTS
+@1      MOVE    #PRTYERR,ASMERR(A2)
+        ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        MOVEQ   #0,D0                   ;RETURN NOW
+        RTS
+
+        ;--------------------------------------------------------------------
+        ; Read widget spare table
+S61     MOVE.L  COMMAND_BUFFER(A2),D3   ;Get data buffer address
+        ANDI.L  #$00FFFFFF,D3           ;Eliminate command
+        MOVE.L  D3,A0
+        MOVE.L  A2,-(SP)                ;Save A2
+        LEA     IRA(A4),A2
+        BSR     RDDATA                  ;Read 512 bytes
+        MOVE.L  (SP)+,A2                ;Restore A2
+        ;
+        ;Adjust spare table to proper interleave if necessary
+        ;
+        MOVE.L  D3,A0                   ;Data Buffer
+        CMPI.B  #1,FMT_INTL(A0)         ;Format interleave = 1?
+        BNE.S   @10                     ;Skip if no
+        ;**************************************
+        ;THE FOLLOWING CODE SHOULD BE REMOVED WHEN ADJUSTMENT OF INTERLEAVE
+        ;IS IMPLEMENTED - STATES 62, 63, 64 WILL THEN BE USED.
+        ;**************************************
+        CMPI.L  #W_IMAP,INTL_MAP(A0)    ;Soft interleave correct?
+        BNE.S   @10                     ;Skip if no
+@9      MOVEQ   #0,D0                   ;Format is correct
+        RTS
+@10     MOVE    #FMTERR,ASMERR(A2)      ;Format error
+        BRA.S   @9
+
+        ADDQ    #2,ASM_STATE(A2)        ;Next state
+        MOVEQ   #1,D0                   ;Now
+        RTS
+
+        ;-------------------------------------------------------------------
+        ; Issue Write Spare Table
+S62     MOVE    #$160E,CMD_BUF(A2)      ;Diag command, write spare table
+        MOVE.L  #$F0783C1E,CMD_BUF+2(A2);Fence
+        BSR     SEND_CMD                ;Issue command
+        TST     D0                      ;Parity error?
+        BNE     @1
+        MOVE.B  #$10,EXPECT_HS(A2)      ;Expected response
+        ADDQ    #2,ASM_STATE(A2)        ;Next state
+        MOVEQ   #1,D0                   ;now
+        RTS
+@1      MOVE    #PRTYERR,ASMERR(A2)
+        ORI.B   #$18,ORB(A4)            ;reset dir=in ; cmd=false
+        CLR.B   DDRA(A4)                ;set port A bits to input
+        MOVEQ   #0,D0                   ;RETURN NOW
+        RTS
+
+        ;---------------------------------------------------------------------
+        ; Write spare table
+S63     MOVE.L  COMMAND_BUFFER(A2),D0   ;Get data buffer address
+        ANDI.L  #$00FFFFFF,D0           ;Eliminate command
+        MOVE.L  D0,A0
+        MOVE.L  A2,-(SP)                ;Save A2
+        LEA     ORA(A4),A2
+        BSR     WRDATA                  ;Write 512 bytes
+        MOVE.L  (SP)+,A2                ;Restore A2
+        MOVE.B  #6,EXPECT_HS(A2)        ;Response on next state
+        ADDQ    #2,ASM_STATE(A2)        ;Next state
+        MOVEQ   #1,D0                   ;Now
+        RTS
+
+        ;-------------------------------------------------------------------
+        ; Finish Widget Format
+S64     MOVEQ   #0,D0                   ;Done
+        RTS
+
+
+ ;END OF PROFASM PROC
+
+
+        ;----------------------------------------------------------------------
+        ;PROFILE/WIDGET DRIVER ENTRY POINT
+        ;
+        ;function DRIVER(parameters: param_ptr): integer;
+        ;
+        ;NOTE: if the function code being passed to PROFILE is NOT "Dinterrupt"
+        ;      then the pascal routine PRODRIVER will be executed to handle it.
+        ;      Dinterrupt is handled locally.
+
+        .PROC   DRIVER
+
+        .REF    PROFASM
+        .REF    PRODRIVER
+
+CONFIG  .EQU    0
+F_CODE  .EQU    4
+
+PARMPTR .EQU    4
+RETURN  .EQU    12
+
+        MOVE.L  PARMPTR(SP),A0
+        TST.W   F_CODE(A0)      ;Function code = Dinterrupt?
+        BNE.S   @11             ;Skip if no
+        ;Dinterrupt function
+        MOVE.L  A2,-(SP)        ;Save A2
+        MOVE.L  CONFIG(A0),A0   ;Get config ptr
+        MOVE.L  CB_ADDR(A0),A2  ;DriveCB
+        MOVE.L  EXT_PTR(A2),A0  ;Ext_driveCB
+        MOVE.L  HWBASE(A0),A1   ;Hardware Base address
+        MOVEQ   #$2A,D0
+        AND.B   IFR(A1),D0      ;READ INTERRUPT FLAG REGISTER
+        MOVE.B  D0,IFR(A1)      ;CLEAR INTERRUPT SOURCE
+        MOVEQ   #0,D2            ;HOLD 0 IN D2
+        MOVEP.W D2,T2CL+6(A1)   ;KILL TIMER INTERRUPTS BY ZEROING TIMER (L THEN H),
+        MOVE.B  #$20,IFR(A1)    ; THEN CLEARING INTERRUPT AFTER IT EXPIRES
+        BTST    #0,IRB(A1)      ;CABLE DISCONNECTED?
+        BNE.S   @20
+        AND.B   #$02,D0         ;CHECK IFR BIT FOR COMPLETION
+        BEQ.S   @30             ;skip if no I/O completion
+        CLR.W   RETURN(SP)      ;Return Profile = 0
+        TST.W   CUR_NUM_REQUESTS(A2)     ;Current request?
+        BEQ.S   @100                     ;Exit if none
+        ;Current request exists - call main part of driver
+        MOVE.L  A2,-(SP)
+        JSR     PROFASM
+        MOVE.L  EXT_PTR(A2),A0           ;Ext_driveCB
+        MOVE.W  ASMERR(A0),D0            ;Get error return
+        MOVE.W  D0,RETURN(SP)            ;Return error code
+        CMPI.W  #WAIT_INT,D0             ;Error = wait for next interrupt?
+        BNE.S   @10                      ;skip if no
+        MOVE.W  #COUNTLIMIT,COUNTER(A0)  ;start timeout
+        BRA.S   @100                     ;exit till next interrupt
+        ;Some unexpected error has occurred - let pascal routine handle it
+@10     MOVE.L  (SP)+,A2                 ;Restore A2
+@11     JMP     PRODRIVER
+
+@20     ;Disconnect error
+        MOVE    #DISCERR,ASMERR(A0)      ;Error = disconnect
+@21     MOVE.B  D2,DDRA(A1)              ;SET PORT A TO INPUT (=0)
+        ORI.B   #$18,ORB(A1)             ;SET DIR = IN
+        TST.W   CUR_NUM_REQUESTS(A2)     ;Current request?
+        BNE.S   @10                      ;skip if yes
+        BRA.S   @100                     ;Exit if no
+
+@30     ;Timer interrupt
+        SUBQ    #1,COUNTER(A0)           ;decrement timeout counter
+        BLE.S   @31                      ;skip if timeout
+        MOVE.B  #$FF,T2CH(A1)            ;poll again in .1 sec
+        BRA.S   @100                     ;exit till next interrupt
+@31     MOVE    #TMOUT,ASMERR(A0)        ;error = timeout
+        BRA.S   @21                      ;setup port and exit
+
+@100    ;Exit after interrupt processing
+        MOVE.L  (SP)+,A2                 ;Restore A2
+        MOVE.L  (SP)+,A0                 ;Return PC
+        ADDA.W  #4,SP                    ;Pop param_ptr
+        JMP     (A0)                     ;return
+
+
+        .PROC   PROF_INIT
+        ;---------------------------------------------------------------------
+        ;
+        ;   FUNCTION PROF_INIT (EXT_CB: PTR_EXT_DRIVE_CB; VIA_ADDR: ABSPTR;
+        ;                       HWSTATUS: ABSPTR; HWST_DDRB: ABSPTR): INTEGER;
+        ;
+
+        MOVEM.L A2-A4,-(SP)     ;SAVE REGS USED
+        MOVEM.L 12(SP),A0-A4    ;A0=RET ADDR, A1=DDRB, A2 = STATUS
+                                ;A3 = BASE ADDR, A4 = PTR_EXT_DRIVE_CB
+        ORI.B   #$A0,(A1)       ;SET PROFILE-RESET & PARITY-RESET TO OUTPUT
+        ORI.B   #$A0,ORB(A2)    ;NORMALLY BITS 5 & 7 OF ORB = 1
+        MOVE.B  #$3B,IER(A3)    ;LEAVE TIMER1 ENABLE & SHIFT REG BITS ALONE
+        ANDI.B  #$DC,ACR(A3)
+        ANDI.B  #$7B,PCR(A3)
+        ORI.B   #$6B,PCR(A3)    ;SET PCR TO $6B, WITHOUT CHANGING BIT #4
+        MOVEQ   #0,D0           ;PUT 0 IN D0
+        MOVEP.W D0,T2CL+6(A3)   ;KILL TIMER INTERRUPTS BY 1ST ZEROING TIMER (L THEN H),
+        CLR.B   DDRA(A3)
+        ANDI.B  #$FC,DDRB(A3)
+        ORI.B   #$1C,DDRB(A3)
+        ANDI.B  #$FB,ORB(A3)
+        ORI.B   #$18,ORB(A3)
+        BTST    #0,IRB(A3)      ;DISCONNECTED?
+        BEQ.S   @2
+        MOVE    #DISCERR,D0     ;DISCONNECTED ERROR
+        BRA     BYE             ;RETURN
+
+        ;DO 1 HANDSHAKE TO MAKE SURE IT IS A PROFILE!
+
+@2      BSR     WAIT_NOTBUSY            ;Wait for device not busy
+        TST     D0                      ;Timeout?
+        BEQ.S   DOIT
+        MOVE    #TMOUT,D0               ;Timeout error
+        BRA     BSYXT
+
+DOIT    MOVEQ   #1,D2                   ;Expected response
+        BSR     DOSHAKE                 ;Do hand shake
+        TST     D0
+        BNE     BSYXT
+        ;Get Device Characteristics
+        ANDI.B  #$DF,ORB(A2)            ;Clear parity
+        ORI.B   #$20,ORB(A2)
+        MOVE.B  #$08,IFR(A3)
+        MOVEQ   #0,D0
+        MOVE.B  D0,ORA(A3)              ;Command=Read
+        NOP
+        MOVE.B  #$FF,ORA(A3)            ;Read sector = $FFFFFF
+        MOVE.B  #$FF,ORA(A3)
+        MOVE.B  #$FF,ORA(A3)
+        MOVE.B  #$0A,ORA(A3)            ;Retry count
+        MOVE.B  D0,ORA(A3)              ;Sparing threshold
+        BTST    #3,IFR(A3)              ;Parity error?
+        BEQ     GTTYP
+        MOVE    #PRTYERR,D0             ;set parity error
+        BRA     BSYXT
+
+GTTYP   MOVEQ   #2,D2                   ;Expected response
+        BSR     DOSHAKE                 ;Do hand shake
+        TST     D0
+        BNE     BSYXT
+        CLR.B   DDRA(A3)                ;Set Port A bits to input
+        ORI.B   #$18,ORB(A3)            ;set dir=in; cmd=false
+
+        ANDI.B  #$DF,ORB(A2)            ;Clear parity
+        ORI.B   #$20,ORB(A2)
+        MOVE.B  #$08,IFR(A3)
+        MOVE.B  IRA(A3),ERRSTAT(A4)     ;Read 4 bytes of status
+        MOVE.B  IRA(A3),ERRSTAT+1(A4)
+        MOVE.B  IRA(A3),ERRSTAT+2(A4)
+        MOVE.B  IRA(A3),ERRSTAT+3(A4)
+        BTST    #3,IFR(A3)              ;Parity error?
+        BEQ     GTTYP2
+        MOVE    #PRTYERR,D0             ;Set parity error
+        BRA.S   BSYXT
+
+GTTYP2  MOVEQ   #13,D0                  ;Read 14 bytes
+@2      MOVE.B  IRA(A3),D1
+        DBF     D0,@2
+        MOVE.B  IRA(A3),DRIVETYPE(A4)   ;Read next byte as drivetype
+        MOVEQ   #2,D0                   ;Read 3 bytes
+@3      MOVE.B  IRA(A3),D1
+        DBF     D0,@3
+        MOVE.B  IRA(A3),DISCSIZE+1(A4)  ;Read discsize MSB
+        MOVE.B  IRA(A3),DISCSIZE+2(A4)
+        MOVE.B  IRA(A3),DISCSIZE+3(A4)  ;Read discsize LSB
+        MOVEQ   #0,D0                   ;Error code = 0
+
+BSYXT   CLR.B   DDRA(A3)                ; Set Port A bits to input
+        ORI.B   #$18,ORB(A3)            ; set dir=in, cmd=false
+
+BYE     MOVE.B  #$3B,IFR(A3)    ;CLEAR ALL INTERRUPTS
+        MOVE.B  #$A2,IER(A3)    ;ENABLE INTERRUPTS
+        MOVEM.L (SP)+,A2-A4     ;RESTORE REGS
+        LEA     20(SP),SP
+        MOVE    D0,(SP)         ;RETURN ERRNUM
+        JMP     (A0)            ;RETURN
+
+
+        ;---------------------------------------------------------------
+        ;POLL UNTIL DEVICE IS NOT BUSY FOR 32 CHECKS IN A ROW
+        ;Registers used = D0, D1
+        ;Output - D0 = 0 OK to continue
+        ;            = 1 Timeout
+
+WAIT_NOTBUSY
+        MOVEQ   #0,D0                   ;OK to continue
+        MOVE.L  #RDTIME,D1
+@1      BTST    #1,IRB(A3)              ;Busy?
+        BNE.S   @2
+        SUBQ.L  #1,D1
+        BNE.S   @1
+        MOVEQ   #1,D0                   ;TIMEOUT
+@2      RTS
+
+        ;---------------------------------------------------------------
+        ;POLL UNTIL DEVICE IS BUSY FOR 32 CHECKS IN A ROW
+        ;Registers used = D0, D1
+        ;Output - D0 = 0 OK to continue
+        ;            = 1 Timeout
+
+WAIT_BUSY
+        MOVEQ   #0,D0                   ;OK to continue
+        MOVE.L  #RDTIME,D1
+@1      BTST    #1,IRB(A3)              ;Not Busy?
+        BEQ.S   @2
+        SUBQ.L  #1,D1
+        BNE.S   @1
+        MOVEQ   #1,D0                   ;TIMEOUT
+@2      RTS
+
+DOSHAKE   ; Do hand shake
+          ; Input - D2 = Expected response
+          ;       - A3 = HARDWARE BASE ADDRESS
+          ; Output- D0 = error # (=0 if OK)
+          ; Exits with dir=out, Port A to output, cmd=false
+        MOVE.B  #$02,IFR(A3)    ;Clear any pending interrupt
+        ANDI.B  #$EF,ORB(A3)    ;Cmd=true
+        ORI.B   #$08,ORB(A3)    ;Set dir = in
+        CLR.B   DDRA(A3)        ;Set Port A bits to input
+        BSR     WAIT_BUSY       ;Wait for device to go busy
+        TST     D0              ;Timeout?
+        BEQ.S   GTRSP           ;Skip if OK
+        MOVE    #TMOUT,D0       ;Timeout error
+        RTS                     ;Exit early
+
+GTRSP   MOVE.B  PORTA(A3),D1    ;Get response
+        ANDI.B  #$E7,ORB(A3)    ;Dir=out; cmd=true
+        MOVE.B  #$FF,DDRA(A3)   ;Port A to output
+        CMP.B   D2,D1           ;Compare response
+        BNE.S   RS_BAD          ;Skip if bad response
+        MOVE.B  #$55,PORTA(A3)  ;Send OK reply
+        ORI.B   #$10,ORB(A3)    ;Cmd=false
+        BSR     WAIT_NOTBUSY    ;Wait for not busy
+        TST     D0              ;Timeout?
+        BEQ.S   @1
+        MOVE    #TMOUT,D0       ;timeout error
+@1      MOVE.B  #$02,IFR(A3)    ;Clear pending interrupt
+        RTS
+RS_BAD  ;bad response
+        MOVE.B  #$AA,PORTA(A3)  ;Send negative reply
+        ORI.B   #$10,ORB(A3)    ;Cmd=false
+        BSR     WAIT_NOTBUSY    ;Wait for not busy
+        MOVE    #BADRSP,D0      ;Bad response error code
+        MOVE.B  #$02,IFR(A3)    ;Clear pending interrupt
+        RTS
+
+        .PROC   PROF_DOWN
+        ;---------------------------------------------------------------------
+        ;
+        ;   PROCEDURE PROF_DOWN (VIA_ADDR: ABSPTR)
+        ;
+        ;       Disable interrupts on drive
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        MOVE.L  (SP)+,A1        ;VIA_ADDR
+        MOVE.B  #$3B,IER(A1)    ;LEAVE TIMER1 ENABLE & SHIFT REG BITS ALONE
+        JMP     (A0)            ;RETURN
+
+        .END
+
+ÿ

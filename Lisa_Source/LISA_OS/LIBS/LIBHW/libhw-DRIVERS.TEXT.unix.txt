@@ -1,0 +1,1272 @@
+
+;
+;   File DRIVERS.TEXT
+;
+;-----------------------------------------------------------------------------
+;
+;   Lisa Hardware Interface Routines
+;
+;   Written by Rick Meyers
+;   Copyright 1983, Apple Computer Inc.
+;
+;
+;
+;   The software below provides an interface for accessing and controlling
+;   several parts of the Lisa hardware.  This interface is intended for use
+;   by several operating systems, including the Lisa OS, the Monitor OS and
+;   Smalltalk.  The following hardware/software capabilities are currently
+;   addressed:  the mouse, the cursor, primary and alternate displays, the
+;   contrast control, inactive fading and power-off, the speaker, both
+;   undecoded and decoded keyboard access, the NMI key, the millisecond timer
+;   and alarms, the microsecond timer and the hardware clock/calendar.
+;
+;   Both Pascal and assembly language interfaces are provided.  Several of
+;   the routines will execute successfully only in supervisor mode.  These
+;   routines are marked with an asterisk (*) in their definition.
+;
+;-----------------------------------------------------------------------------
+;
+;   Change Log
+;
+;   <28Feb83>  RJM  Contrast and SetContrast modified to set and return the
+;                   bright contrast level, rather than the current level
+;   <28Feb83>  RJM  Release 8.4
+;   <23Mar83>  RJM  Shift key state updating modified to OR the option keys
+;   <23Mar83>  RJM  Release 8.5
+;   <21Jun83>  LAN  Added non-breaking space
+;   <21Jun83>  LAN  documented that the alarm number must be in D0 when
+;                   calling the alarm routine.
+;   <27Jun83>  LAN  Added Swiss-German keyboard layout to legends
+;   <07Jul83>  LAN  Added Spanish/Latin American and Swiss-French keyboard layouts
+;   <08Jul83>  LAN  Save alpha-lock in ShiftState rather than Event+State
+;   <29Jul83>  LAN  Deleted routines ReadMMU and WriteMMU from Machine.text
+;   <29Jul83>  LAN  Removed Dvorak keyboard
+;   <10Aug83>  LAN  Input higher initial value in VIA1 T1 counter to accomodate
+;                   faster clock speed in Pepsi
+;   <18Aug83>  LAN  Added BootROMId equate
+;   <18Aug83>  LAN  Added global to indicate pre- or post-Pepsi I/O board
+;   <26Sep83>  LAN  Changed filenames for Lorraines O.S. build
+;   <28Sep83>  LAN  Added routines for user supplied detection of mouse movement
+;   <10Oct83>  LAN  Exported KeyToAscii Routine
+;   <21Oct83>  LAN  Replaced routines ReadMMU and WriteMMU
+;   <21Oct83>  LAN  In TimeToDate, allow December 31 in a leap year (see Libhw/Timers.text).
+;   <25Oct83>  LAN  Turn on bits in EventTable for the 4 Sony disks
+;   <05Dec83>  LAN  During initialization, check for LisaLite (Lisa with Sony and slow timers).
+;   <05Jan84>  DTO  Reduce interrupts-off time in: copscmd, bzucursor, Level2.
+;   <05Jan84>  DTO  Poll all level1 interrupts again before exiting interrupt handler.
+;   <31Jan84>  DTO  Change system clock from 10 ms to 20 ms.
+;   <31Jan84>  DTO  Allow 6522 shift register to cause alarm interrupts.
+;   <13Feb84>  DTO  Reduce length of poll with interrupts off in Copscmd
+;   <14Feb84>  DTO  When StepContrast and CheckActivity are called from alarm,
+;                   lower interrupt priority from 7 to 1 during execution
+
+
+
+                .PROC   Drivers,0           ;
+OSVersion       .EQU    1                   ; 0=Monitor version, 1=OS version
+
+
+;-----------------------------------------------------------------------------
+;
+;   Initial Execution Starting Point
+;
+;   This code is executed as part of the Monitor or OS booting sequence. It
+;   calls the initialization routine, for the Monitor stuffs magic location
+;   $10C, and returns.
+;
+
+           .IF  OSVersion
+                JSR     DriverInit          ; initialize globals, VIAs, etc.
+                RTS                         ; return
+           .ELSE
+                JSR     DriverInit          ; initialize globals, VIAs, etc.
+                LEA     Version,A0          ; address of resident code
+                MOVE.L  A0,$10C             ; tell the Monitor
+                RTS                         ; return
+           .ENDC
+
+
+Version         .ASCII  'Hardware Interface 9.3, Oct  28, 1983 '
+                .ASCII  'Copyright 1983, Apple Computer Inc. '
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Global Constants
+;
+
+           .IF  OSVersion=0                 ; Monitor
+Globals         .EQU    $F00                ; global data area (Monitor Version)
+QueueSize       .EQU    32                  ; keyboard event queue size (Monitor)
+
+           .ELSE                            ; OS
+Globals         .EQU    $CC0000             ; global data area (OS Version)
+QueueSize       .EQU    32                  ; keyboard event queue size (OS)
+           .ENDC
+
+
+MaxX            .EQU    719                 ; maximum mouse/cursor X-coordinate
+MaxY            .EQU    363                 ; maximum mouse/cursor Y-corrdinate
+Alarms          .EQU    20                  ; number of millisecond alarms
+AltQueSize      .EQU    16                  ; alternate keyboard queue size
+ToggleState     .EQU    $4                  ; 'OPTION' must also be down
+
+;   Offsets within a Keyboard Event
+
+Keycode         .EQU    0                   ; keycode offset within event
+Ascii           .EQU    1                   ; ascii offset within event
+State           .EQU    2                   ; state offset within event
+MouseX          .EQU    4                   ; mouse X-coord offset
+MouseY          .EQU    6                   ; mouse Y-coord offset
+Time            .EQU    8                   ; time offset within event
+
+;   Memory Locations
+
+Trap5Vector     .EQU    $94                 ; Trap vector for trap #5
+AltScrnAddr     .EQU    $110                ; alternate screen logical address
+ScrnAddr        .EQU    $160                ; primary screen logical address
+AltScrnPhys     .EQU    $170                ; alternate screen physical address
+ScrnPhys        .EQU    $174                ; primary screen physical address
+MemoryBase      .EQU    $2A4                ; minimum physical memory address
+KeybdQueue      .EQU    $2B0                ; keyboard input queue address
+MMURoutine      .EQU    $F4000              ; address where MMU routines execute
+IOSpace         .EQU    $FC0000             ; I/O Space memory address
+DiskROMId       .EQU    IOSpace+$C031       ; Disk ROM Id                        <18Aug83>
+ContrstLatch    .EQU    IOSpace+$D01C       ; Contrast Latch
+VIA1            .EQU    IOSpace+$D101|$D801 ; Hard Disk VIA memory address
+VIA2            .EQU    IOSpace+$D181|$DC01 ; Keyboard VIA memory address
+SetUpSet        .EQU    IOSpace+$E010       ; SetUp bit set
+SetUpReset      .EQU    IOSpace+$E012       ; SetUp bit reset
+VertReset       .EQU    IOSpace+$E018       ; Vertical Retrace Interrupt
+VideoLatch      .EQU    IOSpace+$E800       ; Video Page Latch
+StatusRegister  .EQU    IOSpace+$F800       ; Hardware Status Register
+
+
+;   Offsets of Parallel Port VIA Registers
+
+PORTB1          .EQU    $00                 ; Port B Data Register
+PORTA1          .EQU    $08                 ; Port A Data Register
+DDRB1           .EQU    $10                 ; Data Direction B
+DDRA1           .EQU    $18                 ; Data Direction A
+T1CL1           .EQU    $20                 ; T1 Counter (Low-Order)
+T1CH1           .EQU    $28                 ; T1 Counter (High-Order)
+T1LL1           .EQU    $30                 ; T1 Latch (Low-Order)
+T1LH1           .EQU    $38                 ; T1 Latch (High-Order)
+T2CL1           .EQU    $40                 ; T2 Counter (Low-Order)
+T2CH1           .EQU    $48                 ; T2 Counter (High-Order)
+SR1             .EQU    $50                 ; Shift Register
+ACR1            .EQU    $58                 ; Auxiliary Control Register
+PCR1            .EQU    $60                 ; Peripheral Control Register
+IFR1            .EQU    $68                 ; Interrupt Flag Register
+IER1            .EQU    $70                 ; Interrupt Enable Register
+IORA1           .EQU    $78                 ; Input/Output Register A
+
+;   Offsets of Keyboard VIA Registers
+
+PORTB2          .EQU    0                   ; Port B Data Register
+PORTA2          .EQU    2                   ; Port A Data Register
+DDRB2           .EQU    4                   ; Data Direction B
+DDRA2           .EQU    6                   ; Data Direction A
+T1CL2           .EQU    8                   ; T1 Counter (Low-Order)
+T1CH2           .EQU    10                  ; T1 Counter (High-Order)
+T1LL2           .EQU    12                  ; T1 Latch (Low-Order)
+T1LH2           .EQU    14                  ; T1 Latch (High-Order)
+T2CL2           .EQU    16                  ; T2 Counter (Low-Order)
+T2CH2           .EQU    18                  ; T2 Counter (High-Order)
+SR2             .EQU    20                  ; Shift Register
+ACR2            .EQU    22                  ; Auxiliary Control Register
+PCR2            .EQU    24                  ; Peripheral Control Register
+IFR2            .EQU    26                  ; Interrupt Flag Register
+IER2            .EQU    28                  ; Interrupt Enable Register
+IORA2           .EQU    30                  ; Input/Output Register A
+
+
+;-----------------------------------------------------------------------------
+;
+;   Global Data Area
+;
+;
+
+ErrorsUp        .EQU    Globals             ; missing up transitions (word)
+ErrorsDown      .EQU    ErrorsUp+2          ; missing down transitions (word)
+ErrorsIO        .EQU    ErrorsDown+2        ; I/O board COPS failures (word)
+ErrorsKeybd     .EQU    ErrorsIO+2          ; keyboard COPS failures (word)
+
+IOBoard         .EQU    ErrorsKeybd+2       ; 0=Sept81, else=Feb82 (byte)
+PostPepsiIO     .EQU    IOBoard+1           ; 0=pre-Pepsi, else=post-Pepsi (byte)<18Aug83>
+LCounterInit    .EQU    PostPepsiIO+1       ; VIA1 counter initial value (byte)  <10Aug83>
+HCounterInit    .EQU    LCounterInit+1      ; VIA1 counter initial value (byte)  <10Aug83>
+TwiggyRoutine   .EQU    HCounterInit|1+1    ; Twiggy driver (long)
+DiskRoutine     .EQU    TwiggyRoutine+4     ; disk driver (long)
+DiskSemaphore   .EQU    DiskRoutine+4       ; 0=free, else=busy (byte)
+COPSState       .EQU    DiskSemaphore+1     ; COPS state code (byte)
+COPSCounter     .EQU    COPSState|1+1       ; COPS transaction counter (long)
+
+MicroTicks      .EQU    COPSCounter+4       ; microsecond timer (long)
+TimerTicks      .EQU    MicroTicks+4        ; millisecond timer (long)
+AlarmTicks      .EQU    TimerTicks+4        ; millisecond alarm (long)
+AlarmEnabled    .EQU    AlarmTicks+4        ; bit 0: 0=free, 1=assigned
+                                            ; bit 1: 0=disabled, 1=enabled
+AlarmSetting    .EQU    AlarmEnabled|1+<Alarms+1> ; alarm setting (long array)
+AlarmRoutine    .EQU    AlarmSetting+<Alarms+1*4> ; user alarm routine (long array)
+ClockReady      .EQU    AlarmRoutine+<Alarms+1*4> ; 0=not ready, else=ready (byte)
+ClockBytes      .EQU    ClockReady+1        ; clock bytes still coming (byte)
+ClockHigh       .EQU    ClockBytes|1+1      ; high word of clock (word)
+ClockLow        .EQU    ClockHigh+2         ; low two words of clock (long)
+
+MouseMVRoutine  .EQU    ClockLow+4          ; address of routine MouseMovement            <28Sep83>
+
+MousX           .EQU    MouseMVRoutine+4    ; mouse X-coordinate (word)
+MousY           .EQU    MousX+2             ; mouse Y-coordinate (word)
+MousDx          .EQU    MousY+2             ; mouse delta-x (byte)
+MousDy          .EQU    MousDx+1            ; mouse delta-y (byte)
+MousScaling     .EQU    MousDy+1            ; 0=disabled, else=enabled (byte)
+MousThresh      .EQU    MousScale|1+1       ; mouse movement threshold (word)
+MousOdometer    .EQU    MousThresh+2        ; mouse odometer (long)
+
+CrsrSwitch      .EQU    MousOdometer+4      ; 0=normal, else=busy cursor (byte)
+CrsrData        .EQU    CrsrSwitch|1+1      ; cursor data bitmap (64 bytes)
+CrsrMask        .EQU    CrsrData+64         ; cursor mask bitmap (64 bytes)
+CrsrHotX        .EQU    CrsrMask+64         ; hotspot X-coordinate (word)
+CrsrHotY        .EQU    CrsrHotX+2          ; hotspot Y-coordinate (word)
+CrsrHeight      .EQU    CrsrHotY+2          ; cursor height, 0-32 (word)
+BusyData        .EQU    CrsrHeight+2        ; busy cursor data bitmap (64 bytes)
+BusyMask        .EQU    BusyData+64         ; busy cursor mask bitmap (64 bytes)
+BusyHotX        .EQU    BusyMask+64         ; busy hotspot X-coordinate (word)
+BusyHotY        .EQU    BusyHotX+2          ; busy hotspot Y-coordinate (word)
+BusyHeight      .EQU    BusyHotY+2          ; busy cursor height, 0-32 (word)
+BusyAlarm       .EQU    BusyHeight+2        ; busy cursor alarm number (word)
+CrsrX           .EQU    BusyAlarm+2         ; cursor X-coordinate (word)
+CrsrY           .EQU    CrsrX+2             ; cursor Y-coordinate (word)
+CrsrTracking    .EQU    CrsrY+2             ; 0=disabled, else=enabled (byte)
+CrsrBusy        .EQU    CrsrTracking+1      ; 0=not busy, else=busy (byte)
+CrsrVisible     .EQU    CrsrBusy+1          ; 0=not visible, else=visible (byte)
+CrsrHidden      .EQU    CrsrVisible|1+1     ; <= 0 implies hidden (word)
+CrsrObscured    .EQU    CrsrHidden+2        ; 0=not obscured, else=obscured (byte)
+
+SavedData       .EQU    CrsrObscured+2      ; data from under cursor (128 bytes)
+SavedX          .EQU    SavedData+128       ; saved data X-coordinate (word)
+SavedY          .EQU    SavedX+2            ; saved data Y-coordinate (word)
+SavedRows       .EQU    SavedY+2            ; rows of saved data (word)
+SavedAddr       .EQU    SavedRows+2         ; saved data screen address (long)
+
+ScrnFrames      .EQU    SavedAddr+4         ; vertical retrace counter (long)
+ScrnKeybd       .EQU    ScrnFrames+4        ; 0=primary, else=alternate (byte)
+ScrnContrast    .EQU    ScrnKeybd|1+1       ; screen contrast (word)
+CntrastDim      .EQU    ScrnContrast+2      ; dim screen contrast (word)
+CntrastGoal     .EQU    CntrastDim+2        ; screen contrast goal (word)
+CntrastStep     .EQU    CntrastGoal+2       ; screen contrast step (word)
+CntrastAlarm    .EQU    CntrastStep+2       ; contrast alarm number (word)
+
+ActiveState     .EQU    CntrastAlarm+2      ; bit 0: 0=no activity, 1=activity
+                                            ; bit 1: 0=dim, 1=bright (byte)
+ActiveDelay     .EQU    ActiveState|1+1     ; milliseconds before dimming (long)
+ActiveAlarm     .EQU    ActiveDelay+4       ; activity alarm number (word)
+ActiveContrast  .EQU    ActiveAlarm+2       ; active contrast level (word)
+
+SpeakerAlarm    .EQU    ActiveContrast+2    ; speaker alarm number (word)
+SpeakerShift    .EQU    SpeakerAlarm+2      ; speaker shift register (byte)
+
+KeybdRoutine    .EQU    SpeakerShift|1+1    ; address of routine Key (long)
+KeybdIdRoutine  .EQU    KeybdRoutine+4      ; address of routine KeyId (long)
+KeybdErrRoutine .EQU    KeybdIdRoutine+4    ; address of routine KeyErr (long)
+
+KeybdId         .EQU    KeybdErrRoutine+4   ; keyboard id (byte)
+KeyLegends      .EQU    KeybdId+1           ; keyboard layout/legends (byte)
+NMIKeyCode      .EQU    KeyLegends+1        ; NMI keycode (byte)
+ToggleCode      .EQU    NMIKeyCode+1        ; Toggle keycode (byte)
+AsciiTable      .EQU    ToggleCode|1+1      ; keycode to Ascii mapping (768 bytes)
+KeyBitmap       .EQU    AsciiTable+768      ; keyboard map, 1=down (128 bits)
+LastKeyDown     .EQU    KeyBitmap+<128/8>   ; keycode of last key down (byte)
+LastKeyTime     .EQU    LastKeyDown|1+1     ; time of last key down (long)
+ShiftState      .EQU    LastKeyTime+4       ; shift key state (word)
+Event           .EQU    ShiftState+2        ; event buffer (12 bytes)           <23Mar83>
+DKDEvent        .EQU    Event+12            ; dead key diacritical event (12 bytes)
+Repeat          .EQU    DKDEvent+12         ; repeat event (12 bytes)
+DKDPending      .EQU    Repeat+12           ; 0=not pending, else=pending (byte)
+RepeatAvailable .EQU    DKDPending+1        ; 0=not available, else=available (byte)
+RepeatInitial   .EQU    RepeatAvailable|1+1 ; initial repeat delay (long)
+RepeatSubseq    .EQU    RepeatInitial+4     ; subsequent repeat delay (long)
+RepeatStart     .EQU    RepeatSubseq+4      ; time key went down (long)
+RepeatTime      .EQU    RepeatStart+4       ; time of next repeat (long)
+
+QueueIn         .EQU    RepeatTime+4        ; queue input index (word)
+QueueOut        .EQU    QueueIn+2           ; queue output index (word)
+Queue           .EQU    QueueOut+2          ; keyboard event queue (32*12 bytes)
+
+AltQueIn        .EQU    Queue+<QueueSize*12>; alternate queue input index (word)
+AltQueOut       .EQU    AltQueIn+2          ; alternate queue output index (word)
+AltQueue        .EQU    AltQueOut+2         ; alternate event queue (16*12 bytes)
+GlobalsEnd      .EQU    AltQueue+<AltQueSize*12> ; next available global location
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Macro Definitions
+;
+;
+;   Disable Interrupts
+
+               .MACRO  DISABLE              ; disable interrupts
+                MOVE.W  SR,-(SP)            ; save status register
+                ORI.W   #$0700,SR           ; disable interrupts
+               .ENDM
+
+;   Enable Interrupts
+
+               .MACRO  ENABLE               ; enable interrupts
+                MOVE.W  (SP)+,SR            ; restore status register
+               .ENDM
+
+
+;   Procedure Head  --  debug assist
+
+               .MACRO   HEAD                ; procedure heading
+                LINK    A6,#0               ; fancy NOP used by debugger
+               .ENDM
+
+
+;   Procedure Tail  --  debug assist, remove parameters and return
+;
+;       %1  --  number of bytes of parameters to delete
+;       %2  --  procedure name as string, exactly 8 characters
+
+                .MACRO  TAIL
+                UNLK    A6                  ; pattern recognized by debugger
+                .IF     %1 = 0              ; if no parameters to pop then
+                  RTS                       ;   return
+                .ELSE                       ; else
+                  .IF     %1 = 4            ;   if 4 bytes of parameters then
+                    MOVE.L  (SP)+,(SP)      ;     slide down the return addr
+                    RTS                     ;     and return
+                  .ELSE                     ;   else
+                    MOVE.L  (SP)+,A0        ;     load return address
+                    ADD.W   #%1,SP          ;     remove parameters from stack
+                    JMP     (A0)            ;     return
+                  .ENDC                     ;   endif
+                .ENDC                       ; endif
+                .ASCII  %2                  ; procedure name
+                .ENDM
+
+;   Report user interaction activity
+
+               .MACRO  ACTIVE               ; report user activity
+                BSET    #0,ActiveState      ; bit 0: 0=no activity, 1=activity
+                BNE.S   *+6                 ; branch if activity already noted
+                JSR     NoteActivity        ; note the activity
+               .ENDM
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Trap Table
+;
+;   The Hardware Interface Routines may be called by stuffing a routine number
+;   into D7 and executing a TRAP #$5 instruction.  Trap5 handles the trap and
+;   calls the appropriate routine.
+;
+
+                HEAD                        ; dummy procedure head
+Trap5           MOVE.W  TrapTable(D7.W),D7  ; target address-TrapTable
+                JSR     TrapTable(D7)       ; call target address
+                RTE                         ; return
+
+
+TrapTable       .WORD   DriverInit-TrapTable            ; 0
+                .WORD   MouseLocation-TrapTable         ; 2
+                .WORD   MouseUpdates-TrapTable          ; 4
+                .WORD   MouseScaling-TrapTable          ; 6
+                .WORD   MouseThresh-TrapTable           ; 8
+                .WORD   CursorLocation-TrapTable        ; 10
+                .WORD   CursorTracking-TrapTable        ; 12
+                .WORD   CursorImage-TrapTable           ; 14
+                .WORD   CursorHide-TrapTable            ; 16
+                .WORD   CursorShield-TrapTable          ; 18
+                .WORD   CursorDisplay-TrapTable         ; 20
+                .WORD   FrameCounter-TrapTable          ; 22
+                .WORD   ScreenAddr-TrapTable            ; 24
+                .WORD   AltScreenAddr-TrapTable         ; 26
+                .WORD   Contrast-TrapTable              ; 28
+                .WORD   SetContrast-TrapTable           ; 30
+                .WORD   RampContrast-TrapTable          ; 32
+                .WORD   FadeDelay-TrapTable             ; 34
+                .WORD   SetFadeDelay-TrapTable          ; 36
+                .WORD   PowerDown-TrapTable             ; 38
+                .WORD   PowerCycle-TrapTable            ; 40
+                .WORD   Volume-TrapTable                ; 42
+                .WORD   SetVolume-TrapTable             ; 44
+                .WORD   Noise-TrapTable                 ; 46
+                .WORD   Silence-TrapTable               ; 48
+                .WORD   Beep-TrapTable                  ; 50
+                .WORD   KeyIsDown-TrapTable             ; 52
+                .WORD   KeyMap-TrapTable                ; 54
+                .WORD   Keyboard-TrapTable              ; 56
+                .WORD   KeybdEvent-TrapTable            ; 58
+                .WORD   KeybdPeek-TrapTable             ; 60
+                .WORD   RepeatRate-TrapTable            ; 62
+                .WORD   SetRepeatRate-TrapTable         ; 64
+                .WORD   KeyPushed-TrapTable             ; 66
+                .WORD   Timer-TrapTable                 ; 68
+                .WORD   AlarmAssign-TrapTable           ; 70
+                .WORD   AlarmReturn-TrapTable           ; 72
+                .WORD   AlarmAbsolute-TrapTable         ; 74
+                .WORD   AlarmRelative-TrapTable         ; 76
+                .WORD   AlarmOff-TrapTable              ; 78
+                .WORD   DateTime-TrapTable              ; 80
+                .WORD   SetDateTime-TrapTable           ; 82
+                .WORD   DateToTime-TrapTable            ; 84
+                .WORD   DateToClock-TrapTable           ; 86
+                .WORD   TimeStamp-TrapTable             ; 88
+                .WORD   SetTimeStamp-TrapTable          ; 90
+                .WORD   TimeToDate-TrapTable            ; 92
+                .WORD   TimeToClock-TrapTable           ; 94
+                .WORD   Clock-TrapTable                 ; 96
+                .WORD   SetClock-TrapTable              ; 98
+                .WORD   ClockToDate-TrapTable           ; 100
+                .WORD   ClockToTime-TrapTable           ; 102
+                .WORD   DiskDriver-TrapTable            ; 104
+                .WORD   TwiggyDriver-TrapTable          ; 106
+                .WORD   DiskSync-TrapTable              ; 108
+                .WORD   CursorObscure-TrapTable         ; 110
+                .WORD   CursorInit-TrapTable            ; 112
+                .WORD   NMIKey-TrapTable                ; 114
+                .WORD   SetNMIKey-TrapTable             ; 116
+                .WORD   KeyRoutine-TrapTable            ; 118
+                .WORD   SetKeyRoutine-TrapTable         ; 120
+                .WORD   KeyIdRoutine-TrapTable          ; 122
+                .WORD   SetKeyIdRoutine-TrapTable       ; 124
+                .WORD   KeyErrRoutine-TrapTable         ; 126
+                .WORD   SetKeyErrRout-TrapTable         ; 128
+                .WORD   DimContrast-TrapTable           ; 130
+                .WORD   SetDimContrast-TrapTable        ; 132
+                .WORD   BusyImage-TrapTable             ; 134
+                .WORD   BusyDelay-TrapTable             ; 136
+                .WORD   ScreenSize-TrapTable            ; 138
+                .WORD   NMISync-TrapTable               ; 140
+                .WORD   ScreenKeybd-TrapTable           ; 142
+                .WORD   SetScreenKeybd-TrapTable        ; 144
+                .WORD   AltKeyPeek-TrapTable            ; 146
+                .WORD   AltKeyEvent-TrapTable           ; 148
+                .WORD   Legends-TrapTable               ; 150
+                .WORD   SetLegends-TrapTable            ; 152
+                .WORD   MicroTimer-TrapTable            ; 154
+                .WORD   CursorReInit-TrapTable          ; 156
+                .WORD   Poll-TrapTable                  ; 158
+                .WORD   ToggleKey-TrapTable             ; 160
+                .WORD   SetToggleKey-TrapTable          ; 162
+                .WORD   KeyToAscii-TrapTable            ; 164            <10Oct83>
+                .WORD   Dummy-TrapTable                 ; 166
+                .WORD   MouseOdometer-TrapTable         ; 168
+                .WORD   COPSSync-TrapTable              ; 170
+                .WORD   MouseRoutine-TrapTable          ; 172
+                .WORD   SetMouseRoutine-TrapTable       ; 174
+                .WORD   ReadMMU-TrapTable               ; 176            <21Oct83>
+                .WORD   WriteMMU-TrapTable              ; 178            <21Oct83>
+
+
+;-----------------------------------------------------------------------------
+;
+;   Dummy Routine
+;
+;   Routine Dummy is used as the default user supplied routine.
+;
+;
+
+Dummy           RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Interrupt Handler Initialization
+;
+;
+;   Routine:    DriverInit
+;   Arguments:    none
+;   Function:   Initialize data areas, VIAs and the interrupt vectors for
+;               level 1 and level 2 interrupts.  Determine which version
+;               of the I/O board is installed.
+;
+
+DriverInit      MOVEM.L D0-D1/A0-A1,-(SP)   ; save registers
+                MOVE.L  #0,D0               ; initialize globals to zero
+                MOVE.L  #Globals,A0         ; base of global data area
+                MOVE.L  #GlobalsEnd,A1      ; approx. end of global data area
+
+@1              MOVE.L  D0,(A0)+            ; initialize globals to zero
+                CMP.L   A1,A0               ; end of global data area ?
+                BLT.S   @1                  ; branch if not end of globals
+
+                LEA     Dummy,A0            ; dummy routine
+                MOVE.L  A0,DiskRoutine      ; initialize disk driver
+                MOVE.L  A0,TwiggyRoutine    ; initialize twiggy driver
+                MOVE.W  #$0FFF,ClockHigh    ; initialize ClockHigh
+                MOVE.L  #$FFFFFFFF,ClockLow ; initialize ClockLow
+                MOVE.W  #8,MousThresh       ; initialize MousThresh
+                MOVE.B  #1,CrsrTracking     ; 0=disable, else=enable
+                MOVE.W  #1,CrsrHidden       ; initialize CrsrHidden
+                MOVE.W  #$0080,ScrnContrast ; initialize ScrnContrast
+                MOVE.W  #$00B0,CntrastDim   ; initialize CntrastDim
+
+                LEA     BzyCursor,A0        ; busy cursor routine (address)        <05Jan84>
+                JSR     AlarmAssign         ; assign busy cursor alarm number
+                MOVE.W  D0,BusyAlarm        ; initialize BusyAlarm
+
+                LEA     Silence,A0          ; silence routine (address)
+                JSR     AlarmAssign         ; assign speaker alarm number
+                MOVE.W  D0,SpeakerAlarm     ; initialize SpeakerAlarm
+
+                LEA     StContrast,A0       ; step contrast routine (address)      <14Feb84>
+                JSR     AlarmAssign         ; assign contrast alarm number
+                MOVE.W  D0,CntrastAlarm     ; initialize CntrastAlarm
+
+                LEA     MouseMovement,A0    ; Address of MouseMovement             <28Sep83>
+                MOVE.L  A0,MouseMVRoutine   ; initialize MouseMVRoutine            <28Sep83>
+
+                LEA     Key,A0              ; address of Key
+                MOVE.L  A0,KeybdRoutine     ; initialize KeybdRoutine
+                LEA     KeyId,A0            ; address of KeyId
+                MOVE.L  A0,KeybdIdRoutine   ; initialize KeybdIdRoutine
+                LEA     KeyErr,A0           ; address of KeyErr
+                MOVE.L  A0,KeybdErrRoutine  ; initialize KeybdErrRoutine
+
+                MOVE.B  #$03,ActiveState    ; activity, bright
+                MOVE.L  #300000,ActiveDelay ; 5 minutes before dimming
+                MOVE.W  #$80,ActiveContrast ; initialize ActiveContrast
+                LEA     ChkActivity,A0      ; check activity routine (address)     <14Feb84>
+                JSR     AlarmAssign         ; assign activity alarm number
+                MOVE.W  D0,ActiveAlarm      ; initialize ActiveAlarm
+                MOVE.L  ActiveDelay,D1      ; milliseconds before dimming
+                JSR     AlarmRelative       ; set alarm to call CheckActivity
+                MOVE.L  #400,RepeatInitial  ; initial repeat delay
+                MOVE.L  #100,RepeatSubseq   ; subsequent repeat delay
+
+                MOVE.B  #0,D0               ; 0=primary, else=alternate
+                JSR     SetScreenKeybd      ; primary screen and keyboard
+
+;
+;   Determine I/O Board Version
+;
+;   Feb82 boards compute parity on data written to the parallel port VIA.
+;   Sept81 boards don't have this parity circuitry.
+;
+
+TestIO          MOVE.B  #0,D0               ; 0=Sept81, else=Feb82
+                MOVE.L  #VIA1,A0            ; VIA1 address
+                BCLR    #5,DDRB1(A0)        ; make PB5 an input
+                BSET    #3,DDRB1(A0)        ; make DIR an output
+                BSET    #2,DDRB1(A0)        ; make DEN/ an output
+                BCLR    #2,PORTB1(A0)       ; enable disk
+                BCLR    #3,PORTB1(A0)       ; set DRW to write
+                MOVE.B  #$FF,DDRA1(A0)      ; make Port A an output
+                MOVE.B  #1,IORA1(A0)        ; value with odd parity
+                BTST    #5,PORTB1(A0)       ; parity/ = 0 ?
+                BNE.S   @1                  ; branch if parity/ not 0
+                MOVE.B  #1,D0               ; Feb82 IO boards have parity/
+
+@1              MOVE.B  #0,DDRA1(A0)        ; make Port A an input
+                BSET    #3,PORTB1(A0)       ; set DRW to read
+                BSET    #5,DDRB1(A0)        ; make PB5 an output
+@2              MOVE.B  D0,IOBoard          ; 0=Sept81, else=Feb82
+
+;   Find out if this is a Pepsi Board (boot Rom $80 or greater).  If so, a           <10Aug83>
+;   larger number must be input into the counter since the clock is running          <10Aug83>
+;   faster.
+
+                MOVE.B  #0,PostPepsiIO      ; 0=pre-Pepsi I/O, else=post-Pepsi I/O   <18Aug83>
+                MOVE.B  #$CA,LCounterInit   ; T1 Counter initial value (Low-Order)   <31Jan84>
+                MOVE.B  #$27,HCounterInit   ; T1 Counter initial value (High-Order)  <31Jan84>
+                BTST    #7,DiskROMId        ; boot ROM > $80 ?                       <10Aug83>
+                BEQ.S   @3                  ; branch if high bit not set             <10Aug83>
+                BTST    #5,DiskROMId        ; LisaLite ?                             <05Dec83>
+                BNE.S   @3                  ; branch if LisaLite (slow timers)       <05Dec83>
+
+                MOVE.B  #1,PostPepsiIO      ; we have a post-Pepsi board             <18Aug83>
+                MOVE.B  #$7B,LCounterInit   ; T1 Counter initial value (Low-Order)   <31Jan84>
+                MOVE.B  #$63,HCounterInit   ; T1 Counter initial value (High-Order)  <31Jan84>
+
+;   Level 1 Interrupt Initialization
+
+@3              MOVE.L  #VIA1,A0            ; VIA1 Address
+                MOVE.B  #$48,ACR1(A0)       ; Auxiliary Control Register              <31Jan84>
+                TST.B   SR1(A0)             ; Start shift register to set IFR bit     <31Jan84>
+                MOVE.B  LCounterInit,T1CL1(A0)    ; T1 Counter (Low-Order)            <10Aug83>
+                MOVE.B  HCounterInit,T1CH1(A0)    ; T1 Counter (High-Order)           <10Aug83>
+                MOVE.B  #$C0,IER1(A0)       ; enable Timer1
+
+                LEA     Level1,A0           ; Level 1 Interrupt Handler
+                MOVE.L  A0,$0064            ; Trap Vector
+                MOVE.L  D0,VertReset        ; enable vertical retrace
+
+
+;   Level 2 Interrupt Initialization
+
+                MOVE.L  #VIA2,A0            ; VIA2 Address
+                MOVE.B  #$00,DDRA2(A0)      ; program port A as inputs
+                MOVE.B  DDRB2(A0),D0        ; current Port B data direction
+                AND.B   #$A0,D0             ; save bits 5 and 7
+                OR.B    #$0E,D0             ; 0=input, 1=output
+                MOVE.B  D0,DDRB2(A0)        ; program Port B data direction
+                MOVE.B  #$C9,PCR2(A0)       ; Peripheral Control Register
+                MOVE.B  #$01,ACR2(A0)       ; Auxiliary Control Register
+                MOVE.B  #$82,IER2(A0)       ; enable COPS
+
+                MOVE.B  #$7C,D0             ; enable mouse interrupts (16 ms)
+                JSR     COPSCMD             ; send command to COPS
+
+                LEA     Level2,A1           ; Level 2 Interrupt Handler
+                MOVE.L  A1,$0068            ; Trap Vector
+
+;   Process the Keyboard Input Queue
+
+                LEA     KeybdQueue,A0       ; keyboard input queue address
+                MOVE.W  #0,D1               ; index into queue
+
+@5              MOVE.B  0(A0,D1.W),D0       ; COPS code
+                BEQ.S   @6                  ; branch if COPS code = 0
+                JSR     COPSX               ; call COPS Interrupt handler
+                ADD.W   #1,D1               ; increment index
+                CMP.W   #16,D1              ; end of queue ?
+                BLT.S   @5                  ; branch if not end of queue
+
+@6              MOVE.W  #0,QueueIn          ; flush the primary input queue
+                MOVE.W  #0,QueueOut         ;  to eliminate keys typed to ROM
+                MOVE.B  #0,COPSState        ; force State 0 -- Normal wait
+                AND.L   #$A0,KeyBitmap      ; save parallel port and mouse plug
+                MOVE.L  #0,KeyBitmap+4      ; clear bits 63 .. 32
+                MOVE.L  #0,KeyBitmap+8      ; clear bits 95 .. 64
+                AND.L   #$20000000,KeyBitmap+12 ; save alpha-lock
+                AND.W   #$1,ShiftState      ; clear state, save alpha-lock         <08Jul83>
+                TST.B   KeybdId             ; have we found a keyboard id ?
+                BNE.S   @7                  ; branch if we found one
+
+                MOVE.W  #$000F,D0           ; assume we have an Old US keyboard
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers
+                MOVE.L  KeybdIdRoutine,A0   ; address of routine KeyId
+                JSR     (A0)                ; call KeyId
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+
+
+;   Trap Vector Initialization
+
+@7              LEA     Trap5,A1            ; Trap 5 Handler
+                MOVE.L  A1,Trap5Vector      ; Trap Vector
+                MOVEM.L (SP)+,D0-D1/A0-A1   ; restore registers
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Twiggy and Disk Drivers
+;
+;   The hardware interface package owns the level 1 and 2 interrupts.  However,
+;   parallel port and twiggy interrupts come in at level 1.  The routines
+;   below must be called, after calling DriverInit, to install the parallel
+;   port (disk) and Twiggy drivers.   Disk and Twiggy drivers execute with
+;   Level 1 interrupts disabled, and must preserve all registers.
+;
+;
+;   Routine:    TwiggyDriver
+;   Arguments:    A0 (input)   --  address of Twiggy driver (long)
+;   Function:   Install the Twiggy driver routine.
+;
+
+TwiggyDriver    MOVE.L  A0,TwiggyRoutine        ; Twiggy driver (long)
+                RTS                             ; return
+
+;
+;   Routine:    DiskDriver
+;   Arguments:    A0 (input)   --  address of disk driver (long)
+;   Function:   Install the parallel port (disk) driver routine.
+;
+
+DiskDriver      MOVE.L  A0,DiskRoutine          ; disk driver (long)
+                RTS                             ; return
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Parallel Port Synchronization
+;
+;   The Parallel Port (Hard Disk VIA) is shared by the disk and/or printer
+;   driver and the contrast control routines.  In order to properly synchronize
+;   access to the parallel port, all disk and printer drivers using this port
+;   must bracket use of the port with calls to routine DiskSync, first with
+;   a parameter "busy", then with "free".  The port is initially free.
+;
+;   When the port is not in use, the contrast control routines will be free
+;   to execute the following sequence at priority level 2.
+;
+;       program data direction register for DEN/ as output
+;       set DEN/ to 1 (disable the disk)
+;       program data direction register for Port A as output
+;       transfer data on Port A
+;       program data direction register for Port A as input
+;       set DEN/ to 0 (enable the disk)
+;
+;
+;   Routine:    DiskSync
+;   Argument:     D0 (input)   --  0=free, else=busy (byte)
+;   Function:   Synchronize access to the parallel port.  All drivers using
+;               the parallel port must call DiskSync before and after each
+;               use of the port.
+;
+
+DiskSync        MOVE.B  D0,DiskSemaphore    ; 0=free, else=busy
+                RTS
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   NMI (Non-Maskable Interrupt) Synchronization
+;
+;   Non-maskable interrupts can occur, oddly enough, even though interrupts
+;   are disabled.  Output to the COPS which has been interrupted by NMI is
+;   sent to the COPS again after the NMI handler has completed.
+;
+;
+;   Routine:    NMISync
+;   Argument:     none
+;   Function:   Inform the hardware interface that an NMI has occurred.
+;               Conversations with the COPS that are in progress will be
+;               restarted when NMI processing has completed.
+;
+
+NMISync         ADD.L   #1,COPSCounter      ; COPS transaction counter
+                RTS                         ; return
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   COPS Synchronization
+;
+;   Input from the COPS (through the keyboard 6522) comes in multiple byte
+;   packets.  These include two byte reset packets, three byte mouse locations
+;   and seven byte clock/calendar packets.  Normally the hardware interface
+;   drivers receive all input from the COPS, and rely on knowledge of previous
+;   inputs to interpret data received from the COPS.  Routines which borrow the
+;   COPS (e.g. customer diagnostics) must take two precautions to insure that
+;   the hardware interface routines won't misinterpret COPS input.  First,
+;   after modifying the Level 2 interrupt vector, the borrower must call routine
+;   COPSSync.  Second, before restoring the interrupt vector, the borrower must
+;   insure that all bytes of the current packet have been read.  That is, the
+;   COPS input stream must be between packets when it is returned to the hardware
+;   interface.
+;
+;   COPSSync abandons any packet in progress and adjusts the keyboard map to
+;   indicate that all keys are up, with the exceptions of the alpha-lock key,
+;   parallel port and mouse plug.
+;
+;
+;   Routine:    COPSSync
+;   Argument:     none
+;   Function:   Inform the hardware interface that the COPS input stream has
+;               been borrowed.
+;
+
+COPSSync        MOVE.B  #0,COPSState        ; new state -- normal wait
+                AND.L   #$A0,KeyBitmap      ; save parallel port and mouse plug
+                MOVE.L  #0,KeyBitmap+4      ; clear bits 63 .. 32
+                MOVE.L  #0,KeyBitmap+8      ; clear bits 95 .. 64
+                AND.L   #$20000000,KeyBitmap+12 ; save alpha-lock
+                AND.W   #$1,ShiftState      ; clear state, save alpha-lock       <08Jul83>
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Poll
+;
+;   The millisecond and microsecond timers and vertical retrace counter stop
+;   running if level 1 interrupts are off for more than about 10 milliseconds.
+;   Similiarly, keyboard and mouse input are disabled if level 2 interrupts
+;   are disabled.  Software which runs for extended periods of time with
+;   interrupts off (e.g. LisaBug) should call Procedure Poll every few
+;   milliseconds to keep the clocks running.   Poll should also be called
+;   prior to requests for keyboard or mouse input if interrupts are disabled.
+;
+;
+;   Routine:    Poll
+;   Arguments:    none
+;   Function:   Poll for COPS, vertical retrace and Timer interrupts.
+;
+
+Poll            MOVEM.L A0/D0,-(SP)         ; save registers
+                DISABLE                     ; disable interrupts
+                BTST    #2,StatusRegister+1 ; vertical retrace interrupt?
+                BNE.S   @0                  ; branch if not vertical retrace
+                JSR     VertRetrace         ; vertical retrace interrupt
+
+@0              MOVE.B  VIA1+IFR1,D0        ; Interrupt Flag Register
+                BTST    #6,D0               ; timer1 interrupt ?
+                BEQ.S   @1                  ; branch if not timer1
+                JSR     Timer0              ; timer pseudo-interrupt
+
+@1              BTST    #1,VIA2+IFR2        ; COPS Interrupt pending ?
+                BEQ.S   @2                  ; branch if not pending
+
+                JSR     COPS                ; (D0) process COPS Interrupt
+
+@2              ENABLE                      ; enable interrupts
+                MOVEM.L (SP)+,A0/D0         ; restore registers
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   COPS Command
+;
+;   Send the command in D0 (byte) to the COPS.  This code synchronizes with
+;   the 6522, and is instruction timing sensitive.  Modify will great care!
+;   All registers are preserved.
+;
+
+COPSCMD         MOVEM.L D1-D3/A0-A1,-(SP)   ; save registers
+                MOVE.W  #6,D2               ; CRDY bit number
+                MOVE.W  #$FFFF,D3           ; data direction 'output'
+                MOVE.L  #VIA2,A0            ; VIA2 Address
+                LEA     DDRA2(A0),A1        ; data direction A
+                DISABLE                     ; disable interrupts                <05Jan84>
+                BRA.S   @1                  ;                                   <05Jan84>
+
+@0              MOVE.W  (SP),SR             ; enable interrupts for brief window<05Jan84>
+                MOVE.W  #$2700,SR           ; disable interrupts again          <05Jan84>
+@1              MOVE.B  D0,IORA2(A0)        ; command byte to Port A            <05Jan84>
+                BTST    D2,(A0)             ; check CRDY bit                    <05Jan84>
+                BEQ.S   @0                  ; wait until 'not ready'            <05Jan84>
+
+                BTST    D2,(A0)             ; check CRDY bit                    <05Jan84>
+                BEQ.S   @2                  ; branch if ready                       "
+                BTST    D2,(A0)             ; check CRDY bit                        "
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit
+                BEQ.S   @2                  ; branch if ready
+                BTST    D2,(A0)             ; check CRDY bit                    <05Jan84>
+                BNE.S   @0                  ; short branch if still not ready -- turn on ints <13Feb84>
+
+@2              MOVE.B  D3,(A1)             ; set data direction to 'output'
+
+                MOVEQ   #10,D1              ; counter for spin loop
+@3              SUBQ    #1,D1               ; decrement counter
+                BGT.S   @3                  ; wait for COPS to get data
+
+                MOVE.B  #$00,(A1)           ; set data direction to 'input'
+                ENABLE                      ; enable interrupts
+                MOVEM.L (SP)+,D1-D3/A0-A1   ; restore registers
+                RTS                         ; return
+
+;-----------------------------------------------------------------------------
+;
+;   Level 1 Interrupt Handler
+;
+;
+
+Level1          MOVEM.L A0/D0,-(SP)         ; save registers
+                BTST    #2,StatusRegister+1 ; vertical retrace interrupt?
+                BNE.S   @0                  ; branch if not vertical retrace
+                JSR     VertRetrace         ; vertical retrace interrupt
+
+@0              MOVE.B  VIA1+IFR1,D0        ; Interrupt Flag Register
+                BTST    #6,D0               ; timer1 interrupt ?
+                BEQ.S   @1                  ; branch if not timer1
+                JSR     Timer1              ; timer1 interrupt
+                BRA.S   @0                  ; avoid missing closely-spaced timer ints <05Jan84>
+
+@1              AND.B   VIA1+IER1,D0        ; Interrupt Enable Register
+                AND.B   #$22,D0             ; I/O completion or Timer 2 ?
+                BEQ.S   @2                  ; branch if not either interrupt
+                MOVE.L  DiskRoutine,A0      ; address of disk driver
+                JSR     (A0)                ; parallel port interrupt
+                BRA.S   @0                  ; avoid missing closely-spaced timer ints <05Jan84>
+
+@2              BTST    #4,VIA2+PORTB2      ; Port B Data Register
+                BEQ.S   @3                  ; branch if not Twiggy interrupt
+                MOVE.L  TwiggyRoutine,A0    ; address of Twiggy driver
+                JSR     (A0)                ; Twiggy interrupt
+                BRA.S   @0                  ; avoid missing closely-spaced timer ints <05Jan84>
+
+@3              BTST    #2,VIA1+IER1        ; Shift register interrupt?               <31Jan84>
+                BEQ.S   @4                  ; Branch if not                           <31Jan84>
+                SUBQ    #8,SP               ; Touchy alarms, so adjust stack size     <31Jan84>
+                JSR     CALL_ALARMS         ; Check the alarm routines                <31Jan84>
+                ADDQ    #8,SP               ; Restore stack                           <31Jan84>
+                BRA.S   @0                  ; Avoid missing closely-spaced timer ints <31Jan84>
+
+@4              MOVEM.L (SP)+,A0/D0         ; restore registers                       <31Jan84>
+                RTE                         ; return from interrupt
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Vertical Retrace Interrupt
+;
+
+VertRetrace     MOVE.L  D0,-(SP)            ; save registers
+                ADD.L   #1,ScrnFrames       ; vertical retrace counter
+                TST.B   CrsrBusy            ; cursor change in progress?
+                BNE.S   @2                  ; branch if change in progress
+
+                TST.B   CrsrTracking        ; cursor tracking disabled
+                BEQ.S   @2                  ; branch if tracking disabled
+
+                MOVE.L  MousX,D0            ; MousX, MousY
+                CMP.L   CrsrX,D0            ; cursor already at mouse ?
+                BEQ.S   @2                  ; branch if already at mouse
+
+                TST.B   CrsrObscured        ; 0=not obscured, else=obscured
+                BNE.S   @1                  ; branch if obscured
+                JSR     CursorHide          ; remove cursor from screen
+
+@1              MOVE.L  D0,CrsrX            ; move cursor to mouse
+                JSR     CursorDisplay       ; display cursor on screen
+                MOVE.B  #0,CrsrObscured     ; 0=not obscured, else=obscured
+
+@2              MOVE.L  (SP)+,D0            ; restore registers
+
+@3              MOVE.L  D0,VertReset        ; reset vertical retrace interrupt
+                BTST    #2,StatusRegister+1 ; actually reset ?
+                BEQ.S   @3                  ; branch if not yet reset
+
+                RTS                         ; return
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Timer0 Handler Pseudo Interrupts.  No alarm routines are called.
+;
+
+Timer0          TST.B   VIA1+T1CL1          ; reset Timer1 interrupt
+                MOVE.B  HCounterInit,VIA1+T1LH1   ; remind 6522 of high order latch   <10Aug83>
+                ADD.L   #20000,MicroTicks   ; increment microsecond timer             <31Jan84>
+                ADD.L   #20,TimerTicks      ; increment millisecond timer             <31Jan84>
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Timer1 Interrupt Handler
+;
+
+Timer1          MOVE.L  D0,-(SP)            ; save register
+                TST.B   VIA1+T1CL1          ; reset Timer1 interrupt
+                MOVE.B  HCounterInit,VIA1+T1LH1   ; remind 6522 of high order latch   <10Aug83>
+                ADD.L   #20000,MicroTicks   ; increment microsecond timer             <31Jan84>
+                ADD.L   #20,TimerTicks      ; increment millisecond timer             <31Jan84>
+                MOVE.L  TimerTicks,D0       ; millisecond timer
+                SUB.L   AlarmTicks,D0       ;  - alarm setting
+                BMI     @5                  ; branch in alarm setting > timer
+                JSR     CALL_ALARMS         ; see which alarms fired                  <31Jan84>
+@5              MOVE.L  (SP)+,D0            ; restore register                        <31Jan84>
+                RTS                         ; return                                  <31Jan84>
+
+;   Check alarm table for any alarms that are ready to fire.
+;   Must be exactly 20 bytes pushed on stack since interrupt!                         <31Jan84>
+
+CALL_ALARMS     MOVEM.L D0-D4/A1,-(SP)      ; save registers (A0 already saved)       <31Jan84>
+                MOVE.B  #$04,VIA1+IER1      ; clear shift register interrupt enable   <31Jan84>
+                LEA     AlarmEnabled,A0     ; alarm enabled table
+                LEA     AlarmSetting,A1     ; alarm setting table
+                MOVE.W  #Alarms,D0          ; number of millisecond alarms
+                MOVE.L  TimerTicks,D2       ; millisecond timer
+
+                MOVE.L  D2,D3               ; millisecond timer
+                ADD.L   #$7FFFFFFF,D3       ; far future
+                MOVE.L  D3,AlarmTicks       ; set alarm to far future
+
+ ;   D0 contains the alarm number.                                            <21Jun83>
+ ;   This alarm number must be in D0 when the ALARM routine is called.
+
+@1              BTST    #1,0(A0,D0.W)       ; bit 1: 0=disabled, 1=enabled
+                BEQ.S   @4                  ; branch if disabled
+
+                DISABLE                     ; disable interrupts
+                MOVE.W  D0,D1               ; alarm number
+                ASL.W   #2,D1               ; alarm number as long index
+                MOVE.L  0(A1,D1.W),D3       ; alarm setting
+                SUB.L   D2,D3               ; alarm setting - millisecond timer
+                BHI.S   @2                  ; branch if alarm setting > timer
+
+;   Recheck enabled bit.  Disable the alarm and call the user routine.
+
+                BCLR    #1,0(A0,D0.W)       ; bit 1: 0=disabled, 1=enabled
+                BEQ.S   @3                  ; branch if previously disabled
+
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers
+                LEA     AlarmRoutine,A0     ; user alarm routine table
+                MOVE.L  0(A0,D1.W),A0       ; user ALARM routine
+                JSR     (A0)                ; call user ALARM routine
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+                BRA.S   @3                  ; continue
+
+;  This alarm isn't firing.  See if it will be the next to fire.
+
+@2              MOVE.L  AlarmTicks,D4       ; millisecond alarm
+                SUB.L   D2,D4               ; millisecond alarm - timer
+                CMP.L   D4,D3               ; which will occur sooner ?
+                BGE.S   @3                  ; branch if AlarmTicks sooner
+                MOVE.L  0(A1,D1.W),AlarmTicks ; millisecond alarm (long)
+
+@3              ENABLE                      ; enable interrupts
+
+@4              DBF     D0,@1               ; loop Alarms times
+
+                MOVEM.L (SP)+,D0-D4/A1      ; restore registers                 <31Jan84>
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Level 2 Interrupt Handler
+;
+;
+
+Level2          MOVE.L  D0,-(SP)            ; save register
+                MOVE.W  SR,-(SP)            ; lock out keypressed calls from    <05Jan84>
+                MOVE.W  #$2500,SR           ;   drivers at prio 5 or less       <05Jan84>
+                BTST    #1,VIA2+IFR2        ; COPS Interrupt?
+                BEQ.S   @1                  ; Branch if not COPS Interrupt
+
+                JSR     COPS                ; COPS Interrupt
+
+@1              ENABLE                      ; enable interrupts
+                MOVE.L  (SP)+,D0            ; restore register
+                RTE                         ; return from interrupt
+
+
+;-----------------------------------------------------------------------------
+;
+;   COPS Interrupt Handler
+;
+
+COPS            CLR.W   D0                  ; clear register
+                MOVE.B  VIA2+PORTA2,D0      ; read input from COPS
+
+COPSX           TST.B   COPSState           ; State 0 -- Normal wait
+                BEQ.S   COPS0               ;
+                CMP.B   #1,COPSState        ; State 1 -- Waiting for Dx
+                BEQ     COPS1               ;
+                CMP.B   #2,COPSState        ; State 2 -- Waiting for Dy
+                BEQ     COPS2               ;
+                CMP.B   #3,COPSState        ; State 3 -- Waiting for clock
+                BEQ     COPS3               ;
+                BRA     COPS4               ; State 4 -- Waiting for reset
+
+;   COPS State 0  --  Normal Wait
+
+COPS0           TST.B   D0                  ; input from COPS
+                BEQ.S   @4                  ; branch if mouse data follows
+
+                CMP.B   #$80,D0             ; reset code follows?
+                BEQ.S   @5                  ; branch if reset code follows
+
+                ACTIVE                      ; report user activity
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers
+                MOVE.W  D0,D1               ; duplicate input from COPS
+                AND.W   #$7F,D0             ; keycode (integer)
+                AND.W   #$80,D1             ; $00=up, $80=down (integer)
+
+;   Two keys on the "Old US Layout" generate keycodes different from the
+;   corresponding keys on the "Final US Layout".  To aid in campatibility,
+;   software changes the keycode for ~` from $7C to $68, and the keycode for
+;   R-Option from $68 to $4E.
+
+                MOVE.B  KeybdId,D2          ; keyboard id (byte)
+                AND.B   #$3F,D2             ; layout/legends
+                CMP.B   #$0F,D2             ; "Old US Layout" ?
+                BNE.S   @2                  ; branch if not old layout
+
+                CMP.W   #$68,D0             ; R-Option key ?
+                BNE.S   @1                  ; branch if not R-Option
+                MOVE.W  #$4E,D0             ; change keycode to $4E
+
+@1              CMP.W   #$7C,D0             ; ~` key ?
+                BNE.S   @2                  ; branch if not ~` key
+                MOVE.W  #$68,D0             ; change keycode to $68
+
+@2              TST.B   ScrnKeybd           ; 0=primary, else=alternate (byte)
+                BEQ.S   @3                  ; branch if primary screen/keyboard
+
+                JSR     Key                 ; call default KEY routine
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+                RTS                         ; return
+
+@3              MOVE.L  KeybdRoutine,A0     ; address of routine Key
+                JSR     (A0)                ; indicate key transition
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+                RTS                         ; return
+
+@4              MOVE.B  #1,COPSState        ; new state -- waiting for Dx
+                RTS                         ; return
+
+@5              MOVE.B  #4,COPSState        ; new state -- waiting for reset
+                RTS                         ; return
+
+
+;   COPS State 1  --  Waiting for mouse Dx
+
+COPS1           MOVE.B  D0,MousDx           ; save mouse delta-x
+                MOVE.B  #2,COPSState        ; new state -- waiting for Dy
+                RTS                         ; return
+
+
+;   COPS State 2  --  Waiting for mouse Dy
+
+COPS2           ACTIVE                      ; report user activity
+                MOVE.B  D0,MousDy           ; save mouse delta-y
+                MOVE.B  #0,COPSState        ; new state -- normal wait
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers                           <28Sep83>
+                CLR.W   D0                  ; clear d0 and move mouse Dx coordinates   <28Sep83>
+                MOVE.B  MousDx,D0           ; to D0 (set up in case of user routine)   <28Sep83>
+                CLR.W   D1                  ; clear d1 and move mouse Dy coordinates   <28Sep83>
+                MOVE.B  MousDy,D1           ; to D1 (set up in case of user routine)   <28Sep83>
+                MOVE.L  MouseMVRoutine,A0   ; address of routine MouseMovement         <28Sep83>
+                JSR     (A0)                ; record mouse movement, return            <28Sep83>
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers                        <28Sep83>
+                RTS
+
+
+;   COPS State 3  --  Waiting for clock
+
+COPS3           MOVE.L  D1,-(SP)            ; save registers
+                CMP.B   #5,ClockBytes       ; 5 bytes still coming ?
+                BNE.S   @1                  ; branch if less than 5
+
+                MOVE.W  ClockHigh,D1        ; high order word of clock
+                LSL.W   #8,D1               ; shift up one byte
+                OR.W    D0,D1               ; add new byte from COPS
+                MOVE.W  D1,ClockHigh        ; high order word of clock
+                BRA.S   @2                  ; continue
+
+@1              MOVE.L  ClockLow,D1         ; low order two words of clock
+                LSL.L   #8,D1               ; shift up one byte
+                OR.W    D0,D1               ; add new byte from COPS
+                MOVE.L  D1,ClockLow         ; low order two words of clock
+
+@2              SUB.B   #1,ClockBytes       ; clock bytes still coming
+                BNE.S   @3                  ; branch if more bytes coming
+
+                MOVE.B  #1,ClockReady       ; 0=not ready, else=ready
+                MOVE.B  #0,COPSState        ; new state -- normal wait
+
+@3              MOVE.L  (SP)+,D1            ; restore registers
+                RTS                         ; return
+
+
+;   COPS State 4  --  Waiting for reset code
+
+COPS4           CMP.B   #$DF,D0             ; reset code <= $DF ?
+                BLS.S   @1                  ; branch if <= $DF
+                CMP.B   #$EF,D0             ; reset code <= $EF ?
+                BLS.S   @2                  ; branch if <= $EF
+                CMP.B   #$FB,D0             ; reset code <= $FB ?
+                BLO.S   @3                  ; branch if < $FB
+                BEQ.S   @4                  ; branch if = $FB
+                CMP.B   #$FD,D0             ; reset code <= $FD ?
+                BLT.S   @3                  ; branch if < $FD
+                BEQ.S   @5                  ; branch if = $FD
+                BRA     @6                  ; branch if > $FD
+
+;     $00-$DF   Keyboard ID number  --  call user KEYID routine
+
+@1              ACTIVE                      ; report user activity
+                MOVE.B  #0,COPSState        ; new state -- normal wait
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers
+                MOVE.L  KeybdIdRoutine,A0   ; address of routine KeyId
+                JSR     (A0)                ; call KeyId
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+                RTS                         ; return
+
+;     $E0-$EF   Clock data  --  save first nibble
+
+@2              MOVE.B  #0,ClockReady       ; 0=not ready, else=ready
+                MOVE.B  #5,ClockBytes       ; clock bytes still coming
+                AND.W   #$000F,D0           ; year nibble from COPS data
+                MOVE.W  D0,ClockHigh        ; high word of clock
+                MOVE.B  #3,COPSState        ; new state -- waiting for clock
+                RTS                         ; return
+
+;     $F0-$FA   Reserved  --  ignored
+;     $FC       Clock timer interrupt  --  ignored
+
+@3              MOVE.B  #0,COPSState        ; new state -- normal wait
+                RTS                         ; return
+
+;     $FB       Power Button  --  simulate down/up transitions
+
+@4              MOVE.B  #0,COPSState        ; new state -- normal wait
+                MOVE.W  #$08,D0             ; power button
+                JSR     KeyPushed           ; indicate power button pushed
+                RTS                         ; return
+
+;     $FD       Keyboard Unplugged  --  clear Keybitmap and state
+
+@5              MOVE.B  #0,COPSState        ; new state -- normal wait
+                AND.L   #$E0,KeyBitmap      ; save parallel port, mouse button & plug
+                MOVE.L  #0,KeyBitmap+4      ; clear  63 .. 32
+                MOVE.L  #0,KeyBitmap+8      ; clear  95 .. 64
+                MOVE.L  #0,KeyBitmap+12     ; clear 127 .. 96
+                MOVE.W  #0,ShiftState       ; clear shift key state         <08Jul83>
+                RTS                         ; return
+
+;     $FE-$FF   COPS failure codes  --  call KeyErr routine
+
+@6              AND.W   #1,D0               ; 0=I/O COPS, 1=keyboard COPS
+                MOVE.B  #0,COPSState        ; new state -- normal wait
+                MOVEM.L D0-D7/A0-A6,-(SP)   ; save registers
+                MOVE.L  KeybdErrRoutine,A0  ; address of routine KeyErr
+                JSR     (A0)                ; call KeyErr
+                MOVEM.L (SP)+,D0-D7/A0-A6   ; restore registers
+                RTS                         ; return
+
+
+
+;-----------------------------------------------------------------------------
+
+
+                .INCLUDE    LibHW/MOUSE.TEXT     ; Mouse
+                .INCLUDE    LibHW/CURSOR.TEXT    ; Cursor
+                .INCLUDE    LibHW/MACHINE.TEXT   ; Screen, Power, Speaker and MMUs
+                .INCLUDE    LibHW/LEGENDS.TEXT   ; Keyboard Layouts and Legends
+                .INCLUDE    LibHW/KEYBD.TEXT     ; Keyboard State and Events
+                .INCLUDE    LibHW/TIMERS.TEXT    ; Timers, Clock and Calendar
+
+                TAIL        0,'Drivers '
+                .END
+
+
+
+
+ÿ

@@ -1,0 +1,423 @@
+
+  UNIT PARAPRINT;           (* PARALLEL PRINTER driver *)
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+  INTERFACE
+
+    USES
+      (*$Uobject/driverdefs.obj*)
+        driverdefs,
+      (*$Uobject/driversubs.obj*)
+        driversubs;
+
+      function DRIVER (parameters: param_ptr): integer;
+
+  IMPLEMENTATION
+
+    (*$R-*)
+
+    CONST
+      errbase = 690;
+      syserrbase = 10690;
+      will_int = 1;  (*error returned from output when next char-ready will interrupt*)
+      papererr = 696;
+      slvl0 = 697;
+      slotcountlimit = 4680; (*=4 mins for 2-port timeout, 10 mins for 4-prt*)
+      bltcountlimit = 1872; (*= 4 mins for built-in parallel port*)
+
+    TYPE
+
+      portrec_ptr = ^portrec;
+      portrec = record
+                  hwbase: longint;      (*base addr of 6522*)
+                  int_prio: intsoff_type;
+                  cur_req_ptr: reqptr_type;
+                  cur_info_ptr: seqextptr_type;
+                  nullink: linkage;  (* points to head of queue *)
+                  harderrnum: integer;
+                  xmit_ref: integer;
+                  prev_char: int1;
+                  autolf: boolean;
+                  counter: integer; (*for timeouts*)
+                  countlimit: integer;
+                  hscount: integer; (*for 1ms handshake delay in PRINT_CHR*)
+                end;
+
+      function PRINT_STATUS (var counter: integer; hwbase: absptr): integer;
+        external;
+
+      function PRINT_CHR (chr: int1; hsdelay: integer; hwbase: absptr): integer;
+                                external;
+
+      procedure PRINT_INIT (builtin: boolean; hwbase: absptr); external;
+
+
+      procedure START_NEW_REQUEST (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start a new read or write from the queue.   *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current printer port*)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Modem control signals are affected.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  appropriate interrupts must be off.*)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      begin
+        WITH port^ do
+          begin
+            cur_req_ptr := CHAIN_FORWARD (nullink);
+            cur_req_ptr^.reqstatus.reqsrv_f := in_service;
+            cur_info_ptr := pointer (cur_req_ptr^.req_extent);
+            ALARMRELATIVE (xmit_ref, 0)  (*queu output to start in timer*)
+          end
+      end;  (*start_new_request*)
+
+       procedure FINISH_REQ (port: portrec_ptr; ok_flag: boolean);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Complete the current request                *)
+       (*                                                           *)
+       (* Input Parameters:  Port points to the current printer port*)
+       (*                    Ok-flag is param to UNBLK_REQ.         *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Modem control signals are affected.        *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Cur_req_ptr must be valid.    *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        ptrsysg: ^longint;
+
+      begin
+          ptrsysg := pointer(bsysglob);   (*set up pointer to b_sysglobal_ptr*)
+          WITH port^, cur_info_ptr^ do
+          begin
+            if not ok_flag then
+              cur_req_ptr^.hard_error := harderrnum;
+            ADJ_IO_CNT (false, buff_rdb_ptr);  (*allow swapout*)
+            UNBLK_REQ (cur_req_ptr, ok_flag);
+            DEQUEUE (cur_req_ptr^.dev_chain, ptrsysg^);
+            if (nullink.fwd_link + ptrsysg^) <> ord(@nullink) then
+              START_NEW_REQUEST (port)
+            else
+            begin
+              if int_prio = winints then (*see if built-in parallel port*)
+                DISKSYNC (false);  (*allow contrast changes after I/O*)
+              cur_req_ptr := nil
+            end
+          end
+      end; (*finish_req*)
+
+
+      procedure LOWPRI (port: portrec_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Low priority printer output handler         *)
+       (*                                                           *)
+       (* Input Parameters: none                                    *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        data_ptr: ^int1;
+        err: integer;
+        prevints: intson_type;
+        data_adr: longint;
+
+      begin
+        if port^.cur_req_ptr = nil then
+          SYSTEM_ERROR (syserrbase+9)
+        else
+        WITH port^, cur_info_ptr^ do
+        begin
+          FREEZE_SEG(err, buff_rdb_ptr, buff_offset, ord(cur_req_ptr), data_adr);
+          if err = 0 then
+          begin
+            if autolf then (*emit linefeeds after CRs*)
+              while (xfer_count < num_bytes) and (err = 0) do
+              begin
+                if prev_char = $0D then
+                begin
+                  err := PRINT_CHR ($0A, hscount, hwbase);  (*do the write*)
+                  prev_char := $0A;
+                  if err = will_int then
+                    xfer_count := xfer_count - 1  (*pre-adjust before next int*)
+                end
+                else
+                begin
+                  data_ptr := pointer(data_adr + xfer_count);
+                  prev_char := data_ptr^;
+                  err := PRINT_CHR (prev_char, hscount, hwbase);  (*do the write*)
+                  if err = 0 then
+                    xfer_count := xfer_count + 1;
+                  if prev_char = -115 (*=$8D*) then
+                    prev_char := $0D; (*strip sign bit from CR*)
+                end
+              end (*while*)
+            else (*no automatic linefeeds*)
+              while (xfer_count < num_bytes) and (err = 0) do
+              begin
+                data_ptr := pointer(data_adr + xfer_count);
+                err := PRINT_CHR (data_ptr^, hscount, hwbase);  (*do the write*)
+                if err = 0 then
+                  xfer_count := xfer_count + 1
+              end; (*while*)
+
+            UNFREEZE_SEG (buff_rdb_ptr); (*allow buffer to move*)
+            INTSOFF (int_prio, prevints); (*finish_req requires interrupts off*)
+
+            case err of
+              0:  FINISH_REQ (port, true);
+
+              will_int: counter := countlimit;
+
+              papererr:  begin
+                  harderrnum := err;
+                  FINISH_REQ (port, false)
+              end;
+            end; (*case*)
+
+          end
+        end
+      end; (*lowpri*)
+
+      function DRIVER(*parameters: param_ptr): integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Parallel printer external interface via     *)
+       (*               DRIVERCALL                                  *)
+       (*                                                           *)
+       (* Input Parameters:  Parameters depend on function code     *)
+       (*                                                           *)
+       (* Output Parameters:  Function returns integer errnum.      *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+      VAR
+        i: integer;
+        prevints: intson_type;
+        port_ptr: portrec_ptr;
+        ptrsysg: ^longint;
+
+
+        procedure PINIT;
+        (*************************************************************)
+        (*  Internal procedure to initialize parallel printer        *)
+        (*************************************************************)
+        VAR
+        prevints: intson_type;
+        errnum, chan: integer;
+        ptrsysg: ^longint;
+        configptr: ptrdevrec;
+        newspace: longint;
+
+        begin
+            ptrsysg := pointer (bsysglob);
+            configptr:=parameters^.configptr;
+            chan:=configptr^.iochannel;
+            if chan >= 0 then INTSOFF(slotints,prevints)
+                         else INTSOFF(winints,prevints);
+            errnum:=610; (* insufficient resources*)
+            if GETSPACE (sizeof(portrec), ptrsysg^, newspace) then
+              begin
+                errnum:=0;
+                port_ptr:=pointer(newspace);
+                configptr^.cb_addr:=newspace;
+                with port_ptr^ do
+                  begin
+                    if chan >= 0 then
+                      begin
+                        int_prio := slotints;
+                        countlimit := slotcountlimit;
+                        hscount := (slotcountlimit DIV 936) - 1;
+                        hwbase := iospacemmu*$20000 + ord4($4000)*configptr^.slot_no
+                                  + $2001 + $800*chan;
+                        PRINT_INIT (false, hwbase);
+                      end
+                     else
+                      begin
+                        int_prio := winints;
+                        countlimit := bltcountlimit;
+                        hscount := (bltcountlimit DIV 936) - 1;
+                        hwbase := iospacemmu*$20000 + $0D801;
+                        PRINT_INIT (true, hwbase);
+                      end;
+
+                    ALARM_ASSIGN (xmit_ref, configptr, clkonints);
+                    if xmit_ref = 0 then
+                    begin
+                      RELSPACE (newspace, ptrsysg^);
+                      errnum := 602 (*no more alarms available*)
+                    end
+                      else
+                       begin
+                         cur_req_ptr := nil;
+                         prev_char := 0;
+                         autolf := false;
+                         nullink.fwd_link := ord(@nullink) - ptrsysg^;
+                         nullink.bkwd_link := nullink.fwd_link;
+                       end;
+                  end;(*with port_ptr*)
+              end;
+            INTSON(prevints);
+            DRIVER:=errnum;
+        end; (*pinit*)
+
+
+        procedure SEQSTART;
+        (*************************************************************)
+        (*  Internal procedure to start up sequential I/O            *)
+        (*************************************************************)
+        VAR
+        leftlink: link_ptr;
+        ptrsysg: ^longint;
+        ext_ptr: seqextptr_type;
+        prevints: intson_type;
+
+        begin
+            ext_ptr := pointer (parameters^.req^.req_extent);
+            if ext_ptr^.num_bytes <= 0 then
+              DRIVER := errbase + 1  (*illegal parameters *)
+            else
+            begin
+              WITH port_ptr^ do
+              begin (* add request to the device queue or finish the request now*)
+                DRIVER := 0;  (*no errors*)
+                ptrsysg := pointer(bsysglob);   (*set pointer to b_sysglobal_ptr*)
+                INTSOFF (int_prio, prevints);
+                leftlink := pointer (nullink.bkwd_link + ptrsysg^);
+                ENQUEUE (parameters^.req^.dev_chain, leftlink^, ptrsysg^);
+                if leftlink = @nullink then
+                begin
+                  if int_prio = winints then (*if built-in parallel port*)
+                    DISKSYNC (true);  (*prevent contrast changes during I/O*)
+                  START_NEW_REQUEST (port_ptr)  (*no other requests present*)
+                end;
+                INTSON (prevints)
+              end
+            end
+        end; (*seqstart*)
+
+        procedure PPCONTROL;
+        (*************************************************************)
+        (*  Internal procedure for dcontrol                          *)
+        (*************************************************************)
+        VAR
+        dc_rec_ptr: ^dc_rec;
+        prevints: intson_type;
+
+        begin
+        WITH parameters^ do
+          begin
+            dc_rec_ptr := pointer(parptr);
+            WITH port_ptr^, dc_rec_ptr^ do
+              if dversion <> 2 then
+                DRIVER := 623  (*wrong application version*)
+              else
+              begin
+                DRIVER := 0;
+                INTSOFF (int_prio, prevints);
+
+                case dcode of
+                  17: autolf := (ar10[0] <> 0);  (*enable/disable auto LF*)
+
+                  otherwise
+                    DRIVER := 623;
+                end;  (*case*)
+
+                INTSON (prevints)
+              end
+          end
+        end; (*ppcontrol*)
+
+        (*************************************************************)
+
+
+      begin  (*DRIVER*)
+        port_ptr := pointer(parameters^.configptr^.cb_addr);
+
+        case parameters^.fnctn_code of
+        seqio: SEQSTART;  (*call internal subroutine*)
+
+        dinit: PINIT;  (*call internal subroutine*)
+
+        ddown: begin
+          DRIVER := 0;
+          with port_ptr^ do
+          begin
+            INTSOFF(int_prio, prevints);
+            if cur_req_ptr <> nil then
+              DRIVER := 607
+            else
+            begin
+              ptrsysg := pointer(bsysglob);
+              PRINT_INIT (int_prio=winints, hwbase); (*make sure it won't interrupt*)
+              ALARMRETURN (xmit_ref);
+              parameters^.configptr^.cb_addr := ord(nil);
+              RELSPACE (ord(port_ptr), ptrsysg^);
+            end;
+            INTSON (prevints);
+          end
+        end; (*ddown*)
+
+        dcontrol: PPCONTROL;  (*call internal subroutine*)
+
+        dinterrupt:  begin (*ignore call version # & returned function value for ints*)
+          WITH port_ptr^, cur_info_ptr^ do
+          begin
+            i := PRINT_STATUS (counter, hwbase);
+            if (cur_req_ptr <> nil) and (i <> will_int) then
+            begin (*don't ignore this interrupt*)
+              xfer_count := xfer_count + 1;
+              if i = slvl0 then
+                ALARMRELATIVE (xmit_ref, 0)
+              else
+              begin
+                harderrnum := i;
+                FINISH_REQ (port_ptr, false)
+              end
+            end
+          end
+        end;  (*dinterrupt*)
+
+        dalarms: LOWPRI (port_ptr);
+
+        reqrestart: begin
+            DRIVER := 0;
+            ALARMRELATIVE (port_ptr^.xmit_ref, 0)
+        end; (*reqrestart*)
+
+        otherwise
+          DRIVER := 656;   (*currently unimplemented w/ error*)
+        end;  (*case*)
+      end; (*DRIVER*)
+
+   end.
+
+
+
+
+
+
+
+
+ÿ

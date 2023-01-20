@@ -1,0 +1,2214 @@
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+{File: source/startup}
+
+PROGRAM STARTUP;
+uses (*$U object/driverdefs.obj*)  driverdefs,
+     (*$U object/hwint.obj*)       hwint,
+     (*$U object/sysglobal.obj *)  globaldata,
+     (*$U object/procprims.obj *)  proc_prims,
+     (*$U object/mmprim.obj *)     mmprimitives,
+     (*$U object/sched.obj *)      sched,
+     (*$U object/asynctr.obj *)    asynctr,
+     (*$U object/genio.obj *)      genio,
+     (*$U object/twiggy.obj *)     twiggy,
+     (*$U object/hdisk.obj *)      hdisk,
+     (*$U object/vmstuff.obj *)    vmstuff,
+     (*$U object/sfileio.obj *)    sfileio,
+     (*$U object/fsprim.obj *)     fs_primitives,
+     (*$U object/fsui.obj *)       fs_interface,
+     (*$U object/pmem.obj *)       pm_interface,
+     (*$U object/objio.obj *)      objio,
+     (*$U object/mm0.obj *)        memorymanager,
+     (*$U object/ds0.obj *)        datasegs,
+     (*$U object/clock.obj *)      clock,
+     (*$U object/osunitio.obj *)   osunitio,
+     (*$U object/exceprim.obj *)   exceprim,
+     (*$U object/eventchn.obj *)   eventchn,
+     (*$U object/excepmgr.obj *)   excepmgr,
+     (*$U object/timemgr.obj *)    timemgr,
+     (*$U object/scavenger.obj *)  scavnger,
+     (*$U object/volcheck.obj *)   volcheck,
+     (*$U object/fsinit.obj *)     initialize,
+     (*$U object/load.obj *)       loader,
+     (*$U object/measure.obj *)    measure,
+     (*$U object/cd.obj *)         CD,
+     (*$U object/procmgmt.obj *)   proc_mgmt;
+
+const
+   osversion = 1331; welcome = '13.3.1';{version of OS...keep BOTH in synch !!! }
+   maxsegments = 48;    { maximum number of segments in the code file, }
+                        {  also defined as inline numeric in file parms.}
+   oscontext = 0;       {OS domain number}
+
+   pmmaxindex=50;       {highest legit (byte) index into the CD_Info part of PM}
+
+
+type
+
+{PARAMETER MEMORY: }
+   Tnibble = 0..15;
+
+ {This record defines the layout of (NEW-STYLE) PM. The numbers to the right
+   indicate the byte offset of that field }
+   pmem = packed record                                            {Byte     Bits}
+          Version:      integer;                                   { 0 }
+          TimeStamp:    integer;                                   { 2 }
+          BootVol:      TNibble;                                   { 4       7-4 }
+          NormCont:     TNibble;                                   { 4       3-0 }
+          DimCont:      TNibble;                                   { 5       7-4 }
+          BeepVol:      TNibble;                                   { 5       3-0 }
+          MouseOn:      boolean; {.................................  6       7 }
+          ExtendMem:    boolean;                                   { 6       6 }
+          ScaleMouse:   boolean;                                   { 6       5 }
+          Pad1:         boolean;                                   { 6       4 }
+          DoubleClick:  TNibble; {.................................  6       3-0 }
+          FadeDelay:    TNibble;                                   { 7       7-4 }
+          BeginRepeat:  TNibble;                                   { 7       3-0 }
+          SubRepeat:    TNibble;                                   { 8       7-4 }
+          pad2:         TNibble;                                   { 8       3-0 }
+          CDcount:      PMByte;                                    { 9 }
+          DevConfig:    array[1..pmmaxindex] of pmbyte;            { 10-59}
+          MemLoss:      integer;                                   { 60-61}
+          Checksum:     integer;                                   { 62-63}
+        end;
+
+   ptr = ^integer;
+   name48 = string[48]; {any string of length 48, esp. used for copyright}
+   ptrlongint = ^longint;
+
+
+{Global variables are NOT allowed in the outer program}
+
+
+
+ {These assembler routines are defined by other modules than startup: }
+   procedure INIT_TRAPV (b_sysglobal : absptr); external;
+   procedure EXCEP_PROLOG; external;
+   procedure PARALLEL; external;        {parallel port int handler}
+   procedure DINT; external;            {twiggy disk interrupt handler}
+   procedure SONYINT; external;         {sony interrupt handler}
+   function  ALLSET (b1,b2: int1): boolean; external;
+ {$%+}  {allow % in identifiers}
+   procedure %I_MUL4; external;
+   procedure %I_DIV4; external;
+   procedure %I_MOD4; external;
+ {$%-}  {dont allow % in identifiers}
+
+ {These assembler routines are defined by startup(asm): }
+   procedure PROG_MMU(index,domain,count,rtn_domain:integer); external;
+   procedure REG_TO_MAPPED(b_sg,b_us:absptr); external;
+   procedure VERIFY_CKSUM(pm_adr : absptr;  var cksum : integer); external;
+   procedure INIT_READ_PM(adr_buf : absptr); external;
+   procedure INIT_WRITE_PM(adr_buf : absptr); external;
+   function  PASCALINIT : ptr; external;
+
+
+(*********)
+(*$S init*)     {begin segment init(ialize) }
+(*********)
+
+procedure SETMMU(index:integer; domain:integer; base:absptr;
+                    length:longint; permits:integer);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Reconfigure an MMU segment. (For a further discussion
+       (*       of the handling of mapping, see the design notes)
+       (*
+       (* Input Parameters:
+       (*    Index - which mmu segment.
+       (*    Domain - which domain.
+       (*    Base - where the segment starts.
+       (*    Length - how long it is, in bytes.
+       (*    Permits - operations allowed once mapping is on.
+       (*
+       (* Note:
+       (*    SETMMU is outside INITSYS so it can be called by SYSTEM_ERROR.
+       (*
+       (*************************************************************)
+var ptr_smt : smt_ptr;
+begin
+
+   (*$IFC DEBUG2*)
+   if TRACE(init,50) then
+   begin
+      writeln('setmmu: index,domain,base,length,permits:');
+      writeln('           ',index,domain,base,length,permits*256);
+   end;
+   (*$ENDC*)
+
+   ptr_smt := pointer(smt_addr);
+   with ptr_smt^[128*domain+index] do {parameters are passed via the SMT}
+   begin
+      origin := base div mempgsize;
+      limit :=  length div mempgsize;
+      access := permits;
+   end;
+   PROG_MMU(index, domain, 1, oscontext);
+
+   (*$IFC DEBUG2*)
+   if TRACE(init,50) then
+      writeln;
+   (*$ENDC*)
+end; { of setmmu }
+
+
+
+procedure INITSYS(ldmapbase : ptr);
+       (*************************************************************)
+       (*
+       (* Description (SOMEWHAT OBSOLETE, ALAS):
+       (*    Initialize the OS.  Briefly, this means to:
+       (*        Copy loader parameters into this program's world,
+       (*           starting towards mapped operation.
+       (*        Switch over to the designated stack (from the loader's stack)
+       (*        Convert the contents of the system jump table
+       (*           to a mapped equivalent.
+       (*        Initialize the parity error handler.
+       (*        Initialize sysglobal and syslocal heaps.
+       (*        Initialize trap and hardware exception vectors.
+       (*        Initialize memory manager data.
+       (*        Initialize the scheduler and process primitives.
+       (*        Initialize event and exception manager data.
+       (*        Initialize the system call table.
+       (*        Initialize I/O device drivers and parameter memory.
+       (*        Enable interrupts.
+       (*        Initialize the file system.
+       (*        Initialize system processes: the memory
+       (*           manager, timer, and  root processes.
+       (*        Release the data areas 'borrowed' during startup for POP.
+       (*        Terminate the psuedo-outer process.
+       (*
+       (* Input Parameters:
+       (*    Ldmapbase - address of the loader's first word of
+       (*       memory map variables, and more specifically,
+       (*       of the version number of the map variables.
+       (*
+       (* Special conditions of use:
+       (*    Initsys is barred from returning.  The baton is
+       (*    passed via the process created by initialize.
+       (*
+       (* Note:
+       (*  The design notes have a more detailed list of the sequence of module
+       (*  initializations.
+       (*
+       (*************************************************************)
+const
+   adr_bootdev = $1b3;   {adr of boot prom record of boot device}
+   cd_pm_version = 4;  {current version of PM format.}
+type
+   bootinfo = record {helps create configinfo entries for boot CDs}
+                pm_id: longint;
+                boot_slot: integer;
+                boot_chan: integer;
+                boot_dev: integer;
+                cdd_stuff: cddentry;
+                cd_adr: longint;
+              end; {of bootinfo}
+
+   cdbooter = array [1 {devcd} .. 3 {slotcd}] of bootinfo;
+
+var
+   OS_version : e_name;
+   OS_copyright: name48;
+   dummy : intson_type;
+   slsdb_ptr, stksdb_ptr : sdb_ptr;
+
+  {Contents read from validated parameter memory:}
+   mem_loss: integer;     {amount un-configured memory}
+   pm_good, snap_good, rewrite_pm: boolean;
+
+
+(*$i source/parms.text*)
+
+
+
+procedure GETLDMAP(ldmapbase:ptr);
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Copies the loader's memory map from the loader data
+    (*       base to variables declared in procedure initsys.
+    (*
+    (*    Getmap also initializes sysglobal vars defining the
+    (*       addresses of several regions.
+    (*
+    (* Input Parameters:
+    (*    Ldmapbase - address of the loader's first word of
+    (*       memory map variables, and more specifically,
+    (*       of the version number of the map variables.
+    (*
+    (*************************************************************)
+var
+   poker, parm_end : ptr;
+begin
+   case ldmapbase^ of    {peg end of loader variables based on db version #}
+      22 : parm_end := @parmend;
+      otherwise SYSTEM_ERROR(badloaderparms);
+   end; { of cases}
+
+   poker := @version;
+   while poker <> parm_end do           {get local copy of loader parameters}
+   begin
+      poker^ := ldmapbase^;
+      poker := pointer(ord(poker) - 2);
+      ldmapbase := pointer(ord(ldmapbase) - 2);
+   end; {of while}
+end; {of getldmap}
+
+
+
+procedure INIT_PE;
+    (*************************************************************)
+    (*
+    (*  Initialize the parity error handler, done as soon as possible
+    (*    after the creation of sysglobal.
+    (*
+    (*************************************************************)
+begin
+   stataddr := ord(nil);
+   pe_loc1 := 0;
+   pe_loc2 := 0;
+   pe_phase := 0;
+   pe_access := 0;
+end; {of init_pe}
+
+
+
+
+procedure DB_INIT;
+    (*************************************************************)
+    (*
+    (*  Initialize as much of our debugging facilities as we can invent.
+    (*
+    (*************************************************************)
+var i : osportion;
+begin
+
+   for i := mm to spare4 do
+       SET_TRACE_FENCE(i,100);
+
+   debugProcess := false;
+   anybps := false;
+   if lb_enabled then
+      Init_BP (ord(@DCT), ord(@anyBPs));  {Tell Lisabug about domains}
+
+   if debugmode then    {give user a chance, now that initsys symbols exist}
+   begin
+(*$IFC DEBUG2*)
+      writeln;writeln('Mend your (debugging) fences now.');
+(*$ENDC*)
+      MACSBUG;
+   end; {of debugmode stuff}
+
+end; {of DB_INIT}
+
+
+
+procedure AVAIL_INIT(var sdb_syslocal, sdb_stack : sdb_ptr);
+    (*************************************************************)
+    (*
+    (* Description:
+    (*  Initialize the memory manager data, along with memory descriptors
+    (*   for the Psuedo Outer Process (POP).
+    (*
+    (* Output Parameters:
+    (*   Sdb_syslocal - returns a pointer to the properly
+    (*     initialized sdb for the outer process syslocal.
+    (*   Sdb_stack - returns a pointer to the properly
+    (*     initialized sdb for the outer process stack.
+    (*
+    (*************************************************************)
+const
+   adr_c_domain_adr = $208;     {address of the debuggers pointer }
+                                { to the current domain number.}
+   adr_lowcore = $2A4;          {address of address of physical byte 0}
+var
+    adjust_index : integer;
+    sys_smt : smt_ptr;
+    sys_mrbt : mrbt_ptr;
+    c_sdb_ptr : sdb_ptr;
+    i, local_c_domain : integer;
+    freebase, freelen : int4;
+    poker : ^absptr;
+    p_refnum_rec: ptr_refnum_rec;
+    jt_ptr: ptr_JumpTable;
+
+ begin
+  {init misc. sysglobal vars: }
+   smt_addr := smt_base;        {establish base address of smt to OS/Pascal}
+   sys_smt := pointer(smt_addr);
+   poker := pointer(adr_c_domain_adr);  {init debugger's access to current}
+   poker^ := ord4(@c_domain);           {  domain variable.}
+   poker := pointer(adr_lowcore);       {init lowcore abs adr}
+   membase := poker^;
+   memleng := l_physicalmem;
+
+   unpacktabaddr := unpktaddr;  {install the pack table, loaded by loader}
+
+  (* initialize global refnum list *)
+   p_refnum_rec:=@glo_refnum;
+   with p_refnum_rec^ do
+     begin
+       next_refnum:=beg_glorefnum;
+       hd_refnum_list.fwd_link:=ord(@hd_refnum_list.fwd_link) - b_sysglobal_ptr;
+       hd_refnum_list.bkwd_link:=hd_refnum_list.fwd_link;
+     end;
+
+   MM_INIT;       {initialize mm process semaphone, et ale.}
+
+   sys_mrbt := pointer(s_mrbt_addr); {get working ptr to system mrbt}
+                                     { s_mrbt_addr is inited in MM_INIT}
+{code already 'swapped in', for use by startup, is inited to resident:}
+
+{  *** BIG ASSUMPTION *** - that segment number X is associated with }
+{                           MMU number KERNELMMU+X-1  !!!!!}
+
+   no_syscodesegs := os_segs;   {number of system code segments}
+
+   (* create an sdb for each swappped in code segment *)
+   jt_ptr:=pointer(b_sysjt); (* pointer to sys jump table *)
+   for i := 1 to os_segs do
+      if {not kernel resident: } swappedin[i] or (b_oscode[i]=0) then
+      begin
+         with jt_ptr^.segDesc[i] do
+            begin
+               MAKE_REGION(c_sdb_ptr, b_oscode[i], BLDPGLEN(l_oscode[i]+8),
+                             SizePacked, SizeUnpacked, SegmentAddr,
+                             keep_resident, code, true);
+               with sys_mrbt^[kernelmmu+i-1] do   {enter swap-seg in system mrbt}
+               begin
+                  access := mmureadonly;
+                  sdbRP  := ord(c_sdb_ptr) - b_sysglobal_ptr;
+               end; {of with}
+            end; {of with jt_segv_ptr}
+      end; {of if}
+
+{physical memory}
+   MAKE_REGION(c_sdb_ptr, 0, l_physicalmem, 0, l_physicalmem, 0,
+                  na_priority, data, false);
+   sdb_realmem := ord(c_sdb_ptr);
+   adjust_index := membase div maxmmusize;  {dont map beyond 2nd mem card}
+
+  {init mmu's and smt for real mem:}
+   for i := realmemmmu to realmemmmu+15-adjust_index do
+      SETMMU(i,oscontext,(i-realmemmmu)*maxmmusize, maxmmusize, mmureadwrite);
+
+   with sys_mrbt^[realmemmmu] do   {enter sysglobal into system mrbt}
+      begin
+         access := mmureadwrite;
+         sdbRP  := ord(sdb_realmmu) - b_sysglobal_ptr;
+      end;
+
+{free space: (start region on a page boundary, with length in multiples of pages)}
+   freebase := BLDPGLEN(lomem);
+   freelen  := BLDPGLEN(himem-lomem); {round free area size DOWN to pagelength, }
+   if freelen <> himem-lomem then     {  avoiding full mempgsize losses. }
+   begin
+
+      (*$IFC DEBUG2*)
+      if TRACE(init,99) then writeln('himem not already on page boundary!');
+      (*$ENDC*)
+
+      freelen := freelen - mempgsize;
+   end;
+   MAKE_FREE(freebase div mempgsize,freelen div mempgsize);
+
+{sysglobal:}
+   MAKE_REGION(c_sdb_ptr, b_sys_global, l_sys_global, 0, l_sys_global, 0,
+                  keep_resident, data, true);
+   sdb_sysglobal := ord(c_sdb_ptr);
+   with sys_mrbt^[sysglobmmu] do       {enter sysglobal in system mrbt}
+   begin
+      access := mmureadwrite;
+      sdbRP := ord(sdb_sysglobal) - b_sysglobal_ptr;
+   end;
+
+{init regions the screen}
+   for local_c_domain := 0 to 3 do
+   begin
+      if l_scrdata > maxmmusize then
+          SYSTEM_ERROR(stup_cantmapscreen);
+      SETMMU(screenmmu, local_c_domain, b_scrdata, l_scrdata, mmureadwrite);
+   end;
+
+{Create syslocal/stack for POP, psuedo-outer process: }
+   MAKE_REGION(c_sdb_ptr, b_opsyslocal, l_opsyslocal, 0, l_opsyslocal, 0,
+                  na_priority, data, true);
+   sdb_syslocal := c_sdb_ptr;
+   with sys_mrbt^[syslocmmu] do       {enter syslocal in system mrbt}
+   begin
+      access := mmureadwrite;
+      sdbRP := ord(sdb_syslocal) - b_sysglobal_ptr;
+   end;
+
+   MAKE_REGION(c_sdb_ptr, b_opustack, l_opustack, 0, l_opustack, 0,
+                  na_priority, data, true);
+   sdb_stack := c_sdb_ptr;
+
+  (*$IFC DEBUG2*)
+   if TRACE(init,50) then writeln('avail_init done');
+  (*$ENDC*)
+end; { of avail_init}
+
+
+
+procedure INIT_PROCESS(slsdb : sdb_ptr);
+    (*************************************************************)
+    (*
+    (*  Initialize enough of a psuedo-outer process for the
+    (*      setup of the rest of the system can continue.  Includes
+    (*      scheduler initialization.
+    (*
+    (* Input  Parameters:
+    (*    Slsdb - pointer to the psuedo-outer process syslocal.
+    (*
+    (*************************************************************)
+var
+  c_mrbt : mrbt_ptr;
+  c_smrbt : smrbt_ptr;
+  c_pcb : ptr_pcb;
+  ordpcbptr, ord_lbt : absptr;
+  c_lbt: lbt_ptr;
+  c_syslocal_ptr : slocal_ptr;
+  i : int2;
+  sentPCBsize : int2;
+  sentPCB_ptr : ptr_PCB;
+
+begin
+   (* allocate PCB for pseudo outer process *)
+   if not GETSPACE(SIZEOF(pcb),b_sysglobal_ptr,ordpcbptr) then
+      SYSTEM_ERROR(stup_nospace);
+   c_pcb:=pointer(ordpcbptr);
+   c_pcb_ptr:=ordpcbptr;
+
+   with c_pcb^ do
+      begin
+         pcbfreqptr := ord(nil);
+         need_mem := false;
+         blk_state := [];
+         domain := 0;
+         proctype := sys;
+         np_count := 0;
+         priority := 255;
+         norm_pri := 255;
+         sems_owned := 0;
+         glob_id := $ABC;
+         fatherptr := 0;
+         sonptr := 0;
+         brotherptr := 0;
+         plcbRP := 0;
+         slocal_sdbRP := ord(slsdb) - b_sysglobal_ptr;
+      end;
+
+   { set up scheduling queues - Blocked queue empty & Ready queue with PCBs }
+   fwd_BlockQ := ord(@fwd_BlockQ);
+   bkwd_BlockQ := fwd_BlockQ;
+   fwd_ReadyQ := c_pcb_ptr;
+
+   { set up sentinel PCB in Ready queue }
+   sentPCBsize := ord(@c_pcb^.norm_pri) - ord(c_pcb);
+   if not GetSpace (sentPCBsize, b_sysglobal_ptr, ordpcbptr) then
+     System_Error (stup_nospace);
+   sentPCB_ptr := pointer(ordpcbptr);
+
+   bkwd_ReadyQ := ord(sentPCB_ptr);
+
+   with sentPCB_ptr^do
+     begin
+       priority := 0;
+       next_schedPtr := @fwd_ReadyQ;
+       prev_schedPtr := c_pcb
+     end;
+   with c_pcb^ do
+     begin
+       next_schedPtr := sentPCB_ptr;
+       prev_schedPtr := @fwd_ReadyQ
+     end;
+
+   next_gprocid := 0;
+   Invoke_sched := false;
+   sched_attn := ord(nil);
+   nonPreempt := ord(nil);
+   ubd_pcb_ptr:= ord(nil);
+
+   SchedEnable;
+
+ (* init Domain control table: *)
+   for i := 0 to 4 do
+   begin
+      dct[i].owner := -1;
+      dct[i].refcounter := 0;
+   end;
+   dct[0].owner := $ABC;        {with glob id matching, scheduler wont remap}
+
+   INIT_GPLIST;   (* initialize the global process list *)
+
+  (* Syslocal space was initialized in avail_init *)
+
+   c_syslocal_ptr := pointer(b_syslocal_ptr);
+   with c_syslocal_ptr^ do
+     begin
+       (* mrbt *)
+       if not GETSPACE(SIZEOF(mrbt),b_syslocal_ptr,mrbt_addr) then
+          SYSTEM_ERROR(stup_nospace);
+
+       c_mrbt:=pointer(mrbt_addr);
+       for i:=minsysldsnmmu to shrsegmmu do
+         begin
+           with c_mrbt^[i] do
+             begin
+               access:=mmuabsent;
+               sdbRP:=0;
+             end;
+         end;
+       with c_mrbt^[stackmmu] do
+         begin
+           access:=mmustack;
+           sdbRP:=ord(stksdb_ptr)-b_sysglobal_ptr;
+         end;
+
+       (* smrbt *)
+       if not GETSPACE(SIZEOF(smrbt),b_syslocal_ptr,smrbt_addr) then
+          SYSTEM_ERROR(stup_nospace);
+
+       c_smrbt:=pointer(smrbt_addr);
+       for i:=minsysldsnmmu to maxsysldsnmmu do
+         begin
+           with c_smrbt^[i] do
+             begin
+               access:=mmuabsent;
+               sdbRP:=0;
+             end;
+         end;
+
+       (* lbt *)
+       if not GETSPACE(SIZEOF(lbt), b_syslocal_ptr, ord_lbt) then
+          SYSTEM_ERROR(stup_nospace);
+       lbt_addr := ord_lbt;
+       c_lbt := pointer(ord_lbt);
+       for i := min_ldsn to max_ldsn do
+          c_lbt^[i] := 0;
+
+       (* initialize scb *)
+       scb.pcvalue:=0;
+       scb.domvalue := 0;
+
+       (* initialize refnum header *)
+       loc_refnum.hd_refnum_list.fwd_link:=
+                      ord(@loc_refnum.hd_refnum_list.fwd_link)-b_syslocal_ptr;
+       loc_refnum.hd_refnum_list.bkwd_link:=loc_refnum.hd_refnum_list.fwd_link;
+       loc_refnum.next_refnum:=beg_locrefnum;
+
+       (* initialize hd_ds_refdb_list *)
+       hd_ds_refdb_list.fwd_link:=ord(@hd_ds_refdb_list.fwd_link)-b_syslocal_ptr;
+       hd_ds_refdb_list.bkwd_link:=hd_ds_refdb_list.fwd_link;
+
+   end;(* with *)
+
+end;  (* procedure INIT_PROCESS *)
+
+
+
+procedure INIT_EM;
+       (*************************************************************)
+       (*
+       (*  Initialize the exception manager.
+       (*
+       (*************************************************************)
+var
+   b_sloc_ptr : slocal_ptr;
+   errnum : integer;
+   pcb_ptr : ptr_pcb;
+begin
+   b_sloc_ptr := pointer (b_syslocal_ptr);
+   pcb_ptr := pointer (c_pcb_ptr);
+   excep_setup (b_sloc_ptr);
+   ec_setup (b_sloc_ptr);
+end;  (* procedure INIT_EXCEP *)
+
+
+
+procedure SCTAB1;         (* init system call table, part I *)
+       (*************************************************************)
+       (*
+       (* System call table initialization.
+       (*   (part I)
+       (*************************************************************)
+var i : integer;
+begin
+  for i := 1 to subc_max do  {init all entries before each specific interface}
+     sctab.sc_adr [i] := @bad_scall;
+
+  sctab.sc_adr [1] := @return_excep;
+  sctab.sc_par_no [1] := 0;
+  sctab.sc_adr [2] := @init_excep;
+  sctab.sc_par_no [2] := 1;
+  sctab.sc_adr [3] := @force_term_excep;
+  sctab.sc_par_no [3] := 1;
+
+                              (* range error routines *)
+  sctab.sc_adr [5] := @rangeerror;
+  sctab.sc_par_no [5] := 4;
+
+                              (* file system calls *)
+  sctab.sc_adr [11] := @make_file;
+  sctab.sc_par_no [11] := 3;
+  sctab.sc_adr [12] := @make_pipe;
+  sctab.sc_par_no [12] := 3;
+  sctab.sc_adr [13] := @make_catalog;
+  sctab.sc_par_no [13] := 3;
+  sctab.sc_adr [14] := @make_link;
+  sctab.sc_par_no [14] := 4;
+  sctab.sc_adr [15] := @kill_object;
+  sctab.sc_par_no [15] := 2;
+  sctab.sc_adr [16] := @rename_entry;
+  sctab.sc_par_no [16] := 3;
+  sctab.sc_adr [17] := @lookup;
+  sctab.sc_par_no [17] := 4;
+  sctab.sc_adr [18] := @info;
+  sctab.sc_par_no [18] := 3;
+  sctab.sc_adr [19] := @open;
+  sctab.sc_par_no [19] := 4;
+  sctab.sc_adr [20] := @close_object;
+  sctab.sc_par_no [20] := 2;
+  sctab.sc_adr [21] := @read_data;
+  sctab.sc_par_no [21] := 7;
+  sctab.sc_adr [22] := @write_data;
+  sctab.sc_par_no [22] := 7;
+  sctab.sc_adr [23] := @read_label;
+  sctab.sc_par_no [23] := 5;
+  sctab.sc_adr [24] := @write_label;
+  sctab.sc_par_no [24] := 5;
+  sctab.sc_adr [25] := @device_control;
+  sctab.sc_par_no [25] := 3;
+  sctab.sc_adr [26] := @allocate;
+  sctab.sc_par_no [26] := 5;
+  sctab.sc_adr [27] := @compact;
+  sctab.sc_par_no [27] := 2;
+  sctab.sc_adr [28] := @truncate;
+  sctab.sc_par_no [28] := 2;
+  sctab.sc_adr [29] := @flush;
+  sctab.sc_par_no [29] := 2;
+  sctab.sc_adr [30] := @set_safety;
+  sctab.sc_par_no [30] := 3;
+  sctab.sc_adr [31] := @set_working_dir;
+  sctab.sc_par_no [31] := 2;
+  sctab.sc_adr [32] := @get_working_dir;
+  sctab.sc_par_no [32] := 2;
+  sctab.sc_adr [33] := @mount;
+  sctab.sc_par_no [33] := 4;
+  sctab.sc_adr [34] := @unmount;
+  sctab.sc_par_no [34] := 2;
+  sctab.sc_adr [35] := @reset_catalog;
+  sctab.sc_par_no [35] := 2;
+  sctab.sc_adr [36] := @get_next_entry;
+  sctab.sc_par_no [36] := 3;
+
+  sctab.sc_adr [38] := @set_file_info;
+  sctab.sc_par_no [38] := 3;
+  sctab.sc_adr [39] := @unkill_file;
+  sctab.sc_par_no [39] := 3;
+  sctab.sc_adr [40] := @quick_lookup;
+  sctab.sc_par_no [40] := 3;
+  sctab.sc_adr [41] := @lookup_next_entry;
+  sctab.sc_par_no [41] := 3;
+  sctab.sc_adr [42] := @reset_subtree;
+  sctab.sc_par_no [42] := 2;
+
+                              (* process management calls *)
+  sctab.sc_adr [50] := @make_process;
+  sctab.sc_par_no [50] := 5;
+  sctab.sc_adr [51] := @terminate_process;
+  sctab.sc_par_no [51] := 2;
+  sctab.sc_adr [52] := @hit_end;
+  sctab.sc_par_no [52] := 0;
+  sctab.sc_adr [53] := @info_process;
+  sctab.sc_par_no [53] := 3;
+  sctab.sc_adr [54] := @kill_process;
+  sctab.sc_par_no [54] := 2;
+  sctab.sc_adr [55] := @suspend_process;
+  sctab.sc_par_no [55] := 3;
+  sctab.sc_adr [56] := @activate_process;
+  sctab.sc_par_no [56] := 3;
+  sctab.sc_adr [57] := @setpriority_process;
+  sctab.sc_par_no [57] := 3;
+  sctab.sc_adr [58] := @yield_cpu;
+  sctab.sc_par_no [58] := 2;
+  sctab.sc_adr [59] := @my_id;
+  sctab.sc_par_no [59] := 0;
+
+  sctab.sc_adr [61] := @sched_class;
+  sctab.sc_par_no [61] := 2;
+
+                               (* memory management calls *)
+  sctab.sc_adr [70] := @make_dataseg;
+  sctab.sc_par_no [70] := 8;
+  sctab.sc_adr [71] := @kill_dataseg;
+  sctab.sc_par_no [71] := 2;
+  sctab.sc_adr [72] := @open_dataseg;
+  sctab.sc_par_no [72] := 5;
+  sctab.sc_adr [73] := @close_dataseg;
+  sctab.sc_par_no [73] := 2;
+  sctab.sc_adr [74] := @size_dataseg;
+  sctab.sc_par_no [74] := 6;
+  sctab.sc_adr [75] := @info_dataseg;
+  sctab.sc_par_no [75] := 3;
+  sctab.sc_adr [76] := @setaccess_dataseg;
+  sctab.sc_par_no [76] := 3;
+  sctab.sc_adr [77] := @unbind_dataseg;
+  sctab.sc_par_no [77] := 2;
+  sctab.sc_adr [78] := @bind_dataseg;
+  sctab.sc_par_no [78] := 2;
+  sctab.sc_adr [79] := @info_ldsn;
+  sctab.sc_par_no [79] := 3;
+  sctab.sc_adr [80] := @flush_dataseg;
+  sctab.sc_par_no [80] := 2;
+  sctab.sc_adr [81] := @mem_info;
+  sctab.sc_par_no [81] := 5;
+  sctab.sc_adr [82] := @info_address;
+  sctab.sc_par_no [82] := 3;
+
+                              (* exception management system calls *)
+  sctab.sc_adr [90] := @declare_excep_hdl;
+  sctab.sc_par_no [90] := 3;
+  sctab.sc_adr [91] := @disable_excep;
+  sctab.sc_par_no [91] := 3;
+  sctab.sc_adr [92] := @enable_excep;
+  sctab.sc_par_no [92] := 2;
+  sctab.sc_adr [93] := @info_excep;
+  sctab.sc_par_no [93] := 3;
+  sctab.sc_adr [94] := @signal_excep;
+  sctab.sc_par_no [94] := 3;
+  sctab.sc_adr [95] := @flush_excep;
+  sctab.sc_par_no [95] := 2;
+
+                              (* event channel system calls *)
+  sctab.sc_adr [96] := @make_event_chn;
+  sctab.sc_par_no [96] := 2;
+  sctab.sc_adr [97] := @kill_event_chn;
+  sctab.sc_par_no [97] := 2;
+  sctab.sc_adr [98] := @open_event_chn;
+  sctab.sc_par_no [98] := 5;
+  sctab.sc_adr [99] := @close_event_chn;
+  sctab.sc_par_no [99] := 2;
+  sctab.sc_adr [100] := @info_event_chn;
+  sctab.sc_par_no [100] := 3;
+  sctab.sc_adr [101] := @wait_event_chn;
+  sctab.sc_par_no [101] := 4;
+  sctab.sc_adr [102] := @flush_event_chn;
+  sctab.sc_par_no [102] := 2;
+  sctab.sc_adr [103] := @send_event_chn;
+  sctab.sc_par_no [103] := 5;
+
+                              (* timer functions system calls *)
+  sctab.sc_adr [104] := @delay_time;
+  sctab.sc_par_no [104] := 3;
+  sctab.sc_adr [105] := @get_time;
+  sctab.sc_par_no [105] := 2;
+  sctab.sc_adr [107] := @convert_time;
+  sctab.sc_par_no [107] := 4;
+
+                              (* configuration system calls *)
+  sctab.sc_adr [140] := @cdinfo;
+  sctab.sc_par_no [140] := 3;
+  sctab.sc_adr [141] := @cdmake;
+  sctab.sc_par_no [141] := 3;
+  sctab.sc_adr [142] := @cdkill;
+  sctab.sc_par_no [142] := 2;
+  sctab.sc_adr [143] := @mach_info;
+  sctab.sc_par_no [143] := 2;
+  sctab.sc_adr [144] := @enabledbg;
+  sctab.sc_par_no [144] := 1;
+  sctab.sc_adr [145] := @read_pmem;
+  sctab.sc_par_no [145] := 2;
+  sctab.sc_adr [146] := @write_pmem;
+  sctab.sc_par_no [146] := 2;
+  sctab.sc_adr [147] := @osbootvol;
+  sctab.sc_par_no [147] := 2;
+  sctab.sc_adr [148] := @getnxtconfig;
+  sctab.sc_par_no [148] := 4;
+  sctab.sc_adr [149] := @putnxtconfig;
+  sctab.sc_par_no [149] := 4;
+  sctab.sc_adr [150] := @cards_equipped;
+  sctab.sc_par_no [150] := 2;
+                                         {END SCTABLE}
+end; {of sctab1}
+
+
+
+procedure SCTAB2;         (* init system call table, part II *)
+       (*************************************************************)
+       (*
+       (* Priviledged system call table initialization.
+       (*    (part II)
+       (*************************************************************)
+begin
+                              (*  privileged system calls (110-139) *)
+  sctab.sc_adr [110] := @Sys_Stat;
+  sctab.sc_par_no [110] := 3;
+
+  sctab.sc_adr [113] := @fs_utilities;
+  sctab.sc_par_no [113] := 2;
+  sctab.sc_adr [114] := @list_versions;
+  sctab.sc_par_no [114] := 1;
+  sctab.sc_adr [115] := @lockseg;
+  sctab.sc_par_no [115] := 1;
+  sctab.sc_adr [116] := @unlocksegs;
+  sctab.sc_par_no [116] := 1;
+  sctab.sc_adr [117] := @change_directory;
+  sctab.sc_par_no [117] := 2;
+  sctab.sc_adr [118] := @unitio;
+  sctab.sc_par_no [118] := 8;
+
+  sctab.sc_adr [120] := @set_time;
+  sctab.sc_par_no [120] := 2;
+  sctab.sc_adr [121] := @popen;
+  sctab.sc_par_no [121] := 4;   {even tho 5 actually exist, this tracks poslib}
+  sctab.sc_adr [122] := @protect;
+  sctab.sc_par_no [122] := 4;
+  sctab.sc_adr [123] := @get_serial_no;
+  sctab.sc_par_no [123] := 2;
+  sctab.sc_adr [124] := @size_stack;
+  sctab.sc_par_no [124] := 2;
+  sctab.sc_adr [125] := @get_open_list;
+  sctab.sc_par_no [125] := 3;
+  sctab.sc_adr [126] := @list_libfiles;
+  sctab.sc_par_no [126] := 3;
+  sctab.sc_adr [127] := @libfilename;
+  sctab.sc_par_no [127] := 3;
+  sctab.sc_adr [128] := @read_attributes;
+  sctab.sc_par_no [128] := 6;
+  sctab.sc_adr [129] := @write_attributes;
+  sctab.sc_par_no [129] := 6;
+
+  sctab.sc_adr [130] := @set_debugmode;
+  sctab.sc_par_no [130] := 2;
+  sctab.sc_adr [131] := @pset_file_info;
+  sctab.sc_par_no [131] := 3;
+  sctab.sc_adr [132] := @pset_vol_info;
+  sctab.sc_par_no [132] := 3;
+  sctab.sc_adr [133] := @make_secure;
+  sctab.sc_par_no [133] := 3;
+  sctab.sc_adr [134] := @kill_secure;
+  sctab.sc_par_no [134] := 3;
+  sctab.sc_adr [135] := @open_secure;
+  sctab.sc_par_no [135] := 5;
+  sctab.sc_adr [136] := @rename_secure;
+  sctab.sc_par_no [136] := 4;
+  sctab.sc_adr [137] := @verify_password;
+  sctab.sc_par_no [137] := 3;
+  sctab.sc_adr [138] := @change_password;
+  sctab.sc_par_no [138] := 4;
+
+end;  (* procedure sctab2 *)
+
+
+
+procedure INIT_SCTAB;
+       (*************************************************************)
+       (*
+       (* System call table initialization.
+       (*
+       (*************************************************************)
+begin           {overcome the code generation errors that occur when }
+  sctab1;       { sctab1 and sctab2 are in the same procedure.}
+  sctab2;
+end; {of SCTAB}
+
+
+
+procedure FS_INIT;
+       (*************************************************************)
+       (*
+       (* File system initialization.
+       (*
+       (*************************************************************)
+var error:integer;
+    sloc_ptr : slocal_ptr;
+    c : char;
+begin
+  SET_TRACE_FENCE(spare1, 0);          {optimize bringup overhead}
+
+ {init pointer to mapped form of the loader-allocated vm space}
+   mainmem := b_vmbuffer - b_sys_global + MMU_BASE(sysglobmmu);
+
+   repeat {until we get it right}
+      FS_MASTER_INIT(error);    {initialize filesystem (in general) for the }
+      if (error > 0)            { defacto-mounted boot volume.  }
+         then
+            begin
+              (*$IFC DEBUG2*)
+               if TRACE(init,99) then
+               begin
+                  writeln('Startup:  couldn''t init the lisa filesystem, error ',error);
+                  writeln;
+               end;
+              (*$ENDC*)
+               SYSTEM_ERROR(stup_fsinit);
+            end;
+   until error=0;
+
+   sloc_ptr := pointer(MMU_BASE(syslocmmu) );
+   FS_SETUP(sloc_ptr);  {for POP, specifically}
+end; {of FS_INIT}
+
+
+
+(***********)
+(*$S initcd*)  {configurable drivers segment}
+(***********)
+
+
+procedure SET_PREFERENCES;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize low-level drivers from parameter memory.
+       (*
+       (*************************************************************)
+CONST   {for SET_PREFERENCES}
+  { These are the defaults values used to reset PM }
+    DfltMemTest = False;
+    DfltNormCont = 6;
+    DfltDimCont = 4;
+    DfltBeepVol = 3;
+    DfltFadeDelay = 2;
+    DfltDoubleClick = 4;
+    DfltMouseOn = true;
+    DfltScaling = false;
+    DfltExtenMem = false;
+    DfltInitRepeat = 4;
+    DfltSubRepeat = 1;
+    threshold = 8;      {Mouse movement threshold for scaling}
+
+var     {for SET_PREFERENCES}
+   pmrec: ^pmem;
+   time: integer;
+   error, index : integer;
+(*$IFC FALSE*)
+   my_minutes : minute_range;
+   my_hours : hour_range;
+(*$ENDC*)
+
+
+
+function FADECONERT(Indepedant: Integer):Integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert the 'independant' value into the appropro # of minutes.
+       (*
+       (*************************************************************)
+begin
+   Case Indepedant of
+      1: FadeConert := 1;
+      2: FadeConert := 2;
+      3: FadeConert := 5;
+      4: FadeConert := 10;
+      5: FadeConert := 15;
+      6: FadeConert := 30;
+   otherwise FadeConert := 2;
+   end
+end {of FADECONERT};
+
+
+
+Function CONERTCONT(Contrast:Integer):Integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert 'contrast' into a practical byte value for use by
+       (*       SETCONTRAST. (Assumes:  Contrast is between 0 and 16.)
+       (*
+       (*************************************************************)
+begin
+   ConertCont := (Contrast * 5) + 90;
+end; {of CONERTCONT}
+
+
+
+Function DIMCONERT(Contrast:Integer):Integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert dim contrast into a practical byte value to be used
+       (*    by SETCONTRAST.  (Assumes contrast is between 0 and 16.)
+       (*
+       (*************************************************************)
+begin
+   DimConert := CONERTCONT(Contrast + 5)
+end; {of DIMCONERT}
+
+
+
+Procedure DEFAULTPM;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Set PM to the default constants.
+       (*
+       (*************************************************************)
+var
+  index: integer;
+begin
+   for index := 1 to 32 do {all fields get zero, avoiding explict init of any}
+      param_mem.parm_mem[index] := 0;
+   rewrite_pm := true;    {make sure new (zeroed) PM gets to disk}
+   With PMRec^ {Same as param_mem.parm_mem[] } do
+   begin
+       version := cd_pm_version;
+       normcont:= DfltNormCont;
+       dimcont := DfltDimCont;
+       beepvol := DfltBeepVol;
+       fadedelay := DfltFadeDelay;
+       DoubleClick := DfltDoubleClick;
+       MouseOn := DfltMouseOn;
+       ScaleMouse := DfltScaling;
+       ExtendMem := DfltExtendMem;
+       beginrepeat := DfltInitRepeat;
+       subrepeat := DfltSubRepeat;
+       for index := 1 to pmmaxindex do devconfig[index] := empty;
+   end; {of with}
+end; {of DEFAULTPM}
+
+
+
+begin  {here begins the body of SET_PREFERENCES}
+   pmrec := @param_mem.parm_mem[1];
+   if not snap_good and not pm_good then DEFAULTPM;
+   With PMRec^ do
+      begin {Tell the drivers all values}
+         SETREPEATRATE(BeginRepeat * 100, SubRepeat * 100);
+         SETCONTRAST(ConertCont(NormCont));
+         SETFADEDELAY(FadeConert(FadeDelay) * 60000);
+         SETDIMCONTRAST(DimConert(Dimcont));
+         SETVOLUME(BeepVol);
+         MOUSESCALING(ScaleMouse);
+         MOUSETHRESH(Threshold);
+
+(*$IFC FALSE*)
+       {set the difference between local and GMT: }
+         my_minutes := 0; {time is in increments of 1/4 hours}
+         my_hours := 0;
+         SET_LOCAL_TIME_DIFF(error, my_hours, my_minutes);
+(*$ENDC*)
+
+      end;
+end; {of SET_PREFERENCES}
+
+
+
+procedure INIT_CONFIG;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize the configuration list from parameter memory or snapshot,
+       (*    depending whether pm or snapshot is valid.
+       (*
+       (*************************************************************)
+type
+   ld_pagetype = array [0..511] of byte;
+var
+   buf : ld_pagetype;
+   mddf : mddfptr;
+   pm_image : pmem;             {get declaration into sysglobal}
+   snap_image : ^pmem;
+   error : integer;
+   its_cksum : integer;
+begin
+  {read and validate parameter memory: }
+   INIT_READ_PM( ord(@pm_image) );
+   VERIFY_CKSUM(ord(@pm_image), its_cksum);
+   pm_good := (its_cksum = 0) and (pm_image.version = cd_pm_version);
+
+  {read and process snapshot version of parameter memory: }
+   mddf := @buf;
+   LD_READBLOCK(0 {=mddf}, ord4(@buf)); {Errors dont even return}
+   with mddf^ do
+      begin
+         snap_image := @pmem.parm_mem[1];
+         VERIFY_CKSUM(ord(snap_image), its_cksum);
+         if (its_cksum<>0) or (snap_image^.version <> cd_pm_version) then
+            begin
+               snap_good := false;
+               rewrite_pm := pm_good;
+            end
+         else {snapshot is readable, continue testing it: }
+            begin
+               if pm_good then
+                  begin
+                     snap_good := (pm_image.timestamp=snap_image^.timestamp) and
+                                  (ld_sernum=pmem_id);
+                     rewrite_pm := not snap_good;
+                  end
+               else {pm is not good}
+                  begin
+                     snap_good := true;
+                     rewrite_pm := false;
+                     INIT_WRITE_PM( ord4(snap_image) );
+                  end;
+            end;
+      end; {of using mddf}
+end; {of init_config}
+
+
+
+function GET_BOOTSPACE(size: longint; lastalloc: boolean) : longint;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Allocate 'size' bytes, returning the address where space is allocated
+       (*    as the function result.  The lastalloc flag denotes whether we
+       (*    must ensure that the loader isn't impinged on.
+       (*
+       (*************************************************************)
+var
+   page_got: integer;
+   ordadr: longint;
+begin
+  if not GETFREE( (size + mempgsize - 1) div mempgsize, page_got) then
+     SYSTEM_ERROR(10701);
+  ordadr := ord4(page_got) * mempgsize; {convert to byte count}
+  if not lastalloc then {have to prevent stepping on top of the loader}
+     if (bothimem>ordadr) then
+        SYSTEM_ERROR(10701); {don't overwrite the loader (YET)}
+  get_bootspace := ordadr + logrealmem; {map driver in realmmu adr space}
+end; {of get_bootspace}
+
+
+
+procedure CONFIG_DOWN;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Config_down discards as many 1 KB chunks of available
+       (*    space as requested by the mem_loss global variable.
+       (*
+       (*    70 KB less memory is un-configured than is requested,
+       (*    allowing space for the debugger.
+       (*
+       (*************************************************************)
+var trasher, length: longint;
+begin
+if mem_loss>0 then
+  begin
+    {Give back enough memory to account for 70KB of lisabug and its data:}
+     if mem_loss>70 then mem_loss := mem_loss - 70;
+     length := mem_loss;    {get into longint mathmatics mode}
+     length := length * 1024;
+     trasher {We dont care what space found} := GET_BOOTSPACE(length, true);
+  end;
+end; {of CONFIG_DOWN}
+
+
+
+function LOADCD(var seglength, segbase : absptr) : boolean;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Load the first segment of the previously 'opened' program,
+       (*      returning the segments length and where it was loaded.
+       (*
+       (*************************************************************)
+const
+{ object file header values, ie, integer value corresponding to type byte }
+   endblock = -127;      {$ff81 -  end block }
+   codeblock = -123;     {$ff85 -  code block }
+type
+   codeheader = record
+                     hdr : int1;
+                     size1 : int1;
+                     size2 : int2;
+                     reloff : int4;
+                  end;
+var
+   search_ptr: longint;
+   done_seg: boolean;    {whether code segment has been loaded yet}
+   codehd : codeheader;
+   hdrptr : ^codeheader;
+   poker : ^integer;
+   counter, blocksize: longint;
+   header : byte;
+   reloffset : absptr;
+begin
+   done_seg := false;
+   search_ptr := 0; {start at beginning of file}
+   repeat           {read in the code for the segment}
+      LD_FILLBUF(search_ptr);
+      header := LD_GETBYTE;                         {Read block type}
+      counter:= LD_GETBYTE;                         { and size.}
+      blocksize := LD_GETWORD;
+      search_ptr := search_ptr + blocksize;         {Form address of next block}
+      if (counter<>0) or (blocksize<=0)  then       {Being lost, blame it }
+         begin                                      {  on the object code!}
+            loadcd := false;
+            EXIT(loadcd);
+         end;
+      if (header=codeblock) then
+         begin
+            if done_seg then {Program has MORE than one code segment!}
+               begin
+                  loadcd := false;
+                  EXIT(loadcd);
+               end
+            else done_seg := true;
+            seglength:=blocksize;
+            segbase := GET_BOOTSPACE(seglength, false); {return code HEADER base}
+            reloffset := LD_GETLONG;
+            LD_MOVEMULTIPLE(seglength-8, segbase+8);    {load the code}
+            with codehd do  {reconstitute header, write it with the code}
+               begin
+                  hdr := codeblock;     {whether originally unpacked or packed}
+                  size1 := 0;           {counter already verified to equal this}
+                  size2 := seglength;   {accounts for both packed/unpacked cases}
+                  reloff := reloffset;
+               end;
+            hdrptr := @codehd;
+            poker := pointer(segbase);
+            MOVER( ord4(hdrptr), ord4(poker), SIZEOF(codehd) );
+         end; { of codeblock is found}
+   until header = endblock;
+   loadcd := true;  {segment successfully loaded}
+end; {of loadcd}
+
+
+
+procedure FIND_BOOT(var seed: bootinfo);
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Report the position of the boot device.  Also initializes
+    (*    'bootport'.  Slots 1-3 are separately determined, in spite
+    (*    of what's inited here.
+    (*
+    (*************************************************************)
+var
+   poker: ^byte;
+begin
+   poker := pointer(adr_bootdev);
+   with seed do
+      begin
+        {start with some popular values, saving a little code}
+         boot_chan := 0;
+         boot_dev := emptydev;
+         pm_id := empty;
+         case poker^ of
+            0: if (iomodel < iob_pepsi {includes iob_twiggy} )
+                  then {uppertwig}
+                     begin
+                        boot_slot := cd_twiggy;
+                       {boot_chan := 0;}
+                     end
+                  else {internal hard disk}
+                     begin
+                        boot_slot := cd_intdisk;
+                        boot_chan := emptychan;
+                     end;
+            1: if (iomodel < iob_pepsi {includes iob_twiggy} )
+                  then {lowertwig}
+                     begin
+                        boot_slot := cd_twiggy;
+                        boot_chan := 1;
+                     end
+                  else {micro_disk}
+                     begin
+                        boot_slot := cd_sony;
+                        boot_chan := emptychan;
+                     end;
+            2: if (iomodel = iob_sony) or (iomodel = iob_lisa)
+                  then {parallel port}
+                     begin
+                        boot_slot := cd_paraport;
+                        boot_chan := emptychan;
+                     end
+               else {internal hard disk}
+                     begin
+                        boot_slot := cd_intdisk;
+                        boot_chan := emptychan; {dif from builtin drvr adr}
+                     end;
+
+        {The rest are (starting) guesses, to be re-adjusted in find_pm_ids.}
+            3: begin {slot11}
+                  boot_slot := cd_slot1;
+                 {boot_chan := 0;}
+                  boot_dev := 0;
+               end;
+            4: begin {slot12}
+                  boot_slot := cd_slot1;
+                 {boot_chan := 0;}
+                  boot_dev := 1;
+               end;
+            5: begin {slot13}
+                  boot_slot := cd_slot1;
+                 {boot_chan := 0;}
+                  boot_dev := 2;
+               end;
+            6: begin {slot21}
+                  boot_slot := cd_slot2;
+                 {boot_chan := 0;}
+                  boot_dev := 0;
+               end;
+            7: begin {slot22}
+                  boot_slot := cd_slot2;
+                 {boot_chan := 0;}
+                  boot_dev := 1;
+               end;
+            8: begin {slot23}
+                  boot_slot := cd_slot2;
+                 {boot_chan := 0;}
+                  boot_dev := 2;
+               end;
+            9: begin {slot31}
+                  boot_slot := cd_slot3;
+                 {boot_chan := 0;}
+                  boot_dev := 0;
+               end;
+           10: begin {slot32}
+                  boot_slot := cd_slot3;
+                 {boot_chan := 0;}
+                  boot_dev := 1;
+               end;
+           11: begin {slot33}
+                  boot_slot := cd_slot3;
+                 {boot_chan := 0;}
+                  boot_dev := 2;
+               end;
+           12: begin {slot14}
+                  boot_slot := cd_slot1;
+                 {boot_chan := 0;}
+                  boot_dev := 3;
+               end;
+           13: begin {slot24}
+                  boot_slot := cd_slot2;
+                 {boot_chan := 0;}
+                  boot_dev := 3;
+               end;
+           14: begin {slot34}
+                  boot_slot := cd_slot3;
+                 {boot_chan := 0;}
+                  boot_dev := 3;
+               end;
+          otherwise SYSTEM_ERROR(stup_find_boot);
+         end; {of cases}
+      end; {of with}
+end; {of find_boot}
+
+
+
+function FIND_PM_IDS(var for_pos: cdbooter): boolean;
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Find the unique ids for the boot CDs (from parameter memory),
+    (*      returning false if they dont exist.
+    (*
+    (*************************************************************)
+var
+   mypmem: pmemrec;
+   pmptr: ^pmemrec;
+   get_it: configdev;
+   pm_error, i, pass: integer;
+   key: longint;
+   done: array[1 {devcd} ..3 {slotcd} ] of boolean;
+   foundall, nonslot: boolean;
+begin
+ {initialize sysglobal copy of parameter memory: }
+   pmptr := @param_mem.parm_mem[1];
+   if snap_good or pm_good then INIT_READ_PM( ord4(pmptr) );
+
+   find_pm_ids := false;
+   mypmem := pmptr^; {get local copy (though direct ref to param_rec
+                      should probably be alright, too) }
+   nonslot := (for_pos[slotcd].boot_slot > cd_slot3);
+   pass := 0;            {pass 1 seeks cd for slot AND chan AND dev}
+   repeat                {pass 2 seeks cd for          chan AND dev}
+      pass := pass + 1;  {pass 3 seeks cd for                   dev}
+      if (pass = 2) then {shift search level}
+         for_pos[chancd].boot_chan := for_pos[devcd].boot_dev;
+      for i := 1 to 3 do
+         begin
+            with for_pos[i] do     {This part could be outside the repeat loop, }
+               begin
+                  pm_id  := empty;
+                  if (i>devcd)  then boot_dev  := emptydev;
+                  if (i>chancd) then boot_chan := emptychan;
+               end;
+            done[i] := (pass > i); {  but this part couldn't}
+         end;
+
+    {avoid duplicate finds for the same position:}
+      if for_pos[devcd ].boot_dev  = emptydev then done[devcd ] := true;
+      if for_pos[chancd].boot_chan = emptychan then done[chancd] := true;
+
+      key := 0; {key into pm}
+      repeat
+         GETNXTCONFIG(pm_error, key, mypmem, get_it);
+         if pm_error > 0 then get_it.pos.slot := emptyslot
+         else
+            begin
+               MAKE_INTERNAL(get_it.pos);
+               if pm_error <= 0 then with get_it do
+                  for i := devcd to slotcd do with for_pos[i] do
+                     if not done[i] then
+                        if (boot_slot = pos.slot) and
+                           (boot_chan = pos.chan) and
+                           (boot_dev  = pos.dev) then
+                              begin
+                                 done[i] := true;
+                                 pm_id := driverid;
+                              end;
+            end;
+         foundall := done[devcd] and done[chancd] and done[slotcd];
+      until foundall or (pm_error > 0);
+   until foundall or nonslot or (pass = 3);
+   find_pm_ids := foundall;
+end; {of find_pm_ids}
+
+
+
+
+function FIND_CDDS(var for_pos: cdbooter) : boolean;
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Extract CDD info for the boot device(s), returning false
+    (*    if they can't be found.
+    (*
+    (*************************************************************)
+var
+   itsname: ld_filename;
+   done: array[1 {devcd} ..3 {slotcd}] of boolean;
+   foundall: boolean;
+   cindex, i: integer;
+   cddentries, conns: integer;
+   cdd_descr: cddheader;
+   cdd_contents:  cddentry;
+   wom: typeconnect; {write only memory}
+begin
+   find_cdds := false;
+   for i := devcd to slotcd do with for_pos[i] do
+      done[i] := (pm_id = empty);
+   itsname := 'SYSTEM.CDD';
+   if not LD_OPENINPUT(itsname) then
+      EXIT(find_cdds);
+   LD_MOVEMULTIPE(sizeof(cddheader), ord4(@cdd_descr));
+   with cdd_descr do
+      begin
+         cddentries := cdcount;
+         if (version<>cdd_version) or (cddentries<=0) then
+            EXIT(find_cdds);
+      end;
+   cindex := 1;
+   repeat
+      LD_MOVEMULTIPLE(sizeof(cddentry), ord4(@cdd_contents));
+      conns := cdd_contents.info.numAttach + cdd_contents.info.numConnectors;
+      if conns > 0 then for i := 1 to conns do
+         LD_MOVEMULTIPLE(sizeof(typeconnect), ord4(@wom) ); {toss connector list}
+      for i := devcd to slotcd do with for_pos[i] do
+        if not done[i] then
+            if (pm_id = cdd_contents.info.driver_id) then
+               begin
+                  done[i] := true;
+                  cdd_stuff := cdd_contents;
+               end;
+      cindex := cindex + 1;
+      foundall := done[devcd] and done[chancd] and done[slotcd];
+   until foundall or (cindex > cddentries);
+   find_cdds := foundall;
+end; {of find_cdds}
+
+
+
+procedure LOADEM(var bt_info: bootinfo);
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Load the code for the boot CD.
+    (*
+    (*************************************************************)
+var
+   itsname: ld_filename;
+   scratch: longint;
+begin
+with bt_info do
+   begin
+      itsname := CONCAT('SYSTEM.CD_',cdd_stuff.drvr_name);
+      if not LD_OPENINPUT(itsname) then
+         SYSTEM_ERROR(stup_find_boot);
+      if not LOADCD(scratch {dont need to keep length}, cd_adr) then
+          SYSTEM_ERROR(stup_load_boot);
+      cd_adr := cd_adr + 8; {compensate for block overhead}
+   end; {of with}
+end; {of loadem}
+
+
+
+procedure STUFF_INFOBUF(var source: cddentry; var destiny: cd_infobuf);
+   (********************)
+   (*
+   (*  Warning: a second copy of this routine exists in unit CD.
+   (*   (dont ask why)
+   (*
+   (********************)
+begin
+   with source.info, destiny do
+   begin
+         cd_driverid := driver_id;
+         cd_perm := permanent;
+         cd_drvrname := source.drvr_name;
+         cd_devt := devicetype;
+         cd_start_block := start_block;
+         cd_fs_start := fs_start_block;
+         cd_ejectable := ejectable;
+         cd_removable := removable;
+         cd_preload := TRUE; {boot device cd is ALREADY loaded}
+   end;
+end; {of stuff_infobuf}
+
+
+
+function NEW_CONFIG(var baby: bootinfo; parent: integer) : integer;
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Create configinfo entry(s) for the boot device.
+    (*
+    (* Parameters:
+    (*    Baby describes the new configinfo entry
+    (*    Parent is the configinfo index of the controlling entry, if any.
+    (*    New_config returns the index of the newly created configinfo entry.
+    (*
+    (*************************************************************)
+var
+   seed: cd_infobuf;
+   error: integer;
+   config_index: integer;
+   workptr: ^drvrec;
+begin
+   with baby do
+      begin
+         if not FIND_EMPTYSLOT(config_index) then
+            {$IFC DEBUG2}
+              MACSBUG
+            {$ENDC} {NO WAY!!} ;
+         STUFF_INFOBUF(baby.cdd_stuff, seed);
+         NEW_DEVICE(error, config_index, boot_slot, boot_chan, boot_dev, seed);
+         if error > 0 then SYSTEM_ERROR(stup_init_boot);
+         with configinfo[config_index]^ do
+            begin
+               if (parent <> empty) then
+                  required_drvr := configinfo[parent];
+               workptr := pointer(drvrec_ptr);
+               workptr^.kres_addr := cd_adr;
+               permanent := true;        {don't unload boot device CD!}
+            end; {of with configinfo}
+      end;
+   new_config := config_index;
+end; {of new_config}
+
+
+
+procedure INIT_BOOT_CDS;
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Specify and create configinfo entry(s) for the boot device(s).
+    (*
+    (*************************************************************)
+var
+   bpoker : ^byte;
+   i, error: integer;
+   wom: integer; {write only memory}
+   booter: cdbooter;
+begin
+   FIND_BOOT(booter[devcd]);
+   for i := chancd to slotcd do booter[i] := booter[devcd];
+   if not FIND_PM_IDS(booter) then
+      begin
+         bpoker := pointer(adr_bootdev);
+         bootdev := bpoker^ + 1; {assume twiggy boot}
+         if (bootdev > 2) then SYSTEM_ERROR(stup_find_boot);
+         EXIT(init_boot_cds); {since twiggy is not not cd boot}
+      end;
+   for i := devcd to slotcd do with pmpos[i], booter[i] do
+      begin
+         slot := boot_slot;  {communicate boot ids to init_cds}
+         chan := boot_chan;
+         dev  := boot_dev;
+      end;
+(*$IFC DEBUG2*)
+   if TRACE(init,50) then
+      for i := devcd to slotcd do
+         if pmpos[i].slot <> emptyslot then with booter[i] do
+            writeln('found ',booter,' (d/c/s) ',boot_dev:3, boot_chan:3, boot_slot:3);
+(*$ENDC*)
+
+   if not FIND_CDDS(booter) then
+      SYSTEM_ERROR(stup_find_boot);
+   bootdev := empty;
+   for i := slotcd downto devcd do if (booter[i].pm_id <> empty) then
+      begin
+         LOADEM(booter[i]);
+         bootdev := NEW_CONFIG(booter[i], bootdev);
+
+(*$IFC DEBUG2*)
+   if TRACE(init,50) then
+      writeln('made configinfo ',bootdev:1);
+(*$ENDC*)
+
+      end;
+   UP(error, configinfo[bootdev], nil);
+   if (error > 0) then SYSTEM_ERROR(stup_init_boot);
+   if not configinfo[bootdev]^.blockstructured then SYSTEM_ERROR(stup_seq_boot)
+end; {of init_boot_cds}
+
+
+
+procedure MAKE_BUILTIN(slot:integer; entryaddr: longint);
+var
+   index: integer;
+   workptr: ptrdevrec;
+   work2ptr: ^drvrec;
+   ordptr: absptr;
+begin
+   if not FIND_EMPTYSLOT(index) then SYSTEM_ERROR(sys_err_base+cdtoomany);
+   if not GETSPACE( SIZEOF(devrec), b_sysglobal_ptr, ordptr)
+      then SYSTEM_ERROR(stup_nospace);
+   workptr := pointer(ordptr);
+   configinfo[index] := workptr;
+   if slot=cd_scc then port_cb_ptrs.rs232 := ordptr;
+   with workptr^ do
+   begin
+      entry_pt := ord(nil); (* indicates not "dinit"ed yet *)
+      devt := non_io;
+      blockstructured := false;
+      slot_no := slot;
+      iochannel := empty;
+      device_no := empty;
+      MAKE_NAME(devname, slot, emptychan, emptydev);
+      required_drvr := nil;
+      permreq_ptr:= nil; (* no pre-allocated request block *)
+      preq_avail:= false;
+      if not GETSPACE( SIZEOF(drvrec), b_sysglobal_ptr, drvrec_ptr) (* driver cb *)
+         then SYSTEM_ERROR(stup_nospace);
+      work2ptr := pointer (drvrec_ptr);
+      with work2ptr^ do
+      begin
+         INIT_SEM (sem, 1);
+         permanent := false;
+         driver_id := empty;  {makes this look like a builtin driver}
+         nusers := 0;
+         drvname := '';      {psuedo-config doesn't have drvr code file}
+         kres_addr := entryaddr;
+      end;
+   end;
+end {of make_builtin};
+
+
+
+procedure SHORTEN (origaddr_ptr: ptrlongint);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Where possible, replace address of a JMP with the address
+       (*      that it jumps to.
+       (*
+       (*************************************************************)
+VAR
+   ptropcode: ^integer;
+   ptrnewaddr: ptrlongint;
+
+begin
+    ptropcode := pointer (origaddr_ptr^);
+    if ptropcode^ = $4EF9 {JMP} then
+    begin
+       ptrnewaddr := pointer(ord(ptropcode)+2);
+       origaddr_ptr^ := ptrnewaddr^
+    end
+end; {of shorten}
+
+
+
+procedure BOOT_IO_INIT(version: e_name);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize the IO subsystem, including builtin drivers.
+       (*
+       (* Input Parameters:
+       (*    Version - what version of the OS needs to be printed in
+       (*       'welcome to' writeln
+       (*
+       (*************************************************************)
+const
+   adr_ioboard = $fcc031;  {stores whether ioboard is lisa or pepsi or ?}
+   adr_intdisk = $fcc015;  {stores what type of builtin disks exists: 0 - twiggy,}
+                           { 1 - single sided sony, 2 - double sided sony.       }
+
+var
+   error, index : integer;
+   ordptr : absptr;
+   workptr, bktptr: ptrdevrec;
+   boot_pm : ^pmemrec;
+   bpoker : ^byte;
+   parm: params;
+   wom: boolean;
+
+ {$%+} {allow % in identifiers}
+
+    procedure INIT_JTDRIVER;
+       (*************************************************************)
+       (*    Initialize jump table used by configurable drivers     *)
+       (*************************************************************)
+
+      CONST
+        drivrjt = $210;
+        maxdtable = 35;
+
+      TYPE
+        djt = ^driverjt;
+        driverjt = record
+                   jt:  array [0..maxdtable] of record
+                          jmpinstr: integer;
+                          routine: ^integer
+                        end
+                   end;
+
+      VAR
+        jtpointer : ^djt;
+        d_ptr: longint;
+        i: integer;
+
+      begin
+        if GETSPACE (sizeof(driverjt), b_sysglobal_ptr, d_ptr) then
+        begin
+          jtpointer := pointer(drivrjt);
+          jtpointer^ := pointer(d_ptr);
+
+          WITH jtpointer^^ do
+          begin
+            for i := 0 to maxdtable do
+              jt[i].jmpinstr := $4EF9;
+
+            jt[0].routine := @CANCEL_REQ;
+            jt[1].routine := @ENQUEUE;
+            jt[2].routine := @DEQUEUE;
+            jt[3].routine := @RELSPACE;
+            jt[4].routine := @GETSPACE;
+            jt[5].routine := @SYSTEM_ERROR;
+            jt[6].routine := @TRACE;
+            jt[7].routine := @MACH_INFO;
+            jt[8].routine := @UNBLK_REQ;
+            jt[9].routine := @BLK_REQ;
+            jt[10].routine := @IODONE;
+            jt[11].routine := @FREEZE_SEG;
+            jt[12].routine := @UNFREEZE_SEG;
+            jt[13].routine := @ADJ_IO_CNT;
+            jt[14].routine := @CVT_BUFF_ADDR;
+            jt[15].routine := @CALLDRIVER;
+            jt[16].routine := @INTSOFF;
+            jt[17].routine := @INTSON;
+            jt[18].routine := @ALLSET;
+            jt[19].routine := @LOG;
+            jt[20].routine := @LOGGING;
+            jt[21].routine := @CHAIN_FORWARD;
+            jt[22].routine := @DISKSYNC;
+            jt[23].routine := @MICROTIMER;
+            jt[24].routine := @ALARM_ASSIGN;
+            jt[25].routine := @ALARMRETURN;
+            jt[26].routine := @ALARMRELATIVE;
+            jt[27].routine := @ALARMOFF;
+            jt[28].routine := @LINK_TO_PCB;
+            jt[29].routine := @USE_HDISK;
+            jt[30].routine := @CALL_HDISK;
+            jt[31].routine := @OKXFERNETXT;
+            jt[32].routine := @KEYPUSHED;
+            jt[33].routine := @%I_MUL4;
+            jt[34].routine := @%I_DIV4;
+            jt[35].routine := @%I_MOD4;
+              (*ADJUST "MAXDTABLE" TO HIGHEST SUBSCRIPT WHEN ADDING TO END*)
+
+            for i := 0 to maxdtable do
+              SHORTEN(@jt[i].routine); (*replace double jumps with single jump*)
+
+            for i := $18 to $2F {=$60 to $BC step 4} do
+              SHORTEN (pointer(4*i));  (*shorten int vectors & traps*)
+          end
+        end
+      end; (*init_jtdriver*)
+
+ {$%-} {dont allow % in identifiers}
+
+
+
+begin {********************}
+      {*** BOOT_IO_INIT ***}
+      {********************}
+
+(*$IFC DEBUG2*)
+ {strike a blow for open dating of shelf items:}
+   writeln;
+   write('Welcome to standalone version Alpha ',version,' of the OS.');
+   writeln;
+
+   if mem_loss>0 then
+         writeln('Startup: Config discards ',mem_loss:4,' KB from real memory.');
+(*$ENDC*)
+
+   INIT_JTDRIVER;  (*init jump table used by configurable drivers*)
+   LD_INITMEDIA(ldr_a5);         (* make the loader's drivers available *)
+   INIT_CONFIG;                  (* validate pm *)
+
+   with port_cb_ptrs do
+   begin
+      slotx[0] := 0;
+      slotx[1] := 0;
+      slotx[2] := 0;
+      rs232 := 0;
+      via1 := 0;
+      rs232a := 0;
+      rs232b := 0;
+      floppy := 0;
+   end; {of port_cb_ptrs init}
+
+   bpoker := pointer(adr_ioboard); {determine cpu/io board types}
+   if (bpoker^ >= 0)
+     then iomodel := iob_lisa  {LISA 1}
+     else if (bpoker^ >= -96) and (bpoker^ <= -33)    {A0 <= model < DF}
+            then
+              if bpoker^ <= -65 then   {A0 <= model < BF}
+                iomodel:= iob_sony (*LISA 1 with inboard Sony*)
+              else
+                iomodel:= iob_lite (*Pepsi I/O board with no builtin hard disk*)
+            else
+             begin (*some form of Pepsi*)
+               bpoker := pointer(adr_intdisk);
+               if (bpoker^ = 0)
+                 then iomodel := iob_twiggy
+                 else iomodel := iob_pepsi;
+             end;
+   cpumodel := 0;                  {cpu is lisa until interesting diff is found}
+
+   if (iomodel = iob_lisa) or (iomodel = iob_twiggy)
+      then TWIGGYDRIVER(ord4 ( @DINT ) )  {establish twiggy driver address}
+      else TWIGGYDRIVER(ord4 ( @SONYINT) );
+   DISKDRIVER(ord4 ( @PARALLEL) ); {establish parallel port driver address}
+
+   serial_no := ld_sernum;      {pass serial number from the loader}
+
+   CLOCK_INIT;
+
+   if (iomodel = iob_lisa) or (iomodel = iob_twiggy) then
+      for index := 0 to 1 do
+         begin
+            INIT_TWIGGGLOB(error, index);
+            if error>0 then
+               begin
+                 (*$IFC DEBUG2*)
+                  writeln('Startup:  couldn''t init twiggy, error ',error);
+                 (*$ENDC*)
+                  SYSTEM_ERROR(stup_twig);
+               end;
+         end; {of initing twiggy driver}
+
+{start off with all bit buckets}
+   if not GETSPACE( SIZEOF(devrec), b_sysglobal_ptr, ordptr)
+      then SYSTEM_ERROR(stup_nospace);
+   workptr := pointer(ordptr);
+   bktptr := workptr;   {remember the location of the SINGLE bitbucket device}
+   with workptr^ do
+   begin
+      entry_pt := ord(@BADCALL);
+      devt := bitbkt;
+      blockstructured := false;
+      devname := 'BITBKT';
+      permreq_ptr:= nil; (*no pre-allocated request block*)
+      preq_avail:= false;
+      drvrec_ptr := ord(nil);  (*flagged as not yet configurable*)
+      self_ident := not_slot;
+      slot_no := empty;
+      iochannel := empty;
+      device_no := empty;
+   end; {of with workptr}
+
+   for index := 0 to maxdev do
+      configinfo[index] := workptr;
+
+  (* init configinfo entry(s) for bootdev: *)
+   INIT_BOOT_CDS;
+   CONFIG_DOWN;                  (* toss un-configed memory *)
+   LD_DISABLE;                   (* lock loader's drivers from further use *)
+
+   MAKE_BUILTIN(cd_scc, ord4(@SCC) );
+   MAKE_BUILTIN(cd_console, ord4(@KEYBD) ); (*initialize configurable SCC *)
+
+   PARAMEMINIT;  {initialize parameter memory and unblk_req interrupt continuation drivers}
+
+{begin initing builtin devices:  }
+   for index := {builtin position candidates} 0 to 8 do
+   begin
+      if not GETSPACE( SIZEOF(devrec), b_sysglobal_ptr, ordptr)
+         then SYSTEM_ERROR(stup_nospace);
+      workptr := pointer(ordptr);
+      with workptr^ do
+      begin
+
+         entry_pt := ord(@BADCALL);     {all entries have at least this much:}
+         configinfo[index] := workptr;  {  (default is to a bit-bucket)      }
+         devt := bitbkt;
+         blockstructured := false;
+         permreq_ptr:= nil; (*no pre-allocated request block*)
+         preq_avail:= false;
+         drvrec_ptr := ord(nil);  (*flagged as not yet configurable*)
+
+         case index of
+
+            1, 2:
+               begin
+                  MAKE_NAME(devname, cd_twiggy, index-1, emptydev);
+                  if (iomodel = iob_lisa) or (iomodel = iob_twiggy) then
+                     MAKE_DISK_INFO(workptr, cd_twiggy, index-1, empty);
+               end;
+
+            4:  begin
+                   DISKSYNC( false {free} );
+                   INTSON(0);
+
+                  (*$IFC DEBUG1*)
+                   if lb_enabled then
+                      SETNMIKEY(33); {program the '/' key on the numeric pad as NMI}
+                  (*$ELSEC*)
+                   if debugmode then
+                      SETNMIKEY(33); {program the '/' key on the numeric pad as NMI}
+                  (*$ENDC*)
+
+                   if two_screens then
+                        SETTOGGLEKEY(47)  {enable toggling}
+                   else SETTOGGLEKEY(0);  {alert that only one screen exists}
+                   INITUID;       {seed the unique id generator}
+                   SET_PREFERENCES;
+                   FS_INIT; (* file system initialization, with bootdev as a param*)
+                end; {of case 4}
+
+            8:    {NO-OP, creating the OFFICIAL bitbkt} ;
+         end; {of case index}
+
+         if (devt=bitbkt) then
+            begin
+               RELSPACE(ord4(workptr), b_sysglobal_ptr);
+               configinfo[index] := bktptr;
+            end; {of freeing all bitbucket configinfo records}
+
+      end; {of with workptr^}
+
+   end; {of for all non-slot entries}
+
+   if rewrite_pm then
+      begin
+         boot_pm := @param_mem.parm_mem[1];
+         WRITE_PMEM(error, boot_pm^);
+      end; {of rewriting parameter memory}
+
+   if pm_good then
+        if snap_good then pmem_state := PMg_SSg
+                     else pmem_state := PMg_SSb
+   else if snap_good then pmem_state := PMb_SSg
+                     else pmem_state := PMb_SSb;
+end; {of boot_io_init}
+
+
+
+procedure Sys_Proc_Init;
+      (*************************************************************)
+      (*                                                           *)
+      (* Description:                                              *)
+      (*   Procedure to set up the system processes in the         *)
+      (*   operating system.  These processes are the
+      (*   resident memory manager and the root process.
+      (*                                                           *)
+      (* Error Conditions:                                         *)
+      (*   Any errors that occur while making system processes     *)
+      (*   result in a system error.                               *)
+      (*                                                           *)
+      (*************************************************************)
+var
+  mmpcb_ptr : ptr_PCB;                { ptr to PCB of MemMgr process }
+  rootpcb_ptr : ptr_PCB;              { ptr to PCB of Root process }
+  error : integer;                    { error return from Make_SProcess }
+
+
+begin {SYS_PROC_INIT}
+  Setup_IUInfo;
+
+  Make_SProcess (error, mmpcb_ptr, 4096, ord(@MemMgr), 250, true { resident });
+  if error <> 0 then System_Error (10101);
+  mm_pcb_ptr := ord(mmpcb_ptr);
+
+  { clear MemMgr's need_mem flag so Prepare_Process won't add it to
+    shared seg's SRB list }
+  mmpcb_ptr^.need_mem := false;
+
+  { move MemMgr process to one end of memory to prevent fragmentation }
+  Move_MemMgr;
+
+  Make_SProcess (error, rootpcb_ptr, 10240, ord(@Root), 230, false);
+  if (error = 133) or (error = 134) then
+    { try making Root resident }
+    Make_SProcess (error, rootpcb_ptr, 10240, ord(@Root), 230, true);
+  if error <> 0 then System_Error (10101);
+  root_pcb_ptr := ord(rootpcb_ptr);
+
+  { make Root process top of hierarchy and MemMgr process its 1st son }
+  with rootpcb_ptr^ do
+    begin
+      fatherptr := 0;   brotherptr := 0;
+      sonptr := ord(mmpcb_ptr) - b_sysglobal_ptr
+    end;
+  with mmpcb_ptr^ do
+    begin
+      brotherptr := 0;
+      fatherptr := ord(rootpcb_ptr) - b_sysglobal_ptr
+    end;
+
+  (*$IFC debug2 *)
+  if TRACE(init,50)  then writeln('Sys_Proc_Init done.');
+  (*$ENDC *)
+end { of Sys_Proc_Init };
+
+
+
+procedure PR_CLEANUP;
+    (*************************************************************)
+    (*
+    (* Description:
+    (*    Get the outer process out of existence
+    (*
+    (*************************************************************)
+const
+   low_core = $800;     {amount of memory to leave mapped in lowest core}
+var mypcbptr : ptr_pcb;
+    i : integer;
+    int_level: intson_type;
+    c_sdb_ptr : sdb_ptr;
+    mrbt_base : mrbt_ptr;
+begin
+   mrbt_base := pointer(s_mrbt_addr);
+   for i := 1 to os_segs do
+   begin
+      if swappedin[i] then
+      begin
+        c_sdb_ptr := pointer(mrbt_base^[kernelmmu+i-1].sdbRP + b_sysglobal_ptr);
+        SET_SEGPRIORITY(c_sdb_ptr, ok_to_swap);
+      end;
+   end;
+
+   if not lb_loaded then
+      begin
+       {undo lowcore mmu mapping, except for a very modest low mem:}
+         SETMMU( 0{mmu numb}, oscontext, 0{base}, low_core{leng}, mmureadwrite);
+         for i := 1 to 15 do
+            SETMMU(i, oscontext, 0{base}, 0{length}, mmuabsent);
+      end;
+
+   mypcbptr := pointer(c_pcb_ptr);      {toss POP's pcb}
+   with mypcbptr^ do
+     begin  { remove PCB from Ready queue }
+       Intsoff (allints, int_level);
+       prev_schedPtr^.next_schedPtr := next_schedPtr;
+       next_schedPtr^.prev_schedPtr := prev_schedPtr;
+     end;
+   RELSPACE(c_pcb_ptr,b_sysglobal_ptr);
+   c_pcb_ptr:=ord(nil);                 {forget pcb ever existed}
+   init_in_progress := false;
+
+   (*$IFC DEBUG2*)
+   if TRACE(init,50) then
+   begin
+      writeln;
+      writeln('STARTUP ALL DONE, GOODBYE');
+      writeln;
+   end;
+   (*$ENDC*)
+
+   ENTER_SCHEDULER; (* will turn interrupts on *)
+   SYSTEM_ERROR(stup_didntblock);
+end; {of pr_cleanup}
+
+
+       (*************************************************************)
+       (*
+       (*  Here lies the body of initialize.
+       (*
+       (*************************************************************)
+
+begin  { initialize}
+
+   INTSOFF(allints, dummy);
+   GETLDMAP(ldmapbase);
+   REG_TO_MAPPED(b_sys_global, b_opustack+l_opustack); {Global vars born here.}
+
+   OS_copyright := 'Copyright 1983, 1984, Apple Computer Inc.'; {What a crock}
+
+   OS_version := welcome;
+   osVers_num := osversion;
+   init_in_progress := true;
+   going_down := 0;     {records that no system errors happened yet}
+   lb_loaded := have_lisabug;
+   lb_enabled := lb_loaded;
+
+   INIT_PE;                     {initialize parity handler}
+   POOL_INIT(MMU_BASE(sysglobmmu), l_sys_global,
+             MMU_BASE(sysglobmmu)+b_sgheap-b_sys_global, l_sgheap,
+             MMU_BASE(syslocmmu), l_opsyslocal);
+
+   INIT_TRAPV(b_sysglobal_ptr);  (* initialize trap vectors *)
+   DB_INIT;
+   AVAIL_INIT(slsdb_ptr, stksdb_ptr);
+   INIT_PROCESS(slsdb_ptr);
+   INIT_EM;             (* excep_setup and ec_setup for shell process *)
+   INIT_EC;             (* init event channel's global variables *)
+   INIT_SCTAB;          (* init sctab and prolog_addr *)
+   INIT_MEASINFO;       (* initialize measurement facilities *)
+   BOOT_IO_INIT(OS_version); {Init all devices (ENABLES ints, runs FS_INIT, too)}
+   SYS_PROC_INIT;       (* create the system processes *)
+   INIT_DRIVER_SPACE;   (* init cd driver space allocator *)
+   FS_CLEANUP;          (* ALREADY! *)
+
+   (* !!!! GOING ON TO THE ETHER *)
+   MEM_CLEANUP(stksdb_ptr, slsdb_ptr);
+   (* !!!! NOTE THAT FROM THIS POINT ON WE ARE EXECUTING FROM FREE SPACE *)
+   (*      IN MEMORY.  WE SHOULD NOT DO ANYTHING THAT CAN CAUSE US TO BLOCK*)
+
+   PR_CLEANUP;             {never returns!}
+end; {of initsys}
+
+
+{rest of this module goes in the main (blank) segment automatically}
+
+
+{program startup: }
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Startup creates some system processes and then goes
+       (*    away, further activity continuing in the system
+       (*    processes.
+       (*
+       (* Special Conditions of Use:
+       (*    The main program of the operating system can't have any local
+       (*    variables, since the object format makes it difficult to allocate
+       (*    space for such global variables.
+       (*
+       (*************************************************************)
+begin
+   INITSYS(PASCALINIT);      {initialize the system}
+
+ {initsys never returns}
+
+end. {of main}
+
+
+
+ÿ

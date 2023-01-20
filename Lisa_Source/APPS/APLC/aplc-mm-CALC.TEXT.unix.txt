@@ -1,0 +1,2594 @@
+(*$F-+ *)
+unit compute;                          {'Copyright 1983, 1984, Apple Computer Inc.'}
+     intrinsic;
+
+interface
+
+uses (*$U UnitStd.obj *)                UnitStd,
+     (*$U UnitHz.obj *)                 UnitHz,
+     (*$U Storage.obj *)                Storage,
+     (*$U QuickDraw.obj *)              QuickDraw,
+     (*$U Fontmgr.obj *)                FontMgr,
+     (*$U dbenv.obj *)                  dbenv,
+     (*$U FEdec.obj *)                  FEdec,
+     (*$U fld.obj *)                    fieldedit,
+     (*$U teenv.obj *)                  teenv,
+
+     (*$U libos/syscall.obj *)          syscall,
+     (*$U FPlib.obj *)                  FPlib,
+     (*$U PMDecl *)                     PMDecl,
+     (*$U PrStdInfo *)                  PrStdInfo,
+     (*$U aplc/mm/matmgr.obj *)         matmgr,
+     (*$U aplc/mm/parse.obj *)          parser,
+
+     (*$U wm.events.obj *)              events,
+     (*$U WMLstd.obj *)                 WMLstd,
+     (*$U WMlsb.obj *)                  WMlsb,
+     (*$U tm.obj *)                     tm,
+     (*$U international *)              International,
+     (*$U MathLib.obj *)                MathLib;
+
+
+   procedure calculate
+     (var calcResult : valueType;       {result of calculation}
+      rowId, colId   : integer          {coordinate of the formula}
+     );
+
+(*$IFC DEBUGVERSION *)
+   procedure dumptable;
+(*$ENDC *)
+
+implementation
+
+(*$R- *)
+
+(*$IFC teSym *)
+(*$D+ *)
+(*$ELSEC *)
+(*$D- *)
+(*$ENDC *)
+
+var VT          : variantType;                                  {unpacking varaint - used all over the place}
+    SnipVis     : packed array [snipKind, TidRng] of boolean;   {what snips are visible information}
+    GlobalRecalc: boolean;
+    lastformula : record
+                     val      : valueType;              {value for the lastformula}
+                     pCel     : TPcel;                  {direct pointer to cell information for the formula}
+                     formPtr  : THFmla;                 {handle to the formula}
+                     PRdata   : TPRTfmla;               {pointer to the paste relative information}
+                     ptr      : ptrData;                {direct pointer to the formula information}
+                     lBitsPtr : TPtrCell;               {direct pointer to the formula logical ordering information}
+                     shared   : boolean;                {is the formula shared: y/n}
+                     absolute : boolean;                {does the shared formula have all absolute coordinates: y/n}
+                     wInvalid : boolean;                {formula cell was invalid}
+                     coordcnt : integer;                {current coordinate being referenced}
+                     row      : integer;                {location of the formulas base cell}
+                     col      : integer;
+                     dh       : integer;                {displacement from the formulas base cell}
+                     dv       : integer;
+                     refcnt   : integer                 {number of references to the formula}
+                  end;
+
+
+(*$IFC DEBUGVERSION *)
+{all of these externals are in aplc/mm/STUBS - Unit STUBS}
+procedure debugmess(messnumber : integer); external;
+procedure dispPasses(numPasses : integer; completed : boolean); external;
+procedure dispRg(rg : range); external;
+procedure dumpcalc(calc : calcStack; icell, iresult : valueType; iRow, iCol : integer;
+                   itt : boolean; calcpt : integer; maxpt : integer; row,col : integer); external;
+procedure dumpenv(myEnvrion : environ); external;
+procedure dumpformula(formula : ptrData); external;
+procedure dumpRefs; external;
+procedure dumpshared(formPtr : THFmla); external;
+function  getbutton : boolean; external;
+procedure meminfo(rowId, colId : integer; cellinfo : boolean); external;
+procedure PrintPtrs; external;
+procedure statusmess(status : integer); external;
+procedure Tracemess(messnumber : integer); external;
+function  wExc : char; external;
+function  wMap(value : integer) : char; external;
+function  wNAN(value : cnSymKind) : char; external;
+function  wNUM(number : longreal) : char;  external;
+function  wxNUM(number : extended) : char;  external;
+function  wbool(flag : boolean) : char;  external;
+function  wRg(rg : range) : char; external;
+function  wSNIP(value : snipKind) : char;  external;
+function  wSRC(value : srcType) : char;  external;
+function  wTEXT(value : variantType) : char; external;
+function  wWords(value : symbol) : char; external;
+(*$ENDC *)
+
+   function  addDhDv
+     (dh, dv       : integer;           {displacements to be added}
+      var coord    : pident             {coordinate to be changed}
+     ) : boolean;
+        external; {in aplc/mm/LCASM - assembly language}
+
+   procedure GetFormula
+     (rowId, colId : idType;            {location of the cell}
+      getvalue     : boolean            {retrieve value for formula: y/n}
+     ); forward; {in aplc/mm/RECALC - Unit Calc}
+
+   procedure FxNewRgImg
+     ; external; {in aplc/mm/FEXEC - Unit LCfexec}
+
+(*$I aplc/mm/decode.text *)
+(*$I aplc/mm/recalc.text *)
+(*$I aplc/mm/calc2.text *)
+
+(***************************************.*******.********************************************************
+   daysFromParts - given a date part, `datePart`, returns the number of days it represents.  Used for date
+                   part comparisons which are done on a # of days comparison.
+
+   NOTE: no overflow checking is done by `daysFromParts`.
+****************************************.*******.*******************************************************)
+(*$S dateCalc *)
+function daysFromParts
+  (datePart : dateACs                   {date part to be converted}
+  ) : longint;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   daysFromParts := datePart.dayAC + datePart.monthAC * 30 + datePart.yearAC * 365
+end;
+
+
+(***************************************.*******.********************************************************
+   julian - given a date, `date`, returns an integer which represents the julian date.
+****************************************.*******.*******************************************************)
+(*$S dateCalc *)
+function julian
+  (date : dateType                      {date to be converted}
+  ) : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   julian := monthLen[date.month] + date.day + ord(date.month > 2)*LeapYear(date.year);
+end;
+
+
+(***************************************.*******.********************************************************
+   JulianToMthDay - given a date, `date`, and a julian date in `julianDate` adjusts the month and day
+                    portions of the date to be correct.
+****************************************.*******.*******************************************************)
+(*$S dateCalc *)
+procedure JulianToMthDay
+  (julianDate : integer;                        {julian date to be converted}
+   var date   : dateType                        {date to be converted}
+  );
+var loop : integer;                             {loop iterator}
+    leap : integer;                             {leap year present: 1/0}
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   with date do begin
+      leap := LeapYear(year);           {determine if the current year is a leap year}
+
+      {loop through to determine the month which is greater than the julian date.  When found, we
+       will have gone one past the month desired.  Set up the month information based on the adjusted
+       loop information.  Set up the day information based on the difference between the julian date
+       and the current acculation of days based on the current month.
+      }
+      for loop := 2 to 13 do begin
+         if monthLen[loop] + leap * ord(loop > 2) >= julianDate then begin
+            month := loop - 1;
+            day   := julianDate - monthLen[month] - leap * ord(loop > 3);
+            exit(JulianToMthDay)
+         end
+      end
+   end
+end;
+
+
+(***************************************.*******.********************************************************
+   normDate - given a date, `date`, and a date part in `datePart` adjusts the date by adding the date part
+              to the date to get a legal date.
+****************************************.*******.*******************************************************)
+(*$S dateCalc *)
+procedure normDate
+  (var date : dateType;                 {date to be adjusted}
+   datePart : dateACs                   {date part to be added to the date}
+  );
+var total : longint;                            {tally for total}
+    leap  : byte;                               {leap year present: 1/0}
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   with date do begin
+      year  := year + datePart.yearAC;                  {tally up the number of years}
+      total := month + datePart.monthAC;                {add the number of months}
+
+      {adjust the number of months to be correcttly placed between 1 and 12}
+      if total <= 0 then begin
+         year  := year + total div 12 - 1;
+         month := total mod 12 + 12
+      end
+      else begin
+              year  := year + total div 12;
+              month := total mod 12;
+              if month = 0 then begin
+                 year  := year - 1;
+                 month := 12
+              end
+           end;
+
+      total := julian(date) + datePart.dayAc;           {tally up the number of days}
+
+      {adjust the number of days to be correctly placed between 1 and 365.  Once done, converted the
+       julian date to an actual date.
+      }
+      if total <= 0 then begin
+         while total <= 0 do begin
+            year  := year - 1;
+            total := total + 365 + LeapYear(year)
+         end
+      end
+      else while total > 365 + LeapYear(year) do begin
+              total := total - 365 - LeapYear(year);
+              year  := year + 1
+           end;
+      JulianToMthDay(total, date)
+   end
+end;
+
+
+(***************************************.*******.********************************************************
+   calculate - decodes the formula pointed to by `lastFormula` and evaluates it.  The result of the
+               evaluation is passed back through `calcResult` which is a varaint.  `rowId, colId` are used
+               to calculate relative coordinates for paste relative (if needed).
+
+   NOTE: the routine assumes that a formula is pointed to by `lastFormula`.  Also `rowId, colId` are
+         only used to do relative calculations.  If for some reason a formula is being calculated, but
+         its coordinates are not known, `rowId, colId` can be set to anything and `lastFormula.PRdata`
+         must be nil.  `lastFormula.FormPtr` should also be set to be a handle to the formula.
+****************************************.*******.*******************************************************)
+(*$S calculator *)
+procedure calculate
+  (* var calcResult : valueType;        {result of calculation}
+     rowId, colId   : integer           {coordinate of the formula}
+  *);
+label 2,3;
+type opState  = (DoOperation, SkipOperation, GenError);         {what to do on certain opCodes}
+var calcPt    : integer;                        {calculation stack ptr}
+    maxpt     : integer;                        {max calc stack depth}
+    row, col  : integer;                        {current coord in range evaluation}
+    iRow,iCol : integer;                        {iteration coordinate}
+    lastIRow  : integer;                        {last iteration coordinate; not the current ones}
+    lastICol  : integer;
+    FSnipRow  : idType;                         {"finalSnip" for rows - optimization to avoid procedure call}
+    FSnipCol  : idType;                         {"finalSnip" for columns - optimization to avoid procedure call}
+    lexToken  : integer;                        {token type for the current lexeme}
+    ittIndex  : integer;                        {iterator index into formula}
+    ittCcnt   : integer;                        {iterator current coordinate counter}
+    formIndex : integer;                        {index into the formula}
+    finished  : boolean;                        {calculation finished: T/F}
+    ittFlag   : boolean;                        {is an iteration being done}
+    ittFirst  : boolean;                        {first time strough iteration: y/n}
+    ittFound  : boolean;                        {an iteration found a calculated result: y/n}
+    ittStopped: boolean;                        {iteration finished: y/n}
+    minMaxFunc: boolean;                        {in a min/max function: y/n}
+    blankSeen : boolean;                        {blank seen during a min/max function}
+    saveInStk : boolean;                        {should results be saved back into the calculation stack}
+    NANtype   : cnSymKind;                      {not-a-number information for binary operations}
+    NANtype1  : cnSymKind;                      {not-a-number information for operand #1}
+    NANtype0  : cnSymKind;                      {not-a-number information for operand #0}
+    opCode    : byte;                           {current opCode being evaluated}
+    Text_Date : variantType;                    {temporary accumlators}
+    tempVal   : valueType;
+    iCell     : valueType;                      {current value for "cell" for iterations}
+    iResult   : valueType;                      {current value for "result" for iterations}
+    calc      : calcStack;                      {calculation stack}
+    boolValue : boolean;                        {result from a boolean expression}
+
+    oFirst      : extended;
+    oSecond     : extended;
+    oResult     : extended;
+    gSgn        : integer;
+    RelOpResult : Relop;
+
+(*$IFC DEBUGVERSION *)
+    myEnviron : environ;
+(*$ENDC *)
+
+
+    (*
+       interpret - interprets the pCodes and pushes any associated operands onto the calculation stack.
+                   Each pCode may have some associated operand data.  This operand data is unpacked by
+                   using the pCodes variants and coping the data into the variant.  The variant is then
+                   pushed onto the calculation stack.  The boolean `forced` is used to push a value in
+                   `tempVal` onto the current stack location.  This is used when an iterator returns its
+                   final result.
+    *)
+    (*$S calculator *)
+    procedure interpret(forced : boolean);
+    var value     : valueType;
+        blankCell : boolean;
+        contPush  : boolean;                    {continue to push item onto the stack}
+        inVT      : boolean;                    {value found in `VT`}
+        inValue   : boolean;                    {value found in `value`}
+        xNumber   : extended;                   {possible value to eventually push onto the stack}
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if forced then begin
+          value   := tempVal;                    {force  the value in `tempVal` to go onto the stack}
+          opCode  := PUSHNOP;
+          xNumber := value.val.xRealVar
+       end
+       else value.nan := syNone;                {otherwise set up a kosher situation}
+
+       blankCell := false;
+       inVT      := false;
+       inValue   := false;
+       contPush  := true;
+       {determine what should be pushed onth the stack based on the current `opCode`}
+
+       case opCode of
+          PUSHINT,
+          PUSHBYTE,
+          PUSHSREAL,
+          PUSHLREAL   : inVT := true;
+          PUSHCOORD   : begin                           {a coordinate reference, check for forward reference}
+                           GetValue(VT.coordvar.length, VT.coordvar.start, true, value);
+                           inValue   := true;
+                           if value.pCel <> nil then blankCell := (value.pcel^.oh = 0)
+                           else blankCell := true
+                        end;
+          PUSHMARKER  : xNumber := xVofZero;            {function marker}
+          PUSHTRUE    : begin                           {value for true}
+                           value.nan := syTrue;
+                           I2X(1, xNumber)
+                        end;
+          PUSHFALSE   : begin                           {value for false}
+                           value.nan := syFalse;
+                           xNumber   := xVofZero
+                        end;
+          UNARYMINUS  : with calc[calcpt] do begin      {unary operator - change the top entry on the stack}
+                           contPush := false;
+                           case NANkind of
+                              syParts : begin
+                                           date.monthAC := -date.monthAc;
+                                           date.dayAC   := -date.dayAC;
+                                           date.yearAC  := -date.yearAC
+                                        end;
+                              syPinf  : begin
+                                           NANkind := syMinf;
+                                           val.xRealVar := VofMinf
+                                        end;
+                              syMinf  : begin
+                                           NANkind := syPinf;
+                                           val.xRealVar := VofPinf
+                                        end;
+                              syNone  : NegX(val.xRealVar);
+                              otherwise begin
+                                           NANkind := syError;
+                                           val.xRealVar := VofNAN
+                                        end
+                           end
+                        end;
+          PUSHDATE    : begin                           {set up date descriptor}
+                           value.nan       := syDate;
+                           value.val.date  := VT.date;
+                           {make sure that the pasking variant is set to zero before stuffing a date.
+                            Otherwise garbage will be in the varaint which will affect how the date is
+                            evaluated.
+                           }
+                           VT.lRealVar := VofZero;
+                           VT.date     := value.val.date;
+                           D2X(VT.lRealVar, xNumber)
+                        end;
+          PUSHTEXT    : begin                           {set up text descriptor}
+                           value.nan := syText;
+                           value.val.textinfo.hContents := @lastformula.formPtr^;
+                           value.val.textinfo.len   := lastformula.ptr^[formindex + 1];
+                           value.val.textinfo.index := ord(@lastformula.ptr^[formindex+2]) - ord(lastformula.formPtr^);
+                           formindex := formindex + lastformula.ptr^[formindex+1] + 2
+                        end;
+          PUSHCDOLLAR,
+          PUSHDOLLAR  : exit(interpret);                {exit if oPcode is a number modifier}
+          PUSHECOORD,                                   {error coordinates will cause the calculated result}
+          PUSHECRANGE : with calc[0] do begin           {to also be an error.  Stop the calculation.}
+                           assumption      := true;     {we have made an assuption about this cells value}
+                           finished        := true;     {stop the calculations}
+                           calcPt          := 0;        {put an error ontop the stack}
+                           NANkind         := syError;  {set the result to ERROR}
+                           val.xRealVar    := VofNAN;   {set up not-a-number information}
+                           ClearXcps                    {clear any calculation exceptions}
+                        end;
+          PUSHEND     : finished := true                {all done}
+       end;
+
+       {push the opCode any any data onto the calculation stack, if necessary}
+       if contPush and not finished then begin
+          if not forced then calcPt := calcPt + 1;
+          with calc[calcPt] do begin
+             dataIsBlank := blankCell;
+             case opCode of
+                PUSHCRANGE : begin
+                                normcoord(VT.rangevar);         {make the range adjust to the top-left corner}
+                                op := COORDRANGE;
+                                val.rangevar := VT.rangevar;
+
+                                {shrink the range reference to be only to the extent of the matrix size.
+                                 This is not possible in show circles mode because all of the cells must
+                                 be checked for possible circling.
+                                }
+                                if circleState <> cMissing then begin
+                                   if FSnipCol < VT.rangevar.second.start then VT.rangevar.second.start := FSnipCol;
+                                   if FSnipRow < VT.rangevar.second.length then VT.rangevar.second.length := FSniprow
+                                end;
+                                coord := VT.rangevar
+                             end;
+                PUSHMARKER : begin
+                                {place a function marker onto the stack.  This is done before the
+                                 formula is evaluated.  During the evaluation of a function, this
+                                 marker signals the end of the function.
+                                }
+                                GetEnv(myEnviorn);                     {remember the exception flags}
+                                op         := STACKMARKER;
+                                formPos    := formindex;                {remember the index into the formula}
+                                val.intvar := lastformula.coordcnt      {remember the current coordinate count}
+                             end;
+                otherwise    begin
+                                op := VALUEINFO;
+                                if opCode = PUSHCOORD then begin
+                                   reference.coordvar := VT.coordvar;
+                                   op  := COORDINFO
+                                end;
+                                case value.nan of
+                                   syParts : begin
+                                                {for a date part, set the stack's float point register to
+                                                 zero - just for luck.  Remember the date part in the
+                                                 stack's `date` field.
+                                                }
+                                                val.xRealVar := xVofZero;
+                                                date := value.val.datepart
+                                             end;
+                                   syText  : val := value.val;          {remember text descriptor}
+                                   otherwise begin
+                                                {for everything else, set the stack's date part info to zero,
+                                                 again just for luck.  Remember the value.
+                                                }
+                                                if inVT then val.xRealVar := VT.xrealVar
+                                                else if inValue then val.xRealVar := value.val.xRealVar
+                                                else val.xRealVar := xNumber;
+                                                date.monthAC := 0;
+                                                date.dayAC   := 0;
+                                                date.yearAC  := 0
+                                             end
+                                end
+                             end
+             end;
+             NANkind := value.nan       {remember the type of the value}
+          end
+       end;
+       formindex := formindex + pcodesize[opCode]       {bump `formindex` to point at the next opCode}
+    end;
+
+
+    (*
+       stuffOperand -  takes the value at the top of the calculation stack and places it into the
+                       `oFirst` operand.  The NAN information is returned through NANresult.
+    *)
+    (*$S calculator *)
+    procedure stuffOperand(var NANresult : cnSymKind);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+       if calcPt >= 0 then
+(*$ENDC *)
+          with calc[calcPt] do begin
+             NANresult := NANkind;
+             oFirst    := val.xRealVar
+          end
+(*$IFC DEBUGVERSION *)
+       else begin
+               write(rowId:1,',',colId:1,'  ');
+               dumpformula(lastformula.ptr);
+               dumpcalc(calc, icell, iresult, irow, icol, ittFlag, calcpt, maxpt, row, col);
+               FatalMess(35)
+            end
+(*$ENDC *)
+    end;
+
+
+    (*
+       CheckErrorOperands - a determination has been made that the operands for the insuing operation
+                            may be erroneous.  `CheckErrorOperands` checks the operands to determine
+                            if the are indeed bad, and returns a result which is the action to be taken
+                            about the operands.  The actions can be:
+                               DoOperation - continue on and do the operation
+                               SkipOperation - skip the operation.  Some value info may be set up.
+                               GenError      - skip the operation and cause an error to be generated.
+
+    *)
+    (*$S calcExtra *)
+    function CheckErrorOperands : opState;
+    var opNum : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       CheckErrorOperands := DoOperation;               {assume the operation can be done}
+
+       (************************************ removed 12/23/83  ************************************************
+       {if the operation is a multiply operation special things are done.  Multiply can be used
+        inconjunction with a boolean value to either return the value being multiplied (boolean = true)
+        or the value zero (boolean = false).  The type of the object being multipled does not
+        matter, meaning TEXT * boolean could return the text.
+       }
+       if VT.lexeme = MULTIop then
+          {if either operand is false, the result of the operation will be zero.  The actual multiply
+           operation will be skipped.
+          }
+          if (NANtype0 = syFalse) or (NANtype1 = syFalse) then begin
+             oResult := xVofZero;
+             NANtype := syNone;
+             CheckErrorOperands := SkipOperation;
+             exit(CheckErrorOperands)
+          end
+          else begin
+                  {determine which operand mind have a true value}
+                  opNum := -1;
+                  if NANtype0 = syTrue then opNum := 1
+                  else if NANtype1 = syTrue then opNum := 0;
+
+                  {if a true value was found, return the other operand as the result.  The actual
+                   multiply operation will be skipped.
+                  }
+                  if opNum >= 0 then
+                     with calc[calcPt + opNum] do begin
+                        NANtype := NANkind;
+                        oResult := oFirst;
+                        if opNum = 1 then oResult := oSecond;
+                        calc[calcPt].date  := date;
+                        CheckErrorOperands := SkipOperation;
+                        exit(CheckErrorOperands)
+                     end
+               end;
+       ************************************* removed 12/23/83  ************************************************)
+
+
+       {only compares or subtraction two dates are allowed}
+       if (NANtype0 = syDate) and (NANtype1 = syDate) then
+          if (lexToken = LRELOP) or (VT.lexeme = SUBop) then exit(CheckErrorOperands);
+
+       {can only add or subtract dates and date parts.  Pairs that generate dates or date parts
+        can only be part of a relational and, or, =, <>, >, <, >=, <=.  Pairs that generate error or
+        na can only be part of a relational =, <>.
+       }
+       case NANtype of
+          syNa,
+          syError : case VT.lexeme of
+                       EQop,
+                       NEop    : oResult := xVofZero;
+                       otherwise begin
+                                    oResult := VofNAN;
+                                    CheckErrorOperands := SkipOperation
+                                 end
+                    end;
+          syParts,
+          syDate  : if lexToken = LRELOP then begin
+                        if NANtype0 = NANtype1 then begin
+                           oResult := xVofZero;
+
+                           {with date parts, the comparisons are done based on the number of
+                            days each date part is equivalent to.
+                           }
+                           if NANtype0 = syParts then begin
+                              L2X(daysFromParts(calc[calcPt].date), oFirst);
+                              L2X(daysFromParts(calc[calcPt + 1].date), oSecond)
+                           end
+                        end
+                        else case VT.lexeme of
+                                EQop,
+                                NEOP    : oResult := xVofZero;
+                                otherwise CheckErrorOperands := GenError
+                             end
+                    end
+                    else if ((NANtype = syParts) and (NANtype0 = syDate)) or (lexToken <> SIGN) then CheckErrorOperands := GenError
+       end
+    end;
+
+
+    (*
+       calcDate -  calculates the difference between two dates or the resulting date from the sum
+                   of a date part and a date.  The determination of what ooperation to do is done
+                   by looking at the current set of operands.  With the operands consisting of a
+                   date and a date part, the sum will be taken.  Two dates in the operands imply
+                   that the difference is to be taken.  The difference between two dates results
+                   in a date part which is =/- the number of days between the two dates.
+    *)
+    (*$S dateCalc *)
+    procedure calcDate;
+    var x       : integer;                {loop iterator}
+        sign    : integer;                {the sign of the difference between two dates}
+        tDate   : variantType;            {temporary date holder}
+        bDate   : dateType;               {beginning date for a date subtraction}
+        eDate   : dateType;               {ending date for a date subtraction}
+        FuncEnv : environ;
+     begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+        GetEnv(FuncEnv);
+        with calc[calcpt] do
+           if NANtype0 = NANtype1 then begin            {if the two operands are the same, must be date - date}
+              sign  := ord(RelX(oFirst, oSecond) = GT);
+              X2D(oFirst, tDate.lRealVar);
+              eDate := tDate.date;                      {load the first date as the ending date}
+              X2D(oSecond, tDate.lRealVar);             {load the second date as the beginning date}
+
+              {determine the sign of the result and setup the low/high dates}
+              if sign = 0 then begin
+                 bDate := eDate;
+                 eDate := tDate.date;
+                 sign  := -1
+              end
+              else begin
+                      bDate := tDate.date;
+                      sign  := 1
+                   end;
+
+              if bDate.year = eDate.year then date.dayAC := 0
+              else date.dayAC := -LeapYear(bdate.year) * ord(bdate.month >= 3) + LeapYear(edate.year) * ord(edate.month >= 3);
+              date.monthAC := 0;
+              date.yearAC  := 0;
+
+              {count the number of days between the two dates based on the number of years}
+              for x := bDate.year to eDate.year - 1 do
+                 date.dayAC := date.dayAC + 365 + LeapYear(x);
+
+              {determine the difference in the julian dates and add to the count days}
+              if bDate.year <> eDate.year then begin
+                  bDate.year := 1;
+                  eDate.year := 1
+              end;
+              date.dayAC := sign * (date.dayAC + julian(eDate) - julian(bDate))
+           end
+           else begin
+                   {determine which operand has the date and make sure it appears in FP1}
+                   if NANtype0 = syDate then begin
+                      X2D(oFirst, tDate.lRealVar);
+                      Text_Date.date := tDate.date;
+                      date := calc[calcpt + 1].date
+                   end
+                   else begin
+                           X2D(oSecond, tDate.lRealVar);
+                           Text_Date.date := tDate.date
+                        end;
+
+       (************************************ removed 12/23/83  ************************************************
+                   {allow a constant to be added to a date that is not a date part}
+                   if (NANtype0 <> syParts) and (NANtype1 <> syParts) then begin
+                      date.monthAC := 0;
+                      date.yearAC  := 0;
+                      X2L(oFirst, dat.dayAC)
+                   end;
+       ************************************* removed 12/23/83  ************************************************)
+
+                   {negate the date part if a subtraction is to be done}
+                   if VT.lexeme = SUBop then begin
+                      date.monthAC := -date.monthAc;
+                      date.dayAC   := -date.dayAC;
+                      date.yearAC  := -date.yearAC
+                   end;
+
+                   {add the date part to the date}
+                   normDate(Text_Date.date, date)
+                end;
+        SetEnv(FuncEnv)
+     end;
+
+
+    (*
+       calcParts - takes two date parts and adds/subtracts them together.  No conversion of the date
+                   parts are done.  Only like parts are added/subtracted.
+    *)
+    (*$S dateCalc *)
+    procedure calcParts(var date0, date1 : dateACs);
+    var sign : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       sign := 1;
+       if VT.lexeme = SUBop then sign := -1;
+
+       (************************************* removed 12/23/83  ************************************************
+       {allow a constant to be added to a date part that is not a date part}
+       if NANtype0 <> NANtype1 then begin
+          if NANtype0 = syParts then begin
+             oResult := oSecond
+             date1 := date0
+          end
+          else oResult := oFirst;
+          X2L(oResult, date.dayAC);
+          date.monthAC := 0;
+          date.yearAC  := 0
+       end;
+       ************************************* removed 12/23/83  ************************************************)
+
+       date0.dayAC   := date0.dayAC   + sign * date1.dayAC;
+       date0.monthAC := date0.monthAC + sign * date1.monthAC;
+       date0.yearAC  := date0.yearAC  + sign * date1.yearAC
+    end;
+
+
+    (*
+       convert - converts one date part into another.  The date part to be converted in in `datePart`
+                 with the particular portion to be converted in `portion`.
+
+                 The conversion is controlled by the other parameters to the routine.  The factor
+                 parameters are set based on the date part being converted to.  The current date part
+                 is converted using these factors.  The example below showm for converting to days:
+
+                    yearFac   - factor for a year (ie 365 days in a year)
+                    monthFac  - factor for a month (ie, 30 days in a month)
+                    dayFac    - factor for a day (ie, 1 day in a day)
+                    protFac   - factor to multiply by to convert weeks to days since weeks are not remembered
+
+                 If the current operand is already a date part, it is converted to the appropriate type.
+                 If is not, then it is made into the appropriate type.
+    *)
+    (*$S dateCalc *)
+    procedure convert(var datePart : dateACs; yearFac, monthFac, dayFac : integer;
+                      var portion : longint; portFac : integer);
+    var count : longint;
+        temp  : longint;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if NANtype = syParts then begin
+          {if `dayFac` is 365 then something must be converting to years.  In this case months should
+           be divided by 12 instead of multiplied.  It is necessary to do it this way because reals
+           are not used as parameters thus 1/12th could not be passed for the `monthFac`.
+          }
+          if dayFac = 365 then temp := datePart.monthAC div 12
+          else temp := datePart.monthAC * monthFac;
+
+          {count the units of the current date part - converting the units based on the factor parameters}
+          count := datePart.yearAC * yearFAC + temp + datePart.dayAC div dayFac
+
+       end
+       else begin
+               NANtype := syParts;      {the operand is not already a date part - make it into one}
+               X2L(oResult, count)      {the units for the date part are in FP0}
+            end;
+
+       {clear the date accumlator to set up for a new value}
+       datePart.yearAC  := 0;
+       datePart.monthAC := 0;
+       datePart.dayAC   := 0;
+       portion := portion + count * portFac
+    end;
+
+
+    (*
+       dateOperations - performs all the niffty date calculations based on what the current operation
+                        should be (`VT.lexeme`).  "dateOperations" will call other routines which will
+                        do the conversion from one date part to another and also will perform the current
+                        date operation.
+    *)
+    (*$S dateCalc *)
+    function dateOperations : boolean;
+    var error    : integer;
+        timeInfo : time_rec;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       dateOperations := false;
+       case VT.lexeme of
+          DAYop,
+          DAYSop    : with calc[calcPt] do convert(date, 365, 30, 1, date.dayAC, 1);
+          WEEKop,
+          WEEKSop   : with calc[calcPt] do convert(date, 52, 4, 7, date.dayAC, 7);
+          MONTHop,
+          MONTHSop  : with calc[calcPt] do convert(date, 12, 1, 30, date.monthAC, 1);
+          YEARop,
+          YEARSop   : with calc[calcPt] do convert(date, 1, 12, 365, date.yearAC, 1);
+          TODAYop   : begin
+                         get_time(error, timeInfo);             {get the time from the OS}
+                         if error = 0 then begin                {did I get it? if not, generate an error}
+                            Text_Date.date.year := timeInfo.year;    {otherwise figure out the julian date and convert it}
+                            JulianToMthDay(timeInfo.day, Text_Date.date);
+                            NANtype := syDate
+                         end
+                         else dateOperations := true
+                      end
+       end
+    end;
+
+
+    (*
+       returnvalue - sets up global information to be a value from the matrix or the top of the
+                     calculation stack.  Returns true if a value was present with the vaule pushed
+                     into FP0 and/or `tempVal` depending on the value's type.  `fullinfo` describes
+                     if text information is to be returned.  "returnvalue" is used inconjuction with
+                     the functions that have arguments (ie, sum(a1, 2, a3:b5)).  `fullinfo` also dictates
+                     if the `gRow` and `gCol` coordinates are filled in.  These represent the coordinate
+                     that the returned value was obtained.
+    *)
+    (*$S LCcalculator *)
+    function returnvalue(fullinfo : boolean; var gRow, gCol : integer) : boolean;
+    label 2;
+    var valuefound : boolean;           {was a value found: y/n}
+        getcell    : boolean;           {should information be obtained from the matrix: y/n}
+        blank      : boolean;           {is the matrix cell blank: y/n}
+        preAssumed : boolean;           {was something already assumed about the matrix cell: y/n}
+        attr       : TAttr;             {attributes of the matrix cell}
+        lRow, lCol : integer;           {local versions of the current row, column - faster acessing these than globals}
+        sExists    : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       lRow    := row;          {remember the current row and column index into the matrix}
+       lCol    := col;
+    2: getcell := false;        {assume that a value does not have to come from the matrix}
+
+       {check the calculation stack to determine where the value is to come from or that no more
+        values are present.  The `op` field of the calculation stack determines what to do.
+       }
+       with calc[calcPt] do begin
+          case op of
+             COORDRANGE : begin
+                             {a coordinate range appears on the stack.  Set up the information to
+                              start evaluating the range.  This is done by changing the `op` field
+                              of the calculation stack from a COORDRANGE to an EVALRANGE and remembering
+                              the start of the range.  Later, the range will be iterated through until all
+                              values are returned.
+                             }
+                             op      := EVALRANGE;
+                             lCol    := coord.first.start;
+                             lRow    := coord.first.length;
+                             getCell := true
+                          end;
+             EVALRANGE  : getcell := true;                      {signal to get the next value}
+             STACKMARKER: valuefound := false;                  {found end of function - not more values to be found}
+             otherwise    begin                                 {get a value off of the calculation stack}
+                             calcPt      := calcPt - 1;         {pop the stack pointer}
+                             if dataIsBlank then begin
+                                if minMaxFunc then blankSeen := true;
+                                goto 2
+                             end;
+                             valuefound  := true;               {signal that a value was found}
+                             tempVal.val := val;                {remember the value and its type}
+                             tempVal.nan := syNone;
+                             case NANkind of                    {check for any particularly strange values}
+                                syPinf  : begin
+                                             tempVal.nan := syPinf;
+                                             tempVal.val.xRealVar := VofPinf
+                                          end;
+                                syMinf  : begin
+                                             tempVal.nan := syMinf;
+                                             tempVal.val.xRealVar := VofMinf
+                                          end;
+                                syText,
+                                syFalse : tempVal.val.xRealVar := xVofZero;
+                                syTrue  : I2X(1, tempVal.val.xRealVar);
+                                syParts : begin
+                                             tempVal.val.datepart := date;
+                                             tempVal.nan := syParts
+                                          end;
+                                otherwise begin
+                                             tempVal.nan := NANkind;
+                                             tempVal.val.xRealVar := val.xRealVar
+                                          end
+                             end
+                          end
+          end;
+
+          {returns a value from the matrix using the current range specification from the calculation stack.
+           The range is evaluated left to right, top to bottom (row order).  The value is returned
+           in `result`.  Depending upon `fullinfo`, non-numeric cells will return a value of zero while
+           blank matrix cells are skipped.
+          }
+          if getcell then
+             repeat
+                blank      := CellBlank(lRow, lCol) and (VT.lexeme <> SEARCHop);    {check if the cell is blank}
+                valuefound := not blank;                {a value was not found if the cell is blank}
+                if blank then
+                   if minMaxFunc then blankSeen := true;
+                if valuefound then begin
+
+                   {insure that the COUNT function does not causes cells to be circled}
+                   if circleState = cMissing then
+                      if VT.lexeme = COUNTop then begin
+                         preAssumed := assumption;
+                         CellFlags(lRow, lCol, attr)
+                      end;
+
+                   {get the value from the matrix}
+                   GetValue(lRow, lCol, fullinfo, tempVal);
+
+                   if fullinfo then begin
+                      gRow := lRow;
+                      gCol := lCol
+                   end;
+
+                   {insure that the COUNT function does not causes cells to be circled}
+                   if circleState = cMissing then
+                      if VT.lexeme = COUNTop then begin
+                         SetCirBits(lRow, lCol, attr.pkCircle, attr.pkInvalid);
+                         assumption := preAssumed
+                      end
+                end
+                else if circleState = cMissing then                 {circle the circle because its values is assumed}
+                        if VT.lexeme <> COUNTop then SetCirBit(lRow, lCol, true, true);
+
+                {move to the next column.  If the next column is not in the range, move to the next
+                 row.  If the next row is not in the range, pop the calculation stack because we
+                 are all done.  After the pop the stack pointer should be pointing at the STACKMARKER
+                 for the function.
+                }
+                repeat
+                   lCol := lCol + 1;
+                   sExists := SnipExists(colKind, lCol) or (VT.lexeme = SEARCHop);
+                   if minMaxFunc then
+                      if not sExists then
+                         if lCol <= coord.second.start then blankSeen := true;
+                until (lCol > coord.second.start) or sExists or (circleState = cMissing);
+                if lCol > coord.second.start then begin
+                   lCol := coord.first.start;
+                   repeat
+                      lRow := lRow + 1;
+                      sExists := SnipExists(rowKind, lRow) or (VT.lexeme = SEARCHop);
+                      if minMaxFunc then
+                         if not sExists then
+                            if lRow <= coord.second.length then blankSeen := true;
+                   until (lRow > coord.second.length) or sExists or (circleState = cMissing);
+                   if lRow > coord.second.length then begin
+                      blank  := false;
+                      calcPt := calcPt - 1
+                   end
+                end;
+
+                {if a value was not found and weare not on the stack marker for the function, then
+                 there are more values to be returned.
+                }
+                if not valuefound then
+                   if calc[calcPt].op <> STACKMARKER then goto 2
+             until not blank
+          end;
+
+       {place the newly computed row and column index into the matrix and save in the globals.
+        Also return if a value was found.
+       }
+       row := lRow;
+       col := lCol;
+       returnvalue := valuefound
+    end;
+
+
+    (*
+       ListOperations - performs all the functions which have an infinite list as its argument.  The
+                        exeception is NPV which is also funneled through "ListOperations".  Most of
+                        the functions will have a token type of FUNC2.  The result of the function evaluation
+                        will appear in FP0 for non-date part results, and for date parts the result will
+                        appear in the stack marker location on the calculation stack.  The NAN information
+                        will be returned through `NANtype`.
+    *)
+    (*$S LCcalculator *)
+    procedure ListOperations;
+    var tally     : extended;           {temporary accumlators}
+        result    : extended;
+        otherSeen : boolean;            {has anything other than a date/date part been seen: y/n}
+        dateSeen  : boolean;            {has a date been seen: y/n}
+        partsSeen : boolean;            {has a date part been seen: y/n}
+        count     : longint;            {count of the number of values seen}
+        FuncEnv   : environ;            {calculation exception flags before the functio is evaluated}
+        value2    : variantType;        {function result to be place in the calcualtion stack}
+        tempCoord : integer;            {temporary coordinate}
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       GetEnv(FuncEnv);                 {remember the exception falgs before the function is evaluated}
+       blankSeen := false;
+
+       {determine if there is at least an initial value for the function}
+       if returnvalue(false, tempCoord, tempCoord) then begin
+          NANtype   := tempVal.nan;             {remember the values type and set up what has been seen}
+          dateSeen  := (NANtype = syDate);
+          partsSeen := (NANtype = syParts);
+          otherSeen := not (dateseen or partsSeen);
+
+
+(*$IFC DEBUGVERSION *)
+          if debug[3] then begin
+             writeln('Stating ',wWords(VT.lexeme),' function:  dpo: ',wbool(dateseen),wbool(partsSeen),wbool(otherSeen),
+                     '  Exc:',wExc,' NANs: ',wNAN(NANtype),wNAN(tempVal.nan),'  val: ',wxnum(tempVal.val.xRealVar));
+          end;
+(*$ENDC *)
+          count := 1;           {set the count of the number of values seen}
+
+          {based on the current function, set up the floating point registers and any
+           special stack and global varaible conditions.
+          }
+          case VT.lexeme of
+             STDop,
+             SQRop : begin
+                        result := tempVal.val.xRealVar;         {remeber the first value - used for STdev}
+                        tally  := result;
+                        MulX(tally, tally)                      {compute first square - save that in `tally`}
+                     end;
+             otherwise
+                     begin
+                        value2.datepart := tempVal.val.datepart;        {remember the date part - mat not be used}
+                        if partsSeen then begin
+                           {if a date part was seen determine if the number of days it represents should
+                            be placed in FP1 or a zero (to may comparisons work correctly.
+                           }
+                           if minMaxFunc then L2X(daysFromParts(value2.datePart), oResult)
+                           else oResult := xVofZero
+                        end
+                        else oResult := tempVal.val.xRealVar
+                     end
+          end;
+
+          {loop the list arguments returning values which will be applied to the functions}
+          while returnvalue(false, tempCoord, tempCoord) do begin
+             NANtype0 := NANtype;       {remember the current type of the result}
+
+(*$IFC DEBUGVERSION *)
+             if debug[3] then begin
+                writeln('   dpo: ',wbool(dateseen),wbool(partsSeen),wbool(otherSeen),' Exc:',wExc,' NANs: ',
+                        wNAN(NANtype),wNAN(tempVal.nan),'  val: ',wxnum(tempVal.val.xRealVar),'  oresult: ',wxnum(oresult))
+             end;
+(*$ENDC *)
+
+             {compute the new type of the result.  The functions are computed on a binary basis, meaning
+              two operands at a type.  Thus the resulting type of the operands can be determined.  The
+              resulting type in `NANtype` may be overridden later if necessary.  Remember also what type
+              of information has been seen such that checks can be made later to see if argument types
+              have been mix-matched.
+             }
+             NANtype := NaErrs[NANtype, tempVal.nan];
+             case tempVal.nan of
+                syDate  : dateSeen  := true;
+                syParts : begin
+                             partsSeen := true;
+                             {for min/max make sure that the date part is converted to a number of days
+                              placed in FP0.  FP1 will have the previous number of days computed.
+                             }
+                             if minMaxFunc then L2X(daysFromParts(tempVal.val.datepart), tempVal.val.xRealVar)
+                          end;
+                otherwise otherSeen := true
+             end;
+             count := count + 1;        {keep count of the number of values seen}
+
+             {based on the function being evaluated, accumulate any results}
+             case VT.lexeme of
+                STDop,
+                SQRop : begin
+                           if VT.lexeme = STDop then                            {compute the sum of the numbers}
+                              AddX(tempVal.val.xRealvar, result);
+                           MulX(tempVal.val.xRealvar, tempVal.val.xRealvar);    {compute the sum of squares}
+                           AddX(tempVal.val.xRealvar, tally)                    {add it into the old `tally`}
+                        end;
+                AVGop,
+                SUMop : begin
+                           {compute the sum based on the type of the argument}
+                           NANtype1 := tempVal.nan;
+                           if NANtype <> syParts then AddX(tempVal.val.xRealVar, oResult)
+                           else if (NANtype0 = syParts) and (NANtype1 = syParts) then
+                                   calcParts(value2.datePart, tempVal.val.datepart);
+                        end;
+                MINop : if RelX(tempVal.val.xRealVar, oResult) = LT then begin           {determine the lesser value}
+                           oResult := tempVal.val.xRealVar;            {remember results for values & date parts}
+                           value2.datePart := tempVal.val.datepart
+                        end;
+                MAXop : if RelX(tempVal.val.xRealVar, oResult) = GT then begin           {determine the greater value}
+                           oResult := tempVal.val.xRealVar;            {remember results for values & date parts}
+                           value2.datePart := tempVal.val.datepart
+                        end
+             end
+          end;
+
+          {determine if a mix/match of values has been seen and if so, generate an error.}
+          if ord(dateSeen)+ord(partsSeen)+ord(otherSeen) > 1 then NANtype := syError;
+
+(*$IFC DEBUGVERSION *)
+          if debug[3] then begin
+             writeln('Ending ',wWords(VT.lexeme),' function: dpo: ',wbool(dateseen),wbool(partsSeen),wbool(otherSeen),
+                     ' Exc: ',wExc,' NAN: ',wNAN(NANtype),'  oresult: ',wxnum(oresult));
+          end;
+(*$ENDC *)
+
+          {based on the function being evaluated, compute the final result (which might be an error)}
+          case VT.lexeme of
+             COUNTop : begin
+                          NANtype := syNone;            {count does not generate an error}
+                          L2X(count, oResult)           {return the count of the number of values seen}
+                       end;
+             STDop,
+             SQRop   : if otherSeen then begin
+                          if VT.lexeme = STDop then begin       {finish standard deviation}
+                             MulX(result, result);              {square the sum of the numbers}
+                             L2X(-count, oResult);              {divide by -count of the # of numbers}
+                             DivX(oResult, result);
+                             AddX(tally, result);               {add the sum of squares to sum of numbers}
+                             L2X(count - 1, oResult);           {divide the total by # of numbers - 1}
+                             DivX(oResult, result);
+                             SqrtX(result);                     {take the square root}
+                             oResult := result
+                          end
+                          else oResult := tally                 {NPV, STdev and SUMSQR only understands numbers}
+                       end
+                       else NANtype := syError;                 {dates and date parts generate errors}
+             otherwise if NANtype <> syError then begin
+                          case VT.lexeme of
+                             AVGop : with value2.datePart do
+                                       {AVERAGE will only average numbers and simple date parts, anthingelse
+                                        will case an error to be generate.  Simple date parts will average
+                                        to an integer.
+                                       }
+                                       if otherSeen then begin
+                                           I2X(count, tally);
+                                           DivX(tally, oResult)
+                                        end
+                                        else if partsSeen and (ord(dayAC<>0)+ord(monthAC<>0)+ord(yearAC<>0) <= 1) then begin
+                                                dayAC   := dayAC div count;
+                                                monthAC := monthAC div count;
+                                                yearAC  := yearAC div count
+                                             end
+                                        else NANtype := syError;
+                             SUMop : if not(partsSeen or otherSeen) then        {sum does not work on dates}
+                                        NANtype := syError;
+                             MINop,
+                             MAXop : if dateSeen then begin                     {min/max works on everything}
+                                        NANtype := syDate;                      {get the date value in FP0}
+                                        X2D(oResult, Text_Date.lRealVar)
+                                     end
+                                     else if blankSeen then
+                                             case RelX(xVofZero, oResult) of
+                                                LT : if VT.lexeme = MINop then oResult := xVofZero;
+                                                GT : if VT.lexeme = MAXop then oResult := xVofZero
+                                             end
+                          end;
+                          calc[calcPt].date := value2.datepart                  {save any calculated date part}
+                       end
+          end;
+
+          {if an error has been generated, restore the exception flags to their state before
+           the function was evaluated and set the value in FP0 to a NAN.
+          }
+          case NANtype of
+             syNone  : ;
+             syNa,
+             syError,
+             syDzero : begin
+                          SetEnv(FuncEnv);
+                          oResult := VofNAN
+                       end;
+             otherwise SetEnv(FuncEnv)
+          end
+       end
+       else begin
+               NANtype := syNone;       {if an initial value is not available, return a zero}
+               oResult := xVofZero
+            end
+    end;
+
+
+    (*
+       ExtraOperations - performs any of the extra operations that are not part of the resident set of
+                         operations.  These include the trignometric, logarhymtic, relational, IF and
+                         elemenatry function (ABS, SQRT, ...) operations.  Normally a value will already
+                         be in `oResult` to be evaluated otherwise the calculation stack is used.  Normally the result
+                         from any of these operations is returned through `oResult` with the NAN information in `NANtype`.
+                         However for relational operations, the result of the relational will be returned
+                         through `boolValue`.  The IF operation sets up an entire result on the stack directly.
+                         Before "ExtraOperations" is called, all of the operands for the operation to be done
+                         have been checked, where appropriate, as being the correct for the operation.
+    *)
+    (*$S calcExtra *)
+    procedure ExtraOperations;
+    var text1   : ptrData;              {used for text string comparisons}
+        text2   : ptrData;
+        index1  : integer;              {used to index into a text string during text string comparisons}
+        index2  : integer;
+        length1 : integer;              {the length of the text strings being compared}
+        length2 : integer;
+        lSgn    : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       {determine the type of operation to be done based on `VT.lexeme`}
+       case VT.lexeme of
+          ABSop  : if NANtype = syParts then
+                      with calc[calcpt].date do begin
+                         monthAC := abs(monthAC);
+                         dayAC   := abs(dayAC);
+                         yearAC  := abs(yearAC)
+                      end
+                   else AbsX(oResult);
+          SQRTop : SqrtX(oResult);
+          LOGop  : begin
+                      LnX(oResult);
+                      DivX(VofLog10, oResult)
+                   end;
+          LNop   : LnX(oResult);
+          EXPop  : ExpX(oResult);
+          SINop  : SinX(oResult);
+          ASINop : AsinX(oResult);
+          HSINop : SinhX(oResult);
+          COSop  : CosX(oResult);
+          ACOSop : AcosX(oResult);
+          HCOSop : CoshX(oResult);
+          TANop  : TanX(oResult);
+          ATANop : AtanX(oResult);
+          HTANop : TanhX(oResult);
+          SIGNop : begin
+                      if NANtype = syParts then L2X(daysFromParts(calc[calcPt].date), oResult);
+                      if ClassX(oResult, lSgn) = ZERO then lSgn := 0
+                      else if lSgn = 1 then lSgn := -1
+                      else lSgn := 1;
+                      I2X(lSgn, oResult);
+                      NANtype := syNone
+                   end;
+          PIop   : begin
+                      NANtype := syNone;
+                      oResult := VofPI
+                   end;
+          INTDIVop: begin
+                      DivX(oSecond, oResult);
+                      SetRnd(TOWARDZERO);       {set rounding mode to round towards zero}
+                      RintX(oResult);           {convert FP0 to an integer}
+                      SetRnd(TONEAREST)         {set back to round to nearest mode}
+                   end;
+          NEop,
+          EQop   : begin
+                      boolValue := (NANtype0 = NANtype1);       {the types of the operands must agree}
+                      if boolValue then begin
+                         if NANtype0 = syDate then NANtype := syNone;   {reset NAN information for dates}
+
+                         {based on the type of the operand perform the check needed.  Text will cause
+                          a syError result type, thus a special check must be made to compare text.
+                          Any other error or na conditions will cause a true value to be returned.
+                          Remember, at this point we have determined if the two operands are of the same type.
+                         }
+                         case NANtype of
+                            syNa,
+                            syError : if NanType0 = syText then begin
+                                         with calc[calcPt].val.textinfo do begin
+                                            text1   := @hContents^^;    {set up text descriptor for operand #1}
+                                            index1  := index;
+                                            length1 := len
+                                         end;
+
+                                         with calc[calcPt+1].val.textinfo do begin
+                                            text2   := @hContents^^;    {set up text descriptor for operand #2}
+                                            index2  := index;
+                                            length2 := len
+                                         end;
+                                         boolValue := CompChrIdentity(@text1^[index1], @text2^[index2], length1, length2, CompWeak)
+                                      end;
+                            otherwise boolValue := (RelOpResult = EQ)    {for other check, use the floating point}
+                         end
+                      end;
+                      NANtype := syNone;                                        {set type}
+                      if VT.lexeme = NEop then boolValue := not boolValue       {flip `boolvalue` for NEop}
+                   end;
+          LTop   : boolValue := (RelOpResult = LT);       {do the correct comparisons using the floating point}
+          LEop   : boolValue := (RelOpResult <> GT);
+          GTop   : boolValue := (RelOpResult = GT);
+          GEop   : boolValue := (RelOpResult <> LT);
+          ORop   : begin
+                      NANtype := syNone;
+                      if ClassX(oFirst, lSgn) = NORMAL then boolValue := true   {if operand #1 is a non-zero number, return true}
+                      else boolValue := (ClassX(oSecond, lSgn) = NORMAL);       {check the other operand for a non-zero value}
+                      oResult := xVofZero                                       {clear anything that might be in FP0}
+                   end;
+          ANDop  : begin
+                      boolValue := false;                       {assume this and will fail}
+                      NANtype   := syNone;
+                      if ClassX(oFirst, lSgn) = NORMAL then begin              {check for both operands being a non-zero value}
+                         boolValue := (ClassX(oSecond, lSgn) = NORMAL)         {check the other operand for a non-zero value}
+                      end;
+                      oResult := xVofZero                                      {clear anything that might be in FP0}
+                   end;
+          NOTop  : begin
+                      NANtype := syFalse;
+                      if ClassX(oResult, lSgn) = ZERO then NANtype := syTrue   {flip the type of the operand}
+                   end;
+          IFop   : begin
+                      with calc[calcPt-2] do begin              {get the value of the 1st operand}
+                         lSgn    := ord(ClassX(val.xRealVar, lSgn) <> ZERO);
+                         NANtype := NANkind
+                      end;
+
+                      {get the value from the appropriate spot on the calculation stack}
+                      with calc[calcPt - lSgn] do begin
+                         calcPt := calcPt - 3;                  {pop the last 3 operands}
+                         SetEnv(calc[calcPt].myEnviorn);        {reset the exception flags}
+                         calc[calcPt].date := date;             {data for date parts}
+                         oResult := val.xRealVar;               {data for other values}
+                         if NANkind = syDate then X2D(oResult, Text_Date.lRealVar)
+                         else Text_Date := val;                 {data for text & dates}
+                         case NANtype of
+                            syTrue,
+                            syFalse : NANtype := NANkind;       {resulting data type}
+                            otherwise begin
+                                         NANtype := syError;
+                                         oResult := VofNAN
+                                      end
+                         end
+                      end
+                   end
+       end
+    end;
+
+
+    (* NumberOfArgs - counts the number of arguments for a function by backtracking through the calculation
+                      stack until a STACKMARKER is found.
+    *)
+    (*$S LCcalculator *)
+    function NumberOfArgs : integer;
+    label 1;
+    var x        : integer;
+        argcount : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       argcount := 0;
+       for x := calcPt downto 0 do
+          if calc[x].op = STACKMARKER then goto 1
+          else argcount := argcount + 1;
+    1: NumberOfArgs := argcount
+    end;
+
+
+    (*$S calcBusiness *)
+    function ValueOpertions : boolean;
+    var numArgs    : integer;
+        nSignChgs  : integer;
+        negPeriod  : integer;
+        posPeriod  : integer;
+        x          : integer;
+        direc      : integer;
+        nCol       : integer;
+        startCell  : pIdent;
+        lastPeriod : longint;
+        negRate    : extended;
+        posRate    : extended;
+        drRate     : extended;
+
+        (*$S calcBusiness *)
+        procedure myPayment(paymentNumber : integer; var pmt : extended);
+        var theRow  : integer;
+            theCol  : integer;
+            result  : valueType;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           theRow := (paymentNumber - 1) div nCol;
+           theCol := (paymentNumber - 1) - theRow * nCol;
+           GetValue(startCell.length + theRow, startCell.start + theCol, false, result);
+           if direc < 0 then NegX(result.val.xRealVar);
+           pmt := result.val.xRealVar
+
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then
+              writeln(paymentNumber:1,' @ ',startCell.length + theRow:1,',', startCell.start + theCol:1,
+                     '   tempVal: ',wNAN(result.nan),'  val(',direc<0,'): ',wxnum(pmt))
+(*$ENDC *)
+        end;
+
+
+    (*$S calcBusiness *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       ValueOperations := false;
+       numArgs := NumberOfArgs;
+       direc   := 1;
+       calcPt  := calcPt - numArgs;
+       for x := 1 to numArgs do
+          with calc[calcPt + x] do
+             case NANkind of
+                syFalse,
+                syTrue  : begin
+                             direc := 0;
+                             if x = 4 then begin
+                                direc := -1;
+                                if NANkind = syTrue then direc := 1
+                             end
+                          end;
+                syNone  : case x of
+                             3 : posRate := val.xrealvar;
+                             2 : negRate := val.xrealvar;
+                             1 : drRate  := val.xrealvar
+                          end;
+                otherwise if op <> COORDRANGE then direc := 0
+             end;
+
+       with calc[calcPt + 1 + ord((VT.lexeme = NPVop) or (VT.lexeme = NFVop))].val.rangeVar do begin
+          startCell  := first;
+          nCol       := second.start - first.start + 1;
+          lastPeriod := (second.length - first.length + 1) * nCol
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then
+              writeln('func: ',wWords(VT.lexeme),'  lastPeriod: ',lastPeriod:1,
+                      '  val.RangeVar: ',first.length:1,',',first.start:1,'  ',
+                      second.length:1,',',second.start:1,'  dpn: ',wxnum(drrate),' ',wxnum(posRate),' ',wxnum(negrate))
+(*$ENDC *)
+       end;
+
+       if (direc <> 0) and (lastPeriod <= maxInt) then begin
+          NANtype := syNone;
+          case VT.lexeme of
+             NFVop,
+             NPVop : begin
+                        posPeriod := 1;
+                        if VT.lexeme = NFVop then posPeriod := lastPeriod;
+                        fin_npv(1, lastPeriod, posPeriod, drRate, oResult, myPayment)
+                     end;
+             XRRop,
+             IRRop : begin
+                        if VT.lexeme = IRRop then begin
+                           negPeriod := -1;
+                           posPeriod := -1
+                        end
+                        else begin
+                                negPeriod := 1;
+                                posPeriod := lastPeriod;
+                                if direc < 0 then begin
+                                   negPeriod := lastPeriod;
+                                   posPeriod := 1
+                                end
+                             end;
+                        fin_return(1, lastPeriod, negPeriod, posPeriod, negRate, posRate, nSignChgs, oResult, myPayment);
+                        if (nSignChgs = 0) or (nSignChgs = -4) then ValueOperations := true;
+                        if nSignChgs > 1 then begin
+                           oResult := VofNan;
+                           NANtype := syNa
+                        end
+                     end
+          end
+       end
+       else ValueOperations := true
+    end;
+
+
+    (*$S calcBusiness *)
+    function LinearSystems : boolean;
+    label 1,2;
+    var numargs    : integer;
+        status     : integer;
+        row, col   : integer;
+        aRow, aCol : integer;
+        bRow, bCol : integer;
+        tRow, tCol : integer;
+        nRow, nCol : integer;
+        numDestCol : integer;
+        row1       : integer;
+        row2       : integer;
+        coordCnt   : integer;
+        condCalc   : integer;
+        error      : boolean;
+        addCol     : boolean;
+        doLinSys   : boolean;
+        inTranSolve: boolean;
+        rg         : range;
+        destRg     : rangeType;
+        ValZero    : valueType;
+        result     : valueType;
+        temp       : extended;
+        tempResult : extended;
+        heapPtr    : wordPtr;
+        attributes : attrRecord;
+        QR         : P_QR_Record;
+        Sums       : array[0..maxCoeffVars] of extended;
+
+
+        (*$S calcBusiness *)
+        procedure aFetch(row, col : integer; var matVal : extended);
+        var result : valueType;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           if addCol and (col = nCol) then I2X(1, result.val.xRealVar)
+           else GetValue(aRow + row, aCol + col, false, result);
+           matVal := result.val.xRealVar
+
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then
+              writeln('aFetch: ',aRow + row:1,',', aCol + col:1,'  result: ',wNAN(result.nan),'  val: ',wxnum(matVal));
+(*$ENDC *)
+        end;
+
+
+        (*$S calcBusiness *)
+        procedure bFetch(row, col : integer; var matVal : extended);
+        var result : valueType;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           if doLinSys then GetValue(tRow + row, tCol + col, false, result)
+           else if inTranSolve then I2X(ord(row = col), result.val.xRealVar)
+           else GetValue(aRow + row, aCol, false, result);
+           matVal := result.val.xRealVar
+
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then
+              if doLinSys then writeln('bFetch: ',tRow + row:1,',', tCol + col:1,'  result: ',wNAN(result.nan),
+              '  val: ',wxnum(matVal))
+              else
+              writeln('bFetch: ',aRow + row:1,',', aCol:1,'  result: ',wNAN(result.nan),'  val: ',wxnum(matVal));
+(*$ENDC *)
+        end;
+
+
+        (*$S calcBusiness *)
+        procedure xFetch(row, col : integer; var matVal : extended);
+        var result : valueType;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           GetValue(bRow + row, bCol + col - 1, false, result);
+           matVal := result.val.xRealVar
+
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then
+              writeln('xFetch: ',bRow + row:1,',', bCol + col - 1:1,'  result: ',wNAN(result.nan),'  val: ',wxnum(matVal));
+(*$ENDC *)
+        end;
+
+
+        (*$S calcBusiness *)
+        procedure xStore(row, col : integer; matVal : extended);
+        var result : valueType;
+            sgn    : integer;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           if inTranSolve then
+              if row <> col then exit(xStore)
+              else begin
+                      SqrtX(matVal);
+                      MulX(oFirst, matVal)
+                   end;
+           case ClassX(matVal, sgn) of
+              QNAN,
+              SNAN     : result.nan := syError;
+              INFINITE : begin
+                            result.nan := syMinf;
+                            if sgn = 0 then result.nan := syPinf
+                         end;
+              otherwise  result.nan := syNone
+           end;
+           if result.nan <> syNone then matVal := VofNan;
+           X2D(matVal, result.val.lRealvar);
+           if inTranSolve then PutValue(bRow + row, bCol + 1, result, false, status)
+           else PutValue(bRow + row, bCol + col - 1, result, false, status)
+(*$IFC DEBUGVERSION *)
+           ;if debug[3] then begin
+              if inTranSolve then write('xStore: ',bRow + row:1,',',bCol + 1:1)
+              else write ('xStore: ',bRow + row:1,',', bCol + col - 1:1);
+              writeln('  result: ',wNAN(result.nan),'  val: ',wnum(result.val.lRealVar));
+           end
+(*$ENDC *)
+        end;
+
+
+        (*$S calcBusiness *)
+        procedure QR_StatInfo(var rSqr : extended);
+        var i, j, k : integer;
+            ySum    : extended;
+            resid   : extended;
+            bik     : extended;
+            aij     : extended;
+            xjk     : extended;
+            ax      : extended;
+            BtB     : extended;         { B*B = total sum of squares. }
+            RtR     : extended;         { R*R = residual sum of squares = B*R. }
+            AXtAX   : extended;         {(AX)*AX= regression sum of squares = B*AX. }
+                                        { In infinite precision, B*B = R*R + (AX)*AX.
+                                          Any discrepancy reflects roundoff. }
+        begin (* statinfo *)
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           rtr   := xVofZero;
+           btb   := xVofZero;
+           axtax := xVofZero;
+           ySum  := xVofZero;
+           for i := 1 to nRow do begin (* compute b-a*x *)
+              ax := xVofZero;
+              bfetch(i, 1, bik);
+              resid := bik;
+              AddX(bik, ySum);
+              MulX(bik, bik);
+              AddX(bik, btb);
+              for j := 1 to nCol - 1 + ord(addCol) do begin (* sub Aij*Xjk *)
+                 afetch(i, j, aij);
+                 xfetch(j, 1, xjk);
+                 MulX(aij, xjk);
+                 SubX(xjk, resid);
+                 AddX(xjk, ax)
+              end;
+              MulX(ax, ax);
+              AddX(ax, axtax);
+              MulX(resid, resid);
+              AddX(resid, rtr)
+           end;
+           I2X(nRow, ax);
+           DivX(ax, ySum);
+           MulX(ySum, ySum);
+           MulX(ax, ySum);
+           oFirst := RtR;
+           I2X(nRow - (nCol - 1 + ord(addCol)), ax);
+           divX(ax, oFirst);
+           sqrtX(oFirst);
+
+           inTranSolve := true;
+           QR_TranSolve(nCol - ord(not addCol), QR, error, bFetch, xStore);
+           inTranSolve := false;
+           xStore(destRg.second.length - destRg.first.length + 1, 2, oFirst);
+
+           rSqr := AXtAX;
+           SubX(ySum, rSqr);
+           SubX(ySum, BtB);
+           DivX(BtB, rSqr)
+(*$IFC DEBUGVERSION *)
+          ;if debug[3] then writeln('QR_statinfo:   stdErr: ',wxnum(oFirst),'  rsqr: ',wxnum(rsqr));
+(*$ENDC *)
+        end;
+
+
+    (*$S calcBusiness *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       mark(heapPtr);
+
+       numargs     := NumberOfArgs;
+       calcPt      := calcPt - numargs;
+       addCol      := false;
+       doLinSys    := (VT.lexeme = LINSYSop);
+       inTranSolve := false;
+
+       LinearSystems := true;
+
+       {check to destination range to any cells that have formulas, that are protected , or are invisible.
+        If any of these conditions are true the result of the function will be ERROR.  If not, set the
+        destination range to zero.
+       }
+       if numArgs > 1 then begin
+          destRg := calc[calcPt + 2 + ord(doLinSys)].val.rangeVar;
+          with destRg do begin
+             bRow       := first.length - 1;
+             bCol       := first.start;
+             numDestCol := second.start - first.start + 1 - ord(VT.lexeme = REGRESSop);
+
+(*$IFC DEBUGVERSION *)
+             if debug[3] then
+               writeln('func: ',wWords(VT.lexeme),'  bRow,bCol: ',bRow:1,',',bCol:1,'  numDestCol: ',numDestCol:1,
+                       '  dest: ',first.length:1,',',first.start:1,'  ',second.length:1,',',second.start:1);
+(*$ENDC *)
+             for row := first.length to second.length do
+                for col := first.start to second.start do begin
+                   CellAttr(row, col, attributes);
+                   if (attributes.attProt <> ProtNone) or (attributes.attAlign = aInVis) or CellHasRule(row, col) then goto 1
+                end;
+
+             X2D(VofNAN, ValZero.val.lRealVar);
+             ValZero.nan := syNa;
+             case VT.lexeme of
+                REGRESSop : begin
+                               addCol := true;
+                               if numArgs = 3 then
+                                  case calc[calcPt + 3].NANkind of
+                                     syTrue  : {addCol already set to true} ;
+                                     syFalse : addCol := false;
+                                     otherwise goto 2
+                                  end
+                            end;
+                COEFFop   : begin
+                               ValZero.val.lRealVar := VofZero;
+                               ValZero.nan := syNone
+                            end
+             end;
+             X2D(VofPI, result.val.lRealVar);
+             result.nan := syNone;
+             for row := first.length to second.length do
+                for col := first.start to second.start do begin
+                    PutValue(row, col, result, false, status);
+                    if status <> 0 then goto 2;
+                    PutValue(row, col, ValZero, false, status);
+                    if status <> 0 then goto 2
+                 end
+          end;
+
+          if doLinSys then
+             with calc[calcPt + 2].val.rangeVar do begin
+                tRow := first.length - 1;
+                tCol := first.start - 1
+             end
+       end;
+
+       status := 0;
+       error  := false;
+       LinearSystems := false;
+
+       with calc[calcPt + 1].val.rangeVar do begin
+          aRow := first.length - 1;
+          aCol := first.start - ord(doLinSys or (VT.lexeme = DETop));
+          nRow := second.length - first.length + 1;
+          nCol := second.start - first.start + 1
+(*$IFC DEBUGVERSION *)
+          ;if debug[3] then
+             writeln('func: ',wWords(VT.lexeme),'  aRow,aCol: ',aRow:1,',',aCol:1,'  nRow,nCol: ',nRow:1,',',nCol:1,
+                     '  source: ',first.length:1,',',first.start:1,'  ',second.length:1,',',second.start:1);
+(*$ENDC *)
+       end;
+
+       case VT.lexeme of
+          LINSYSop,
+          DETop,
+          REGRESSop : begin
+                         QR_Factor(nRow, nCol - 1 + ord(addCol or doLinSys or (VT.lexeme = DETop)), true, QR, aFetch);
+                         if QR = ord(nil) then goto 2;
+                         if VT.lexeme <> DETop then begin
+                            QR_solve(numDestCol, QR, error, bfetch, xStore);
+                            if error then goto 2;
+                            QR_Improve(numDestCol, QR, error, aFetch, bFetch, xFetch, xStore);
+                            if error then goto 2;
+                            if doLinSys then begin
+                               QR_Condition(QR, oResult);
+                               SetRnd(TOWARDZERO);
+                               LnX(oResult);
+                               DivX(VofLog10, oResult);
+                               I2X(19, result.val.xrealVar);
+                               AddX(result.val.xrealvar, oResult);
+                               RintX(oResult);
+                               X2I(oResult, condCalc);
+                               if condCalc > 0 then condCalc := 0;
+                               if condCalc < 15 then condCalc := 15;
+                               I2X(condCalc, oResult);
+                               SetRnd(TONEAREST)
+                            end
+                            else QR_StatInfo(oResult)
+                         end
+                         else QR_Determinant(QR, oResult)
+                      end;
+          COEFFop   : begin
+                         for col := 0 to maxCoeffVars do Sums[col] := xVofZero;
+
+                         for row2 := 1 to nRow do
+                            for row1 := 0 to nCol - 1 do begin
+                               aFetch(row2, row1, tempResult);
+                               AddX(tempResult, Sums[row1]);
+
+                               for col := 0 to nCol - 1 do begin
+                                  aFetch(row2, col, temp);
+                                  MulX(tempResult, temp);
+                                  xFetch(row1 + 1, col + 1, result.val.xrealVar);
+                                  AddX(result.val.xrealVar, temp);
+                                  xStore(row1 + 1, col + 1, temp)
+                               end
+                            end;
+
+                         I2X(nRow, tempResult);
+                         for row1 := 0 to nCol - 1 do
+                            for col := 0 to nCol - 1 do begin
+                               result.val.xrealVar := Sums[col];
+                               MulX(Sums[row1], result.val.xrealVar);
+                               DivX(tempResult, result.val.xrealVar);
+                               xFetch(row1 + 1, col + 1, temp);
+                               SubX(result.val.xrealVar, temp);
+                               DivX(tempResult, temp);
+                               xStore(row1 + 1, col + 1, temp)
+                            end;
+
+                         for row1 := 0 to nCol - 1 do begin
+                            xFetch(row1 + 1, row1 + 1, Sums[row1]);
+                            SqrtX(Sums[row1])
+                         end;
+
+                         for row1 := 0 to nCol - 1 do
+                            for col := 0 to nCol - 1 do begin
+                               result.val.xrealVar := Sums[col];
+                               MulX(Sums[row1], result.val.xrealVar);
+                               xFetch(row1 + 1, col + 1, temp);
+                               DivX(result.val.xrealVar, temp);
+                               xStore(row1 + 1, col + 1, temp)
+                            end;
+
+                        aRow := destRg.first.length - 1;
+                        aCol := destRg.first.start - 1;
+                        QR_Factor(nCol, nCol, true, QR, aFetch);
+                        QR_Determinant(QR, oResult)
+                     end
+       end;
+
+       NANtype := syNone;
+       goto 1;
+
+    2: NANtype := syNa;
+       oResult := VofNan;
+       result.nan := syNa;
+       X2D(VofNan, result.val.lRealVar);
+       for row := destRg.first.length to destRg.second.length do
+          for col := destrg.first.start to destRg.second.length do
+             PutValue(row, col, result, false, status);
+
+    1: release(heapPtr);
+       if numArgs > 1 then begin
+          with rg, destRg do begin
+             rKind := aRectRg;
+             loRow := first.length;
+             loCol := first.start;
+             hiRow := second.length;
+             hiCol := second.start
+          end;
+          DisplayRange(rg)
+       end;
+
+       coordCnt := lastformula.coordCnt;
+       with lastFormula.formPtr^^ do
+          if shared <> fSingle then SetLastFormula(lastformula.formPtr)
+          else lastformula.ptr := @vecOp;
+       lastformula.coordCnt := coordCnt
+    end;
+
+
+    (*
+       BusinessOperations - performs any of the business operations that are not part of the resident set of
+                            operations.  These include the ANNUITY, COMPOUND, y^x and MOD operations.
+                            Normally the values to be used with the functions are already in the floating
+                            point operands.  For ANNUNITY and COMPOUND or any other function that is of
+                            a FUNC2 type, the values must be load into the floating pointer operands.
+                            The results from any of these calculations will appear in `oResult`.  Before
+                            "BusinessOperations" is called, all of the operands for the operation to be done
+                            should have been checked, where appropriate, as being the correct for the operation.
+    *)
+    (*$S calcBusiness *)
+    procedure BusinessOperations;
+    var signX   : boolean;              {sign of first operand in a MOD operation}
+        signY   : boolean;              {sign of second operand in a MOD operation}
+        quo     : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       {if the operations to be done is a FUNC2 type (ie, ANNUNITY, COMP), only one value has been
+        placed into `oFirst`.  The second value will be obtained from the calculation stack and placed
+        in `oFirst` while the first value is copied in `oSecond`.  If the type of either
+        operand is not a number, an error value will be returned.
+       }
+       if lextoken = FUNC2 then begin
+          oSecond := oFirst;
+          calcPt  := calcPt - 1;
+          stuffOperand(NANtype0);
+          if (NANtype <> syNone) or (NANtype0 <> syNone) then begin
+             calcPt  := calcPt - 1;
+             NANtype := syError;
+             oResult := VofNAN;
+             exit(BusinessOperations)
+          end
+          else NANtype := NaErrs[NANtype, NANtype0]
+       end;
+
+       {determine the type of operation to be done based on `VT.lexeme`}
+       case VT.lexeme of
+          ANNUITYop : begin
+                         annuity(oFirst, oSecond, oResult);
+                         calcPt := calcPt - 1
+                      end;
+          COMPop    : begin
+                         compound(oFirst, oSecond, oResult);
+                         calcPt := calcPt - 1
+                      end;
+          POWop     : XpwrY(oSecond, oResult);
+          MODop     : begin
+                         signX := SignOfX(oFirst);                       {determine the signs of the two operands}
+                         signY := SignOfX(oSecond);
+                         RemX(oSecond, oResult, quo);                   {compute an IEEE remainder}
+                         if signX <> SignOfX(oResult) then begin
+                            if signY then signX := not signX;
+                            if signX then begin
+                               oFirst  := oResult;
+                               oResult := oSecond;
+                               oSecond := oFirst;
+                               SubX(oSecond, oResult)
+                            end
+                            else AddX(oSecond, oResult)
+                         end
+                      end;
+       end
+    end;
+
+
+    (* GetStackValue - returns a value from the calculation stack.  The stack position is given
+                       in `stackPt` and the value is returned through `stackValue`.  Used with
+                       a SEARCH function.
+    *)
+    (*$S calcLookup *)
+    procedure GetStackValue(stackPt : integer; var StackValue : valueType);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       with calc[stackPt] do begin
+          StackValue.nan := NANkind;
+          case NANkind of
+             syParts : StackValue.val.datePart := date;
+             syText  : StackValue.val := val;
+             syDate,
+             syNone  : StackValue.val.xRealVar := val.xRealVar;
+             otherwise StackValue.val.xRealVar := VofNAN
+          end
+       end
+    end;
+
+
+    (*
+       findOperations - performs the SEARCH function along with the CELL & RESULT constants.
+    *)
+    (*$S calcLookup *)
+    function findOperations : boolean;
+    var numArgs : integer;
+        sCalcPt : integer;
+        xNumber : extended;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       saveInStk := false;
+       findOperation := false;
+       case VT.lexeme of
+          CELLop,
+          RESULTop : if ittflag then begin
+                        if VT.lexeme = CELLop then tempVal := iCell
+                        else tempVal := iResult;
+                        calcPt := calcPt + 1;
+                        interpret(true);
+                        if VT.lexeme = CELLop then
+                           with calc[calcPt] do begin
+                              op := COORDINFO;
+                              reference.coordvar.start  := lastICol;
+                              reference.coordvar.length := lastIRow
+                           end;
+                        calcpt := calcPt - 1
+                     end
+                     else begin
+                             findOperation := true;
+                             saveInStk := true
+                          end;
+          SEARCHop : begin
+                       numArgs  := NumberOfArgs;
+                       ittFirst := true;
+                       sCalcPt  := calcPt;
+                       if ittFlag then begin
+                          if calc[sCalcPt - numArgs + 2].NANKind = syTrue then begin
+                             ittFound := true;
+                             if numArgs = 2 then begin
+                                I2X(1, xNumber);
+                                AddX(xNumber, iResult.val.xRealVar)
+                             end
+                             else GetStackValue(sCalcPt, iResult)
+                          end
+                       end
+                       else begin
+                               {start the iteration process.  With 2 arguments, the result returned will
+                                be the count of the cells that statisfy the qualifing expression.  The
+                                initial value in this case will be 0.  With 4 arguments, the initial value
+                                if optained from the calculation stack.
+                               }
+                               if numargs = 2 then begin
+                                  iResult.val.xRealVar := xVofZero;
+                                  iResult.nan := syNone
+                               end
+                               else GetStackValue(sCalcPt - 1, iResult);
+                               with calc[sCalcPt - numArgs] do begin
+                                  ittIndex := formPos;
+                                  ittCcnt  := val.intvar
+                               end;
+                               ittFound   := false;
+                               ittStopped := false
+                            end;
+
+                        {Get a value from the range and remember it and also what coordinate within the range
+                         we are on.
+                        }
+                        row    := iRow;
+                        col    := iCol;
+                        calcPt := sCalcPt - numArgs + 1;
+                        if ittStopped then ittFlag := false
+                        else begin
+                                if ittFlag then calc[calcPt].op := EVALRANGE;
+                                ittFlag := returnValue(true, lastIrow, lastIcol);
+                                if calcPt = sCalcPt - numArgs then ittStopped := true
+                             end;
+                        if ittFlag then begin
+                           iRow  := row;
+                           iCol  := col;
+                           iCell := tempVal
+                        end
+                        else begin
+                                if ittFound then tempVal := iResult
+                                else begin
+                                        tempVal.nan := syNa;
+                                        tempVal.val.xRealVar := VofNan
+                                     end;
+                                calcPt := sCalcPt - numArgs;
+                                InterPret(true)
+                             end;
+                        calcPt := sCalcPt - numArgs - ord(ittFlag)
+                     end
+       end
+    end;
+
+
+    (*$S calcLookup *)
+    function  IndexOperations : boolean;
+    label 1, 2, 3, 4;
+    var disp         : array [0..1] of integer;
+        displacement : integer;
+        x            : integer;
+        argCount     : integer;
+        value        : valueType;
+        namePresent  : boolean;
+        rg           : range;
+        FuncEnv      : environ;          {calculation exception flags before the functio is evaluated}
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       GetEnv(FuncEnv);
+       IndexOperations := true;                                 {assume that the index will fail}
+       argCount        := NumberOfArgs;                         {get the number of argument present}
+
+       {2 or 4 arguments represent a external name is present.  A check is made to insure that the name argument
+        is a piece of text.  If it is not, the stack pointer is cleaned up and the function will return error.
+        If the argument is a piece of text, the namePresent flag is set to true.
+       }
+       if argCount <> 3 then begin
+
+          if calc[calcPt].NANkind <> syText then begin
+             calcPt := calcPt - argCount;
+             goto 4;
+          end;
+
+          argCount    := argCount - 1;
+          namePresent := true;
+          calcPt      := calcPt - 1
+       end
+       else namePresent := false;
+
+       {set up the displacements for the cell reference.  The displacements will be derived from the stack
+        if 3 or more arguments are present.  Otherwise these displacements are set to zero.  The displacements
+        must be a numeric or boolean value; anything else will cause an error to be returned as the function
+        result.
+       }
+       for x := 0 to 1 do
+          if argCount = 3 then
+             with calc[calcPt - x] do begin
+                ClearXcps;
+                case NANkind of
+                   syTrue  : displacement := 1;
+                   syFalse : displacement := 0;
+                   syNone  : begin
+                                SetRnd(TOWARDZERO);       {set rounding mode to round towards zero}
+                                X2I(val.xRealVar, displacement);
+                                SetRnd(TONEAREST)         {set back to round to nearest mode}
+                             end;
+                   otherwise begin
+                                calcPt := calcPt - argCount;
+                                goto 4
+                             end
+                end;
+                disp[x] := displacement
+             end
+          else disp[x] := 0;
+
+       {determine what coordinate is to be referenced.  This is accomplished by adding the displacments to the
+        coordinate or range to get the new coordinates.  In the case of a range, the new coordinate may not be
+        outside the range.  With a single coordinate, the dispalcements may reference any cell within the
+        matrix.  If the new coordinate is not in the range or the matrix, the function result will be
+        set to NA.
+       }
+       calcPt := calcPt - argCount + 1;
+       with calc[calcPt] do begin
+          calcPt := calcPt - 1;
+          case op of
+             COORDRANGE : begin
+                             disp[1]  := coord.first.start + disp[1];
+                             disp[0]  := coord.first.length + disp[0];
+                             rg.loCol := coord.first.start;
+                             rg.hiCol := coord.second.start;
+                             rg.loRow := coord.first.length;
+                             rg.hiRow := coord.second.length;
+                             if not CoordInRange(disp[0], disp[1], rg) then goto 3
+                          end;
+             COORDINFO  : begin
+                             disp[1] := reference.coordvar.start + disp[1];
+                             disp[0] := reference.coordvar.length + disp[0];
+                             if not CoordInMatrix(disp[0], disp[1]) then goto 3
+                          end;
+             otherwise    goto 4
+          end
+       end;
+
+       {get the value of the cell from the matrix}
+       GetValue(disp[0], disp[1], true, value);
+       calc[calcPt].date := value.val.datePart;
+       oResult   := value.val.xRealVar;
+       Text_Date := value.val;
+       NANtype   := value.nan;
+       goto 1;
+
+    4: NANtype := syError;
+       goto 2;
+    3: NANtype := syNa;
+    2: oResult := VofNAN;
+    1: IndexOperations := false;
+       SetEnv(FuncEnv)
+    end;
+
+
+
+    (*$S calcLookup *)
+    procedure LookupOperations;
+    label 1,2,3;
+    var resultcnt : integer;
+        row,col   : integer;
+        status    : integer;
+        numByte0  : integer;
+        numByte1  : integer;
+        geThan    : boolean;
+        equalTo   : boolean;
+        snip      : snipKind;
+        value     : valueType;
+        origVal   : extended;
+        RelResult : RelOp;
+        FuncEnv   : environ;
+        dataPtr   : ptrData;
+        area      : array [snipKind] of integer;
+        snipindex : array [snipKind] of integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       GetEnv(FuncEnv);
+       with calc[calcPt].val.rangevar do begin
+          area[rowKind] := first.length;
+          area[colKind] := first.start;
+          resultcnt := second.length - first.length;
+          if resultcnt = 0 then begin
+             resultcnt := second.start - first.start;
+             snip      := rowKind;
+             snipindex[colKind] := 0
+          end
+          else begin
+                  snip := colKind;
+                  snipindex[rowKind] := 0
+               end
+       end;
+       if NumberOfArgs = 2 then begin
+          if area[snip] = idmax then goto 2;
+          area[snip] := area[snip] + 1;
+          calcPt     := calcPt - 2
+       end
+       else calcPt := calcPt - 3;
+       with calc[calcPt + 1] do begin
+          origVal := val.xRealVar;
+          NANtype := NANkind;
+          case NANtype of
+             syParts : L2X(daysFromParts(date), origVal);
+             syText  : with val.textinfo do begin
+                          dataPtr  := @hContents^^;
+                          dataPtr  := @dataPtr^[index];
+                          numByte0 := len
+                       end
+          end
+       end;
+
+       snipindex[snip] := -1;
+       with calc[calcPt + 2].coord do
+          for col := first.start to second.start do
+             for row := first.length to second.length do
+                if snipindex[snip] <= resultcnt - 1 then begin
+                   if NANtype = syText then begin
+                      numByte1 := evalMax + 1;
+                      CellValue(mmRead, row, col, @eval[0], true, numByte1, status);
+                      equalTo := CompChrIdentity(@eval[0], @dataPtr^, numByte1, numByte0, CompWeak);
+                      geThan  := equalTo
+                   end
+                   else begin
+                           GetValue(row, col, true, value);
+                           if NANtype = syParts then L2X(daysFromParts(value.val.datePart), value.val.xRealVar);
+                           RelResult := relX(value.val.xRealVar, origVal);
+                           geThan    := (RelResult <> LT);
+                           equalTo   := (RelResult = EQ)
+                        end;
+                   if geThan then begin
+                      if equalTo then snipindex[snip] := snipindex[snip] + 1;
+                      if snipindex[snip] < 0 then goto 3;
+                      GetValue(area[rowKind] + snipindex[colKind], area[colKind] + snipindex[rowKInd], true, value);
+                      calc[calcpt].date := value.val.datepart;
+                      oResult   := value.val.xRealVar;
+                      Text_Date := value.val;
+                      NANtype   := value.nan;
+                      goto 1
+                   end
+                   else snipindex[snip] := snipindex[snip] + 1
+                end
+                else goto 3;
+    3: NANtype := syNa;
+    2: oResult := VofNAN;
+       SetEnv(FuncEnv);
+    1:
+    end;
+
+
+    (*$S calcRounding *)
+    function  RoundOperations : boolean;
+    var numDecPlaces : longint;
+        temp         : longint;
+        count        : integer;
+        x            : integer;
+        sign         : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       RoundOperations := true;
+       if NumberOfArgs <> 1 then begin
+          calcPt := calcPt - 1;
+          if NANtype <> syNone then begin
+             calcPt := calcPt - 1;
+             exit(RoundOperations)
+          end;
+          X2L(oFirst, numDecPlaces);
+          stuffOperand(NANtype)
+       end
+       else numDecPlaces := 0;
+       oResult := oFirst;
+       calcPt := calcPt - 1;
+       case NANtype of
+          syText,
+          syDate  : exit(RoundOperations);
+          syParts : with calc[calcPt+1].date do
+                       if ord(dayAC <> 0) + ord(monthAC <> 0) + ord(yearAC <> 0) > 1 then begin
+                          NANtype := syError;
+                          oResult := VofNAN;
+                          exit(RoundOperations)
+                       end
+                       else  begin
+                                temp := 0;
+                                if dayAC <> 0 then temp := dayAC;
+                                if monthAC <> 0 then temp := monthAC;
+                                if yearAC <> 0 then temp := yearAC;
+                                L2X(temp, oResult);
+                                NANtype := syNone
+                             end
+       end;
+       sign  := (numDecPlaces < 0);
+       count := Cmin(abs(numDecPlaces), maxDecPlaces);
+
+       {calculate the power of ten to adjust by}
+       numDecPlaces := 1;
+       for x := 1 to count do
+          numDecPlaces := numDecPlaces * 10;
+       L2X(numDecPlaces, oFirst);
+       if VT.lexeme <> DROUNDop then SetRnd(TOWARDZERO);
+
+       {adjust the number}
+       if sign then DivX(oFirst, oResult)
+       else MulX(oFirst, oResult);
+
+       {add .5 to decimal place for round function}
+       if VT.lexeme = ROUNDop then
+          if SignOfX(oResult) then SubX(VofHalf, oResult)
+          else AddX(VofHalf, oResult);
+
+       RintX(oResult);
+
+       SetRnd(TONEAREST);
+       if sign then MulX(oFirst, oResult)
+       else DivX(oFirst, oResult);
+       RoundOperations := false
+    end;
+
+
+(*$S calculator *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   if debug[3] then begin
+      write(rowId:1,',',colId:1,'  ');
+      dumpformula(lastformula.ptr)
+   end;
+   if debug[10] and not debug[23] then timestart(6);
+(*$ENDC *)
+
+   calcPt     := -1;
+   maxpt      := -1;
+   formindex  := 0;
+   ittFlag    := false;
+   ittFirst   := false;
+   finished   := false;
+   assumption := false;
+   FSnipRow   := FinalSnip(rowkind);
+   FSnipCol   := FinalSnip(colKind);
+   ClearXcps;
+   repeat
+      if ittFlag then
+         if ittFirst then begin
+            ittFirst  := false;
+            formIndex := ittIndex;
+            lastformula.coordCnt := ittCcnt
+(*$IFC DEBUGVERSION *)
+            ;if debug[3] then
+               writeln('Restart search:  index: ',formIndex:1,'  coordCnt: ',lastformula.coordCnt:1)
+(*$ENDC *)
+         end;
+      saveInStk := true;
+
+      {determine if opcode is a operator/function or a p-code}
+      getoperand(lastformula.ptr, formindex, rowId, colId, opCode);
+      if opCode <= ENDPCODE then interpret(false)
+      else if VT.lexeme <> RPARENop then begin
+              lexToken := token[VT.lexeme];
+
+              {remember if a min/max function is being evaluated - used for faster determination in the inner loop}
+              minMaxFunc := (VT.lexeme = MINop) or (VT.lexeme = MAXop);
+
+              {load & validate the operands for the operation to be done}
+              if lexToken <> FUNC1 then stuffOperand(NANtype);
+              case lexToken of
+                 LOGICALAND,           {binary operators}
+                 LOGICALOR,
+                 UPARROW,
+                 LRELOP,
+                 MULOP,
+                 SIGN       : begin
+                                 NANtype1 := NANtype;
+                                 calcPt := calcPt - 1;
+                                 oSecond := oFirst;
+                                 stuffOperand(NANtype0);
+                                 NANtype := NaErrs[NANtype1, NANtype0];
+                                 oResult := oFirst;
+(*$IFC DEBUGVERSION *)
+                                 if debug[3] then writeln('operands: ',wxnum(oFirst),' ',wxnum(oSecond));
+(*$ENDC *)
+                                 if NANtype <> syNone then
+                                    case CheckErrorOperands of
+                                       SkipOperation : goto 2;
+                                       GenError      : goto 3
+                                    end;
+                                 if lexToken = LRELOP then begin
+                                    X2D(oFirst, tempVal.val.lRealVar);
+                                    D2X(tempVal.val.lRealVar, oFirst);
+                                    X2D(oSecond, tempVal.val.lRealVar);
+                                    D2X(tempVal.val.lRealVar, oSecond);
+                                    RelOpResult := RelX(oFirst, oSecond)
+                                 end
+                              end;
+                 LOGICALNOT : case NANtype of
+                                 syTrue,
+                                 syFalse : oResult := oFirst;
+                                 syNa    : goto 2;
+                                 otherwise goto 3
+                              end;
+                 FUNC3      : case NANtype of
+                                 syPinf  : begin
+                                              oResult := VofPinf;
+                                              NANtype := syNone
+                                           end;
+                                 syMinf  : begin
+                                              oResult := VofMinf;
+                                              NANtype := syNone
+                                           end;
+                                 syNone  : oResult := oFirst;
+                                 syParts : case VT.lexeme of
+                                              ABSop,
+                                              SIGNop  : ;
+                                              otherwise goto 3
+                                           end;
+                                 syNa    : goto 2;
+                                 otherwise goto 3
+                              end;
+                 MODIFIER   : case NANtype of
+                                 syNone,
+                                 syParts : oResult := oFirst;
+                                 syNa    : goto 2;
+                                 otherwise goto 3
+                              end
+              end;
+
+              case VT.lexeme of
+                 ADDop,
+                 SUBop     : case NANtype of
+                                syDate,
+                                syParts : if (NANtype0 = syDate) or (NANtype1 = syDate) then calcDate
+                                          else calcParts(calc[calcPt].date, calc[calcPt + 1].date);
+                                otherwise if VT.lexeme = SUBop then SubX(oSecond, oResult)
+                                          else AddX(oSecond, oResult)
+                             end;
+                 MULTIop   : MulX(oSecond, oResult);
+                 DIVOP     : DivX(oSecond, oResult);
+                 ERRORop   : goto 3;
+                 NAop      : begin
+                                NANtype := syNa;
+                                oResult := VofNan
+                             end;
+                 PINFop    : begin
+                                NANtype := syPinf;
+                                oResult := VofPinf
+                             end;
+                 MINFop    : begin
+                                NANtype := syMinf;
+                                oResult := VofMinf
+                             end;
+                 ABSop,
+                 SQRTop,
+                 LOGop,
+                 LNop,
+                 EXPop,
+                 SINop,
+                 ASINop,
+                 HSINop,
+                 COSop,
+                 ACOSop,
+                 HCOSop,
+                 TANop,
+                 ATANop,
+                 HTANop,
+                 PIop,
+                 INTDIVop,
+
+                 EQop,
+                 NEop,
+                 LTop,
+                 LEop,
+                 GTop,
+                 GEop,
+                 ORop,
+                 ANDop,
+                 NOTop,
+                 SIGNop,
+                 IFop      : ExtraOperations;
+                 POWop,
+                 MODop,
+                 ANNUITYop,
+                 COMPop    : BusinessOperations;
+                 RESULTop,
+                 CELLop,
+                 SEARCHop  : if findOperations then goto 3;
+                 DROUNDop,
+                 ROUNDop,
+                 INTop     : if RoundOperations then goto 3;
+                 DAYop,
+                 DAYSop,
+                 WEEKop,
+                 WEEKSop,
+                 MONTHop,
+                 MONTHSop,
+                 YEARop,
+                 YEARSop,
+                 TODAYop   : if dateOperations then goto 3;
+                 LOOKop    : LookupOperation;
+                 LINSYSop,
+                 DETop,
+                 COEFFop,
+                 REGRESSop : if LinearSystems then goto 3;
+                 INDEXop   : if IndexOperation then goto 3;
+                 NPVop,
+                 NFVop,
+                 XRRop,
+                 IRRop     : if ValueOperations then goto 3;
+                 otherwise   ListOperations
+              end;
+              goto 2;
+
+           3: NANtype := syError;
+              oResult := VofNAN;
+
+           2: case NANtype of
+                 syText,
+                 syParts,
+                 syDate  : ;
+                 otherwise case ClassX(oResult, gSgn) of
+                              QNAN,
+                              SNAN     : if NANtype = syNone then NANtype := syError;
+                              INFINITE : begin
+                                            NANtype := syMinf;
+                                            if gSgn = 0 then NANtype := syPinf
+                                         end
+                           end
+              end;
+
+              {adjust the calculation stack pointer and any values}
+              case lexToken of
+                 LOGICALAND,
+                 LOGICALOR,
+                 LRELOP      : case NANtype of
+                                  syError,
+                                  syNa : ;
+                                  otherwise begin
+                                               NANtype := syFalse;
+                                               if boolValue then NANtype := syTrue
+                                            end
+                               end;
+                 FUNC1       : calcPt := calcPt + 1
+              end;
+
+              {push result back onto the stack}
+              if saveInStk then
+                 with calc[calcPt] do begin
+                    NANkind := NANtype;
+                    op      := VALUEINFO;
+                    case NANtype of
+                       syText : begin
+                                   val.lRealVar := VofZero;
+                                   val.textinfo := Text_Date.textinfo
+                                end;
+                       syDate : begin
+                                   val.lRealVar := VofZero;
+                                   val.date     := Text_Date.date;
+                                   D2X(val.lRealVar, val.xRealVar)
+                                end;
+                       otherwise
+                                begin
+                                   case NANtype of
+                                      syPinf  : oResult := VofPinf;
+                                      syMinf  : oResult := VofMinf;
+                                      syTrue  : I2X(1, oResult);
+                                      syParts,
+                                      syFalse : oResult := xVofZero
+                                   end;
+                                   val.xRealVar := oResult
+                                end
+                    end
+                 end
+           end;
+
+       formindex := formindex + 1;
+
+(*$IFC DEBUGVERSION *)
+       ;if calcPt > maxpt then maxpt := calcPt;
+       if debug[3] then dumpCalc(calc, icell, iresult, irow, icol, ittflag, calcpt, maxpt, row, col)
+(*$ENDC *)
+
+    until finished;
+(*$IFC DEBUGVERSION *)
+    if calcPt <> 0 then FatalMess(14);
+(*$ENDC *)
+
+
+    {get the calculated result.  The last value on the calculation stack has the final result.
+     That result will be checked, the proper NAN information set and the final result returned
+     through `calcResult`.  If that result is a number, the result will be rounded to
+     a double precision real instead of an extended.
+    }
+    with calc[0] do begin
+       calcResult.nan := NANkind;
+       if calcResult.nan <> syText then X2D(val.xRealVar, val.lRealVar);
+
+       {check for an overflow exception and translate that into an infinity}
+       if TestXcp(OVERFLOW) then
+          if SignOfX(val.xRealVar) then calcResult.nan := syMinf         {check the original extended - should be no problem}
+          else calcResult.nan := syPinf;
+
+       {based on the NAN information, return the proper result in `calcResult`}
+       case calcResult.nan of
+          syParts : calcResult.val.datepart := date;
+          syDate,
+          syNone,
+          syText  : calcResult.val := val;
+          otherwise X2D(VofNAN, calcResult.val.lRealVar)
+       end
+    end;
+
+    if assumption and (circleState = cMissing) then SetCirBit(rowId, colId, true, true);
+
+(*$IFC DEBUGVERSION *)
+    ;if debug[10] and not debug[23] then timepeak(6);
+    if debug[6] then begin
+       GetEnv(myEnviron);
+       dumpenv(myEnviron)
+    end;
+(*$ENDC *)
+
+end;
+
+(*$S initial *)
+END.
+
+ÿ

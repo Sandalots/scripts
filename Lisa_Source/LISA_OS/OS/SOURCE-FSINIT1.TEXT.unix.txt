@@ -1,0 +1,326 @@
+(*********************************************************************************)
+(*
+(*  (c) copyright 1983, 1984  Apple Computer Inc.
+(*
+(*********************************************************************************)
+
+{file: source/fsinit1}
+
+(*$S fs4 *)
+
+function FIND_EMPTYSLOT(var config_index: integer):boolean;
+   external;   {forward reference}
+
+
+(*$S fs4 *)
+
+
+procedure PWBT{var errnum : integer; srcfname : pathname;
+                    boot_drive : integer};
+     (**********)
+     (*
+     (* Description:
+     (*    Write a file into the boot tracks.
+     (*
+     (* Input Parameter:
+     (*   Srcfname - source filename of object to be written to boot tracks.
+     (*   boot_drive - destination device whose boot tracks are to be written.
+     (*
+     (* Output Parameter:
+     (*    Errnum - if any.  Possible values are listed below.
+     (*
+     (*    Besides locating the executable code within the object
+     (*    format, this procedure also extracts and then writes
+     (*    the start program counter, program size, global data
+     (*    size, and the first filesystem block
+     (*    number at a agreed location in the binary
+     (*    image that's later to be written to the boot device.
+     (*
+     (**********)
+
+label 1;  {exit path}
+
+const
+   disk_header = 20;         {number of bytes actually stored for header}
+   two_header_delta = 24;
+   pagesize = 512;
+
+ {possible error return values: (values also used/declared in startup) }
+   wbt_base = 1210;          {base from which all others are an offset:}
+   wbt_nex = 0;              {object file not executable}
+   wbt_too_big = 1;          {object file too big}
+   wbt_io_in = 2;            {any sort of io error READING}
+   wbt_io_out = 3;           {any sort of io error WRITING}
+   wbt_src = 4;              {source file not found}
+   wbt_bdev = 5;             {cant write boot tracks on that device}
+   wbt_dserr = 6;            {couldn't create/close internal buffer}
+   wbt_seg = 7;              {multi-seg program}
+   wbt_no_conf = 8;          {couldn't find configinfo entry to write block 0}
+   wbt_nospace = 9;          {couldn't find working space}
+   wbt_pre_eof = 10;         {premature eof on source file}
+
+type
+   ld_pagelabel = record     {loaders version of pagelabel definition,
+                              differing from standard definition by
+                              declaring version to be a full word}
+                     version: integer;
+                     volume: integer;
+                     fileid: integer;
+                     dataused: integer;
+                     abspage: longint;
+                     relpage: longint;
+                     fwdlink: longint;
+                     bkwdlink:longint;
+                  end; {of ld_pagelabel}
+
+   bootdata = record
+                 globalsize: integer;  {size of programs global vars}
+                 codesize: integer;    {programs codesize}
+                 pc_offset: integer;   {offset to boot track entrypoint}
+                 fs0_offset: integer;  {vol block where FS block 0 lives}
+              end; {of bootdata}
+
+var
+   i, numbsegs,
+   blocknumb,                {index to block write loop}
+   log_block,                {count of blocks actually written}
+   first_fs_block,           {as in mddf location}
+   first_block,              {ie, after mount table}
+   lisaerr : integer;
+   read_size : integer;
+   datapart, bt_codesize : absptr;
+   tranbuf : array[0..535] of byte;
+   p_extconfig: ^ext_diskconfig;
+   trailhead: integer;      {size of trailing/reversed header}
+
+ {diskio stuff:}
+   req: reqptr_type;
+   read_f, verify: boolean;
+   status : reqsts_type;
+   hdrptr: ^pagelabel;
+   hdr: ld_pagelabel;
+   ld_hdrptr: ^ld_pagelabel;
+   devptr: ptrdevrec;
+
+ {object file twiddlers}
+   src_desc: objhandle;
+   invar :  objblock;
+   deviant : objvarblock;
+   bootinfo : ^bootdata;
+   the_info : bootdata;
+
+
+   procedure CHECK_READ_ERROR; {ala recover}
+   begin
+      if src_desc^.error<>0 then
+      begin
+         errnum := wbt_base + wbt_io_in;
+         goto 1;
+      end;
+   end;
+
+
+   (**************************************)
+   (****** here is the body of PWBT ******)
+   (**************************************)
+
+begin
+   errnum := 0;              {being optimistic}
+   if (boot_drive<0) or (boot_drive>maxdev) then
+      begin
+         errnum := wbt_base + wbt_bdev;
+         EXIT(PWBT);
+      end;
+   devptr := configinfo[boot_drive];
+   with devptr^ do
+      if not blockstructured or (devt=pascalbd {meaning corvus} ) then
+         begin
+            errnum := wbt_base + wbt_bdev;
+            EXIT(PWBT);
+         end;
+   UP(lisaerr, devptr, nil);
+   if lisaerr <> 0 then
+      begin
+         errnum := wbt_base + wbt_io_out;
+         EXIT(pwbt);
+      end;
+   p_extconfig:=pointer(devptr^.ext_addr);
+   with p_extconfig^ do
+      begin
+         first_fs_block := fs_strt_blok;
+         first_block := strt_blok;
+         trailhead := rvrs_hdr;
+      end; {of with}
+
+   INITOBJFILE(src_desc, 4 {blocks of scratch space});
+   if src_desc=NIL then
+      begin
+         DOWN(lisaerr, devptr, nil, 0);
+         errnum := wbt_base + wbt_nospace;
+         EXIT(PWBT);
+      end;
+
+   OPENOBJFILE(src_desc, srcfname, false {dont lock it} );
+   if ( src_desc^.error=948 {file not found}) then
+      begin
+         errnum := wbt_base + wbt_src;
+         goto 1;
+      end
+   else CHECK_READ_ERROR;
+
+  {Is it executable?}
+   GETOBJINVAR(src_desc, invar);
+   CHECK_READ_ERROR;
+   if invar.blockheader=versionctrl then
+      begin
+         GETOBJINVAR(src_desc, invar);  {skip version ctrl, if present}
+         CHECK_READ_ERROR;
+      end;
+   if invar.blockheader<>Executable then
+      begin
+         errnum := wbt_base + wbt_nex;
+         goto 1;
+      end;
+
+  with the_info do
+     begin
+       {read how many unitglobals exist}
+         {the_info.}globalsize := invar.bphysicalExec.datasize;
+
+        {loader's read pointer is now pointing to the variant sequence:
+              integer      (holding the number of segments),
+              JTSegVariant (but only ONE segment, please),
+              integer      (number of descriptors),
+              JumpTVariant (for the main procedure, esp the entrypoint)  }
+
+         GETOBJSEQ(src_desc, @numbsegs, 2); {check number of segs}
+         CHECK_READ_ERROR;
+         if (numbsegs<>1) then
+            begin
+               errnum := wbt_base + wbt_seg;
+               goto 1;
+            end;
+
+         GETOBJVAR(src_desc, JTSegVariant, deviant); {read loaders size}
+         CHECK_READ_ERROR;
+         bt_codesize := deviant.bJTSegVariant.sizeUnpacked - 8; {8 bytes overhead}
+         bt_codesize := bt_codesize + trailhead;
+         {the_info.}codesize := bt_codesize;
+
+
+         SKIPOBJBYTES(src_desc, 2);        {skip number of descriptors field}
+         CHECK_READ_ERROR;
+
+         GETOBJVAR(src_desc, JumpTVariant, deviant); {read the loaders entrypoint}
+         CHECK_READ_ERROR;
+         {the_info.}pc_offset := deviant.bJumpTVariant.AbsAddr - 8;
+
+         {the_info.}fs0_offset := first_fs_block;
+      end; {of with the_info}
+
+ {position to the start of the object code}
+   repeat
+      GETOBJINVAR(src_desc, invar);
+      CHECK_READ_ERROR;
+   until invar.blockheader=codeblock;
+
+ {copy databuf contents to boot device: }
+   blocknumb := 0;
+   log_block := 0;
+   lisaerr := 0;       {insecurity reigns}
+   read_f := false;
+   verify := false;    (* no read after write *)
+
+   ld_hdrptr := @tranbuf[0];
+   hdrptr := pointer( ord4( ld_hdrptr));
+   datapart := ord4(hdrptr);
+
+   p_extconfig^.strt_blok := 0;  {get access to block 0}
+
+   while blocknumb < (first_fs_block -1) do
+      begin
+
+         if blocknumb=1 then {cleanup from volume flim/flammery: }
+            p_extconfig^.strt_blok := first_block;  {restore original value}
+
+      {init header EVERY time in case DISKIO stomps on some fields:}
+         with ld_hdrptr^ do
+         begin
+            version := 0;
+            volume := boot_drive;
+            if blocknumb=0 then fileid:=$AAAA else fileid:=$BBBB;
+            dataused:= 512;
+            abspage := -1;
+            relpage := log_block;
+            log_block := log_block+1;
+            fwdlink := -1;
+            bkwdlink := -1;
+         end;
+
+       {read in one page's object code, null filled if necessary}
+         if bt_codesize<pagesize then
+            begin
+               for i := bt_codesize to pagesize-1 do
+                  tranbuf[two_header_delta + i] := 0;
+               read_size := bt_codesize;
+               bt_codesize := 0;
+            end
+         else
+            begin
+               if (blocknumb = 0) then
+                    read_size := pagesize - trailhead
+               else read_size := pagesize;
+               bt_codesize := bt_codesize - pagesize;
+            end;
+         GETOBJSEQ(src_desc, @tranbuf[two_header_delta], read_size);
+         CHECK_READ_ERROR;
+
+       {block 0 gets bootinfo:}
+         if blocknumb=0 then
+            begin
+               bootinfo := @tranbuf[two_header_delta + 8]; {'+8' skips jmp, bootable,}
+                                                           {  and ldr version fields.}
+               bootinfo^ := the_info;   {install all fields into object image}
+               if (trailhead > 0) then {DUPLICATE the bootinfo portion IN PLACE}
+                  for i := 535 downto (trailhead + two_header_delta) do
+                     tranbuf[i] := tranbuf[i-trailhead];
+            end; {of if blocknumb=0}
+
+         DISKIO(lisaerr, boot_drive, hdrptr^, hdrptr^.fwdlink,
+            hdrptr^.dataused, datapart, 1(*block*), blocknumb,
+            read_f, raw_io, req);
+
+         if lisaerr = 0 then (* asynchronous I/O request was queued *)
+         begin
+            (* loop until completion *)
+            repeat status_req (req, status) until status.reqsrv_f = complete;
+            if not status.reqsuccess_f then
+               begin
+                  errnum := wbt_base + wbt_io_out;
+                  goto 1;
+               end;
+            CANCEL_REQ (req);
+         end
+         else
+            begin
+               errnum := wbt_base + wbt_io_out;
+               goto 1;
+            end;
+
+         blocknumb := blocknumb + 1;
+
+      end; {of while, LISAIO for the last glop of code from disk II}
+
+   if bt_codesize>0 then     {boot tracks not big enough?}
+      errnum := wbt_base + wbt_too_big;
+
+1:
+ {cleanup before exiting:}
+   CLOSEOBJFILE(src_desc, false {nothing special} );
+   p_extconfig^.strt_blok := first_block;     {in case of murphy's law}
+   DOWN(lisaerr, devptr, nil, 0);
+
+end; {of PWBT}
+
+
+ÿ

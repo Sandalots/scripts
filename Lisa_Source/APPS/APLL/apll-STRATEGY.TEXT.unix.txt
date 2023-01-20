@@ -1,0 +1,824 @@
+{#F     lm:strategy.text }
+{$IFC PRERELEASE }
+{$S noidebug }
+{***************************************************************************
+
+                                printquery
+
+***************************************************************************}
+procedure printquery(scanid : integer;pquery : ptrquery);
+label
+        1;
+var
+        i : integer;
+        pvfld : ptrvfld;
+        pconst : ptrdata;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with pdifftable^[scanid]^ do
+            begin
+            writeln(dumpfile,'ntriples:',pquery^.ntriples);
+            pconst := @pquery^.qexp[pquery^.ntriples];
+            writeln(dumpfile,'tuple':10,'action':10,'op1':10,'op2':10);
+            for i := 0 to pquery^.ntriples-1 do
+                with pquery^.qexp[i] do
+                    begin
+                    write(dumpfile,i:10);
+                    case action of
+                    ex_const : write(dumpfile,'ex_const':10);
+                    ex_field : write(dumpfile,'ex_field':10);
+                    ex_and : write(dumpfile,'ex_and':10);
+                    ex_eq : write(dumpfile,'ex_eq':10);
+                    ex_ne : write(dumpfile,'ex_ne':10);
+                    ex_lt : write(dumpfile,'ex_lt':10);
+                    ex_gt : write(dumpfile,'ex_gt':10);
+                    ex_le : write(dumpfile,'ex_le':10);
+                    ex_ge : write(dumpfile,'ex_ge':10);
+                    end;
+                    if action = ex_field then
+                        begin
+                        writeln(dumpfile,fileid:10,fldid:10);
+                        end
+                    else if action = ex_const then
+                        begin
+                        writeln(dumpfile,desc.ftype:10,desc.offset:10);
+                        if desc.ftype > ftypvstr then
+                            begin
+                            pvfld := pointer(ord(pconst)+desc.offset);
+                            writeln(dumpfile,' ':20,
+                                    pvfld^.size:7,pvfld^.offset:7);
+                            end;
+                        printkey(@desc,1,pconst);
+                        end
+                    else
+                        begin
+                        writeln(dumpfile,op1:10,op2:10);
+                        end;
+                    end;
+            end; { with }
+1:
+end;
+{$ENDC}
+{$S lmopen }
+{************************************************************************
+
+                                cost_out
+
+        computes the expected execution cost on using path as the access
+        path.  the cost is the sum of the retrieval cost and sort cost.
+        the sort cost is 0 if the access path is sorted on the sort
+        key (or the reverse order).  see interface for a discussion of
+        the tables used in computing costs.
+
+        Input Parameters
+               pquery - pts to query
+               pold_approx - records the constant triples used to form
+                   the high and low keys for the current lowest cost
+                   path
+               pnew_approx - records the constant triples used to form
+                   the high and low keys for the current path
+               key_id - file index of current path
+               nskeys - # of fields in sort key
+               psort - describes sort key
+               nlflds - # of fields in lowest cost path low key
+               nhflds - # of fields in lowest cost path high key
+               cost - current lowest cost
+               sorted - true iff the lowest cost path produces records
+                   in an order compatible with the sort key
+
+        Output Parameters
+
+               these are set iff key_id becomes the new lowest cost path:
+
+               pold_approx
+               nlflds
+               nhflds
+               cost
+               sorted
+               pdifftable^[scanid]^.via
+               pdifftable^[scanid]^.reversescan
+
+
+
+*************************************************************************}
+procedure cost_out(    scanid : integer;
+                       pquery : ptrquery;
+                       pold_approx,
+                       pnew_approx : ptrapproxkey;
+                       key_id,
+                       nskeys : integer;
+                       psort : ptridesc;
+                   var nlflds,
+                       nhflds : integer;
+                   var cost : fileptr;
+                   var sorted : boolean);
+label
+        10;
+var
+        expon,
+        loccost,
+        totalpages,
+        Via_recs,
+        Via_ios,
+        Data_recs,
+        Find_ios : fileptr;
+
+        depth,
+        cnt_eq,
+        cnt_ineq,
+        itriple,
+        passes,
+        recsper,
+        keysper,
+        action,
+        fldnum,
+        ifld,
+        i,
+        trash,
+        high_flds,
+        low_flds,
+        on_id,
+        keys : integer;
+
+        qual_type : qualification_type;
+
+        le,
+        ge,
+        temp,
+        path_is_data,
+        high_open,
+        low_open,
+        low_active,
+        high_active,
+        break_low,
+        break_high,
+        backscan,
+        locsorted : boolean;
+
+        pldesc,
+        pdesc : ptrflddesc;
+        pindexseg : ^ isegment;
+
+        pexpr : ptrtriple;
+
+        pconst : ptrdata;
+
+        pnew : ^approxrec;
+
+        {*************************************************************
+
+                                  field_num
+
+                returns the data record field corresponding to field
+                number fld of some access path.
+
+        **************************************************************}
+        function field_num(scanid,
+                           fileid,
+                           fld : integer) : integer;
+        label
+                1;
+        var
+                i : integer;
+                pon : ptrfiledesc;
+                pfdesc : ptrflddesc;
+                fdesc : flddesc;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                with pfiletable^[fileid]^ do
+                    begin
+                    if path_is_data then field_num := fld
+                    else { an index file! }
+                        begin
+                        fdesc := pkdesc^[fld];
+                        pon := pfiletable^[pdifftable^[scanid]^.on];
+                        pfdesc := @pon^.pedesc^;
+                        for i := 0 to pon^.nfields-1 do
+                            begin
+                            if (pfdesc^.offset = fdesc.offset) and
+                               (pfdesc^.size = fdesc.size)
+                            then
+                                begin
+                                field_num := i;
+                                goto 1;
+                                end;
+                            pfdesc := pointer(ord(pfdesc)+sizeof(flddesc));
+                            end;
+                        end;
+                    end;
+        1 :
+        end; { field_num }
+
+        {*****************************************************************
+
+                             recsper_estimate
+
+            estimates the number of records per file page.  if the
+            labellist is not null it subtracts 1 labelpage.  if the
+            freelist is not null it subtracts 1 page for freelist.
+            doesn't correct for nonleaf pages.  assumes 1/2 full pages.
+
+
+        *****************************************************************}
+
+        function recsper_estimate(fileid:integer) : integer;
+        var
+                estimate,
+                trash : integer;
+                lnrecs,
+                totalpages : fileptr;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                with pfiletable^[fileid]^ do
+                    begin
+                    lnrecs := nrecs;
+                    totalpages:=div424(lastpage-firstpage,pagesize,trash);
+                    if freelist <> nilptr then totalpages := totalpages - 1;
+                    if labellist <> nilptr then totalpages := totalpages - 1;
+                    end;
+                estimate := 0;
+                while comp44(lnrecs,totalpages) = gt do
+                    begin
+                    lnrecs := lnrecs - totalpages;
+                    estimate := estimate + 1;
+                    end;
+                (*dbif lmdebug then
+                    begin
+                    writeln(dumpfile,'recsper:',estimate);
+                    end;*)
+                recsper_estimate := estimate;
+        end;
+
+        {******************************************************************
+
+                                     count_free_quals
+
+            counts the number of qualifications (equality and inequality)
+            in excess of those used to establish the scan range.  this is
+            used to predict a fraction of the records responding. ignores
+            <> qualifications as not sufficiently restrictive.
+
+        *******************************************************************}
+
+        procedure count_free_quals(var cnt_eq,cnt_ineq : integer);
+        label
+                10;
+        var
+                action,
+                j,
+                i : integer;
+                ptriple : ptrtriple;
+                pnew : ^ approxrec;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                cnt_ineq := 0;
+                cnt_eq := 0;
+                ptriple := @pquery^.qexp;
+                for i := 0 to pquery^.ntriples-1 do
+                    begin
+                    action := ptriple^.action;
+                    if (action > ex_and) and (action <> ex_ne) then
+                        begin
+                        pnew := @pnew_approx^;
+                        for j := 0 to high_flds-1 do
+                            begin
+                            if pnew^.high = (i + 2) then goto 10;
+                            pnew := pointer(ord(pnew) + sizeof(approxrec));
+                            end;
+                        pnew := @pnew_approx^;
+                        for j := 0 to low_flds-1 do
+                            begin
+                            if pnew^.low = (i + 2) then goto 10;
+                            pnew := pointer(ord(pnew) + sizeof(approxrec));
+                            end;
+                        if action = ex_eq then cnt_eq := cnt_eq + 1
+                        else cnt_ineq := cnt_ineq + 1;
+                    10 :
+                        end;
+                    ptriple := pointer(ord(ptriple)+sizeof(triple));
+                    end;
+                (*dbif lmdebug then writeln(dumpfile,'free quals:',
+                                        cnt_eq:7,cnt_ineq:7);*)
+                if cnt_eq > max_filtrate then cnt_eq := max_filtrate;
+                if cnt_ineq > max_filtrate then cnt_ineq := max_filtrate;
+        end; { count_free_quals }
+
+        {***************************************************************
+
+                                fraction
+
+                computes a fraction of a fileptr.
+
+        *****************************************************************}
+
+        function fraction(num : fileptr;fract : a_fraction) : fileptr;
+        var
+                result,
+                longrem : fileptr;
+                rem : integer;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                result := div424(num,fract.denominator,rem);
+                result := mult424(result,fract.numerator);
+                longrem := mult424(fract.numerator,rem);
+                result := result + div424(longrem,fract.denominator,rem);
+                fraction := result;
+        end; { fraction }
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'cost_out:',key_id:7,cost:14,ord(sorted):3);
+            end;*)
+
+        locsorted := false;
+        backscan := false;
+
+    {   determine whether key_id produces records in an order compatible
+        with the sort key.  note: if the sort key is empty, then any path
+        does this.  note: paths can be scanned backwards if the path's
+        sort order is the reverse of that desired }
+
+        with pfiletable^[key_id]^ do
+            begin
+            Via_recs := nrecs;
+            totalpages:=div424(lastpage-firstpage,pagesize,trash);
+            if freelist <> nilptr then totalpages := totalpages - 1;
+            if labellist <> nilptr then totalpages := totalpages - 1;
+            keys := nsort;
+            pldesc := @pedesc^;
+            path_is_data := inpset(@flags,fdata);
+            if nskeys <> 0 then
+                begin
+                if nskeys > nkeys then goto 10; { have to sort }
+                pdesc := pldesc;
+                pindexseg := @psort^;
+                backscan := (pindexseg^.aord <> pdesc^.direction);
+                for i := 0 to nskeys-1 do
+                    begin
+                    if (pindexseg^.field <> field_num(scanid,key_id,i)) or
+                       (backscan <> (pindexseg^.aord <> pdesc^.direction))
+                    then goto 10; { have to sort }
+                    pdesc := pointer(ord(pdesc)+sizeof(flddesc));
+                    pindexseg := pointer(ord(pindexseg)+sizeof(isegment));
+                    end;
+                end;
+            end; { with }
+        locsorted := true;
+
+10 :    { must do a sort }
+
+    {   if the query is null, set the cost so that we choose the
+        data file - lets not use indexes for sorting the file  }
+
+        if pquery = nil then
+            begin
+            (*dbif lmdebug then writeln(dumpfile,'null query');*)
+            if path_is_data then
+                begin
+                sorted := locsorted;
+                cost := 0;
+                nhflds := 0;
+                nlflds := 0;
+                with pdifftable^[scanid]^ do
+                    begin
+                    if locsorted then reversescan := backscan;
+                    via := key_id;
+                    end;
+                end;
+            end
+        else
+            begin
+
+        {   compute the high and low search keys that derive from this path
+            and the query.  also record the constant triples used in these
+            keys.  also determine whether the range defined by the key is
+            open (a >,<,>=,<= qualification is used to establish the key).
+
+            keys are formed by choosing the longest sequence of = quals
+            followed by the longest sequence of <,>=,<,<= quals, where the
+            latter must all satisfy the following constraints:
+
+            low key : if the corresponding field of the path is sorted
+                ascending then > or >= else < or <=
+
+            high key : if the corresponding field of the path is sorted
+                ascending then < or <= else > or >= }
+
+            pconst := pointer(ord(@pquery^.qexp) +
+                              sizeof(triple)*pquery^.ntriples);
+            pdesc := pldesc;
+            pnew := @pnew_approx^;
+
+            high_open := false;
+            low_open := false;
+            high_active := true;
+            low_active := true;
+            high_flds := 0;
+            low_flds := 0;
+            ifld := 0;
+            repeat
+                itriple := 0;
+                pexpr := @pquery^.qexp;
+                fldnum := field_num(scanid,key_id,ifld);
+                break_low := not low_active;
+                break_high := not high_active;
+                repeat
+                    action := pexpr^.action;
+                    if action > ex_and then
+                        begin
+                        pexpr := pointer(ord(pexpr) + sizeof(triple));
+                        itriple := itriple + 1;
+                        if fldnum = pexpr^.fldid then
+                            begin
+                            le := (action = ex_eq) or (action = ex_lt) or
+                                   (action = ex_le);
+                            ge := (action = ex_eq) or (action = ex_gt) or
+                                   (action = ex_ge);
+                            if pdesc^.direction = descending then
+                                begin
+                                temp := le;
+                                le := ge;
+                                ge := temp;
+                                end;
+                            if high_active then
+                                begin
+                                if le then
+                                    begin
+                                    if high_open and (action = ex_eq) then
+                                        begin
+                                        high_active := false
+                                        end
+                                    else
+                                        begin
+                                        high_open := high_open or
+                                                     (action <> ex_eq);
+                                        high_flds := high_flds + 1;
+                                        pnew^.high := itriple+1;
+                                        end;
+                                    break_high := true;
+                                    end;
+                                end;
+                            if low_active then
+                                begin
+                                if ge then
+                                    begin
+                                    if low_open and (action = ex_eq) then
+                                        begin
+                                        low_active := false
+                                        end
+                                    else
+                                        begin
+                                        low_open := low_open or
+                                                    (action <> ex_eq);
+                                        low_flds := low_flds + 1;
+                                        pnew^.low := itriple+1;
+                                        end;
+                                    break_low := true;
+                                    end;
+                                end;
+                            end;
+                        end;
+                    itriple := itriple + 1;
+                    pexpr := pointer(ord(pexpr) + sizeof(triple));
+                until (ord(pexpr) = ord(pconst)) or
+                      (break_high and break_low);
+                high_active := high_active and break_high;
+                low_active := low_active and break_low;
+                pdesc := pointer(ord(pdesc)+sizeof(flddesc));
+                pnew := pointer(ord(pnew)+sizeof(approxrec));
+                ifld := ifld + 1;
+            until (ifld = keys) or ((not high_active) and (not low_active));
+
+            (*dbif lmdebug then
+                begin
+                writeln(dumpfile,'low_flds,high_flds:',low_flds:7,
+                                                       high_flds:7);
+                writeln(dumpfile,'low_open,high_open:',ord(low_open):7,
+                        ord(high_open):7);
+                end;*)
+
+
+        {   given the presence and nature of the high and low keys, we
+            distinquish four types of situations:
+
+            equals - either low key or high key is all equals
+            onesided - only a low key or only a high key exists, and it
+                is open (contains a >, <, <=, >=)
+            twosided - both a low key and a high key exist and they are
+                both open
+            unbounded - the query does not allow a restriction on the
+                access path }
+
+            if (low_flds > 0) and (not low_open) then
+                begin
+                high_flds := low_flds;
+                pnew := @pnew_approx^;
+                for i := 1 to high_flds do
+                    begin
+                    pnew^.high := pnew^.low;
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                qual_type := equals;
+                end
+            else if (high_flds > 0) and (not high_open) then
+                begin
+                low_flds := high_flds;
+                pnew := @pnew_approx^;
+                for i := 1 to high_flds do
+                    begin
+                    pnew^.low := pnew^.high;
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                qual_type := equals;
+                end
+            else if (low_flds = 0) and (high_flds = 0) then
+                qual_type := unbounded
+            else if (low_flds > 0) then
+                begin
+                if high_flds > 0 then qual_type := twosided
+                else qual_type := onesided;
+                end
+            else qual_type := onesided;
+
+            (*dbif lmdebug then
+                begin
+                writeln(dumpfile,'qual_type:',ord(qual_type));
+                end;*)
+
+            {  Estimate the number of keys per page of on file }
+
+            on_id := pdifftable^[scanid]^.on;
+
+            recsper := recsper_estimate(on_id);
+            keysper := recsper_estimate(key_id);
+
+            {  Estimate the number of ios to via file and the number of
+               resulting data records fetched }
+
+            with strategy[qual_type] do
+                begin
+                (*dbwriteln(dumpfile,
+                            fract_ios.numerator:7,fract_ios.denominator:7);*)
+                Via_ios := abs_ios + fraction(totalpages,fract_ios);
+                Via_recs := abs_recs + fraction(Via_recs,fract_recs);
+                end;
+
+            {  Check for empty file }
+
+            if recsper = 0 then
+                begin
+                low_flds := 0;
+                high_flds := 0;
+                if path_is_data then loccost := 0
+                else loccost := 1;
+                end
+            else
+                begin
+
+            {   compute expected number of total ios necessary to fetch
+                data records  }
+
+                if path_is_data then Find_ios := Via_ios
+                else
+                    begin
+                    depth := pfiletable^[on_id]^.depth;
+                    if depth = 0 then Find_ios := Via_ios + 1
+                    else Find_ios := Via_ios+mult424(Via_recs,depth-1);
+                    end;
+
+           {    compute and add the cost of sorting, if necessary }
+
+                if locsorted then loccost := Find_ios
+                else
+                    begin
+
+                {   compute filtration as function of unused restrictions }
+
+                    count_free_quals(cnt_eq,cnt_ineq);
+                    Data_recs := fraction(Via_recs,eq_filtrate[cnt_eq]);
+                    Data_recs := fraction(Data_recs,ineq_filtrate[cnt_ineq]);
+
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'Via_recs,Data_recs:',Via_recs:14,
+                                Data_recs:14);*)
+
+                {   later we must make a better estimate of run length - for
+                    now take passes := ceiling(log Run_Pages (totalpages)) }
+
+
+                    totalpages := div424(Data_recs,recsper*2,trash);
+                    if trash <> 0 then totalpages := totalpages + 1;
+                    passes := 0;
+                    expon := 1;
+                    repeat
+                        passes := passes + 1;
+                        expon := mult424(expon,Run_Pages);
+                    until comp44(expon,totalpages) <> lt;
+
+                    (*dbif lmdebug then
+                        writeln(dumpfile,'totalpages,expon,passes:',
+                                totalpages:14,expon:14,passes:7);*)
+
+                    loccost := Find_ios + mult424(totalpages,2*passes-1);
+                    end;
+                end;
+
+        {    if we have a lower cost path, then record the proper data }
+
+            if comp44(loccost,cost) = lt then
+                begin
+                sorted := locsorted;
+                cost := loccost;
+                nhflds := high_flds;
+                nlflds := low_flds;
+                with pdifftable^[scanid]^ do
+                    begin
+                    movelf(@pnew_approx^,@pold_approx^,sizeof(approxrec)*keys);
+                    if locsorted then reversescan := backscan;
+                    via := key_id;
+                    end;
+                end;
+            end;
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'cost,loccost,locsorted:',
+                    cost:14,loccost:14,ord(locsorted):3);
+            end;*)
+end; { cost_out }
+{***************************************************************************
+
+                                key_sizes
+
+        computes the sizes for the low and high search keys.  the search
+        keys are records from the on file.
+
+        Input Parameters
+                scanid - differential scan index
+                pquery - pts to query
+                papprox - gives the constant triples needed for the low
+                    and high keys
+                high_flds - # of fields in high key
+                low_flds - # of fields in low key
+
+         Output Parameters
+                lowsize - size of low key record
+                highsize - size of high key record
+
+****************************************************************************}
+procedure key_sizes(    scanid : integer;
+                        pquery : ptrquery;
+                        papprox : ptrapproxkey;
+                        low_flds,
+                        high_flds : integer;
+                    var lowsize,
+                        highsize : integer);
+var
+        vflds : integer;{##}
+        i : integer;
+        pvia : ptrfiledesc;
+        pctriple : ptrtriple;
+        pconst : ptrdata;
+        pvfld : ptrvfld;
+        pexpr : ptrexpr;
+        pnew : ^ approxrec;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with pdifftable^[scanid]^ do
+            begin
+            pexpr := @pquery^.qexp;
+            pconst := @pexpr^[pquery^.ntriples];
+            pvia := pfiletable^[via];
+            vflds := pfiletable^[on]^.vflds;{##}
+            if high_flds <> 0 then
+                begin
+                highsize := vflds;{##}
+                pnew := @papprox^;
+                for i := 1 to high_flds do
+                    begin
+                    pctriple := @pexpr^[pnew^.high];
+                    if pctriple^.desc.ftype >= ftypvstr then
+                        begin
+                        pvfld := pointer(ord(pconst)+pctriple^.desc.offset);
+                        highsize := highsize + pvfld^.size;
+                        end;
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                end
+            else highsize := 0;
+
+            if low_flds <> 0 then
+                begin
+                lowsize := vflds;{##}
+                pnew := @papprox^;
+                for i := 1 to low_flds do
+                    begin
+                    pctriple := @pexpr^[pnew^.low];
+                    if pctriple^.desc.ftype >= ftypvstr then
+                        begin
+                        pvfld := pointer(ord(pconst)+pctriple^.desc.offset);
+                        lowsize := lowsize + pvfld^.size;
+                        end;
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                end
+            else lowsize := 0;
+            end;
+
+        (*if lmdebug then writeln(dumpfile,'low,high:',lowsize:7,highsize:7);*)
+end; { key_sizes }
+{***************************************************************************
+
+                                fill_keys
+
+        extracts the fields for the low and high search keys.  the search
+        keys are records from the on file.
+
+        Input Parameters
+                scanid - differential scan index
+                pquery - pts to query
+                papprox - gives the constant triples needed for the low
+                    and high keys
+                ploclow - pts to area for low key
+                plochigh - pts to area for high key
+                high_flds - # of fields in high key
+                low_flds - # of fields in low key
+
+
+****************************************************************************}
+procedure fill_keys(    scanid : integer;
+                        pquery : ptrquery;
+                        papprox : ptrapproxkey;
+                        ploclow,plochigh : ptrdata;
+                        low_flds,high_flds : integer);
+var
+        onvflds,{##}
+        highsize,lowsize,
+        i : integer;
+        psdesc : ptrrecptr; {##}
+        pdesc : ptrflddesc;
+        pvia : ptrfiledesc;
+        pctriple : ptrtriple;
+        pconst : ptrdata;
+        pvfld : ptrvfld;
+        pexpr : ptrexpr;
+        pnew : ^ approxrec;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with pdifftable^[scanid]^ do
+            begin
+            pexpr := @pquery^.qexp;
+            pconst := @pexpr^[pquery^.ntriples];
+            pvia := pfiletable^[via];
+            with pfiletable^[on]^ do{##}
+                begin{##}
+                onvflds := vflds;{##}
+                if on <> via then psdesc := pfiletable^[via]^.pkdesc{##}
+                else psdesc := pedesc;{##}
+                end;{##}
+            if high_flds <> 0 then
+                begin
+                pdesc := pointer(ord(psdesc));{##}
+                highsize := onvflds;{##}
+                pnew := @papprox^;
+                for i := 1 to high_flds do
+                    begin
+                    pctriple := @pexpr^[pnew^.high];
+                    extractkey(@pctriple^.desc,@pdesc^,1,pconst,plochigh,
+                               highsize);
+                    if pctriple^.desc.ftype >= ftypvstr then
+                        begin
+                        pvfld := pointer(ord(pconst)+pctriple^.desc.offset);
+                        highsize := highsize + pvfld^.size;
+                        end;
+                    pdesc := pointer(ord(pdesc) + sizeof(flddesc));
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                end;
+            if low_flds <> 0 then
+                begin
+                pdesc := pointer(ord(psdesc));{##}
+                lowsize := onvflds;{##}
+                pnew := @papprox^;
+                for i := 1 to low_flds do
+                    begin
+                    pctriple := @pexpr^[pnew^.low];
+                    extractkey(@pctriple^.desc,@pdesc^,1,pconst,ploclow,
+                               lowsize);
+                    if pctriple^.desc.ftype >= ftypvstr then
+                        begin
+                        pvfld := pointer(ord(pconst)+pctriple^.desc.offset);
+                        lowsize := lowsize + pvfld^.size;
+                        end;
+                    pdesc := pointer(ord(pdesc) + sizeof(flddesc));
+                    pnew := pointer(ord(pnew)+sizeof(approxrec));
+                    end;
+                end;
+            end;
+
+end; { fill_keys }
+
+ÿ

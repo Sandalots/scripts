@@ -1,0 +1,737 @@
+{ Copyright 1983,Apple Computer Inc. }
+{$L-}
+{#F     libdb/schema.text }
+{$R-}
+{$U-}
+{$SETC OSBUILT := TRUE }
+unit schema ;
+       intrinsic;
+
+interface
+
+uses
+{$IFC OSBUILT }
+       {$U libsm/unitstd.obj} unitstd,
+       {$U libdb/dbenv.obj } dbenv,
+       {$U libin/INTRLIBp.obj } international,
+       {$U libdb/dbdecl1.obj } dbdecl1,
+       {$U libos/syscall.obj } syscall,
+       {$U libos/psyscall.obj } psyscall,
+       {$U libdb/lowlevel.obj } lowlevel,
+       {$U libdb/pooler.obj } pooler,
+       {$U libdb/heap.obj } heap,
+       {$U libdb/czcompact.obj } czCompact,
+       {$U libdb/vltree.obj } vltree,
+       {$U libdb/scan.obj } scan,
+       {$U libdb/labscan.obj } labscan;
+{$ELSEC }
+{$U OBJ:dbenv.obj } dbenv,
+     {$U INTRLIB.obj } international,
+       {$U OBJ:dbdecl1.obj } dbdecl1,
+       {$U OBJ:syscall.obj } syscall,
+       {$U OBJ:lowlevel.obj } lowlevel,
+       {$U OBJ:pooler.obj } pooler,
+       {$U OBJ:heap.obj } heap,
+       {$U OBJ:czcompact.obj } czCompact,
+       {$U OBJ:vltree.obj } vltree,
+       {$U OBJ:scan.obj } scan,
+       {$U OBJ:labscan.obj } labscan;
+{$ENDC }
+
+const
+
+
+        { label record types }
+
+        indexfile       = 0;    { describes index file  }
+        fileschema      = 1;    { more complete desc. of data file }
+        queryCheckPoint = 2;    { list manager query check point }{##}
+
+        { file opening labelusages }
+
+        not_needed      = 0;    { don't need label to open file }
+        via_only        = 1;    { only need to open the via file }
+        on_only         = 2;    { only need to open indexes for onfile }
+        on_and_via      = 3;    { need via file & indexes for onfile }
+        new_index       = 4;    { only need to tack on a newly made index
+                                  to already open onfile's list of indexes }
+
+type
+        isegment =
+            packed record
+                aord : 0..1;            { ascending (0) or descending (1) }
+                field : 0..32767;       { field # in data file }
+            end;
+        ptrisegment = ^isegment;
+
+        idesc =                         { describes index sort key }
+            array[0..0] of isegment;
+        ptridesc = ^ idesc;
+
+        ientry =
+            record
+                lab       : labelentry; { standard label preamble }
+                iduplok   : boolean;    { true iff duplicates allowed }
+                isort     : integer;    { # fields to put in nonleaf pages }
+                ikeys     : integer;    { # fields in index sort key }
+                iunique   : uniqueid;   { unique id of index file }
+                iflds     : idesc;      { describes ikeys sort fields }
+               {ifilename : pathname      (located at
+                                           @iflds+ikeys*sizeof(isegment))}
+            end;
+        ptrientry = ^ ientry;
+
+
+{!!!!   The following procedures are only included in the interface for the
+        use of the indexbuild unit.  They are not for general use  }
+
+{^T 20}
+{************************************************************************
+
+                                filldesc
+
+
+        initializes the bare minimum fields of the file descriptor
+        beyond the filelabel.
+
+        openid
+        fstatus
+        pkeyfiles
+        scans
+        lastvfld,firstvfld,lastvsfld
+
+        Input Parameters
+                pfile - file descriptor to fill in
+        Output Parameters
+                ddresult - return result
+        Return Results
+                noerr
+                errors from OS(info)
+
+        !!!not for general use!!! exported only for indexbuild unit
+
+************************************************************************}
+
+procedure filldesc(var ddresult : integer;
+                       pfile : ptrfiledesc);
+
+{^T20}
+{**********************************************************************
+
+                               makefile
+
+        note : all names are appended to the prefix first.
+
+        creates a btree file and writes the fixed part of the file label
+        out.  leaves the file open. makefile expects that the following
+        things are correct in the pfdesc:
+
+        prod_vers
+        flags, except fisbtree and ffileok
+        pagesize
+        lastpage
+        nfields
+        nkeys
+        nsort
+        ticketfld
+        vflds
+        kvflds
+        pedesc
+        updateversion
+
+        makefile adds the following things in the filelabel
+
+        nrecs
+        depth
+        root
+        firstpage
+        freelist
+        labellist
+        labelticket
+        tickets
+        funiqueid
+
+        Input Parameters:
+
+                pfdesc - points to in memory file descriptor
+                pname - points to pathname for new file
+
+        Output Parameters:
+
+                ddresult - result code
+                pfdesc^.frefno - on noerr, the refno of the created file
+
+        Error Statuses:
+                noerr
+                nobuffs
+                ioerr
+                noroom
+                inconsistent
+                OS(make_file,open,info)
+
+**********************************************************************}
+
+procedure makefile(var ddresult : integer;
+                        pname : ptrpathname;
+                        pfdesc : ptrfiledesc);
+
+{^T 30}
+{**************************************************************************
+
+                                openindexes
+
+        note : all names are appended to the prefix first.
+
+        depending on labelusage, open the via index and/or all the indexes
+        (for update).
+
+        labelusage values and what they mean:
+
+        not_needed      = 0       don't need label to open file
+        via_only        = 1       only need to open the via file
+        on_only         = 2       only need to open indexes for onfile
+        on_and_via      = 3       need via file & indexes for onfile
+        new_index       = 4       only need to tack on a newly made index
+                                  to already open onfile's list of indexes
+
+        Input Parameters
+                scanid - scan for which the indexes are being opened
+                ifilename - name of index file (for viafile or new index)
+                intent - scan intent
+                labelusage - what indexes are to be opened and why (see above)
+
+        Output Parameters
+                ddresult - return result
+                viafile - if viafile is desired, returns file index of viafile
+
+        Return Results
+
+                noerr
+                nomem
+                nobuffs
+                noroom
+                wrongfile
+                ioerr
+                notfound
+                inconsistent
+                notdbfile
+                DBVersionMismatch
+                DBTooNew
+                badpagesize
+                OS(open,lookup,info)
+
+        !!!not for general use!!! exported only for indexbuild unit
+
+***************************************************************************}
+procedure openindexes(var ddresult : integer;
+                      var viafile : integer;
+                          scanid : integer;
+                          ifilename : ptrpathname;
+                          intent : integer;
+                          labelusage : integer);
+
+{**************************************************************************
+
+                                cvt_scan
+
+        converts a scan to a different intent.  the on file has been
+        opened for a label scan & the via file and any indexes have been
+        opened in the proper mode for the data scan.  we just remove the
+        traces of the scan.  note that the complete scan descriptor,
+        including update bits is assumed to be allocated already.
+
+        legal conversions:
+            readonly to labelupdate
+            labelreadonly to update
+            labelreadonly to readonly
+            labelreadonly to labelupdate
+            labelreadonly to labelreadonly
+
+         Input Parameters
+                scanid - scan to be converted
+                sintent - new scan intent
+                sviafile - new scan viafile
+
+
+         Output Parameters
+                ddresult - return result
+
+         Return Results
+                noerr
+                nomem
+                noroom
+                inconsistent
+                OS(close_object)
+
+        !!!not for general use!!! exported only for indexbuild unit
+
+
+****************************************************************************}
+
+procedure cvt_scan(var ddresult : integer;
+                       scanid,
+                       sintent,
+                       sviafile : integer);
+
+{^T 20}
+{***************************************************************************
+
+                                initpool
+
+        sets up data structures to use database intrinsics.  must be called
+        before calling any other database intrinsic with the parameter
+        first_time = true and giving the ldsn for the heap and buffer pool
+        segment in heap_ldsn. can be called subsequently with first_time =
+        false giving new heap size and number of buffers for buffer
+        pool.  either a shared or private data segment can be used for the heap
+        segment.  shared segments are opened if they exist, else they are
+        created.
+
+        Input Parameters
+                first_time - true iff this the first call to initpool
+                heap_ldsn - if this is the first call to initpool, gives
+                    the ldsn for heap_segment
+                nbuff - the # of buffers for buffer pool
+                dheapsize - new size for heap
+                pheapname - name of heap segment (only if first_time), set to
+                    nil if the default datasegment is desired (boot disk)
+                dstype - type of heap segment: OS Tdstype
+                pagesize - size of buffer pool page
+
+
+        Output Parameters
+                ddresult - return result
+
+        Return Results
+                noerr
+                if first_time then also
+                    OS(make_dataseg,info_dataseg) unless a segment name is given
+                    in which case
+                    OS(make_dataseg,info_dataseg,size_dataseg,setaccess_dataseg,
+                       open_dataseg)
+                else also
+                    nomem
+                    noroom
+                    ioerr
+                    OS(size_dataseg)
+
+***************************************************************************}
+
+procedure initpool(var ddresult : integer;
+                        first_time : boolean;
+                        heap_ldsn : integer;
+                        nbuff : integer;
+                        dheapsize : integer;
+                        pheapname : ptrpathname;
+                        dstype : Tdstype;
+                        pagesize : integer);
+
+{^T 20}
+{***************************************************************************
+
+                                flushscan
+
+            flushes all buffers associated with the specified scan and
+            rewrites the file schema to indicate that the file is
+            consistent.
+
+
+            Input Parameter
+                scanid - scan to close
+
+            Output Parameter
+                ddresult - return result
+
+            Return Results
+                noerr
+                ioerr
+                inconsistent
+                badscanid
+                OS(close_object)
+
+****************************************************************************}
+
+procedure flushscan(var ddresult : integer;
+                        scanid : integer);
+
+{***************************************************************************
+
+                                closescan
+
+            closes a scan.
+
+            Input Parameter
+                scanid - scan to close
+
+            Output Parameter
+                ddresult - return result
+
+            Return Results
+                noerr
+                ioerr
+                inconsistent
+                badscanid
+                OS(close_object)
+
+
+****************************************************************************}
+
+procedure closescan(var ddresult : integer;
+                         scanid : integer);
+
+{^T 30}
+{**************************************************************************
+
+                                openscan
+
+        note : all names are appended to the prefix first.
+
+        opens a scan on onname via vianame with scan intent sintent.
+
+        Input Parameters
+                onname - name of on file
+                vianame - name of via file, may be the same as onname
+                sintent - intent of scan :
+                    update
+                    readonly
+                    labelreadonly
+                    labelupdate
+
+        Output Parameters
+                ddresult - return result
+                scanid - index of scan descriptor
+
+        Return Results
+                noerr
+                notfound
+                nomem
+                ioerr
+                nobuffs
+                inconsistent
+                wrongfile
+                notdbfile
+                badpagesize
+                DBVersionMismatch
+                DBTooNew
+                OS(open,lookup,info)
+
+***************************************************************************}
+
+procedure openscan(var ddresult : integer;
+                        onname,
+                        vianame : ptrpathname;
+                    var scanid : integer;
+                        sintent : integer);
+
+
+{***************************************************************************
+
+                                makedescfile
+
+        note : all names are appended to the prefix first.
+
+        creates a datafile from an internal memory descriptor.  no
+        variable part is added to the label. makedescfile expects the
+        following to be set in pfdesc:
+
+        prod_vers
+        flags, except fisbtree, ffileok, fdata, which makedescfile sets
+        nfields
+        nkeys
+        nsort
+        ticketfld
+        vflds
+        kvflds
+        pedesc
+
+
+        Input Parameters:
+
+                pfdesc - points to in memory file descriptor
+                pfname - points to pathname for new file
+
+        Output Parameters:
+
+                ddresult - result code
+
+        Error Statuses:
+                noerr
+                nobuffs
+                ioerr
+                noroom
+                inconsistent
+                OS(make_file,open,info,close_object)
+
+
+**********************************************************************}
+
+procedure makedescfile(var ddresult : integer;
+                           pname : ptrpathname;
+                           pfdesc : ptrfiledesc);
+
+{***************************************************************************
+
+                                clonefile
+
+        note : all names are appended to the prefix first.
+
+        Creates a file from the lowlevel description in sourcefile.  The
+        actual OS file containing the data may already exist.  If the file
+        already exists, only adds the form from the sourcefile to the schema
+        (and deletes the old form, if one exists).
+
+        Input Parameters
+                sourcefile - ptr to name of file to be cloned
+                filename - ptr to name of new file
+                needtoomakefile - true iff the file does not already exist
+
+        Output Parameter
+
+                ddresult - result code:
+                    noerr
+                    nomem
+                    notdbfile
+                    DBVersionMismatch
+                    noroom
+                    ioerr
+                    inconsistent
+                    nobuffs
+                    inconsistent
+                    OS(open,lookup,info,close_object)
+
+                    and, if needtomakefile is true
+
+                    OS(make_file)
+
+
+
+**********************************************************************}
+
+procedure clonefile(var ddresult : integer;
+                        sourcefile,
+                        filename : ptrpathname;
+                        needtomakefile : boolean);
+
+
+{******************************************************************************
+
+                                makeformfile
+
+        note : all names are appended to the prefix first.
+
+        Creates a file from the form in memory pointed to by pform.  The
+        actual OS file containing the data may already exist.  If the file
+        already exists, only adds the form to the schema (and deletes the
+        old form, if one exists).
+
+        Input Parameters
+                pform - ptr to form description
+                filename - ptr to name of file
+                needtoomakefile - true iff the file does not already exist
+
+        Output Parameter
+
+                ddresult - result code:
+                    noerr
+                    nomem
+                    notdbfile
+                    DBVersionMismatch
+                    noroom
+                    ioerr
+                    inconsistent
+                    nobuffs
+                    inconsistent
+                    OS(open,lookup,info,close_object)
+
+                    and, if needtomakefile is true
+
+                    OS(make_file)
+
+
+*******************************************************************************}
+
+procedure makeformfile(var ddresult : integer;
+                           pform : ptrdata;
+                           pfname : ptrpathname;
+                           needtomakefile : boolean);
+
+{******************************************************************************
+
+                                    quick_label_scan
+
+        uses an open scan (scanid) to create a labelscan on the onfile of
+        that scan (labelreadonly).
+
+        Input Parameters
+                scanid - index of scan on whose onfile the labelscan is
+                        desired
+                sintent - labelreadonly or labelupdate
+
+        Output Parameters
+                ddresult - return result
+                lscanid - index of label scan
+
+         Return Results
+                noerr
+                nomem
+                badscanid
+
+******************************************************************************}
+
+procedure quick_label_scan(var ddresult : integer; {##}
+                               scanid : integer;{##}
+                               sintent : integer; {##}
+                           var lscanid : integer);{##}
+
+{*************************************************************************
+
+                               get_header
+
+        Reads in the form header for the data file associate with scanid.
+        The form header contains various useful information, including
+        the number of bytes in the rest of the description.  call
+        get_header and allocate the necessary memory before calling
+        getform.
+
+        Input Parameters:
+
+                scanid - specifies scan.  the header is retrieved from this
+                    search file
+
+        Output Parameters:
+
+                head - the header
+                ddresult - return codes:
+                        noerr
+                        nomem
+                        notfound  - no form exists for this file
+                        badscanid
+                        ioerr
+                        inconsistent
+                        nobuffs
+
+**************************************************************************}
+
+procedure get_header(var ddresult : integer;
+                         scanid : integer;
+                      var head   : header);
+
+{*************************************************************************
+
+                            getform
+
+        Reads in the form for the data file associate with scanid.  Call
+        get_header and allocate the necessary memory before calling
+        getform.
+
+        Input Parameters:
+
+                scanid - specifies scan.  the header is retrieved from this
+                    search file
+
+        Output Parameters:
+
+                pdesc - pointer to where the descriptor will be read
+                ddresult - return codes:
+                        noerr
+                        notfound - no form exists for this file
+                        badscanid
+                        ioerr
+                        inconsistent
+                        nobuffs
+
+*************************************************************************}
+
+procedure getform (var ddresult : integer;
+                        scanid : integer;
+                        pdesc : ptrdata);
+{^T20}
+{*********************************************************************
+
+                           deletefile
+
+        note : all names are appended to the prefix first.
+
+        deletes a data file and all of it's indexes.
+
+        Input Parameters:
+
+                pfname - the name of the file to delete
+
+        Output Parameters:
+
+                ddresult - result code
+
+        Error Statuses
+                noerr
+                ioerr
+                notfound
+                nomem
+                inconsistent
+                nobuffs
+                badpagesize
+                OS(kill_object,open,info,close_object)
+
+
+**********************************************************************}
+
+procedure deletefile(var ddresult : integer;
+                          pfname : ptrpathname);
+
+{^T20}
+{*********************************************************************
+
+                           deleteindex
+
+        note : all names are appended to the prefix first.
+
+        deletes an index file.
+
+        Input Parameters:
+
+                pfname - the name of the file to delete
+                piname - the name of the index file to delete
+
+        Output Parameters:
+
+                ddresult - result code
+
+        Error Statuses
+                noerr
+                ioerr
+                notfound
+                nomem
+                inconsistent
+                nobuffs
+                OS(kill_object,open,info,close_object)
+
+**********************************************************************}
+
+procedure deleteindex(var ddresult : integer;
+                          piname,
+                          pfname : ptrpathname);
+
+
+Implementation
+{$SETC debug  := false  }
+{$IFC DOLLARD }
+{$D- }
+{$ENDC}
+
+type
+        ptrflddesc = ^ flddesc;
+
+{$IFC OSBuilt }
+{$I libdb/opensup.text }
+{$I libdb/open.text }
+{$I libdb/filecreate.text }
+{$I libdb/hilevel.text }
+{$ELSEC}
+{$I l:opensup.text }
+{$I l:open.text }
+{$I l:filecreate.text }
+{$I l:hilevel.text }
+{$ENDC }
+end.
+
+ÿ

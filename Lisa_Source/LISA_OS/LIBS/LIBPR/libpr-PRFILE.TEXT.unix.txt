@@ -1,0 +1,403 @@
+(*
+$Exec
+PLibPr/PrFile
+{no listing}
+LibPr/Temp
+GLibPr/Temp
+LibPr/PrFile
+$EndExec
+*)
+{               NOTE: The above compiles this program.                   }
+{ ---------------------------------------------------------------------- }
+{                Copyright 1983, Apple Computer Inc.                     }
+UNIT PrFile;
+INTRINSIC;
+
+{
+    This interface contains the TYPE's and PROC's needed for background printing.
+}
+INTERFACE
+
+USES {$U LibOS/SysCall   }  SysCall,
+     {$U LibPM/PMDecl    }  PMDecl,
+     {$U LibSM/UnitStd   }  UnitStd,
+     {$U LibSM/UnitHz    }  UnitHz,
+     {$U LibQD/Storage   }  Storage,
+     {$U LibQD/QuickDraw }  QuickDraw,
+     {$U LibFM/FontMgr   }  FontMgr,
+
+     {$U LibPr/PrStd     }  PrStd;
+
+{ ---------------------------------------------------------------------- }
+
+CONST
+    pfPassword = -13264;
+    pfPicHRule = 20;
+    pfPicVRule = 21;
+    pfPicTab   = 22;
+
+{ ---------------------------------------------------------------------- }
+
+TYPE
+    TPfHeader = RECORD
+        prins: TPrins;
+        password: TC;
+        cPages: TC;
+    END;
+
+    TPfPage = RECORD
+        lStart: TL;             {Start in print file of page}
+        lLength: TL;            {Length of page}
+        hOffset, vOffset: TC;   {Page offset}
+    END;
+    TPfPages = ARRAY[1..999] OF TPfPage;
+    TPPfPages = ^TPfPages;
+    THPfPages = ^TPPfPages;
+
+    TPfSpecial = RECORD
+        CASE INTEGER OF
+            1: (ptorg: Point;
+                leng: TC );
+    END;
+    TPPfSpecial = ^TPfSpecial;
+    THPfSpecial = ^TPPfSpecial;
+
+{ ---------------------------------------------------------------------- }
+
+{PrFile writer}
+PROCEDURE PfDocStart( prins: TPrins );
+PROCEDURE PfStartPage;
+PROCEDURE PfNextBand( rNextBand: Rect );
+PROCEDURE PfDumpBand;
+PROCEDURE PfEndPage;
+PROCEDURE PfDocEnd;
+
+PROCEDURE PfOffsetPage( h, v: TC );
+
+{ Our graphics stuff }
+PROCEDURE PfTab    ( cLng: TC );
+PROCEDURE PfHRule  ( cLng: TC );
+PROCEDURE PfVRule  ( cLng: TC );
+
+{Cleanup}
+PROCEDURE PfCleanup;
+
+{ ---------------------------------------------------------------------- }
+
+IMPLEMENTATION
+{$S Pr      }
+
+{$IFC fPrDbgOK}
+   {$R+}
+{$ELSEC}
+   {$R-}
+{$ENDC}
+
+{$IFC fPrSymbols}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+
+{ ---------------------------------------------------------------------- }
+
+VAR
+    hPfPages: THPfPages;
+    pfHeader: TPfHeader;
+    pfPic: PicHandle;
+
+    cPfRefNum: TC;
+
+    pfSpecial: TPfSpecial;
+    pPfSpecial: TPPfSpecial;
+    hPfSpecial: THPfSpecial;
+
+{Generic IO}
+PROCEDURE OpenBlock( VAR cError:TC; path: PathName; access: MSet); FORWARD;
+PROCEDURE WriteBlock( VAR cError:TC; p: TP; cCount: TC); FORWARD;
+PROCEDURE PfSavePos( VAR cError: TC; VAR lPos: TL); FORWARD;
+
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfCleanup;
+VAR
+    cError: TC;
+BEGIN
+   IF fProcDbg THEN WRITELN('PfCleanup');
+
+   IF ( (PrIs=PrIsSpooling) and (pfPic<>NIL) ) THEN BEGIN        {!PE192}
+      If pPr<>Nil then Begin                                  { <- These two If statements are here for }
+         If pPr^.PrHz<>Nil then Begin                        {    the latency involved when PrIs is set}
+            ClosePicture;                                     {    to PrIsSpooling and when pfPic is set}
+            KillPicture( pfPic );                             {    to Nil. EZ 4/13/83                   }
+            pfPic := NIL;
+         End;
+      End;
+   END;
+
+   Close_Object( cError, cPfRefNum );
+END;
+
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfDocEnd;
+VAR
+    cError: TC;
+    lActual: TL;
+BEGIN
+    IF fProcDbg THEN WRITELN('PfDocEnd');
+
+{Trim empty page off end, zero reference is OK}
+    WITH pfHeader DO BEGIN
+        WHILE (cPages > 0 ) AND
+              (hPfPages^^[cPages].lLength = -1)
+        DO BEGIN
+            cPages:=cPages-1;
+        END;
+    END;
+
+{Close the print data file}
+    Close_Object( cError, cPfRefNum );
+    PsCheckError( cError );
+
+
+{Open the control file}
+    OpenBlock( cError, 'Print.Control', [dwrite, private] );
+
+{Write out the header}
+    WriteBlock( cError, @pfHeader, SIZEOF(TPfHeader) );
+    IF cError > 0 THEN cError:=prErrFore;
+    PsCheckError( cError );
+
+{Write out the page array}
+    WriteBlock( cError, POINTER(ORD(hPfPages^)), pfHeader.cPages*SIZEOF(TPfPage) );
+    IF cError > 0 THEN cError:=prErrFore;
+    PsCheckError( cError );
+
+{Close the print control file}
+    Close_Object( cError, cPfRefNum );
+    PsCheckError( cError );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfDocStart{ prins: TPrins; pBlock: TPPfBlock };
+VAR
+    cError: TC;
+BEGIN
+    IF fProcDbg THEN WRITELN('PfDocStart');
+
+    OpenBlock( cError, spBackFile, [dwrite, private] );
+
+{Write out the header identifying the device}
+    pfHeader.prins:=prins;
+    pfHeader.password:=pfPassword;
+    pfHeader.cPages:=0;
+
+{Set pfPic handle to nil}
+    pfPic := NIL;   {!PE192}
+
+{Set initial throwaway allocation}
+    hPfPages:=POINTER(ORD( HAllocate( pPr^.prHz, 4 ) ));
+
+{Set up the thing for rules and tabs}
+    pPfSpecial:=POINTER(ORD(@pfSpecial));
+    hPfSpecial:=POINTER(ORD(@pPfSpecial));
+
+{Set up the default Pr bottleneck procs}
+    SetStdProcs(pPr^.gprocs);                     {!New quickdraw fix. EZ}
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfDumpBand;
+VAR
+    cError: TC;
+BEGIN
+{Close the picture and save it}
+    ClosePicture;
+
+    IF pfPic^^.picSize<0 THEN BEGIN {!GE326}
+       cError:=prErrFore;
+    END
+    ELSE BEGIN
+       WriteBlock( cError, POINTER(ORD(pfPic^)), pfPic^^.picSize );
+
+   {Update the page stuff}
+       WITH pfHeader DO BEGIN
+           WITH hPfPages^^[cPages] DO BEGIN
+               lLength:=pfPic^^.picSize;
+               IF fProcDbg THEN WRITELN('PfEndPage', cpages, lStart, lLength);
+           END;
+       END;
+    END;
+
+    KillPicture( pfPic );
+    pfPic := NIL;   {!PE192}
+    PsCheckError( cError );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfEndPage;
+BEGIN
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfHRule{ cLng: TC };
+BEGIN
+    IF fProcDbg THEN WRITELN('PfHRule');
+
+    WITH pfSpecial, thePort^ DO BEGIN
+        ptOrg:=pnLoc;
+        leng:=cLng;
+    END;
+    PicComment( pfPicHRule, 6, POINTER(ORD(hPfSpecial)) );
+    Move( cLng, 0 );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfNextBand{ ( rNextBand: Rect ) };
+VAR hzSave: THz;
+BEGIN
+   IF fProcDbg THEN PrWrtRect( 'PfNextBand, picFrame', rNextBand, TRUE );
+
+{Note: pfPic should be nil here.}
+   hzSave  := theHeap;
+   theHeap := pPr^.prHz;
+   pfPic   := OpenPicture( rNextBand );
+   theHeap := hzSave;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfOffsetPage{ ( h, v: TC ) };
+BEGIN
+    IF fProcDbg THEN WRITELN('PfOffsetPage');
+
+    WITH hPfPages^^[pfHeader.cPages] DO BEGIN
+        hOffset:=h;
+        vOffset:=v;
+    END;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE OpenBlock{( VAR cError: TC; path: PathName; access: MSet) };
+BEGIN
+    OPEN( cError, path, cPfRefNum, access );
+    IF
+        cError = 948
+    THEN BEGIN
+        MAKE_FILE( cError, path, 0);
+        IF cError > 0 THEN cError:=prErrFore;
+        PsCheckError( cError );
+        OPEN( cError, path, cPfRefNum, access );
+    END;
+    IF cError > 0 THEN cError:=prErrFore;
+    PsCheckError( cError );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfSavePos{ VAR cError: TC; VAR lPos: TL };
+VAR finfo: fs_info;
+BEGIN
+    IF fProcDbg THEN WRITELN('PfSavePos');
+
+    Info( cError, cPfRefNum, finfo );
+    lPos:=finfo.fmark;
+
+    PsCheckError( cError );
+    cError:=cPrError;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfStartPage;
+VAR
+    cError: TC;
+    savePort: GrafPtr;
+BEGIN
+    WITH pfHeader DO BEGIN
+        cPages:=cPages+1;
+        ChangeSizeH( pPr^.prHz, POINTER(ORD( hPfPages )), cPages*SIZEOF(TPfPage) );
+        WITH hPfPages^^[cPages] DO BEGIN
+            PfSavePos( cError, lStart );
+            PsCheckError( cError );
+            lLength:=-1;
+            hOffset:=0;
+            vOffset:=0;
+            IF fProcDbg THEN WRITELN('PfStartPage', cpages, lStart, lLength);
+        END;
+    END;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfTab{ cLng: TC };
+BEGIN
+    IF fProcDbg THEN WRITELN('PfTab');
+
+    WITH pfSpecial, thePort^ DO BEGIN
+        ptOrg:=pnLoc;
+        leng:=cLng;
+    END;
+    PicComment( pfPicTab, 6, POINTER(ORD(hPfSpecial)) );
+    Move( cLng, 0 );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE PfVRule{ cLng: TC };
+VAR
+    h: TH;
+    p: TP;
+BEGIN
+    IF fProcDbg THEN WRITELN('PfVRule');
+
+    WITH pfSpecial, thePort^ DO BEGIN
+        ptOrg:=pnLoc;
+        leng:=cLng;
+    END;
+    PicComment( pfPicVRule, 6, POINTER(ORD(hPfSpecial)) );
+    Move( 0, cLng );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE WriteBlock{ VAR cError:TC; p: TP; cCount: TC };
+VAR
+    lActual: TL;
+    i: TC;
+    iJunk: TC;
+BEGIN
+   IF fUnLockIO THEN Sched_Class ( iJunk, FALSE ); {UnLock}
+    Write_Data( cError, cPfRefNum, ORD(p), cCount, lActual, sequential, 0 );
+   IF fUnLockIO THEN Sched_Class ( iJunk, TRUE );  {Lock}
+
+    IF cError > 0 THEN BEGIN
+        cError:=prErrFore;
+        EXIT( WriteBlock);
+    END;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+END.
+{
+UNIT PrFile CHANGE LOG:
+     10/25/83 EZ: PfDocStart - Deleted procedure stuffing. Added call to SetStdProcs for new QuickDraw.
+      9/28/83 EZ: deleted declaration of ReadBlock - it was not used.
+      4/13/83 EZ & OD: pfCleanUp: fixed latency problem of PrIS and pfPic.
+      4/08/83 BH & OD: pfPic: check for nil value at cleanup.
+      2/19/83 OD: PfDumpBand: check for picSize<0 [>32K].
+      1/29/83 OD: Add Sched_Fence calls.
+}
+
+
+ÿ

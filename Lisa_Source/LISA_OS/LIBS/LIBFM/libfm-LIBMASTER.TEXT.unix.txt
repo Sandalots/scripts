@@ -1,0 +1,855 @@
+
+PROGRAM LibMaster; { January 1984 }
+
+USES
+   {$U libos/SysCall}      SysCall,
+   {$U libpl/PasLibCall}   PasLibCall,
+   {$U libsm/UnitStd}      UnitStd,
+   {$U libsm/UnitHz }      UnitHz,
+   {$U libfm/FontStuff}    FontStuff,
+   {$U libfm/OSVol}        Vol;
+
+{$E LIB.ERROR.TEXT}
+
+CONST
+    bufSize = $19000;  {100k}
+    tableSize = 127;  {0..127 = 128}
+
+TYPE
+    L_Name = STRING [64];
+    TFontList = ARRAY [1..tableSize] OF L_Name;
+
+    TPlace = RECORD
+        fstWord,
+        lstWord,
+        fst_MetWid,
+        lst_MetWid: LONGINT;
+    END;
+    TPosition = ARRAY [1..tableSize] OF TPlace;
+
+    TAddList = ARRAY [1..tableSize] OF BOOLEAN;
+
+    TDirectory = ARRAY [1..tableSize] OF
+        RECORD
+            id: E_Name;
+            fstWord,
+            lstWord,
+            fst_MetWid,
+            lst_MetWid: LONGINT;
+    END; {TDirectory}
+
+    TFinfo = RECORD
+               ascent,         {Distance from baseline to top of font bounding box}
+               descent,        {Distance from baseline to bottom of font bounding box}
+               widMax,         {Width of widest character in font}
+               leading: TC;    {White space between two adjacent lines of text}
+             END;
+
+VAR
+    srcName,
+    libName,
+    volumeName: PathName;
+    realFileName: E_Name;
+
+    pDirectory: ^TDirectory;
+    pFontlist: ^TFontList;
+    pPosition: ^TPosition;
+    pAddlist: ^TAddList;
+    dstFile,
+    dirSize,
+    lstEntry: INTEGER;
+
+    pSrc,
+    pDst,
+    FontPointer: TP;
+    ch: CHAR;
+
+    fvalidDirec: BOOLEAN;
+
+
+{===============================================================================
+
+#######> InitDirectory
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE InitDirectory;
+VAR
+    i: INTEGER;
+
+BEGIN {InitDirectory}
+    FOR i := 1 TO tableSize DO BEGIN
+        WITH pDirectory^ [i] DO BEGIN
+            id := '';
+            fstword := 0;
+            lstword := 0;
+            fst_MetWid := 0;
+            lst_MetWid := 0;
+        END; {with pDirectory^ [i]}
+        WITH pPosition^ [i] DO BEGIN
+            fstword := 0;
+            lstword := 0;
+            fst_MetWid := 0;
+            lst_MetWid := 0;
+        END;{with pPosition^ [i]}
+        pFontlist^ [i] := '';
+        pAddlist^ [i] := FALSE;
+    END; {for i}
+    lstEntry := 0;
+    dirSize := 0;
+    fvalidDirec := FALSE;
+END; {InitDirectory}
+
+
+{===============================================================================
+
+#######> InitMain
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE InitMain;
+CONST
+    delta = $8000; {32k}
+    myLdsn = 100;
+    noSwapping = FALSE;
+
+VAR
+    cError,
+    refNum: INTEGER;
+
+BEGIN
+    PLInitHeap (cError, refNum, bufSize, delta, myLdsn, noSwapping);
+    AllocMem (pSrc, bufSize);
+    AllocMem (pDst, bufSize);
+
+    NEW (pDirectory);
+    NEW (pFontlist);
+    NEW (pAddlist);
+    NEW (pPosition);
+
+    InitFontStuff;
+    REPEAT
+        WRITE ('Output to S)creen, or P)rinter? ');
+        READ (ch);
+        WRITELN;
+    UNTIL ch IN ['s', 'S', 'p', 'P'];
+    IF ch IN ['s', 'S'] THEN BEGIN
+        REWRITE (output, 'CONSOLE:');
+    END
+    ELSE BEGIN
+        REWRITE (output, 'PRINTER:');
+    END;
+END;
+
+{===============================================================================
+
+#######> AddToDirec
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE AddToDirec
+    (    srcName: PathName;
+         entryIndex: INTEGER);
+VAR
+    vname: PathName;
+
+BEGIN {AddToDirec}
+    pFontlist^ [entryIndex] := srcName;
+    WITH pDirectory^ [entryIndex] DO BEGIN
+        BreakName (srcName, vname, id);
+        WRITELN (output, 'Entry #', entryIndex:1 ,': "', srcName, '".');
+    END;  {with pDirectory^ [entryIndex]}
+END; {AddToDirec}
+
+
+{===============================================================================
+
+#######> WriteMetricsWidths
+
+        COMMENT:    Write out a trailing record that has just the metrics and
+                    the widths in it, i.e. one with a null bit map.
+
+===============================================================================}
+PROCEDURE WriteMetricsWidths
+     (    dstFile: INTEGER;
+          pSrc: TP;
+      VAR MetWid_Size: LONGINT);
+
+VAR
+    pkshdr: TPkshdr;
+    BitMap_Size: LONGINT;
+    actual,
+    Widths_Size,
+    LocTable_Size: LONGINT;
+    cError,
+    oldStrikeBody_Length: INTEGER;
+
+BEGIN {WriteMetricsWidths}
+    pkshdr := POINTER(ORD(pSrc));
+    WITH pkshdr^ DO BEGIN
+        BitMap_Size := ((ascent + descent) * raster) * 2;  {Current size in bytes}
+        oldStrikeBody_Length := length;
+        length := 5;  {Length in words without bit map and location table}
+        raster := 0; {Indicate it will be a null length bit map}
+        Widths_Size := (chLst - chFst + 2) * 2;  {Size of widths section}
+        LocTable_Size := Widths_Size;   {Size of Location table section}
+
+        WRITE_DATA (cError, dstFile, ORD(pSrc), SIZEOF(TKshdr), actual,
+                    sequential, 0);  {Write out metrics part}
+        IF (cError <> 0) OR (actual <> SIZEOF(TKshdr)) THEN BEGIN
+            WRITELN (output, 'Error in WRITE_DATA in WriteMetricsWidths. error # ',
+             cError:1, '   actual was ', actual, '   SIZEOF(TKshdr) was',
+             SIZEOF(TKshdr));
+        END;
+
+        WRITE_DATA (cError, dstFile,
+                    ORD(pSrc) + 16 + (oldStrikeBody_Length * 2),
+                    Widths_Size, actual, sequential, 0);  {Write out widths part}
+        IF (cError <> 0) OR (actual <> Widths_Size) THEN BEGIN
+            WRITELN (output, 'Error in WRITE_DATA in WriteMetricsWidths. error # ',
+             cError:1, '   actual was ', actual, '   Widths_Size was',
+             Widths_Size);
+        END;
+
+        MetWid_Size := (SIZEOF(TKshdr) + Widths_Size) DIV 2;  {Size in words}
+        WRITELN (output, 'Leaving WriteMetricsWidths: MetWid_Size = ', MetWid_Size,
+                 '   BitMap_Size = ', BitMap_Size, '   length = ', length,
+                 '   Widths_Size = ', Widths_Size,
+                 '   SIZEOF(TKshdr) = ', SIZEOF(TKshdr));
+    END; {with}
+END; {WriteMetricsWidths}
+
+{===============================================================================
+
+#######> WriteAllFonts
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE WriteAllFonts;
+VAR
+    cword,
+    index,
+    oldSize,                {size of font before compaction -- in words}
+    newSize,                {size of font after compaction -- in words}
+    MetWid_Size: LONGINT;   {size of the appended null font version of the file}
+    pw: TPw;
+    validCheckSum: BOOLEAN;
+    cError: Integer;
+    actual: LongInt;
+
+BEGIN {WriteAllFonts}
+    FOR index := 1 TO lstEntry DO BEGIN
+        WITH pDirectory^ [index] DO BEGIN
+            ReadFont (pFontlist^ [index], pSrc, oldSize);
+            WRITELN (output, 'Writing "', id, '" to library.');
+            IF Compact_Font (pSrc, pDst, oldSize, newSize) THEN BEGIN
+                WriteFont (dstFile, pDst, newSize);
+            END
+            ELSE BEGIN
+                WriteFont (dstFile, pSrc, newSize);
+            END;
+            IF index = 1 THEN BEGIN
+                fstWord := 0;
+            END
+            ELSE BEGIN
+                fstWord := pDirectory^ [index - 1].lst_MetWid;
+            END;
+            lstWord := fstWord + newSize;
+
+            WriteMetricsWidths (dstFile, pSrc, MetWid_Size);
+            fst_MetWid := lstWord;
+            lst_MetWid := fst_MetWid + MetWid_Size;
+
+            WRITELN (output, '"', id, '" entered from ',
+                     fstWord:1, ' to ', lstWord:1,
+                     '   and MetricsWidths part from ',
+                     fst_MetWid:1, ' to ', lst_MetWid:1);
+            WRITELN (output, '      oldsize = ',oldsize, '   newsize = ', newsize);
+
+        END; {with pDirectory^ [index]}
+    END; {for index}
+END; {WriteAllFonts}
+
+
+{===============================================================================
+
+#######> LengthInWords
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+FUNCTION LengthInWords
+    (    s: PathName)
+: INTEGER;
+VAR
+    c: INTEGER;
+
+BEGIN {LengthInWords}
+    c := LENGTH (s) + 1;  {include byte count at beginning of string}
+    IF ODD (c) THEN BEGIN
+        c := c + 1;
+    END;
+    LengthInWords := c DIV 2;
+END; {LengthInWords}
+
+
+{===============================================================================
+
+#######> SizeDirectory
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+FUNCTION SizeDirectory
+: INTEGER;
+VAR
+    i,
+    c: INTEGER;
+
+BEGIN {SizeDirectory}
+    c := 0;
+    FOR i := 1 TO lstEntry DO BEGIN
+        WITH pDirectory^ [i] DO BEGIN
+            c := c + (LengthInWords
+                            (COPY (id,
+                                     POS (':', id) + 1,
+                                     LENGTH (id) - POS (':', id))) + 8);
+        END; {with pDirectory^ [i]}
+    END; {for i}
+    SizeDirectory := c;
+END; {SizeDirectory}
+
+
+{===============================================================================
+
+#######> WriteDirectory
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE WriteDirectory
+    (    fvisible: BOOLEAN);
+
+VAR
+    index: INTEGER;
+    direcOffset: LONGINT;
+    cheat: RECORD
+        CASE BOOLEAN OF
+            TRUE: (l: LONGINT);
+            FALSE: (w1: INTEGER;
+                     w2: INTEGER);
+    END;
+
+
+    PROCEDURE WriteName
+        (VAR dstFile: INTEGER;
+             s: PathName);
+    VAR
+        i,
+        cword: INTEGER;
+        pword: TPw;
+
+    BEGIN {WriteName}
+            pword := @s;
+            cword := LengthInWords (s);
+            FOR i := 1 TO cword DO BEGIN
+                WriteWord (dstFile, pword^);
+                pword := POINTER (ORD (pword) + 2);
+            END; {for i}
+    END; {WriteName}
+
+
+BEGIN {WriteDirectory}
+    direcOffset := SizeDirectory;
+    WriteWord (dstFile, direcOffset);
+    WriteWord (dstFile, lstEntry);
+    IF fvisible THEN BEGIN
+        WRITELN (output, 'Writing the directory.');
+        WRITELN (output, 'The directory size is ', direcOffset:1, ' words and has ',
+                            lstEntry:1, ' entries.');
+    END;
+    FOR index := 1 TO lstEntry DO BEGIN
+        WITH pDirectory^ [index] DO BEGIN
+            WriteName (dstFile, id);
+            cheat.l := fstWord;
+            WriteWord (dstFile, cheat.w1);
+            WriteWord (dstFile, cheat.w2);
+            cheat.l := lstWord;
+            WriteWord (dstFile, cheat.w1);
+            WriteWord (dstFile, cheat.w2);
+            cheat.l := fst_MetWid;
+            WriteWord (dstFile, cheat.w1);
+            WriteWord (dstFile, cheat.w2);
+            cheat.l := lst_MetWid;
+            WriteWord (dstFile, cheat.w1);
+            WriteWord (dstFile, cheat.w2);
+        END; {with pDirectory^ [index]}
+    END; {for index}
+END; {WriteDirectory}
+
+
+{===============================================================================
+
+#######> MakeLib
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE MakeLib;
+
+CONST
+    fileExists = 890;
+    visible = TRUE;
+    invisible = FALSE;
+
+VAR
+    cError: INTEGER;
+
+BEGIN {MakeLib}
+    MAKE_FILE (cError, libName, 0);
+    IF (cError <= 0) OR (cError = fileExists) THEN BEGIN
+        OPEN (cError, libName, dstFile, [dread, dwrite]);
+        IF cError > 0 THEN BEGIN
+            WRITELN (output, '<IO error #', cError:1, ' with file "', libName, '">');
+            CLOSE_OBJECT (cError, dstFile);
+            HALT;
+        END
+        ELSE BEGIN
+            WriteDirectory (invisible);  {space filler}
+            WriteAllFonts;
+            Reposition (dstFile, 0);
+            WriteDirectory (visible);  {correct directory}
+        END;
+        CLOSE_OBJECT (cError, dstFile);
+    END
+    ELSE BEGIN
+        WRITELN (output, '<IO error #', cError:1, ' with file "', libName, '">');
+        HALT;
+    END;
+END; {MakeLib}
+
+
+{===============================================================================
+
+#######> ReadName
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE ReadName
+    (VAR p: TP;
+     VAR id: E_Name);
+VAR
+    i,
+    c: INTEGER;
+    pid: TP;
+
+BEGIN {ReadName}
+    pid := @id;
+    c := p^;
+    FOR i := 0 TO c DO BEGIN
+        pid^ := p^;
+        pid := POINTER (ORD (pid) + 1);
+        p := POINTER (ORD (p) + 1);
+    END; {for i}
+    IF NOT ODD (c) THEN BEGIN
+        p := POINTER (ORD (p) + 1);
+    END;
+END; {ReadName}
+
+
+{===============================================================================
+
+#######> ReadDirectory
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE ReadDirectory
+    (    srcFile: INTEGER);
+
+VAR
+    index,
+    cError: INTEGER;
+    actual: LONGINT;
+    pl: TPl;
+
+BEGIN {ReadDirectory}
+    READ_DATA (cError, srcFile, ORD (@dirSize), 2, actual, sequential, 0);
+    IF (cError > 0) OR (actual <> 2) THEN BEGIN
+        WRITELN (output, 'Error in READ_DATA for ReadDirectory. Error #', cError:1);
+        EXIT (ReadDirectory);
+    END;
+    READ_DATA (cError, srcFile, ORD (@lstEntry), 2, actual, sequential, 0);
+    WRITELN ('dirSize = ', dirSize:1);
+    WRITELN ('# Entrys = ', lstEntry:1);
+    READ_DATA (cError, srcFile, ORD (pSrc), dirSize * 2, actual, sequential, 0);
+    FOR index := 1 TO lstEntry DO BEGIN
+        WITH pDirectory^ [index] DO BEGIN
+            ReadName (pSrc, id);
+            pl := POINTER (ORD (pSrc));
+            fstword := pl^;
+            pl := POINTER (ORD (pSrc) + 4);
+            lstword := pl^;
+            pSrc := POINTER (ORD (pSrc) + 8);
+            fst_MetWid := pl^;
+            pl := POINTER (ORD (pSrc) + 4);
+            lst_MetWid := pl^;
+            pSrc := POINTER (ORD (pSrc) + 8);
+        END; {with pDirectory^ [index]}
+    END; {for index}
+END; {ReadDirectory}
+
+
+{===============================================================================
+
+#######> ListLib
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE ListLib
+    (    libName: PathName);
+
+VAR
+    index,
+    cError,
+    srcFile: INTEGER;
+
+BEGIN {ListLib}
+    OPEN (cError, libName, srcFile, [dread]);
+    IF cError > 0 THEN BEGIN
+        WRITELN (output, '<IO error #', cError:1, ' with file "', libName, '">');
+        CLOSE_OBJECT (cError, srcFile);
+        EXIT (ListLib);
+    END;
+    IF NOT fvalidDirec THEN BEGIN
+        ReadDirectory (srcFile);
+    END;
+    WRITELN ('dirSize = ', dirSize:1);
+    WRITELN ('lstEntry = ', lstEntry:1);
+    FOR index := 1 TO lstEntry DO BEGIN
+        WITH pDirectory^ [index] DO BEGIN
+            WRITE (output, 'Entry #', index:2, '  id: "', id, '"');
+            WRITE (output, ' from ', fstWord:1);
+            WRITELN (output, ' to ', lstWord:1, '.');
+            WRITE (output, '    MetricsWidths  from ', fst_MetWid:1);
+            WRITELN (output, ' to ', lst_MetWid:1, '.');
+        END; {with pDirectory^ [index]}
+    END; {for index}
+    CLOSE_OBJECT (cError, srcFile);
+END; {ListLib}
+
+{===============================================================================
+
+#######> VerifyLib
+
+        COMMENT:  The library could be be verified by positioning at the start of the
+                     first font and then reading successive fonts and testing the validity
+                     of their checksum. Instead, I also check that the directory is valid
+                     by using its contents to position for each font in the library.
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE VerifyLib
+    (    libName: PathName);
+
+VAR
+    index,
+    cError,
+    srcFile: INTEGER;
+    actual,
+    direcOffset: LONGINT;
+
+    PROCEDURE CheckFont
+        (    index: INTEGER);
+    VAR
+        cError: INTEGER;
+        actual,
+        fontSize: LONGINT;
+
+    BEGIN {CheckFont}
+        WITH pDirectory^ [index] DO BEGIN
+            Reposition (srcFile, (fstWord * 2) + direcOffset);
+            fontSize := (lstWord - fstWord) * 2;
+        END; {with pDirectory^ [index]}
+        READ_DATA (cError, srcFile, ORD (pdst), fontSize, actual, sequential, 0);
+        IF (cError > 0) OR (actual <> fontSize) THEN BEGIN
+            WRITELN (output, 'Error in READ_DATA for CheckFont. Error #', cError:1);
+        END
+        ELSE BEGIN
+            IF ChekSumOk (pdst, (fontSize DIV 2) - 1) THEN BEGIN
+                WRITELN (output, '"', pDirectory^ [index].id, '" verified correctly.');
+            END
+            ELSE BEGIN
+                WRITELN (output, '<"', pDirectory^ [index].id, '" did not verify correctly.>');
+            END;
+        END;
+    END; {CheckFont}
+
+
+BEGIN {VerifyLib}
+    OPEN (cError, libName, srcFile, [dread]);
+    IF cError > 0 THEN BEGIN
+        WRITELN (output, '<IO error #', cError:1, ' with file "', libName, '">');
+        CLOSE_OBJECT (cError, srcFile);
+        EXIT (VerifyLib);
+    END;
+    IF NOT fvalidDirec THEN BEGIN
+        ReadDirectory (srcFile);
+    END;
+    direcOffset := (dirSize + 2) * 2;  {byte offset to first font in library}
+    FOR index := 1 TO lstEntry DO BEGIN
+        CheckFont (index);
+    END; {for index}
+    CLOSE_OBJECT (cError, srcFile);
+END; {VerifyLib}
+
+
+{===============================================================================
+
+#######> DoFile
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE DoFile;
+VAR
+    fileList: TEXT;
+    fQuestion, fOk: TF;
+    filePattern: E_Name;
+    ch: CHAR;
+    cDash,
+    cJ,
+    cError: TC;
+
+BEGIN
+    IF srcName [1] = '<' THEN BEGIN
+        DELETE (srcName, 1, 1);
+        RESET (fileList, srcName);
+        WHILE NOT EOF (fileList) DO BEGIN
+            READLN (fileList, srcName);
+            DoFile;
+        END;
+        CLOSE (fileList);
+    END
+    ELSE BEGIN
+        fQuestion := FALSE;
+        WHILE POS ('?', srcName) > 0 DO BEGIN
+            fQuestion := TRUE;
+            srcName [POS ('?', srcName)] := '=';
+        END;
+
+        IF POS ('-', srcName) > 0 THEN BEGIN
+            BreakName (srcName, volumeName, filePattern);
+        END
+        ELSE BEGIN
+            filePattern := srcName;
+            GET_WORKING_DIR (cError, volumeName);
+            IF cError > 0 THEN BEGIN
+                WRITELN ('Can''t get the current working directory!');
+                volumeName := '';
+                EXIT (DoFile);
+            END;
+        END;
+        WRITELN ('volume name is "', volumeName, '"');
+        WRITELN ('filePattern is "', filePattern, '"');
+
+        IF VSetVolume (volumeName, filePattern, cError) THEN BEGIN
+            WHILE vNextName (realFileName) DO BEGIN
+                srcName := CONCAT (volumeName, '-', realFileName);
+                IF fQuestion THEN BEGIN
+                    WRITE ('Add ', srcName, ' to ', libName, '?');
+                    READ (ch);
+                    WRITELN;
+                    fOk := ch IN ['y', 'Y'];
+                END
+                ELSE BEGIN
+                    fOk := TRUE;
+                END;
+                IF fOk THEN BEGIN
+                    lstEntry := lstEntry + 1;
+                    AddToDirec (srcName, lstEntry);
+                END;
+            END; {while}
+        END
+        ELSE BEGIN
+            WRITELN ('Cannot find volume??');
+        END;
+    END;
+END;
+
+
+{===============================================================================
+
+#######> CreateLib
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE CreateLib;
+
+BEGIN {CreateLib}
+    InitDirectory;
+    WRITE ('Destination Library name? ');
+    READLN (libName);
+    REPEAT
+        REPEAT
+            WRITE('Source font pattern: ');
+            READLN( srcName );
+
+            IF (LENGTH (srcName) > 0)
+               AND
+               (LENGTH (libName) > 0) THEN BEGIN
+                DoFile;
+            END;
+        UNTIL LENGTH (srcName) = 0;
+        REPEAT
+            WRITE ('C)ontinue, G)enerate Library, or A)bort? ');
+            READ (ch);
+            WRITELN;
+        UNTIL ch IN ['c', 'C', 'g', 'G', 'a', 'A'];
+    UNTIL ch IN ['g', 'G', 'a', 'A'];
+    IF NOT (ch IN ['a', 'A']) THEN BEGIN
+        MakeLib;
+    END;
+END; {CreateLib}
+
+
+{===============================================================================
+
+#######> AppendLib
+
+        COMMENT:
+
+        GLOBALS:
+
+===============================================================================}
+PROCEDURE AppendLib;
+
+VAR
+    index,
+    cError,
+    srcFile,
+    finalEntry: INTEGER;
+
+(*
+    PROCEDURE AdjustLib;
+
+    BEGIN {AdjustLib}
+        Reposition (srcFile, (pDirectory^ [finalEntry]
+    END; {AdjustLib}
+*)
+
+BEGIN {AppendLib}
+    WRITELN ('Not Implemented Yet!');
+(*
+    InitDirectory;
+    WRITE ('Source Library name? ');
+    READLN (libName);
+    OPEN (cError, libName, srcFile, [dread]);
+    IF cError > 0 THEN BEGIN
+        WRITELN (output, '<IO error #', cError:1, ' with file "', libName, '">');
+        CLOSE_OBJECT (cError, srcFile);
+        EXIT (AppendLib);
+    END;
+    ReadDirectory (srcFile);
+    finalEntry := lstEntry;
+    REPEAT
+        REPEAT
+            WRITE('Source font pattern: ');
+            READLN( srcName );
+
+            IF (LENGTH (srcName) > 0)
+               AND
+               (LENGTH (libName) > 0) THEN BEGIN
+                DoFile;
+            END;
+        UNTIL LENGTH (srcName) = 0;
+        REPEAT
+            WRITE ('C)ontinue, G)enerate Library, or A)bort? ');
+            READ (ch);
+            WRITELN;
+        UNTIL ch IN ['c', 'C', 'g', 'G', 'a', 'A'];
+    UNTIL ch IN ['g', 'G', 'a', 'A'];
+    IF NOT (ch IN ['a', 'A']) THEN BEGIN
+        AdjustLib;
+    END;
+    CLOSE_OBJECT (cError, srcFile);
+*)
+END; {AppendLib}
+
+
+{******************************************************************************}
+BEGIN {LibMaster}
+    InitMain;
+    REPEAT
+        WRITE ('L)ist,  N)ew,  D)elete,  A)dd,  V)erify,  Q)uit');
+        READ (ch);
+        WRITELN;
+        CASE ch OF
+            'n',
+            'N': BEGIN
+                CreateLib;
+            END; {new}
+
+            'l',
+            'L': BEGIN
+                WRITE ('Library name? ');
+                READLN (libName);
+                ListLib (libName);
+            END; {list}
+
+            'd',
+            'D': BEGIN
+                WRITELN ('not implemented yet');
+            END; {delete}
+
+            'a',
+            'A': BEGIN
+                WRITELN ('not implemented yet');
+            END; {add}
+
+            'v',
+            'V': BEGIN
+                InitDirectory;
+                WRITE ('Library name? ');
+                READLN (libName);
+                VerifyLib (libName);
+            END; {add}
+        END; {case ch}
+    UNTIL ch IN ['q', 'Q'];
+END. {LibMaster}
+
+ÿ

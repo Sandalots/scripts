@@ -1,0 +1,2476 @@
+{File USTDTERM2.TEXT}          {part of standard terminal unit, menu command functions}
+
+{Implementation notes :
+   Clear screen or lines action does not save the output lines that are erased. The only time output lines
+ are saved is when they are scrolled off from the top of the active view or scrolling region.
+   When screen size is changed, the buffer is not changed. The redraw routine will display the lines and
+ columns within the screen size only.
+   Font and style can change from character to character (e.g., graphic character in VT100), but we are
+ assuming all the fonts used have the same line height and width, ie, leading + ascent + descent. If this is
+ not true, newline and cursor reposition routines will have to be modified.
+   The view size is initially 1 page of 24 by 80 or 132. The bottom page is the active view. The output
+ starts from the home position, top of the active view, and continue downword. When lines are
+ scrolled off the top of the active view, they go to the buffer area if saveBuffer is true and the viewsize
+ extended minimum 2 pages at a time. So output lines may not fill the entire view, nor the entire active view.
+ But the home position point is always at the one-page point from the bottom of the viewRect. We assume that
+ the screen size in # lines does not change at the run time. Also home point calculation relys on that the
+ line heights of all the fonts are the same as described above. The leading in the dfontInfo is for spacing in
+ between lines. For each character, it has, from top to bottom, leading, ascent and then descent. There is a
+ space of vindent at the bottom of view. The screenRect is the bottom 24 lines of the view. The vscreenRect.top
+ is the bottom of the last line in the buffer area. We draw a gray solid line between screen and buffer area.
+ This line is at screenRect.top. The screen area's lines number from 0 to maxLines-1. The line numbering from
+ subclass for the buffer area is -1, -2 etc from the last line up. GetPoint computes the point base on line
+ number. The cursor block has height of ascent+descent and width of widmax.
+
+   Use one list for the buffer area (non-active part) and another one for the screen area (active view).
+ Acessing to screen area is much faster than one list for both when buffer area is large. But scrolling has to
+ move lines from one list to the other.
+   Always have maxLines lines in the screen area, created at docManager.open, and ensured when scrolling up
+ or down in MoveCursor. This makes cursor positioning and subsequent VWrite easier, but redraw screen slower
+ having to go thru all possibly empty lines. But VWrite is called more ofter than redraw screen.
+
+   The lines in the Consterm, either in the screen or buffer area do not contain CR. But when lines are copied
+ onto the clipboard, a CR is appended if the whole line is copied, so that we can distingush partial strings
+ from complete lines.
+   All terminal lines are of type TTermLine, but they are really maxtextline+charattr in screen. When they are
+ scrolled to the buffer area, the textline would only take up the tmline.ch[0] (linelength) bytes if no char
+ attr fields. If there is char attr fields, textlines are not shrunk down.
+
+   For now, click on the input panel does not have any effect, i.e., the selection in the text panel will not
+ be changed. The selection is always with the text panel, and the text panel is always the selectPanel.
+ Actually this may be convenient for the user because he can paste without clicking in the input panel (can
+ copy even when clicking in the input panel.  ---- This is changed, we may not have input panel!!!!!
+
+   The typeahead buffer is really an array of inputbuffer. It starts out with one for keyboard input. When
+ something is pasted, a new inputbuffer gets created. Then the next keyboard input will start with another
+ inputbuffer.
+
+   The view size of text panel is limited to 32767 (maxint) vertically so we can take advantage of small view
+ and QuickDraw call instead of MoveToL, LineL, etc. So the max lines saved will be determined by this limit.
+}
+
+{$IFC fRngQP}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC fSymQP}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+CONST
+
+    keyBELL = 7;
+    keyBS   = 8;
+    keyHT   = 9;
+    keyLF   = 10;
+    keyCR   = 13;
+    keyCtrS = 19;
+    keyCtrQ = 17;
+                                   {size limits}
+    maxtypeahead   = 132;
+    cStdMaxLines   = 24;
+    cStdMaxColumns = 80;
+    initbuflines   = 1000;         {initial buffer lines, also for each increment}
+    maxbuflines    = 5000;         {max lines in buffer - we dont want to use more than 2 data seg.}
+    univBufferSize = 2048;         {max paste buffer}
+    maxMouseEvents = 500;          {max number of mouse events that can be queued}
+
+    maxeventinterval = 500;        {process user events no longer than 500 milliseconds interval}
+
+
+    phraseVersion = 1;
+
+    hindent = 6;
+    vindent = 6;
+
+    noselKind   = 1;               {selection kind, for initial selection and mouse press}
+    termselKind = 2;               {for a real selection in the text panel, changed to this in mousemove}
+    gpselKind   = 3;               {for a real selection in the graphic panel, changed to this in SelGraph men}
+
+    widthGrPanel = 200;            {default graphic panel size when graphic panel exists -}
+    htTabRuler = 40;               {height of tab ruler}
+
+
+    AbortKey = 14;                 {Apple (Control) Period}
+
+    termmessage   = '  ***  Program Terminated  ***';
+
+    phCharPerLine = 1001;          {phrase numbers dialog box strings}
+    phWraparound  = 1002;
+    phYes         = 1003;
+    phNo          = 1004;
+    phTab         = 1005;
+    sc80          = '80 ';         {numbers are universal}
+    sc132         = '132';
+
+    phBufTooBig   = 1008;
+
+
+  {menu command codes}
+                                   {UABC defines the standard ones}
+    ccErase          = 1200;
+    ccSaveBuffer     = 1201;
+    ccDontSaveBuffer = 1202;
+    ccFlushInput     = 1203;
+    ccSelText        = 204;
+    ccSelGraph       = 1205;
+
+    ccSetup          = 2001;
+    ccShowTabRuler   = 2002;
+    ccHideTabRuler   = 2003;
+
+    ccRestart        = 2101;
+    ccResume         = 2102;
+                                   {without 'Flush Input' menu item in}
+    midTxOnlyEdit  = 3;            {menuID of text panel only edit menu, have to agree with the phrase file}
+    midGrOnlyEdit  = 4;            {menuID of graphic panel only edit menu}
+    midTxGrEdit    = 5;            {menuID of both text and graphic panel edit menu}
+    midTermSpec    = 6;            {menuID of terminal specific menu, only if there is text panel}
+    midExecution   = 7;            {menuID of execution menu}
+                                   {with 'Flush Input' menu item in}
+    midInTxOnlyEdit = 8;           {menuID of text panel only edit menu, have to agree with the phrase file}
+    midInGrOnlyEdit = 9;           {menuID of graphic panel only edit menu}
+    midInTxGrEdit   = 10;          {menuID of both text and graphic panel edit menu}
+
+  {error codes for -printer in the QuickPort}
+    er_openprinter  = 6050;        {these error codes are in paslib i/o range, user get them via ioresult}
+    er_prwrite      = 6051;
+    er_closeprinter = 6052;
+
+
+TYPE
+    strlen = packed array [1..1] of 0..255;
+    Pstrlen = ^strlen;
+    paoc8000 = packed array [1..8000] of char;
+    PTpaoc = ^paoc8000;
+
+    TCombKeys = RECORD
+                   keycapvalue : Byte;
+                   appledown, shiftdown, optiondown : BOOLEAN;
+                 END;
+    TPCombKeys = ^TCombKeys;
+
+    TinsertORdelete = (shInsert, shDelete);
+
+   (*terminal line data structure to be overlaid on the TTermLine - @tmline.ch:
+    TTermLine = PACKED RECORD
+                  textline   : PACKED ARRAY [0..maxtextline] OF CHAR;         {same as string}
+                  attrsize   : INTEGER;
+                  charAttr   : ARRAY [1..attrsize] OF TAttributes;
+                END;
+   *)
+
+    TStrTextline = string [maxtextline];          {string equivalent type for textline part}
+    PTTermStr  = ^TStrTextline;
+
+    TAttributes = RECORD
+                    beginX : INTEGER;
+                    chAttr : TRAttributes;
+                  END;
+
+    TCharAttrs = RECORD
+                  attrsize  : INTEGER;
+                  charAttrs : ARRAY [1..maxtextline] OF TAttributes;
+                END;
+
+    PTCharAttrs = ^TCharAttrs;
+    PTAttributes = ^TAttributes;
+
+
+
+VAR
+                                        {Info needed to be on process stack, so that clipboard view method
+                                         can access them. They are to be kept the same as in Consterm.}
+    pmaxColumns    : INTEGER;
+    pdfontInfo     : TFontinfo;         {cash of default font info}
+    pdefltAttr     : TRAttributes;      {default type style and font, for the screen column size,
+                                          changed by ChangeMaxColumns only }
+    pcurrAttr      : TRAttributes;      {current type style and font}
+
+    vscreenRect    : Rect;              {the screen area, so we can save some convertion time}
+    tabRect        : Rect;              {tab ruler area}
+    workRgn        : RgnHandle;         {to be used in QPMoveCursor and VScrollLines, and TGraphView.Draw}
+    maxcoltofit    : INTEGER;           {maximum number of columns in 80-column font that will fit in view}
+
+    preWriteTime : milliseconds;
+
+
+    {program execution states : these need not be in Consterm since they are not document related.}
+    blankdocument  : BOOLEAN;
+    restarted      : BOOLEAN;           {to restart program after reopen}
+    outputStopped  : BOOLEAN;           {output is stopped by Ctr-S}
+    inputStopped   : BOOLEAN;           {input is stopped by program}
+    gotapplePeriod : BOOLEAN;           {got Apple .}
+    Pterminating   : BOOLEAN;           {to end recursive call to twclose}
+    tabRulerShown  : BOOLEAN;           {in 'show tab ruler' menu item}
+    needChangeAttr : BOOLEAN;           {need to change attributes since cursor is changed.}
+
+
+{Internal routines}
+
+PROCEDURE InitScreen;     FORWARD;      {in UStdTerm3.text}
+                                        {Called by DocManager.Open after all terminal subclass has being created}
+PROCEDURE DrawTmLine (tmline : TTermLine);  FORWARD;
+                                        {Caller should do MoveTo, focus before call}
+PROCEDURE HiLiteCursor (highTransit: THighTransit; cursorpoint : Point);  FORWARD;
+                                        {highlight cursor position, to be called from inside the pad proc}
+PROCEDURE QPMoveCursor (scroll : BOOLEAN; xdistance, ydistance : INTEGER);  FORWARD;
+                                        {internal movecursor, no BindDocHeap and HandleEvent.}
+PROCEDURE GetPoint (x, y : INTEGER; VAR basept : Point);  FORWARD;  {y is home relative}
+
+PROCEDURE CharPosWithPt (mouseLPt : LPoint; VAR charXY : TCoordinate);  FORWARD;
+                                        {find the corresponding character position}
+PROCEDURE ChangeAttributes (newattr : TRAttributes); FORWARD;       {Attributes change, to screen lines only}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+{----------------------------------------------- PaintOrErase -----------------------------------------------}
+
+PROCEDURE PaintOrErase (toPaint : BOOLEAN; fromXY, toXY : TCoordinate);
+                                    {called to highlight (paint) or clear (erase) a text area}
+VAR fromPt, toPt : Point;
+    r : Rect;
+    rleft, rtop : INTEGER;
+BEGIN
+    {$IFC fTrace}BP(10);{$ENDC}
+                      {highlight or erase the solid line too, since if we break into two highlighted parted,
+                       user might be confused.}
+    GetPoint (fromXY.x, fromXY.y, fromPt);
+    GetPoint (toXY.x, toXY.y, toPt);
+    WITH Consterm, dfontInfo DO
+      BEGIN
+        rleft := fromPt.h;
+        rtop := fromPt.v - (ascent + leading);
+        IF toXY.y > fromXY.y THEN       {have to break the partial end line part}
+          BEGIN
+            IF fromXY.x > 0 THEN        {have to paint the partial first line part}
+              BEGIN
+          {$H-} SetRect (r, rleft, rtop, vscreenRect.right, fromPt.v + descent);
+                IF toPaint THEN PaintRect (r) ELSE EraseRect (r);
+                rleft := hindent;
+                rtop := rtop + lineheight;
+              END;
+            SetRect (r, rleft, rtop, vscreenRect.right, toPt.v - (ascent + leading));
+                                                                      {draw the middle part}
+            IF toPaint THEN PaintRect (r) ELSE EraseRect (r);
+            rtop := toPt.v - (ascent + leading);
+          END;
+        SetRect (r, rleft, rtop, toPt.h, toPt.v + descent);  {last partial line}
+        IF toPaint THEN PaintRect (r) ELSE EraseRect (r);  {$H+}
+      END;
+    {$IFC fTrace}EP;{$ENDC}
+END;  {PaintOrErase}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+{----------------------------------------------- HiLiteText ------------------------------------------------}
+
+PROCEDURE HiLiteText (highTransit : THighTransit; fromXY, toXY : TCoordinate);
+                                         {highlight selected text from fromXY to toXY (next char position),
+                                          assuming already focused on thePad}
+BEGIN
+    {$IFC fTrace}BP(10);{$ENDC}
+    SetPenState (highPen[highTransit]);
+    PaintOrErase (TRUE, fromXY, toXY);             {to do highlight}
+    {$IFC fTrace}EP;{$ENDC}
+END;  {HiLiteText}
+
+
+
+
+{----------------------------------------------- WrTermMsg ------------------------------------------------}
+
+PROCEDURE WrTermMsg;      {write termmessage, called by TVanWindow.NewCommand when put away, and TWClose only}
+VAR str : Tstr255;
+    newattr : TRAttributes;
+BEGIN
+    {$IFC fTrace}BP(10);{$ENDC}
+    WITH Consterm DO
+      IF NOT grpanelonly THEN                                    {we only write to text panel}
+        BEGIN
+   {$H-}  QPMoveCursor (TRUE, -200, maxLines - cursorXY.y);      {scroll up to write one line at bottom}
+          WITH Consterm DO
+            IF (currAttr.charStyle <> []) OR (currAttr.charFont <> fIDLT12Text) OR
+               (currAttr.charFont <> fIDLT20Text) THEN
+              BEGIN
+                newattr.charStyle := [];
+                IF maxColumns <= maxcoltofit THEN newattr.charFont := fIDLT12Text
+                ELSE newattr.charFont := fIDLT20Text;                   {132 column font}
+                ChangeAttributes (newattr);
+              END;
+          str := termmessage;
+          VStrWrite (str); {$H+}                                 {roll up screen in next open}
+        END;
+    {$IFC fTrace}EP;{$ENDC}
+END;  {WrTermMsg}
+
+
+
+{----------------------------------------------- ToggleTab ------------------------------------------------}
+
+PROCEDURE ToggleTab (tabindex : INTEGER);              {toggle tab, called by DrawTabRuler and
+                                                        TTermView.MousePress only}
+VAR h : INTEGER;
+BEGIN
+    {$IFC fTrace}BP(10);{$ENDC}
+    WITH Consterm, dfontInfo DO
+      BEGIN
+        h := tabindex * widmax + hindent;
+  {$H-} MoveToL (h + 1 - widmax div 2 - widmax, tabRect.bottom - lineheight + 2);
+        TextFace (defltAttr.charStyle);  {$H+}
+      END;
+    TextFont (fIDRulers);
+    TextMode (srcXor);                                 {toggle mode}
+    DrawChar (CHR (60));                               {upside down triangle}
+    {$IFC fTrace}EP;{$ENDC}
+END;  {ToggleTab}
+
+
+
+{----------------------------------------------- DrawTabRuler ------------------------------------------------}
+
+PROCEDURE DrawTabRuler;
+CONST htTabRuler = 40;
+      htTabLine  = 20;
+VAR h, v, v1, i, p : INTEGER;
+    str : S255;
+    pnstate : PenState;
+BEGIN
+    {$IFC fTrace}BP(10);{$ENDC}
+    EraseRect (tabRect);
+    WITH pnstate DO
+      BEGIN
+        pnSize.h := 1;
+        pnSize.v := 1;
+        pnMode := patCopy;
+        pnPat  := black;
+      END;
+    SetPenState (pnstate);
+    TextFace (Consterm.defltAttr.charStyle);
+    h := hindent;
+    v := tabRect.bottom - htTabLine;
+    FOR i := 0 To Consterm.maxColumns - 1 DO
+      BEGIN
+        IF (i MOD 5 = 0) THEN
+          BEGIN
+            MoveToL (h + 2, v + 5);
+            IntToStr(i, @str);
+            TextFont (Consterm.defltAttr.charFont);
+            DrawString (str);
+            v1 := v;
+            p := htTabLine;
+          END
+        ELSE
+          BEGIN
+            v1 := v - 8;
+            p := htTabLine - 8;
+          END;
+        MoveToL (h, v1);
+        LineL (0, -p);
+        IF Consterm.tabPosition.tabStop [i] THEN ToggleTab (i);
+        h := h + Consterm.dfontInfo.widmax;
+      END;
+    {$IFC fTrace}EP;{$ENDC}
+END;  {DrawTabRuler}
+
+
+
+
+{$S sQPortInit}                         {initialization code segment}
+
+{----------------------------------------------- TTermProcess ----------------------------------------------}
+
+METHODS OF TTermProcess;
+
+    FUNCTION  {TTermProcess.}CREATE{: TTermProcess};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        SELF := TTermProcess (TProcess.CREATE (NewObject (mainHeap, THISCLASS), mainHeap));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+    FUNCTION  {TTermProcess.}newDocManager{(volumePrefix: TFilePath; openAsTool : BOOLEAN): TDocManager};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}               {allow open as tool also, it should be like blankstationary}
+        newDocManager := TTermDocManager.CREATE(NIL, mainHeap, volumePrefix);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;  {methods of TTermProcess}
+
+
+
+
+{----------------------------------------------- TTermDocManager --------------------------------------------}
+
+METHODS OF TTermDocManager;
+
+    FUNCTION  {TTermDocManager.}CREATE{(object: TObject; heap: THeap; itsPathPrefix: TFilePath): TTermDocManager};
+
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject (heap, THISCLASS);
+        SELF := TTermDocManager (TDocManager.CREATE (object, heap, itsPathPrefix));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+    FUNCTION  {TTermDocManager.}newWindow{(heap: THeap; wmgrID: TWindowID):TWindow};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        newWindow := TVanWindow.CREATE(NIL, heap, wmgrID);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+    PROCEDURE {TTermDocManager.}Open{(VAR error: INTEGER; wmgrID: TWindowID;
+                                      Var OpenedSuspended:Boolean)};
+    VAR termView:  TTermView;
+        vanWindow : TVanWindow;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        blankdocument := FALSE;
+        SUPERSELF.Open (error, wmgrID, OpenedSuspended);    {do the standard one}
+        vanWindow := TVanWindow (SELF.window);
+        IF blankdocument THEN                               {openblank}
+          BEGIN
+            Consterm.window := vanWindow;                   {init the window field}
+            InitScreen;
+          END
+        ELSE                                                {open saved or suspended}
+          BEGIN
+            Consterm := vanWindow.stdterm;                  {reinstate the consterm from saved one}
+            WITH Consterm DO
+              BEGIN
+                pmaxColumns := maxColumns;
+                pdfontInfo  := dfontInfo;
+                pdefltAttr  := defltAttr;
+                pcurrAttr   := currAttr;
+              END;
+            vanWindow.termPanel.selection.kind := noselKind;
+            IF qdpUsed THEN                                 {or should I check NOT txpanelonly ?}
+              vanWindow.graphPanel.selection.kind := noselKind;
+                                                            {scroll up whole screen when restart}
+          END;
+
+        WITH Consterm DO
+          IF grpanelonly THEN
+            BEGIN
+              cursorPt.h := hindent;
+              cursorPt.v := dfontInfo.leading + dfontInfo.ascent;
+              vscreenRect := qdpViewRect;
+            END
+          ELSE
+            BEGIN  {$H-}
+              GetPoint (0, 0, cursorPt);         {locate home point}
+              SetRect (vscreenRect, cursorPt.h, cursorPt.v - dfontInfo.ascent - dfontInfo.leading,
+                                   vanWindow.termPanel.view.extentLRect.right,
+                                   vanWindow.termPanel.view.extentLRect.bottom);  {$H+}
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;  {methods of TTermDocManager}
+
+
+
+
+{----------------------------------------------- TTermView --------------------------------------------------}
+
+METHODS OF TTermView;
+
+    FUNCTION  {TTermView.}CREATE{(object: TObject; heap: THeap; itsPanel: TPanel; itsExtent: LRect;
+                                                  itsLines : TArray): TTermView};
+    VAR itsPrintManager:   TPrintManager;
+        margins : LRect;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        WITH TTermView (object) DO
+          BEGIN
+            lines := itsLines;
+            minViewLRect := itsExtent;       {must be before NewView, since it calls SetMinView}
+          END;
+        itsPrintManager := TStdPrintManager.CREATE(NIL, heap);        {allow heading, page break, page margin}
+                                             {just have user change margins to whatever they want.}
+        SELF := TTermView (itsPanel.NewView (object, itsExtent, itsPrintManager, stdMargins{margins}, FALSE));
+        SELF.allowMouseOutside := TRUE;      {so that we can get the click in the tab ruler}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.CREATE}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TTermView.}Draw;         {printing and page margin mode will call this method too, but for
+                                         this to work, we have to call MoveToL stuff. Or we could check
+                                         amPrinting or SELF.panel.previewmode = mPrvwMargin and do MoveToL}
+    LABEL 9;
+    VAR tmline: TTermLine;
+        pt : Point;
+        bsize, i, v : INTEGER;
+        pnstate : PenState;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        TextFont (pdefltAttr.charFont);
+        TextFace (pdefltAttr.charStyle);
+        IF SELF.lines <> NIL THEN                      {clipview, can not access to Consterm on docheap}
+         WITH pdfontInfo DO  {$H-}
+          BEGIN
+            v := leading + ascent;
+            FOR i := 1 TO SELF.lines.size DO
+              BEGIN
+                tmline := TTermLine (SELF.lines.At (i)^);
+                MovetoL (hindent, v);                  {moveto next line}
+                DrawTmLine (tmline);
+                v := v + lineheight;
+              END;
+          END
+        ELSE                                           {regular window view}
+         IF Consterm.window <> NIL THEN                {done initialization}
+          BEGIN
+            IF thePad.visLRect.top < vscreenRect.top THEN
+              BEGIN
+                bsize := Consterm.buffer.size;
+                IF bsize > 0 THEN
+                  BEGIN
+                    GetPoint (0, -bsize, pt);
+                    v := pt.v;
+                    FOR i := 1 TO bsize DO
+                     WITH Consterm, dfontInfo DO  {$H-}
+                      BEGIN
+                        IF v > 0 THEN             {in case font size is changed and we have more lines than what
+                                                   would fit in the view.}
+                          IF thePad.visLRect.top < (v + descent) THEN
+                            IF thePad.visLRect.bottom > (v - ascent - leading) THEN
+                              BEGIN
+                                MovetoL (hindent, v);               {moveto next line}
+                                tmline := TTermLine (Consterm.buffer.At (i)^);
+                                DrawTmLine (tmline);
+                              END  {$H+}
+                            ELSE GOTO 9;
+                        v := v + lineheight;
+                      END;
+                  END;
+                IF NOT amPrinting THEN
+                  BEGIN
+                    WITH pnstate DO
+                      BEGIN
+                        pnLoc.h := 0;
+                        pnLoc.v := vscreenRect.top;
+                        pnSize.h := 1;                   {use smallest pen size}
+                        pnSize.v := 1;
+                        pnMode := patCopy;
+                        pnPat  := gray;
+                      END;
+                    SetPenState (pnstate);
+                    MoveToL (0, vscreenRect.top);           {go to the solid line}
+                    LineL (vscreenRect.right, 0);           {draw a line between screen and buffer areas}
+                  END;
+              END;
+
+            WITH Consterm, dfontInfo DO
+              BEGIN
+                v := vscreenRect.top + leading + ascent;
+                FOR i := 0 TO maxLines - 1 DO
+                  BEGIN
+                    IF thePad.visLRect.top < (v + descent) THEN
+                      IF thePad.visLRect.bottom > (v - ascent - leading) THEN
+                        BEGIN  {$H-}
+                          MovetoL (hindent, v);               {moveto next line}
+                          DrawTmLine (Consterm.screen [i]);
+                        END  {$H+}
+                      ELSE GOTO 9;
+                    v := v + lineheight;
+                  END;
+              END;
+          9:
+            IF tabRulerShown THEN
+              BEGIN
+                SetRect (tabRect, 0, -htTabRuler, vscreenRect.right, 0);
+                IF RectIsVisible (tabRect) THEN DrawTabRuler;
+              END;
+          END;      {regular window and done init}
+
+        TextFont (pcurrAttr.charFont);                 {restore current attr, so that VWrite would not
+                                                             have to set them everytime.}
+        TextFace (pcurrAttr.charStyle);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.Draw}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+{----------------------------------------------- TTermView.MousePress ---------------------------------------}
+
+    PROCEDURE {TTermView.}MousePress {(mouseLPt: LPoint)};
+    VAR panel : TPanel;
+        termSelection : TTermSelection;
+        charXY : TCoordinate;
+        pt : Point;
+        i : INTEGER;
+
+        PROCEDURE HiCursorOnThePad;
+        BEGIN
+            HiLiteCursor (hOffToOn, Consterm.cursorPt);             {we dont want to unhighlight cursor}
+        END;  {HiCursorOnThePad}
+
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF (mouseLPt.h <= vscreenRect.right) AND (mouseLPt.v <= vscreenRect.bottom) THEN
+          BEGIN
+            panel := SELF.panel;
+                                {can not assign panel.selection to termSelection since it may be noSelection.}
+            pt.h := mouseLPt.h;
+            pt.v := mouseLPt.v;
+            IF tabRulerShown AND PtInRect (pt, tabRect) THEN
+              WITH Consterm, tabPosition DO
+                BEGIN
+                  i := (pt.h - hindent) div dfontInfo.widmax;
+                  IF i <= maxColumns - 1 THEN
+                    BEGIN
+                      tabStop [i] := NOT tabStop [i];
+                      IF tabStop [i] THEN tabSet := TRUE
+                      ELSE IF (All [1] = 0) AND (All [2] = 0) AND (All [3] = 0) AND (All [4] = 0) AND
+                              (All [5] = 0) THEN tabSet := FALSE;
+                {$H-} ToggleTab (i);  {$H+}
+                    END;
+                END
+            ELSE
+              IF clickState.fShift AND InClass (panel.selection, TTermSelection) THEN
+                panel.selection.MouseMove (mouseLPt)       {Let the selection extend itself}
+              ELSE
+                BEGIN                                            {check selection kind ? }
+                  panel.BeginSelection;            {will unhighlight all selections in all panels, and deselect all
+                                                    selections in all panels and set selectPanel to SELF}
+                  panel.OnAllPadsDo (HiCursorOnThePad);          {we dont want to unhighlight cursor}
+                  CharPosWithPt (mouseLPt, charXY);              {find the corresponding character position}
+                  termSelection := TTermSelection (panel.selection.FreedAndReplacedBy (
+                          TTermSelection.CREATE (NIL, SELF.heap, SELF, noselKind, charXY, mouseLPt)));
+                END;
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.MousePress}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TTermView.}SetMinViewSize {(VAR minLRect : LRect)};
+    BEGIN                                    {toolkit will call this when we call view.ReactToPrinterChange
+                                              in QPMoveCursor to expand the view.}
+        {$IFC fTrace}BP(11);{$ENDC}
+        minLRect := SELF.minViewLRect;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.SetMinViewSize}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TTermView.}CreateUniversalText;
+    VAR writeUnivText : TTermWriteUnivText;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        writeUnivText := TTermWriteUnivText.CREATE (NIL, Consterm.heap, NIL, univBufferSize, SELF);
+                                             {not SELF.heap since it gets unbound before we free UT}
+        writeUnivText.Free;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.CreateUniversalText}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TTermView}
+
+
+
+
+{----------------------------------------------- TInputView -------------------------------------------------}
+
+METHODS OF TInputView;
+
+    FUNCTION  {TInputView.}CREATE {(object: TObject; heap: THeap; itsPanel: TPanel; itsExtent: LRect): TInputView};
+    VAR itsPrintManager:   TPrintManager;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TInputView (itsPanel.NewStatusView (object, itsExtent));        {no print}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TInputView.CREATE}
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TInputView.}Draw;
+    VAR i, j, v, k : INTEGER;
+        inputbuffer : TInputBuffer;
+        vanWindow   : TVanWindow;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        {Uptimize later to see whether the lines are visible in the window before drawing}
+
+        TextFont (Consterm.defltAttr.charFont);
+        TextFace (Consterm.defltAttr.charStyle);
+        v := Consterm.dfontInfo.leading + Consterm.dfontInfo.ascent;
+        MoveTo (hindent, v);
+        DrawString ('INPUT: ');
+        vanWindow := TVanWindow (SELF.panel.window);
+        FOR k := 1 TO vanWindow.typeAhead.size DO
+          BEGIN
+            inputbuffer := TInputBuffer (vanWindow.typeAhead.At (k)^);
+            WITH inputbuffer DO
+             BEGIN                                        {scan for CR to display multiple lines if any}
+               i := 1;
+        {$H-}  FOR j := 1 TO inputRun.size DO
+                 IF inputRun.At (j) = CHR (keyCR) THEN
+                   BEGIN
+                     IF j > i THEN inputRun.Draw (i, j-i);
+                     v := v + Consterm.dfontInfo.lineheight;
+                     MoveTo (hindent, v);                {to new line}
+                     i := j + 1;
+                   END;
+               IF inputRun.size > i THEN inputRun.Draw (i, inputRun.size - i + 1);  {$H+}
+             END;
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+        TextFont (Consterm.currAttr.charFont);              {restore current attr, so that VWrite would have
+                                                             to set them everytime.}
+        TextFace (Consterm.currAttr.charStyle);
+    END;  {TInputView.Draw}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TInputView}
+
+
+
+
+{----------------------------------------------- TTermCutCopyCmd -------------------------------------------}
+
+METHODS OF TTermCutCopyCmd {SUBCLASS OF TCutCopyCommand};
+
+    FUNCTION  {TTermCutCopyCmd.}CREATE {(object: TObject; heap: THeap; itsCmdNumber: TCmdNumber;
+                                         itsView: TView; itsSelection: TTermSelection): TTermCutCopyCmd};
+
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        WITH TTermCutCopyCmd (object) DO
+          BEGIN
+            undoable := FALSE;                         {no undo for copying}
+            termSelection := itsSelection;
+          END;
+
+        SELF := TTermCutCopyCmd (TCutCopyCommand.CREATE (object, heap, itsCmdNumber, itsView, FALSE));                                                                                               {no cut}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermCutCopyCmd.CREATE }
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TTermCutCopyCmd.}DoCutCopy{(clipSelection: TSelection; deleteOriginal: BOOLEAN;
+                                           cmdPhase: TCmdPhase)};
+    LABEL 9;
+    VAR clipHeap      : THeap;
+        clipPanel     : TPanel;
+        clipTmView    : TTermView;
+        termSelection : TTermSelection;
+        clipTmSelection : TTermSelection;
+        clipLines   : TArray;
+        clipTmline  : TTermLine;
+        tmline      : TTermLine;
+        cliptmstrP  : PTTermStr;
+        i, bsize, charstocopy, k  : INTEGER;
+        s  : PTAttributes;
+        attrP : PTCharAttr;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        CASE cmdPhase OF
+            doPhase:
+              BEGIN
+                clipHeap := clipSelection.heap;
+                clipPanel := clipSelection.panel;
+                clipLines := TArray.CREATE (NIL, clipHeap, cStdMaxLines, 4);    {initial size}
+                termSelection := SELF.termSelection;
+                bsize := Consterm.buffer.size;
+                WITH termSelection.selRange DO         {clone selected lines to clipview}
+                  FOR i := startXY.y TO endXY.y DO
+                    BEGIN
+               {$H-}  IF i < 0 THEN tmline := TTermLine (Consterm.buffer.At (bsize + i + 1)^)
+                      ELSE tmline := Consterm.screen[i];
+                              {need to clone entire termline including charAttributes in case going to UT}
+                      IF (i <> endXY.y) OR (endXY.x <> 0) THEN
+                        BEGIN
+                          clipTmline := TTermLine (tmline.Clone (clipHeap));
+                          cliptmstrP := @clipTmline.ch;
+                          charstocopy := ORD (tmline.ch [0]);
+                          IF i = endXY.y THEN charstocopy := Min (charstocopy, endXY.x)
+                          ELSE
+                            BEGIN
+                              charstocopy := charstocopy+1;         {one more for CR in between lines}
+                              cliptmstrP^[charstocopy] := CHR (keyCR);     {insert a CR in between lines}
+                            END;
+                          cliptmstrP^[0] := CHR (charstocopy);       {set linelength}
+                          (*
+                          IF i = startXY.y THEN
+                            IF startXY.x > 0 THEN
+                              BEGIN
+                                delete (cliptmstrP^, 1, startXY.x);
+                                IF clipTmline.size < 0 THEN      {has charattr, adjust charAttr's beginX too}
+                                  BEGIN
+                                    attrP := POINTER (ORD (@clipTmline.ch) + 1 + maxtextline);
+                                    k := 1;
+                                    WHILE k <= attrP^.attrsize DO
+                                      BEGIN
+                                        s := @attrP^.charAttr [k];
+                                        s^.beginX := s^.beginX - startXY.x;
+                                        k := k + 1;
+                                      END;
+                                  END;
+                              END;
+                          *)
+                          clipLines.InsLast (@clipTmline);  {$H+}
+                        END;
+                    END;
+9:
+                clipTmView := TTermView.CREATE(NIL, clipHeap, clipPanel, termSelection.view.extentLRect,
+                                                  clipLines);
+                clipTmView.firstLineStartX := termSelection.selRange.startXY.x;
+                clipTmSelection := TTermSelection (clipSelection.FreedAndReplacedBy(
+                       TTermSelection.CREATE(NIL, clipHeap, clipTmView, termselKind, termSelection.anchorXY, zeroLPt)));
+                {clipTmSelection.SetRange(0, MAXINT, TRUE);}
+              END;
+            undoPhase:
+                BEGIN
+                END;
+            redoPhase:
+                BEGIN
+                END;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermCutCopyCmd.DoCutCopy}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END; {METHODS OF TTermCutCopy}
+
+
+
+{----------------------------------------------- TTermPasteCmd ---------------------------------------------}
+
+METHODS OF TTermPasteCmd;
+
+    FUNCTION  {TTermPasteCmd.}CREATE{(object: TObject; heap: THeap; itsCmdNumber: TCmdNumber;
+                                      itsView: TView): TTermPasteCmd};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        TTermPasteCmd (object).undoable := FALSE;               {absolutely no undo for pasting}
+        SELF := TTermPasteCmd (TPasteCommand.CREATE (object, heap, itsCmdNumber, itsView));
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermPasteCmd.CREATE}
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TTermPasteCmd.}DoPaste {(clipSelection: TSelection; pic: PicHandle; cmdPhase: TCmdPhase)};
+                                   {This is really 'Read input from clipboard'. It is selected in window, so
+                                    that text or graphic program can have this command.}
+    VAR clipTmView    : TTermView;
+        i, runSize    : INTEGER;
+        vanWindow     : TVanWindow;
+        clipTmline    : TTermLine;
+        termstrP      : TPString;
+        inputbuffer   : TInputBuffer;
+        heap          : Theap;
+        readUnivText  : TTKReadUnivText;
+        done          : BOOLEAN;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        heap := SELF.heap;
+        CASE cmdPhase OF
+            doPhase:
+              BEGIN
+                vanWindow := Consterm.window;
+                IF InClass (clipSelection, TTermSelection) {AND (clipTmView.lines <> NIL)} THEN  {from same app}
+                  BEGIN                 {copy the clipSelection's data to input buffer}
+                    clipTmView := TTermView (clipSelection.view);
+                    FOR i := 1 TO clipTmView.lines.size DO
+                      BEGIN
+                        clipTmline := TTermLine (clipTmView.lines.At (i)^);
+                        termstrP := @clipTmline.ch;
+                        inputbuffer := TInputBuffer.CREATE (NIL, heap, FALSE);
+                        inputbuffer.inputRun.DelAll;
+                        inputbuffer.inputRun.InsPStrAt (1, termstrP);
+                                                  {have to copy to doc heap, since clipTmline is on clipheap}
+                        vanWindow.typeAhead.InsLast (@inputbuffer);
+                        vanWindow.inputcount := vanWindow.inputcount + ORD (termstrP^[0]);
+                      END;
+                    IF vanWindow.inputPanel <> NIL THEN
+                      vanWindow.inputPanel.Invalidate;       {invalidate the whole panel, will force redisplay}
+                    vanWindow.selectPanel.selection.MarkChanged;
+                  END
+                ELSE IF clipboard.hasUniversalText THEN          {from UT, other apps}
+                  BEGIN                 {copy from universal text's data to input buffer}
+                    inputbuffer := TInputBuffer.CREATE (NIL, heap, FALSE);
+                    readUnivText := TTKReadUnivText.CREATE (NIL, heap, inputbuffer.inputRun, univBufferSize,
+                                                            [UTparagraphs]);
+                    done := FALSE;
+                    REPEAT
+                      readUnivText.ReadRun;
+                      runSize := inputbuffer.inputRun.size;
+                      IF runSize > 0 THEN
+                        BEGIN
+                          vanWindow.typeAhead.InsLast (@inputbuffer);
+                          vanWindow.inputcount := vanWindow.inputcount + runSize;
+                          inputbuffer := TInputBuffer.CREATE (NIL, heap, FALSE);   {for next run}
+                          readUnivText.data := inputbuffer.inputRun;
+                        END
+                      ELSE
+                        BEGIN
+                          done := TRUE;
+                          inputbuffer.Free;            {release the allocate ahead}
+                        END;
+                    UNTIL done;
+                    readUnivText.Free;
+
+                    IF vanWindow.inputPanel <> NIL THEN
+                      vanWindow.inputPanel.Invalidate;       {invalidate the whole panel, will force redisplay}
+                    vanWindow.selectPanel.selection.MarkChanged;
+                  END
+                ELSE
+                  process.Stop(phUnkClip);
+              END;
+
+            undoPhase:
+                BEGIN
+                END;
+            redoPhase:
+                BEGIN
+                END;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermPasteCmd.DoPaste}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END; {METHODS OF TTermPasteCmd}
+
+
+
+
+{----------------------------------------------- TTermSelection ---------------------------------------------}
+
+METHODS OF TTermSelection;
+
+{$S sQPortInit}                         {initialization code segment}
+
+    FUNCTION  {TTermSelection.}CREATE {(object: TObject; heap: THeap; itsView: TView; itsKind: INTEGER;
+                                        itsCharPos : TCoordinate; itsAnchorLPt: Point): TTermSelection};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        TTermSelection (object).anchorXY := itsCharPos;
+
+        SELF := TTermSelection (TSelection.CREATE (object, heap, itsView, itsKind, itsAnchorLPt));
+        SELF.SetRange (itsCharPos, itsCharPos, TRUE);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TTermSelection.}DoKey{(ascii: CHAR; keycap : Byte; shiftKey, appleKey, optionKey: BOOLEAN)};
+    BEGIN             {only active window's key will get here, no dialog box keys}
+        {$IFC fTrace}BP(10);{$ENDC}
+        Consterm.window.DoKey (ascii, keycap, shiftKey, appleKey, optionKey);     {let window do the work}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.DoKey}
+
+
+
+    PROCEDURE {TTermSelection.}SetRange {(sXY, eXY : TCoordinate; startIsAnchor : BOOLEAN)};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        WITH SELF, selRange DO
+          BEGIN
+            startXY := sXY;
+            endXY := eXY;
+            IF startIsAnchor THEN
+              anchorXY := sXY
+            ELSE
+              anchorXY := eXY;
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.SetRange}
+
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+{----------------------------------------------- QPHighlight ------------------------------------------------}
+
+    PROCEDURE {TTermSelection.}QPHighlight (highTransit: THighTransit; cursorpoint : Point);
+                                                       {already focused on the Pad, called by Toolkit}
+    LABEL 1;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        HiLiteCursor (highTransit, cursorpoint);
+        IF SELF.kind = termselKind THEN
+          BEGIN
+            CASE highTransit OF
+              hOffToDim : GOTO 1;
+              hDimToOn  : highTransit := hOffToOn;
+              hDimToOff : GOTO 1;
+              hONToDim  : highTransit := hONToOff;         {we dont want to highlight when deactivated}
+            END;
+            SetPenState (highPen[highTransit]);
+            WITH SELF.selRange DO
+       {$H-}  PaintOrErase (TRUE, startXY, endXY); {$H-}      {to highlight}
+    1:
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.QPHighlight}
+
+
+
+    PROCEDURE {TTermSelection.}Highlight {(highTransit: THighTransit)};
+                                                       {already focused on the Pad, called by Toolkit}
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        SELF.QPHighlight (highTransit, Consterm.cursorPt);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.Highlight}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+{----------------------------------------------- TTermSelection.MouseMove -----------------------------------}
+
+    PROCEDURE {TTermSelection.}MouseMove {(mouseLPt: LPoint)};
+    VAR charXY : TCoordinate;
+        oldXY  : TCoordinate;
+        pt     : Point;
+
+        PROCEDURE HiLiteSel (highTransit : THighTransit; fromXY, toXY : TCoordinate);
+                                                           {to be called from outside the Pad}
+            PROCEDURE HiLiteOnThePad;
+            BEGIN
+              HiLiteText (highTransit, fromXY, toXY);
+            END;
+        BEGIN
+            SELF.panel.OnAllPadsDo (HiLiteOnThePad);
+        END;  {HiLiteSel}
+
+    BEGIN      {TTermSelection.MouseMove}
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF (mouseLPt.h <= vscreenRect.right) AND (mouseLPt.v <= vscreenRect.bottom) THEN
+          BEGIN
+                                            {Assuming highlighing is on ?}
+            pt.h := mouseLPt.h;
+            pt.v := mouseLPt.v;
+            IF tabRulerShown AND PtInRect (pt, tabRect) THEN         {view.MousePress already handles this}
+            ELSE
+              BEGIN
+                SELF.currLPt := mouseLPt;         {the place the mouse is last tracked}
+                CharPosWithPt (mouseLPt, charXY);       {find the corresponding character position}
+                WITH SELF, selRange DO
+                  IF endXY.xyCoord = anchorXY.xyCoord THEN            {mouse moved left}
+                      oldXY := startXY
+                  ELSE
+                      oldXY := endXY;
+
+                IF charXY.xyCoord <> oldXY.xyCoord THEN
+                  BEGIN
+                    IF charXY.xyCoord < SELF.anchorXY.xyCoord THEN
+                        SELF.SetRange (charXY, SELF.anchorXY, FALSE)
+                    ELSE
+                        SELF.SetRange (SELF.anchorXY, charXY, TRUE);
+                    WITH SELF, selRange DO
+                      IF startXY.xyCoord < endXY.xyCoord THEN kind := termselKind;        {turn into real selection}
+
+                    IF charXY.xyCoord < oldXY.xyCoord THEN
+                      HiLiteSel (hOffToOn, charXY, oldXY)             {Xor, turn off already highlighted area too}
+                    ELSE
+                      HiLiteSel (hOffToOn, oldXY, charXY);
+                  END;
+              END;
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.MouseMove}
+
+
+
+    FUNCTION {TTermSelection.}CanDoCommand {(cmdNumber: TCmdNumber; VAR checkIt: BOOLEAN): BOOLEAN};
+    BEGIN  {TTermSelection.NewCommand}
+        {$IFC fTrace}BP(11);{$ENDC}
+        CASE cmdNumber OF
+          uCopy, ccErase:
+              CanDoCommand := SELF.kind = termselKind;
+
+          OTHERWISE
+              CanDoCommand := SUPERSELF.CanDoCommand(cmdNumber, checkIt);
+        END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.CanDoCommand}
+
+
+
+{----------------------------------------------- TTermSelection.NewCommand ----------------------------------}
+
+    FUNCTION {TTermSelection.}NewCommand {(cmdNumber: TcmdNumber) : TCommand};
+                                                       {no Undo in vanilla window}
+    LABEL 1;
+    VAR heap   : THeap;
+        view   : TView;
+        i, j, bsize, lineinbuffer : INTEGER;
+        tmline : TTermLine;
+        termmstrP : PTTermStr;
+        vanWindow : TVanWindow;
+        termSelection : TTermSelection;
+        fromXY, toXy  : TCoordinate;
+        panel : TPanel;
+
+        PROCEDURE ClearSOnThePad;
+        BEGIN
+            PaintOrErase (FALSE, fromXY, toXy);                   {to erase}
+            HiLiteCursor (hOffToOn, Consterm.cursorPt);
+        END;
+
+
+    BEGIN  {TTermSelection.NewCommand}
+        {$IFC fTrace}BP(11);{$ENDC}
+        NewCommand := NIL;              {any command that does not apply to selection will be handled by
+                                         TVanWindow's NewCommand}
+        heap := SELF.heap;
+        view := SELF.view;
+        CASE cmdNumber OF
+          uCopy :
+            BEGIN
+              IF SELF.kind <> termselKind THEN
+                SELF.CantDoIt
+              ELSE
+                NewCommand := TTermCutCopyCmd.CREATE (NIL, heap, cmdNumber, view, SELF);
+                              {Have to go to a subclass of TCommand because clipboard is setup in TCommand }
+            END;
+
+          ccErase :
+            BEGIN                                 {clear lines in Consterm}
+              bsize := Consterm.buffer.size;
+              WITH SELF.selRange DO
+                BEGIN
+                  fromXY := startXY;
+                  toXY := endXY;
+                  FOR i := startXY.y TO endXY.y DO
+                    BEGIN  {$H-}
+                      IF i < 0 THEN
+                        BEGIN
+                          lineinbuffer := bsize + i + 1;
+                          IF (lineinbuffer = 1) AND (startXY.x = 0) AND (i <> endXY.y) THEN
+                            BEGIN
+                              tmline := TTermLine (Consterm.buffer.First^);
+                              tmline.Free;                         {have to free the buffer.First myself}
+                              Consterm.buffer.DelFirst;            {need not shrink the view size down}
+                              bsize := bsize - 1;
+                              Consterm.bufhasroom := TRUE;
+                              GOTO 1;
+                            END
+                          ELSE
+                              tmline := TTermLine (Consterm.buffer.At (lineinbuffer)^);
+                        END
+                      ELSE
+                          tmline := Consterm.screen[i];
+                      termmstrP := @tmline.ch;
+                      IF startXY.y = endXY.y THEN
+                        IF endXY.x - startXY.x >= ORD (termmstrP^[0]) THEN termmstrP^[0] := CHR (0)
+                        ELSE FOR j := startXY.x + 1 TO endXY.x DO termmstrP^[j] := ' '
+                      ELSE IF i = startXY.y THEN
+                        termmstrP^[0] := CHR (startXY.x)
+                      ELSE IF i = endXY.y THEN
+                        FOR j := 1 TO endXY.x DO termmstrP^[j] := ' '
+                      ELSE termmstrP^[0] := CHR (0);
+                  1:
+             {$H+}  END;  {FOR i := startXY.y TO endXY.y DO}
+                END;  {WITH SELF.selRange}
+
+              panel := SELF.panel;
+              panel.BeginSelection;             {will unhighlight all selections in all panels, and deselect
+                                                      all selections in all panels and set selectPanel to SELF}
+              panel.OnAllPadsDo (ClearSOnThePad);
+              termSelection := TTermSelection (panel.selection.FreedAndReplacedBy (
+                        TTermSelection.CREATE (NIL, heap, view, noselKind, SELF.anchorXY, zeroLPt)));
+            END;
+
+          OTHERWISE NewCommand := SUPERSELF.NewCommand (cmdNumber);
+        END;
+
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermSelection.NewCommand}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TTermSelection}
+
+
+
+
+{----------------------------------------------- TGraphView -------------------------------------------------}
+
+METHODS OF TGraphView;
+
+{$S sQPortInit}                         {initialization code segment}
+
+    FUNCTION  {TGraphView.}CREATE{(object: TObject; heap: THeap; itsPanel: TPanel; itsExtent: LRect): TGraphView};
+    VAR itsPrintManager:   TPrintManager;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        WITH TGraphView (object) DO
+          BEGIN
+            qdpPicture   := NIL;
+            scrolldh     := 0;
+            scrolldv     := 0;
+            minViewLRect := itsExtent;       {must be before NewView, since it calls SetMinView}
+          END;
+        itsPrintManager := TStdPrintManager.CREATE (NIL, heap);       {allow heading, page break, page margin}
+        SELF := TGraphView (itsPanel.NewView (object, itsExtent, itsPrintManager, stdMargins, FALSE));
+                                                       {retain my view size, not to fit in page size}
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TGraphView.}Draw;
+    VAR lr : LRect;
+        rInView : LRect;
+        lPtInView : LPoint;
+        originPt : Point;
+        saveport : grafptr;
+        anything, i, v : INTEGER;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        WITH Consterm DO
+          IF SELF.panel = window.termPanel THEN
+            BEGIN
+              anything := 0;
+              FOR i := 0 TO maxLines - 1 DO
+                anything := ORD (screen [i].ch [0]) + anything;      {any writelns ?}
+              IF anything > 0 THEN
+                BEGIN
+                  v := vscreenRect.top + dfontInfo.leading + dfontInfo.ascent;
+                  FOR i := 0 TO maxLines - 1 DO
+                    BEGIN {$H-}
+                      MovetoL (hindent, v);                         {moveto next line}
+                      DrawTmLine (screen [i]);
+                      v := v + dfontInfo.lineheight; {$H+}
+                    END;
+                END;
+            END;
+
+        IF qdpPicOpen THEN
+          BEGIN
+            GetPort (saveport);
+            SetPort (qdpGPtr);           {set graphPanel's grafport before closepicture}
+            ClosePicture;                {have to close picture before picture can be drawn}
+            qdpPicOpen := FALSE;
+            SetPort (saveport);
+          END;
+        IF SELF.qdpPicture <> NIL THEN
+          BEGIN
+            (*
+                                        {have to setorigin like in QDPBits}
+            thePad.PtToLPt (zeroPt, lPtInView);
+            originPt := thePort^.portRect.topleft;
+            SetOrigin (lPtInView.h, lPtInView.v);        {does not affect clipRgn which is window relative}
+            GetClip (workRgn);                               {toolkit set the clipRgn to the pad}
+            OffsetRgn (workRgn, lPtInView.h, lPtInView.v);   {temp offset clipRgn to view relative}
+            SetClip (workRgn);
+
+            OffsetRect (qdpViewRect, -SELF.scrolldh, -SELF.scrolldv);
+                                                         {work around to QuickDraw' scrollRect problem.}
+            *)
+
+            IF amPrinting OR (SELF.panel.previewMode = mPrvwMargin) THEN
+              BEGIN
+                noPad.RectToLRect (qdpViewRect, rInView);
+                thePad.DrawLPicture (SELF.qdpPicture, rInView);
+              END
+            ELSE
+              DrawPicture (SELF.qdpPicture, qdpViewRect);
+                                     {wait until capture proc to open another picture, so that continuous
+                                      scrolling will not have to open and close repeatedly}
+
+            (*
+            SetOrigin (originPt.h, originPt.v);
+            OffsetRgn (workRgn, -lPtInView.h, -lPtInView.v);    {offset clipRgn back to window relative}
+            SetClip (workRgn);
+            *)
+          END;
+
+        TextFont (pcurrAttr.charFont);                 {restore current attr, so that VWrite would not
+                                                             have to set them everytime.}
+        TextFace (pcurrAttr.charStyle);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphView.Draw}
+
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+{----------------------------------------------- TGraphView.MousePress --------------------------------------}
+
+    PROCEDURE {TGraphView.}MousePress {(mouseLPt: LPoint)};
+    VAR amouseevent : TMouseEvent;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+                    {can not use click to deselect, since click is to be sent to program.}
+        IF qMouseEvents <> NIL THEN
+          IF qMouseEvents.size < maxMouseEvents THEN
+            BEGIN
+              WITH amouseevent, clickstate DO                     {enqueue a mouse down event}
+                BEGIN
+                  mouseLoc.h := mouseLPt.h;
+                  mouseLoc.v := mouseLPt.v;
+                  mouseDown  := TRUE;
+                  clicknum   := clickcount;
+                  meShift    := fShift;
+                  meApple    := fApple;
+                  meOption   := fOption;
+                END;
+              qMouseEvents.InsLast (@amouseevent);
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphView.MousePress}
+
+
+
+          {We have to queue mouse move as events because if we dont, WaitMouseEvent or WaitEvent will only
+           get the mouse down and up events, and they only return to program after mouse release (ToolKit
+           calls MouseMove continuously while mouse is down, and not return from ObeyEvents.)}
+    PROCEDURE {TGraphView.}MouseMove {(mouseLPt: LPoint)};
+    VAR pmouseevent : TPMouseEvent;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF qMouseEvents <> NIL THEN
+          pmouseevent := TPMouseEvent (qMouseEvents.Last);
+        WITH pmouseevent^ DO
+          IF (mouseLoc.h <> mouseLPt.h) OR (mouseLoc.v <> mouseLPt.v) THEN SELF.MousePress (mouseLPt);
+                         {only give programs the mouse states that have different mouse locations}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphView.MouseMove}
+
+
+
+    PROCEDURE {TGraphView.}MouseRelease;
+    VAR pmouseevent : TPMouseEvent;
+        mouseLPt : LPoint;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF qMouseEvents <> NIL THEN
+         IF qMouseEvents.size < maxMouseEvents THEN
+          BEGIN
+            (*
+            pmouseevent := TPMouseEvent (qMouseEvents.Last);
+            WITH pmouseevent^ DO
+              BEGIN
+                mouseLPt.h := mouseLoc.h;
+                mouseLPt.v := mouseLoc.v;
+              END;
+            SELF.MousePress (mouseLPt);               {enqueue a mouse up event with same mouseLoc as last one}
+            *)
+            mouseLPt := SELF.clickLPt;
+            SELF.MousePress (mouseLPt);           {enq a mouse up event with the last button click loc}
+            pmouseevent := TPMouseEvent (qMouseEvents.Last);
+            pmouseevent^.mouseDown := FALSE;
+          END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphView.MouseRelease}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TGraphView.}SetMinViewSize {(VAR minLRect : LRect)};        {toolkit will call this.}
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        minLRect := SELF.minViewLRect;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermView.SetMinViewSize}
+
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TGraphView}
+
+
+
+{----------------------------------------------- TGraphCutCopyCmd -------------------------------------------}
+
+METHODS OF TGraphCutCopyCmd {SUBCLASS OF TCutCopyCommand};
+
+    FUNCTION  {TGraphCutCopyCmd.}CREATE {(object: TObject; heap: THeap; itsCmdNumber: TCmdNumber; itsView: TView;
+                                       itsSelection: TGraphSelection): TGraphCutCopyCmd};
+
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        WITH TGraphCutCopyCmd (object) DO
+          BEGIN
+            undoable := FALSE;                         {no undo for copying}
+            graphSelection := itsSelection;
+          END;
+
+        SELF := TGraphCutCopyCmd (TCutCopyCommand.CREATE (object, heap, itsCmdNumber, itsView, FALSE));                                                                                               {no cut}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphCutCopyCmd.CREATE }
+
+
+
+    PROCEDURE {TGraphCutCopyCmd.}DoCutCopy{(clipSelection: TSelection; deleteOriginal: BOOLEAN;
+                                           cmdPhase: TCmdPhase)};
+    VAR clipHeap, currHeap      : THeap;
+        clipPanel     : TPanel;
+        clipGrView, graphView    : TGraphView;
+        clipGrSelection : TGraphSelection;
+        aPicture : PicHandle;
+        saveport : grafptr;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        CASE cmdPhase OF
+            doPhase:
+              BEGIN
+                IF qdpPicOpen THEN
+                  BEGIN
+                    GetPort (saveport);
+                    SetPort (qdpGPtr);           {set graphPanel's grafport before closepicture}
+                    ClosePicture;                {have to close picture before picture can be drawn}
+                    qdpPicOpen := FALSE;
+                    SetPort (saveport);
+                  END;
+                graphView := TGraphView (SELF.graphSelection.view);
+                IF graphView.qdpPicture <> NIL THEN
+                  BEGIN
+                    clipHeap := clipSelection.heap;
+                    clipPanel := clipSelection.panel;
+                                            {clone entire graphic panel to clipview}
+                    GetHeap (currHeap);
+                    SetHeap (clipHeap);                         {use clipheap for picture}
+                    GetClip (workRgn);                          {save toolkit's cliprgn}
+                    ClipRect (qdpViewRect);                     {we want the cliprgn to be entire view}
+                    aPicture := OpenPicture (qdpViewRect);      {clipboard is limited to one picture -32k only}
+                    (*
+                    OffsetRect (qdpViewRect, -graphView.scrolldh, -graphView.scrolldv);
+                                                            {work around to QuickDraw' scrollRect problem.}
+                    *)
+                    DrawPicture (graphView.qdpPicture, qdpViewRect);      {draw the picture}
+                    ClosePicture;
+                    SetClip (workRgn);                          {restore toolkit's cliprgn}
+                    SetHeap (currHeap);                         {restore our heap}
+
+                    clipGrView := TGraphView.CREATE(NIL, clipHeap, clipPanel, graphView.extentLRect);
+                    clipGrView.qdpPicture := aPicture;
+                    clipGrSelection := TGraphSelection (clipSelection.FreedAndReplacedBy(
+                           TGraphSelection.CREATE(NIL, clipHeap, clipGrView, gpselKind, zeroLPt)));
+                  END;
+              END;
+            undoPhase:
+                BEGIN
+                END;
+            redoPhase:
+                BEGIN
+                END;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphCutCopyCmd.DoCutCopy}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END; {METHODS OF TGraphCutCopyCmd}
+
+
+
+
+{----------------------------------------------- TGraphSelection --------------------------------------------}
+
+METHODS OF TGraphSelection;
+
+{$S sQPortInit}                         {initialization code segment}
+
+    FUNCTION  {TGraphSelection.}CREATE {(object: TObject; heap: THeap; itsView: TView; itsKind: INTEGER;
+                                                  itsAnchorLPt: LPoint): TGraphSelection};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TGraphSelection (TSelection.CREATE (object, heap, itsView, itsKind, itsAnchorLPt));
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphSelection.CREATE}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TGraphSelection.}DoKey{(ascii: CHAR; keycap : Byte; shiftKey, appleKey, optionKey: BOOLEAN)};
+    BEGIN                                    {so that graphic panel only program can do read}
+        {$IFC fTrace}BP(11);{$ENDC}
+        Consterm.window.DoKey (ascii, keycap, shiftKey, appleKey, optionKey);     {let window do the work}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphSelection.DoKey}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+    PROCEDURE {TGraphSelection.}Highlight {(highTransit: THighTransit)};
+    LABEL 1;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF SELF.kind = gpselKind THEN
+          BEGIN
+            CASE highTransit OF
+              hOffToDim : GOTO 1;
+              hDimToOn  : highTransit := hOffToOn;
+              hDimToOff : GOTO 1;
+              hONToDim  : highTransit := hONToOff;         {we dont want to highlight when deactivated}
+            END;
+            SetPenState(highPen[highTransit]);
+            PaintRect (qdpViewRect);
+          END;
+        1:
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphSelection.Highlight}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    FUNCTION {TGraphSelection.}CanDoCommand {(cmdNumber: TCmdNumber; VAR checkIt: BOOLEAN): BOOLEAN};
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF cmdNumber = uCopy THEN
+            CanDoCommand := Consterm.grpanelonly OR (SELF.kind = gpselKind)
+        ELSE
+            CanDoCommand := SUPERSELF.CanDoCommand (cmdNumber, checkIt);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphSelection.CanDoCommand}
+
+
+
+    FUNCTION {TGraphSelection.}NewCommand {(cmdNumber: TcmdNumber) : TCommand};
+                                                       {no Undo in vanilla window}
+    BEGIN  {TGraphSelection.NewCommand}
+        {$IFC fTrace}BP(11);{$ENDC}
+        NewCommand := NIL;              {any command that does not apply to selection will be handled by
+                                         TVanWindow's NewCommand}
+        CASE cmdNumber OF          {should disable the ones that are not valid in graphic panel}
+          uCopy :
+              BEGIN
+                (* need not check this since CanDoCommand already checked it
+                IF SELF.kind <> gpselKind THEN
+                  SELF.CantDoIt
+                ELSE
+                *)
+                  NewCommand := TGraphCutCopyCmd.CREATE (NIL, SELF.heap, cmdNumber, SELF.view, SELF);
+                                {Have to go to a subclass of TCommand because clipboard is setup in TCommand }
+              END;
+
+          OTHERWISE NewCommand := SUPERSELF.NewCommand (cmdNumber);
+        END;
+
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TGraphSelection.NewCommand}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TGraphSelection}
+
+
+
+
+{----------------------------------------------- TInputBuffer -----------------------------------------------}
+
+METHODS OF TInputBuffer;
+
+{$S sQPortInit}                         {initialization code segment}
+
+    FUNCTION  {TInputBuffer.}CREATE{(object: TObject; heap: THeap; fromKeyboard : BOOLEAN): TInputBuffer};
+    VAR inputsize : INTEGER;
+        anarray   : TArray;
+        astring   : TString;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject (heap, THISCLASS);
+        SELF := TInputBuffer (object);
+
+        IF fromKeyboard THEN
+          BEGIN
+            inputsize := maxtypeahead;
+            anarray := TArray.CREATE (NIL, heap, maxtypeahead, SIZEOF (TCombKeys));
+            SELF.combKeys := anarray;
+          END
+        ELSE
+          BEGIN
+            inputsize := univBufferSize;
+            SELF.combKeys := NIL;
+          END;
+        astring := TString.CREATE (NIL, heap, inputsize);
+        SELF.inputRun := astring;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TInputBuffer.CREATE}
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    PROCEDURE {TInputBuffer.}Free;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF SELF.combKeys <> NIL THEN SELF.combKeys.Free;
+        SELF.inputRun.Free;
+        TObject.Free;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TInputBuffer.Free}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TInputBuffer}
+
+
+
+
+{----------------------------------------------- TVanWindow -------------------------------------------------}
+
+METHODS OF TVanWindow;
+
+{$S sQPortInit}                         {initialization code segment}
+
+    FUNCTION  {TVanWindow.}CREATE{(object: TObject; heap: THeap; itsWmgrID: TWindowID): TWindow};
+    VAR anarray : TArray;
+        inputbuffer : TInputBuffer;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject (heap, THISCLASS);
+
+        anarray := TArray.CREATE (NIL, heap, 1, 4);                   {initial size of 1}
+        inputbuffer := TInputBuffer.CREATE (NIL, heap, TRUE);         {always have a keyboard input buffer}
+        anarray.InsLast (@inputbuffer);
+        WITH TVanWindow (object) DO
+          BEGIN
+            typeAhead  := anarray;
+            inputcount := 0;
+            termPanel  := NIL;
+            inputPanel := NIL;
+            graphPanel := NIL;
+            stdterm    := NIL;
+            dialogWindow := NIL;
+          END;
+
+        SELF := TVanWindow (TWindow.CREATE(object, heap, itsWmgrID, TRUE));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+
+    PROCEDURE {TVanWindow.}BlankStationery;
+    VAR viewLRect : LRect;
+        panel, graphPanel:     TPanel;
+        termView:  TTermView;
+        termSelection : TTermSelection;
+        graphSelection : TGraphSelection;
+        tvertviewsize : INTEGER;
+        graphView : TGraphView;
+        itsCharPos : TCoordinate;
+        heap : THeap;
+        pConsterm : TStdTerm;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        blankdocument := TRUE;
+
+        {set up default panel layout here - one panel, either text or graphic panel}
+        heap := SELF.heap;
+        pConsterm := Consterm;
+        Consterm := TStdTerm (pConsTerm.Clone (heap));   {need not clone screen or buffer since they are
+                                                          initialized by InitScreen call from doc.Open}
+        SELF.stdterm := Consterm;            {Consterm is initialized before process.ObjectEvents}
+        panel := TPanel.CREATE (NIL, heap, SELF, 0, 0, [aBar, aScroll, aSplit], [aBar, aScroll, aSplit]);
+                      {split pane in text panel caused multiple cursors to show up-didn't get dehighlighted}
+        IF NOT qdpUsed THEN             {text output only, text panel only}
+          BEGIN
+            WITH Consterm DO                 {Consterm has been inited by subclass by now}
+                tvertviewsize := viewSize * dfontInfo.lineheight + vindent;          {some space at bottom}
+            SetLRect (viewLRect, 0, 0, 720, tvertviewsize);        {size of terminal output for text view}
+            termView := TTermView.CREATE (NIL, heap, panel, viewLRect, NIL);
+            SELF.termPanel := panel;
+            SELF.graphPanel := NIL;
+            itsCharPos.xyCoord := 0;
+            termSelection := TTermSelection (panel.selection.freedAndReplacedBy(
+                        TtermSelection.CREATE (NIL, heap, termView, noselKind, itsCharPos, zeroLPt)));
+            {ToolKit will call WantMenu to put up the text-panel-only edit menu}
+          END
+        ELSE                            {graphic output only, graphic panel only}
+          BEGIN
+            noPad.RectToLRect (qdpViewRect, viewLRect);          {size of graphical panel view}
+            (*
+            graphPanel := panel.Divide (h, -50, percentFromEdge, [userCanResizeIt, windowCanResizeIt],
+                                        0, [aBar, aScroll, aSplit], [aBar, aScroll, aSplit]);
+            *)
+            graphView := TGraphView.CREATE (NIL, heap, panel, viewLRect);
+            SELF.graphPanel := panel;
+            SELF.termPanel := panel;
+            graphSelection := TGraphSelection (panel.selection.freedAndReplacedBy(
+                              TGraphSelection.CREATE (NIL, heap, graphView, noselKind, zeroLPt)));
+            {ToolKit will call WantMenu to put up the graphic-panel-only edit menu}
+          END;
+
+
+(* no input panel for default
+        panel := TPanel.CREATE (NIL, heap, SELF, ir, [aBar, aScroll], []);  {input panel has no h scroll}
+        SetLRect (viewRect, 0, 0, 720, 364);                {size of input panel view}
+        inputView := TInputView.CREATE (NIL, heap, panel, viewRect);
+        SELF.inputPanel := panel;
+*)
+        SELF.inputPanel := NIL;                             {default is no input panel}
+
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.BlankStationery}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+{----------------------------------------------- TVanWindow.DoKey -------------------------------------------}
+
+    PROCEDURE {TVanWindow.}DoKey{(ascii: CHAR; keycap : Byte; shiftKey, appleKey, optionKey: BOOLEAN)};
+    LABEL 9;
+    VAR inputbuffer : TInputBuffer;
+        acombkey    : TCombKeys;
+
+    BEGIN             {only active window's key will get here, no dialog box keys}
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF Pterminating THEN goto 9;              {don't respond to key input when completing}
+        IF appleKey AND (ascii > '?') THEN ascii := CHR (ORD (ascii) MOD ORD (' '));
+        IF (NOT outputStopped) AND (Consterm.stopOutputKey = ascii) THEN outputStopped := TRUE
+        ELSE IF Consterm.startOutputKey = ascii THEN outputStopped := FALSE
+        (*
+        ELSE IF Consterm.handleApplePeriod AND appleKey AND (ascii = '.') THEN
+               BEGIN
+                 gotapplePeriod := TRUE;
+                 outputStopped := TRUE;
+               END
+        *)
+        ELSE IF outputStopped OR inputStopped THEN
+                          {do not save input during XON & XOFF or if input is stopped by program}
+             ELSE
+               BEGIN
+                 IF SELF.typeAhead.Size = 0 THEN
+                   BEGIN
+                     inputbuffer := TInputBuffer.CREATE (NIL, SELF.heap, TRUE);
+                     SELF.typeAhead.InsLast (@inputbuffer);
+                   END
+                 ELSE
+                   BEGIN
+                     inputbuffer := TInputBuffer (SELF.typeAhead.Last^);
+                     IF inputbuffer.combKeys = NIL THEN          {last buffer is from paste}
+                       BEGIN
+                         inputbuffer := TInputBuffer.CREATE (NIL, SELF.heap, TRUE);
+                         SELF.typeAhead.InsLast (@inputbuffer);
+                       END;
+                   END;
+                 WITH SELF, inputbuffer DO
+                   BEGIN
+               {$H-} inputRun.InsLast (ascii);            {return everything to paslib}
+                     WITH acombkey DO
+                       BEGIN
+                         keycapvalue := keycap;
+                         appledown := appleKey;
+                         shiftdown := shiftKey;
+                         optiondown := optionKey;
+                       END;
+                     combKeys.InsLast (@acombkey);  {$H+}
+                     inputcount := inputcount + 1;
+                   END;
+                 SELF.selectPanel.selection.MarkChanged;
+               END;
+9:
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.DoKey}
+
+
+
+    FUNCTION  {TVanWindow.}WantMenu {(menuID: INTEGER; inClipboard : BOOLEAN) : BOOLEAN};
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        WantMenu := SUPERSELF.WantMenu (menuID, inClipboard);         {do standard one first}
+        WITH Consterm DO
+          IF haveInputPanel THEN
+            BEGIN
+              IF txpanelonly THEN
+                  IF (menuID = midInGrOnlyEdit) OR (menuID = midInTxGrEdit) THEN WantMenu := FALSE;
+              IF grpanelonly THEN
+                  IF (menuID = midInTxOnlyEdit) OR (menuID = midInTxGrEdit) OR (menuID = midTermSpec) THEN
+                    WantMenu := FALSE;
+              IF haveTwoPanels THEN
+                  IF (menuID = midInTxOnlyEdit) OR (menuID = midInGrOnlyEdit) THEN WantMenu := FALSE;
+
+              IF (menuID = midTxOnlyEdit) OR (menuID = midGrOnlyEdit) OR (menuID = midTxGrEdit) THEN
+                WantMenu := FALSE;
+            END
+          ELSE
+            BEGIN
+              IF txpanelonly THEN
+                  IF (menuID = midGrOnlyEdit) OR (menuID = midTxGrEdit) THEN WantMenu := FALSE;
+              IF grpanelonly THEN
+                  IF (menuID = midTxOnlyEdit) OR (menuID = midTxGrEdit) OR (menuID = midTermSpec) THEN
+                    WantMenu := FALSE;
+              IF haveTwoPanels THEN
+                  IF (menuID = midTxOnlyEdit) OR (menuID = midGrOnlyEdit) THEN WantMenu := FALSE;
+
+              IF (menuID = midInTxOnlyEdit) OR (menuID = midInGrOnlyEdit) OR (menuID = midInTxGrEdit) THEN
+                WantMenu := FALSE;
+           END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.WantMenu}
+
+
+
+{$S sQPortCold}                         {cold segment - user interface code - and infrequent code segment}
+
+    FUNCTION {TVanWindow.}CanDoCommand {(cmdNumber: TCmdNumber; VAR checkIt: BOOLEAN): BOOLEAN};
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        CASE cmdNumber OF
+          uRevertVersion : CanDoCommand := FALSE;      {no revert to previous version in QuickPort}
+
+          uPaste,                                      {Read Input from Clipboard}
+          ccSelText, ccSelGraph, ccSetup :
+              CanDoCommand := TRUE;
+
+          ccShowTabRuler :
+              CanDoCommand := NOT tabRulerShown;
+
+          ccHideTabRuler :
+              CanDoCommand := tabRulerShown;
+
+          ccSaveBuffer :
+            BEGIN
+              CanDoCommand := TRUE;
+              checkIt := Consterm.saveBuffer;
+            END;
+
+          ccDontSaveBuffer :
+            BEGIN
+              CanDoCommand := TRUE;
+              checkIt := NOT Consterm.saveBuffer;
+            END;
+
+          ccFlushInput : CanDoCommand := Consterm.haveInputPanel;
+
+          ccRestart    : CanDoCommand := NOT restarted;
+
+          ccResume     : CanDoCommand := restarted AND gotapplePeriod AND Consterm.handleApplePeriod;
+
+          OTHERWISE      CanDoCommand := SUPERSELF.CanDoCommand (cmdNumber, checkIt);
+        END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.CanDoCommand}
+
+
+
+{----------------------------------------------- TVanWindow.NewCommand --------------------------------------}
+
+    FUNCTION  {TVanWindow.}NewCommand {(cmdNumber: TcmdNumber) : TCommand};
+    VAR heap   : THeap;
+        graphSelection : TGraphSelection;
+        grpanel  : TPanel;
+        txpanel  : TPanel;
+        diWindow : TDialogWindow;
+        diView   : TDialogView;
+        adialog  : TTermDialog;
+        graphView : TGraphView;
+        bcursorpoint : Point;
+        lr : LRect;
+        saveport : grafptr;
+        hsize : INTEGER;
+        fromXY, toXY : TCoordinate;
+        termSelection : TTermSelection;
+
+        PROCEDURE SelTextOnThePad;
+        BEGIN
+            HiLiteCursor (hOffToOn, Consterm.cursorPt);             {we dont want to unhighlight cursor}
+            HiLiteText (hOffToOn, fromXY, toXY);
+        END;
+
+        PROCEDURE HiCursorOnThePad;
+        BEGIN
+            HiLiteCursor (hOffToOn, Consterm.cursorPt);             {we dont want to unhighlight cursor}
+        END;  {HiCursorOnThePad}
+
+        PROCEDURE HiLiCursorOnThePad;
+        BEGIN
+            HiLiteCursor (hOnToOff, bcursorpoint);
+            WITH Consterm DO
+              BEGIN
+          {$H-} GetPoint (0, 0, cursorPt);
+                HiLiteCursor (hOffToOn, cursorPt);  {$H+}
+              END;
+        END;
+
+        PROCEDURE ErScreenOnThePad;
+        BEGIN
+            EraseRect (qdpViewRect);
+        END;
+
+        (*
+        PROCEDURE ShowTabRulerOnThePad;
+        BEGIN
+          DrawTabRuler;
+        END;
+        *)
+
+    BEGIN  {TVanWindow.NewCommand}
+        {$IFC fTrace}BP(10);{$ENDC}
+        NewCommand := NIL;  {any command that applys to the window will be handled by TVanWindow's NewCommand}
+        heap := SELF.heap;
+        txpanel := SELF.termPanel;
+        grpanel := SELF.graphPanel;
+        CASE cmdNumber OF
+          uPutAway, uSaveVersion :
+            BEGIN
+              IF qdpUsed AND qdpPicOpen THEN                     {closepicture before ToolKit sweep the heap.}
+                BEGIN
+                  GetPort (saveport);
+                  SetPort (qdpGPtr);           {set graphPanel's grafport before closepicture}
+                  ClosePicture;                {have to close picture before picture can be drawn}
+                  qdpPicOpen := FALSE;
+                  SetPort (saveport);
+                END;
+              IF cmdNumber = uPutAway THEN
+                BEGIN
+                  IF tabRulerShown THEN                              {take down tab ruler if any}
+                      txpanel.ShowSideBand (v, FALSE, -1, -1);       {tab ruler beneath the view}
+                  IF NOT Pterminating THEN                           {TWClose has already done this}
+                      WrTermMsg;                                     {write terminal message to text panel if any}
+                END;
+              NewCommand := SUPERSELF.NewCommand (cmdNumber);    {still do the standard thing}
+            END;
+
+          uPaste:                            {Read Input from Clipboard}
+            BEGIN
+              clipboard.Inspect;
+              IF clipboard.hasView OR clipboard.hasUniversalText THEN
+                  NewCommand := TTermPasteCmd.CREATE (NIL, heap, cmdNumber, txpanel.view)
+                              {Have to go to a subclass of TCommand because clipboard is setup in TCommand }
+              ELSE
+                  process.Stop (phUnkClip);
+            END;
+
+          ccSaveBuffer :
+              Consterm.saveBuffer := TRUE;
+
+          ccDontSaveBuffer :
+              Consterm.saveBuffer := FALSE;
+
+          ccFlushInput :
+              IF SELF.inputcount <> 0 THEN
+                BEGIN
+                  SELF.inputcount := 0;
+                  SELF.typeAhead.Free;
+                END;
+
+          ccSelText :
+              BEGIN
+                txpanel.BeginSelection;           {will unhighlight all selections in all panels, and deselect all
+                                                   selections in all panels and set selectPanel to SELF}
+                fromXY.x := 0;
+                fromXY.y := -Consterm.buffer.size;
+                toXY.x := Consterm.maxColumns - 1;
+                toXY.y := Consterm.maxLines - 1;       {if screen is not full, will highlight blank lines too}
+                termSelection := TTermSelection (txpanel.selection.FreedAndReplacedBy (
+                        TTermSelection.CREATE (NIL, heap, txpanel.view, termselKind, fromXY, zeroLPt)));
+                termSelection.SetRange (fromXY, toXY, TRUE);
+                txpanel.OnAllPadsDo (SelTextOnThePad);
+              END;
+
+          ccSelGraph :
+              IF grpanel.selection.kind <> gpselKind THEN   {do nothing if already selected}
+                BEGIN
+                  grpanel.BeginSelection;     {will unhighlight all selections in all panels, and deselect all
+                                               selections in all panels and set selectPanel to SELF}
+                  txpanel.OnAllPadsDo (HiCursorOnThePad);          {we dont want to unhighlight cursor}
+                  graphSelection := TGraphSelection (grpanel.selection.FreedAndReplacedBy (
+                                 TGraphSelection.CREATE (NIL, heap, grpanel.view, gpselKind, zeroLPt)));
+                  termSelection := TTermSelection (txpanel.selection.FreedAndReplacedBy (
+                        TTermSelection.CREATE (NIL, heap, txpanel.view, noselKind, fromXY, zeroLPt)));
+                              {we need a selection in the text panel for writeln to unhighlight the selection}
+                  grpanel.HighLight (graphSelection, hOffToOn);         {will do OnAllPadsDo}
+                END;
+
+          ccSetup :
+            BEGIN
+              IF SELF.dialogWindow = NIL THEN
+                  BEGIN
+                    diWindow := NewStdDialogWindow (heap, 200, diAccept {keys},
+                                        diAccept {menu events}, diDismissDialogBox {down in main window});
+                    SELF.dialogWindow := diWindow;
+                    diView := TDialogView (diWindow.controlPanel.view);
+                    adialog := TTermDialog.CREATE (NIL, heap, diView);
+                    SELF.termDialog := adialog;
+                    diView.AddDialog (adialog);
+                  END
+              ELSE SELF.termDialog.SetupDialog;
+              SELF.PutUpDialogBox (SELF.dialogWindow);
+            END;
+
+          (*
+          ccShowTabRuler :
+            BEGIN
+              tabRulerShown := TRUE;
+              txpanel.OnAllPadsDo (ShowTabRulerOnThePad);
+            END;
+
+          ccHideTabRuler :
+            BEGIN
+              tabRulerShown := FALSE;
+              noPad.RectToLRect (tabRect, lr);
+              txpanel.InvalLRect (lr);
+            END;
+          *)
+          ccShowTabRuler, ccHideTabRuler :
+            BEGIN
+              IF cmdNumber = ccShowTabRuler THEN
+                  hsize := htTabRuler
+              ELSE
+                  hsize := -1;
+
+              txpanel.ShowSideBand (v, FALSE, hsize, -hsize);         {tab ruler beneath the view}
+              tabRulerShown := cmdNumber = ccShowTabRuler;
+            END;
+
+          ccRestart :
+            BEGIN
+              IF NOT Consterm.grpanelonly THEN
+                BEGIN
+                  QPMoveCursor (TRUE, -200, Consterm.maxLines);            {scroll up whole screen}
+                  bcursorpoint := Consterm.cursorPt;
+                  Consterm.cursorXY.xyCoord := 0;
+                  txpanel.OnAllPadsDo (HiLiCursorOnThePad);
+                END;
+              IF NOT Consterm.txpanelonly THEN
+                BEGIN
+                  grpanel.OnAllPadsDo (ErScreenOnThePad);                  {erase the entire screen}
+                  graphView := TGraphView (grpanel.view);
+                  KillPicture (graphView.qdpPicture);                      {throw away the old picture}
+                  graphView.qdpPicture := NIL;
+                END;
+
+              restarted := TRUE;
+            END;
+
+          ccResume :
+            BEGIN
+              gotapplePeriod := FALSE;
+              outputStopped := FALSE;
+            END;
+
+          OTHERWISE NewCommand := SUPERSELF.NewCommand (cmdNumber);
+        END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.NewCommand}
+
+
+
+    PROCEDURE {TVanWindow.}StashPicture {(highTransit : THighTransit)};
+                              {in order to run in the background, and since we are writing to window all the
+                               time when we are running in background, we can not stashpicture here because
+                               then window manager will update the window from its picture.}
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF NOT inBackGround THEN SUPERSELF.StashPicture (highTransit);
+                                                       {if we are waiting for read, we can stash picture}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.StashPicture}
+
+
+
+    PROCEDURE {TVanWindow.}AbortEvent;       {toolkit will call this if detect Apple . in GetEvent}
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        gotapplePeriod := TRUE;
+        IF Consterm.handleApplePeriod THEN outputStopped := TRUE;
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TVanWindow.StashPicture}
+
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TVanWindow}
+
+
+
+
+{----------------------------------------------- TTermWriteUnivText -----------------------------------------}
+
+METHODS OF TTermWriteUnivText;
+
+    FUNCTION  {TTermWriteUnivText.}CREATE {(object: TObject; heap: THeap; itsDataArray: TString;
+                                             itsDataSize: INTEGER; itsView : TTermView): TTermWriteUnivText};
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+
+        WITH TTermWriteUnivText (object) DO
+          BEGIN
+            termView := itsView;
+            linePosition := 1;
+            charPosition := itsView.firstLineStartX;
+          END;
+        SELF := TTermWriteUnivText (TTKWriteUnivText.CREATE (object, heap, itsDataArray, itsDataSize));
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermWriteUnivText.CREATE}
+
+
+    PROCEDURE {TTermWriteUnivText.}FillParagraph {FillRun }{(howmany : INTEGER)};
+          {InitiateWriteToUTScrap in TTermView.CreateUniversalText calls this to write one run of text each
+           time until we set data.size to 0 when done with converting all copied lines }
+    LABEL 1, 2;
+    VAR lineno, linesize, i, runsize : INTEGER;
+        clipTmView : TTermView;
+        clipTmline : TTermLine;
+        termstrP   : TPString;
+        str        : STRING [132];
+        fromptr, toptr : pTpaoc;
+        attrP : PTCharAttr;
+        s  : PTAttributes;
+
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+                                             {copy clipview.lines to SELF.data}
+        clipTmView := SELF.termView;
+        lineno := SELF.linePosition;
+        IF lineno <= clipTmView.lines.Size THEN             {more to go}
+          BEGIN
+            clipTmline := TTermLine (clipTmView.lines.At (lineno)^);
+            linesize := ORD (clipTmline.ch [0]);
+            SELF.paragraphDescriptor.tabTable.DelAll;       {BeSize (0);    tabs not supported yet}
+            SELF.data.DelAll;
+            WITH SELF, paragraphDescriptor, characterDescriptor DO
+              BEGIN
+                paragraphStart := (charPosition = 0)
+                                   OR ((lineno = 1) AND (charPosition = clipTmView.firstLineStartX));
+                {firstLineMargin := clipTmView.firstLineStartX;   - we dont know LW's margin}
+                superscript := 0;
+                keepOnSamePage := FALSE;
+                font := Consterm.defltAttr.charFont;
+                face := Consterm.defltAttr.charStyle;
+          {$H-} runsize := linesize - charPosition;      { Min (howmany, linesize - charPosition);}
+                IF (clipTmline.size > 0) AND (runsize = linesize) THEN
+                  BEGIN                                     {no char attr and can copy the whole line}
+                    termstrP := @clipTmline.ch;
+                    SELF.data.InsPStrAt (1, termstrP);
+                  END
+                ELSE
+                  BEGIN
+                    IF clipTmline.size < 0 THEN               {has charattr}
+                      BEGIN
+                        attrP := POINTER (ORD (@clipTmline.ch) + 1 + maxtextline);
+                        i := 1;
+                        WHILE i <= attrP^.attrsize DO
+                          BEGIN
+                            s := @attrP^.charAttr [i];
+                            IF charPosition < s^.beginX THEN    {copy up to next attr change}
+                              BEGIN
+                                runsize := s^.beginX - charPosition;   {Min (howmany, s^.beginX - charPosition);}
+                                IF i > 1 THEN
+                                  BEGIN
+                                    i := i - 1;        {if there is attr before this one, use it}
+                                    GOTO 1;
+                                  END
+                                ELSE GOTO 2;           {else, use the default}
+                              END;
+                            i := i + 1;
+                          END;
+                        {no more attr change beyond charPosition}
+                        i := attrP^.attrsize;
+                    1:
+                        s := @attrP^.charAttr [i];
+                        font := s^.chAttr.charFont;
+                        face := s^.chAttr.charStyle;
+                      END;
+                  2:
+                    fromptr := POINTER (ORD (@clipTmline.ch) + 1 + charPosition);
+                    toptr := POINTER (ORD (@str) + 1);
+                    MoveLeft (fromptr^, toptr^, runsize);              {copy to a string}
+                    str [0] := CHR (runsize);
+                    termstrP := @str;
+                    SELF.data.InsPStrAt (1, termstrP);
+                  END; {$H+}
+              END;
+            WITH SELF DO
+              BEGIN
+                charPosition := charPosition + runsize;
+                IF charPosition >= linesize THEN
+                  BEGIN
+                    charPosition := 0;
+                    linePosition := lineno + 1;
+                  END;
+              END;
+          END
+        ELSE
+          SELF.data.DelAll;                                 {BeSize (0);}
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermWriteUnivText.FillRun}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TTermWriteUnivText}
+
+
+
+
+{----------------------------------------------- TTermDialog ------------------------------------------------}
+
+METHODS OF TTermDialog;
+
+    FUNCTION  {TTermDialog.}CREATE {(object: TObject; heap: THeap; itsView: TView) : TTermDialog};
+    LABEL 9;
+    VAR cluster : TCluster;
+        newImage: TDialogImage;
+        selthisone : BOOLEAN;
+        inputFrame : TInputFrame;
+        str : S255;
+        i : INTEGER;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject (heap, THISCLASS);
+        SELF := TTermDialog (TDialog.CREATE (object, heap, 'TERM', itsView));
+
+        SELF.AddOKButton (noCmdNumber);
+        SELF.AddCancelButton (noCmdNumber);
+
+        process.GetAlert (phCharPerLine, str);
+        newImage := SELF.AddSysLegend(str, 30, 30);
+        cluster := SELF.AddStdCluster (str, 300, 20);                      {first line}
+        selthisone := Consterm.maxColumns <= maxcoltofit;
+        newImage := cluster.AddAlignedCheckbox (sc80, selthisone);
+        newImage := cluster.AddAlignedCheckbox (sc132, NOT selthisone);
+
+        process.GetAlert (phWraparound, str);
+        newImage := SELF.AddSysLegend(str, 30, 50);
+        cluster := SELF.AddStdCluster (str, 300, 40);                      {second line}
+        process.GetAlert (phYes, str);
+        newImage := cluster.AddAlignedCheckbox (str, Consterm.wrapAround);
+        process.GetAlert (phNo, str);
+        newImage := cluster.AddAlignedCheckbox (str, NOT Consterm.wrapAround);
+
+        process.GetAlert (phTab, str);
+        inputFrame := SELF.AddStdInputFrame (str, 50, 100, 3);             {third line, max 3 digits}
+                                                  {later on, override this to avoid the use of UText}
+        WITH Consterm, tabPosition DO
+          IF tabSet THEN                          {current first tab position}
+            BEGIN
+              FOR i := 0 TO maxColumns - 1 DO
+                IF tabStop [i] THEN GOTO 9;
+            END
+          ELSE i := 0;
+9:
+        SELF.orgtabindex := i;                         {remember the original tab index}
+        IntToStr(i, @str);
+        SELF.orgtabstr := str;
+        inputFrame.SupplantContents (str);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermDialog.CREATE}
+
+
+
+    PROCEDURE {TTermDialog.}SetupDialog;
+    LABEL 9;
+    VAR ccluster : TCluster;
+        inputFrame : TInputFrame;
+        str : S255;
+        i : INTEGER;
+
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        process.GetAlert (phCharPerLine, str);
+        ccluster := TCluster (SELF.ObjWithId (str));
+        IF Consterm.maxColumns <= maxcoltofit THEN
+            ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (sc80)))
+        ELSE
+            ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (sc132)));
+
+        process.GetAlert (phWraparound, str);
+        ccluster := TCluster (SELF.ObjWithId (str));
+        IF Consterm.wrapAround THEN
+          BEGIN
+            process.GetAlert (phYes, str);
+            ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (str)));
+          END
+        ELSE
+          BEGIN
+            process.GetAlert (phNo, str);
+            ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (str)));
+          END;
+
+        process.GetAlert (phTab, str);
+        inputFrame := TInputFrame (SELF.ObjWithId (str));
+
+        WITH Consterm, tabPosition DO
+          IF tabSet THEN                          {current first tab position}
+            BEGIN
+              FOR i := 0 TO maxColumns - 1 DO
+                IF tabStop [i] THEN GOTO 9;
+            END
+          ELSE i := 0;
+9:
+        SELF.orgtabindex := i;                         {remember the original tab index}
+        IntToStr(i, @str);
+        SELF.orgtabstr := str;
+        inputFrame.SupplantContents (str);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermDialog.SetupDialog }
+
+
+
+
+    PROCEDURE {TTermDialog.}ButtonPushed {(button: TButton)};
+    VAR ccluster, wcluster : TCluster;
+        inputFrame : TInputFrame;
+        str : S255;
+        newindex, j : INTEGER;
+        lr : LRect;
+        strYes, strNo, strTab : S255;
+
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        process.GetAlert (phCharPerLine, str);
+        ccluster := TCluster (SELF.ObjWithId (str));
+        process.GetAlert (phWraparound, str);
+        wcluster := TCluster (SELF.ObjWithId (str));
+        process.GetAlert (phYes, strYes);
+        process.GetAlert (phNo, strNo);
+        process.GetAlert (phTab, strTab);
+        inputFrame := TInputFrame (SELF.ObjWithId (strTab));
+        inputFrame.GetContents (str);
+
+        IF button.HasId (okString) THEN
+          BEGIN                                        {find the checked box in each cluster}
+            IF ccluster.hiLitBox.HasId (sc80) THEN
+              BEGIN
+                IF Consterm.maxColumns > maxcoltofit THEN ChangeMaxColumns (80);
+              END
+            ELSE
+              IF Consterm.maxColumns <= maxcoltofit THEN
+                ChangeMaxColumns (132);                {132}
+
+            IF wcluster.hiLitBox.HasId (strYes) THEN Consterm.wrapAround := TRUE
+            ELSE Consterm.wrapAround := FALSE;         {No}
+
+            IF str <> SELF.orgtabstr THEN
+              IF str = '0' THEN ClearTab (TRUE, 0)
+              ELSE
+                WITH Consterm, tabPosition DO
+                  BEGIN
+                    j := 0;                              {convert str to integer}
+                    FOR newindex := 1 TO length (str) DO
+                      j := (ORD (str [newindex]) - ORD ('0')) + j * 10;
+                    newindex := j;
+                    IF (newindex > 0) AND (newindex <> SELF.orgtabindex) THEN
+                      BEGIN
+                        IF SELF.orgtabindex > 0 THEN          {clear the original tab indexes}
+                          BEGIN
+                            j := SELF.orgtabindex;
+                            WHILE j <= maxColumns - 1 DO
+                              BEGIN
+                                tabStop [j] := FALSE;
+                                j := j + SELF.orgtabindex;
+                              END;
+                          END;
+                        j := newindex;
+                        WHILE j <= maxColumns - 1 DO     {set new tab indexes}
+                          BEGIN
+                            tabSet := TRUE;
+                            tabStop [j] := TRUE;
+                            j := j + newindex;
+                          END;
+                      END;
+                  END;
+          END
+        ELSE IF button.HasId (cancelString) THEN          {put everything back to original values}
+          BEGIN
+            (*
+            IF Consterm.maxColumns <= maxcoltofit THEN
+              BEGIN
+                IF ccluster.hiLitBox.HasId (sc132) THEN
+                  ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (sc80)));
+              END
+            ELSE
+              IF ccluster.hiLitBox.HasId (sc80) THEN
+                ccluster.SelectBox (TCheckBox (ccluster.ObjWithId (sc132)));
+
+            IF Consterm.wrapAround THEN
+              BEGIN
+                IF wcluster.hiLitBox.HasId (strNo) THEN
+                  wcluster.SelectBox (TCheckBox (wcluster.ObjWithId (strYes)));
+              END
+            ELSE
+              IF wcluster.hiLitBox.HasId (strYes) THEN
+                wcluster.SelectBox (TCheckBox (wcluster.ObjWithId (strNo)));
+
+            IF str <> SELF.orgtabstr THEN inputFrame.SupplantContents (SELF.orgtabstr);
+            *)
+            SELF.SetupDialog;
+          END;
+
+        SUPERSELF.ButtonPushed (button);               {take down dialog box}
+
+        IF (newindex <> SELF.orgtabindex) AND tabRulerShown THEN
+          BEGIN
+            (*
+            noPad.RectToLRect (tabRect, lr);
+            *)
+            SetLRect (lr, 0, -htTabRuler, vscreenRect.right, 0);
+            Consterm.window.termPanel.InvalLRect (lr);
+          END;
+
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TTermDialog.ButtonPushed}
+
+{$S sQPortInit}                         {initialization code segment}
+
+END;  {Methods of TTermDialog}
+
+
+ÿ

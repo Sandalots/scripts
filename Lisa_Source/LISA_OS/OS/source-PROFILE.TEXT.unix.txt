@@ -1,0 +1,438 @@
+UNIT PROFDRVR;
+
+
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+      (*  By Wendell Henry  1/17/83                                           *)
+      (*  A device specific driver for the Profile.  It uses the generic hard *)
+      (*  disk driver HDISK.                                                  *)
+
+      (*  By Wendell Henry  8/23/83                                           *)
+      (*  The driver has been extended to support the Widget device.          *)
+
+      (*  By Wendell Henry  12/30/83                                          *)
+      (*  The driver has been made configurable.                              *)
+
+INTERFACE
+
+  USES
+      (*$Uobject/driverdefs.obj*)
+      driverdefs,
+      (*$Uobject/driversubs.obj*)
+      driversubs;
+
+
+   function PRODRIVER (parameters: param_ptr): integer;
+
+  IMPLEMENTATION
+
+  CONST
+    errbase = 650;
+    countlimit = 100; (*100 = 5 secs before timeout on 2-port*)
+                      (*    =12 secs on parallel*)
+    wait_int = 1;     (* "wait for next interrupt" error code *)
+    ignorerr = 661;   (* error code when get timer error requiring no action *)
+    hd_err = 654;
+    cserr  = -663;
+
+    (*Drive types*)
+    T_Profile = 0;
+    T_Seagate = 1;
+    T_Widget  = 2;
+
+    (*Driver commands*)
+    Readcmd   = 0;
+    Writecmd  = 1;
+    Formatcmd = 2;
+
+  TYPE
+    (* Extension to Drive_cb for Profile *)
+
+    {NOTE: definitions marked with (**) have corresponding definitions in PROFASM}
+
+    ext_drive_cb = record  (*driver info for Profile hard disk *)
+          (**)  hwbase: longint;              (*base addr of 6522*)
+          (**)  hwstatus: longint;            (*addr of 6522 status register B*)
+          (**)  remap_interleave: boolean;    (*true if interleave remapped *)
+          (**)  command_buffer:  record       (*command buffer for profile*)
+          (**)     case integer of
+          (**)       0: (cmd: 0..2);          (*set value after storing "sector"*)
+          (**)       1: (sector: longint; retry_cnt: int1; sparing_thresh: int1);
+          (**)     end;
+          (**)  checksum: integer;            (*temp storage during write*)
+          (**)  expect_hs: int1;              (*internal storage for profasm*)
+          (**)  drivetype: int1;              (*type of disc drive*)
+          (**)  asm_state: integer;           (*state internal to assemb lang*)
+          (**)  errstat: longint;             (*error returned from profile*)
+          (**)  asmerr: integer;              (*err returned from asmbly routine*)
+          (**)  last_hard_error: longint;     (*last error from errstat*)
+          (**)  counter: integer;             (*used for timeout*)
+          (**)  discsize: longint;            (*device size from controller*)
+          (**)  cxfercnt: int1;               (*current transfer count*)
+          (**)  csum_valid: int1;             (*true if precomputed checksum valid*)
+          (**)  nested_bdr: int1;             (*true if bad response being handled*)
+          (**)  accstat: longint;             (*4 bytes for state register status*)
+          (**)  cmd_buf: array[0..7] of int1; (*8 bytes for sending widget cmds*)
+          (**)  cntresets: integer;           (*count of times widget reset*)
+              end;
+
+    ptr_ext_drive_cb = ^ext_drive_cb;
+
+  procedure PROFASM(control_block: hdiskcb_ptr); external;
+
+  procedure PROF_DOWN(via_addr: longint); external;
+
+  function PROF_INIT(ext_cb: ptr_ext_drive_cb; via_addr: longint;
+                     hwst_irb: longint; hwst_ddrb: longint): integer; external;
+
+  Procedure START_NONIO(var errnum: integer; drivecb_ptr: hdiskcb_ptr);
+    (**********************************************)
+    (* Issue non-I/O request to low level driver  *)
+    (**********************************************)
+    var
+      extdrivecb_ptr: ptr_ext_drive_cb;
+      reqptr: reqptr_type;
+      bufaddr: longint;
+
+    begin
+      extdrivecb_ptr:=pointer(drivecb_ptr^.ext_ptr);
+      with drivecb_ptr^, extdrivecb_ptr^, req_hd_ptr^ do
+        begin
+          reqstatus.reqsrv_f:=in_service;
+          cur_info_ptr:=pointer(req_extent);
+          (*process format request*)
+          command_buffer.sector:=ord(req_hd_ptr)+sizeof(reqblk);(*data address*)
+          command_buffer.cmd:=operatn;
+          asm_state:=0;
+          PROFASM(drivecb_ptr);
+          errnum:=asmerr;
+          if errnum <> 0 then
+            if errnum = wait_int
+              then counter:=countlimit;
+        end;(*drivecb_ptr, extdrivecb_ptr, req_hd_ptr*)
+    end; (*START_NONIO*)
+
+
+  Procedure NONIO_REQ(var errnum: integer; cmd: integer; devconfig: ptrdevrec);
+    (**********************************************)
+    (* Build a request for Format                 *)
+    (**********************************************)
+    var
+      drivecb_ptr: hdiskcb_ptr;
+      reqaddr: absptr;
+      reqptr: reqptr_type;
+      ints: intson_type;
+      leftlink: reqptr_type;
+      space: integer;
+      ptrsysg: ^longint;
+
+    begin
+      drivecb_ptr:=pointer(devconfig^.cb_addr);
+      errnum:=errbase+3; (* insufficient sysglobal space *)
+      space:=sizeof(reqblk);
+      if cmd = formatcmd
+        then space:=space+512; (*extra space for spare table map*)
+      ptrsysg:=pointer(bsysglob);
+      if GETSPACE(space,ptrsysg^,reqaddr) then
+        begin
+          errnum:=0;
+          reqptr:=pointer(reqaddr);
+          with reqptr^, drivecb_ptr^ do
+            begin
+              cfigptr:=devconfig;
+              operatn:=cmd;
+              req_extent:=ord(nil);
+              with list_chain do
+                begin
+                  fwd_link:=ord(@fwd_link) - ptrsysg^;
+                  bkwd_link:=fwd_link;
+                end;
+              LINK_TO_PCB(reqptr);
+
+              (*add to device queue*)
+              INTSOFF(int_prio,ints);
+              reqspec_info:=req_hd_ptr^.reqspec_info;
+              leftlink:=pointer(req_hd_ptr^.dev_chain.bkwd_link -
+                        sizeof(rb_headT) + ptrsysg^);
+              if req_hd_ptr = dummy_req_ptr
+                then req_hd_ptr:=reqptr; (*place at head *)
+              cur_num_requests:=cur_num_requests+1;
+              ENQUEUE(dev_chain,leftlink^.dev_chain,ptrsysg^);
+              if cur_num_requests = 1
+                then START_NONIO(errnum,drivecb_ptr);
+              INTSON(ints);
+
+              if errnum = wait_int then
+                begin
+                  BLK_REQ(reqptr,reqptr);
+                  (*process will block until the operation is done*)
+
+                  if reqptr^.reqstatus.reqsuccess_f
+                    then errnum:=0
+                    else errnum:=hd_err;
+                end;
+              CANCEL_REQ(reqptr);(*this will also release data space*)
+            end; (*with reqptr drivecb_ptr*)
+        end;
+    end;(*NONIO_REQ*)
+
+
+  function PRODRIVER; (*parameters: param_ptr): integer*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  PROFILE device-dependent user I/O request   *)
+       (*                                                           *)
+       (* Input Parameters:  Rqst is the partially initialized      *)
+       (*   request block.  Blkno is the s-file block number.       *)
+       (*   Rqst^.reqspec_info[2] will hold the cylinder number.    *)
+       (*   Rqst^.reqspec_info[1] points to disk-extend record      *)
+       (*   which holds info necessary to do I/O to the disk.       *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  The request is added to the queue for the  *)
+       (*   appropriate drive.  If no request is busy, the request  *)
+       (*   is started up immediately.                              *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+  var
+    hwddrb: longint;
+    p_extdevrec: ^ext_diskconfig;
+    port_ptr: hdiskcb_ptr;
+    newextdrivecb: absptr;
+    p_extdrivecb: ptr_ext_drive_cb;
+    p_dc_rec: ^dc_rec;
+    ints: intson_type;
+    error: int2;
+    parm: params;
+    response: integer;
+    i: integer;
+    operation: integer;
+    ptrsysg: ^longint;
+
+  begin (*PROFILE DRIVER*)
+    with parameters^ do
+      begin
+
+        port_ptr:=pointer(configptr^.cb_addr);
+
+        (* Preliminaries are done - now process function request *)
+        case fnctn_code of
+
+         dinit: (* first level of device initialization*)
+           begin
+             USE_HDISK(configptr); (* Use HDISK for handling sector headers *)
+             CALL_HDISK(error,configptr,parameters);
+             prodriver:=error;
+           end; (*dinit*)
+
+         hdinit:  (* now initialize device *)
+           begin
+             prodriver:=errbase+3; (* insufficient sysglobal space *)
+             ptrsysg:=pointer(bsysglob);
+             if GETSPACE(sizeof(ext_drive_cb),ptrsysg^,newextdrivecb) then
+               begin
+                 p_extdrivecb:=pointer(newextdrivecb);
+                 with p_extdrivecb^, configptr^ do
+                   begin
+                     port_ptr^.ext_ptr:=newextdrivecb;
+                     p_extdevrec:=pointer(ext_addr);
+                     if iochannel >= 0 then
+                       begin (* attached to multi-port card *)
+                         hwbase := iospacemmu*$20000 + ord4($4000)*slot_no +
+                                   $2001 + $800*iochannel;
+                         hwstatus := hwbase;
+                         hwddrb := hwstatus + $10;
+                       end
+                      else
+                       begin (* attached to built-in port *)
+                         hwbase := iospacemmu*$20000 + $0D801;
+                         hwstatus := hwbase + $400;
+                         hwddrb := hwstatus + 4;
+                       end;
+                     nested_bdr:=0;
+                     accstat:=0;
+                     cntresets:=0;
+                     discsize:=0;
+                     (*assume the device is a profile*)
+                     with p_extdevrec^ do
+                       begin
+                         num_bloks:=9720;
+                         rvrs_hdr:=0;
+                       end;
+                     last_hard_err := 0;
+                     command_buffer.retry_cnt := 10;
+                     command_buffer.sparing_thresh := 3;
+                     remap_interleave := true;
+                     if iochannel < 0 then DISKSYNC(true);
+                     response:=PROF_INIT(p_extdrivecb,hwbase,hwstatus,hwddrb);
+                     if iochannel < 0 then DISKSYNC(false);
+                     prodriver:=response;
+                     if response > 0 then
+                     begin (*initialize failure*)
+                       PROF_DOWN(hwbase);
+                       RELSPACE(newextdrivecb,ptrsysg^); (*release cb extension *)
+                       port_ptr^.ext_ptr:=ord(nil);
+                       EXIT (prodriver)
+                     end;
+                     if (discsize <= 9728) or (discsize > 30000)
+                       then drivetype:= T_Profile (* set drivetype to profile *)
+                       else
+                        begin
+                          with p_extdevrec^ do
+                            begin
+                              num_bloks:=discsize-strt_blok;
+                              if drivetype <> 0 then
+                                begin (*widget*)
+                                  remap_interleave := false;
+                                  drivetype:=T_Widget;
+                                  rvrs_hdr:=20; (*headers are at end of sector*)
+                                end
+                               else
+                                begin (*Seagate*)
+                                  drivetype:=T_Seagate;(*10mb seagate*)
+                                end;
+                            end;(*with p_extdevrec*)
+                        end;
+                   end;(*with p_extdrivecb, configptr*)
+               end;
+           end;(*hdinit*)
+
+          hddown:  (* down the device *)
+              with port_ptr^ do
+                begin
+                  p_extdrivecb:=pointer(ext_ptr);
+                  PROF_DOWN(p_extdrivecb^.hwbase);
+                  ptrsysg:=pointer(bsysglob);
+                  RELSPACE(ext_ptr,ptrsysg^); (*release cb extension *)
+                  ext_ptr:=ord(nil);
+                  prodriver:=0;
+                end;
+
+         hdskio: (* start I/O to disk *)
+           with port_ptr^ do
+           begin
+             operation:=req_hd_ptr^.operatn;
+             if operation = formatcmd then
+               begin
+                 START_NONIO(error,port_ptr);
+                 prodriver:=error;
+               end
+              else
+               begin
+                 p_extdrivecb:=pointer(ext_ptr);
+                 with p_extdrivecb^ do
+                   begin
+                     command_buffer.sector:=cur_info_ptr^.blkno;
+                     command_buffer.cmd:=1-operation; (*SET AFTER SECTOR IS STORED!! *)
+                     asm_state:=0;     (*initialize state machine*)
+                     PROFASM(port_ptr);(*call state machine*)
+                     prodriver:=asmerr; (*return driver status*)
+                     if asmerr <> 0 then
+                       if asmerr = wait_int
+                         then counter:=countlimit      (*timeout limit*)
+                         else IODONE(port_ptr,asmerr); (*unexpected error*)
+                   end;
+               end;
+           end; (*hdskio*)
+
+         dinterrupt: (* Interrupt from device *)
+           begin
+             (* This function will be entered only when the assembly language *)
+             (* part of the driver completes a request or an unexpected error *)
+             (* has occurred.                                                 *)
+
+             with port_ptr^ do
+               begin
+                 p_extdrivecb:=pointer(ext_ptr);
+                 with p_extdrivecb^ do
+                   begin
+                     prodriver:=asmerr; (*return status *)
+                     if errstat <> 0 then
+                       if (asmerr = hd_err) or (asmerr = cserr)
+                         then last_hard_error:=errstat;
+                     IODONE(port_ptr,asmerr);
+                   end;(*with p_extdrivecb*)
+               end;(*with port_ptr*)
+           end; (*dinterrupt*)
+
+         dskunclamp: (* Unclamp request *)
+           begin
+             prodriver := 685;  (*not an ejectable media*)
+           end; (*dskunclamp*)
+
+         dcontrol: (* Device control*)
+           begin
+                begin
+                  p_dc_rec := pointer(parptr);
+                  p_extdrivecb:=pointer(port_ptr^.ext_ptr);
+                  with port_ptr^, p_dc_rec^, p_extdrivecb^ do
+                    begin
+                      if dversion <> 2
+                        then prodriver := errbase + 7 (*wrong application version*)
+                        else
+                         begin
+                           prodriver:=0;
+                           INTSOFF (int_prio, ints);
+                           case dcode of
+                            15: begin (*return:                                *)
+                                      (* o last error from profile controller  *)
+                                      (* o state-machine restart count         *)
+                                  ar10[0] := last_hard_error;
+                                  ar10[1] := total_restarts;
+                                end;
+                            20: begin  (*get disk status*)
+                                  ar10[0] := 4;  (*good disk*)
+                                  ar10[1] := 0;
+                                  ar10[2] := 999;  (*don't know how many blocks *)
+                                                   (*are available*)
+                                  ar10[3] := 0;
+                                  ar10[4] := 1;  (*sparing always enabled*)
+                                  ar10[5] := ord(command_buffer.sparing_thresh
+                                                 <= 10);
+                                  ar10[6] := ord(v_flag)
+                                end;
+                            21: begin (*enable/disable sparing*)
+                                  if ar10[1] = 0 then (*don't rewrite soft errs*)
+                                    command_buffer.sparing_thresh := 11
+                                  else (*rewrite if >30% err rate*)
+                                    command_buffer.sparing_thresh := 3;
+                                  v_flag := (ar10[2] <> 0);(*verify all writes?*)
+                                end;
+                            otherwise prodriver := errbase + 7;
+                           end;(*case*)
+                           INTSON (ints);
+                         end;
+                    end;(*with port_ptr, p_dc_rec, p_extdrivecb*)
+                end;
+           end; (*dcontrol*)
+
+         dskformat: (* format disk *)
+           begin
+             error := 0;
+             p_extdrivecb:=pointer(port_ptr^.ext_ptr);
+             if p_extdrivecb^.drivetype = T_Widget then
+               NONIO_REQ(error,Formatcmd,configptr);(*widget format doesn't do much*)
+             if error <= 0 then
+               error := -684; (*disk needs to have zero's written to it*)
+             prodriver:=error;
+           end; (*dskformat*)
+
+         otherwise (*pass the function on to HDISK*)
+           begin
+             CALL_HDISK(error,configptr,parameters);
+             prodriver:=error;
+           end;
+
+        end (*case*);
+      end;(*with parameters*)
+  end;(*PRODRIVER*)
+end.
+
+
+ÿ

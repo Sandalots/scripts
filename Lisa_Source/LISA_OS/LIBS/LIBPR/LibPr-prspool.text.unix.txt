@@ -1,0 +1,886 @@
+(*
+*)
+{               NOTE: The above compiles this program.                   }
+{ ---------------------------------------------------------------------- }
+{             Copyright 1983, 1984, Apple Computer Inc.                  }
+UNIT PrSpool;
+INTRINSIC;
+{ ---------------------------------------------------------------------- }
+                               INTERFACE
+{ ---------------------------------------------------------------------- }
+
+USES
+     {$U LibHW/HWInt         }  HWInt,
+     {$U LibOS/SysCall       }  SysCall,
+     {$U LibPM/PMDecl        }  PMDecl,
+     {$U LibSM/UnitStd       }  UnitStd,
+     {$U LibSM/UnitHz        }  UnitHz,
+     {$U LibQD/Storage       }  Storage,
+     {$U LibQD/QuickDraw     }  QuickDraw,
+     {$U LibFM/FontMgr       }  FontMgr,
+     {$U LibWM/Events        }  Events,
+     {$U LibWM/Folders       }  Folders,
+     {$U libWM/Menus         }  Menus,
+     {$U libWM/Windows       }  Windows,
+     {$U libSB/WmlStd        }  WmlStd,
+     {$U libSB/WmlCrs        }  WmlCrs,
+     {$U LibAM/AlertMgr      }  AlertMgr,
+
+     {$U LibPr/PrStdInfo     }  PrStdInfo,
+     {$U LibPr/PrStdProcs    }  PrStdProcs,
+     {$U LibPr/PrFileProcs   }  PrFileProcs,
+
+     {$U LibPr/Queues        }  Queues,
+     {$U LibPr/PrEvents      }  PrEvents,
+     {$U LibPr/PrDlgMgr      }  PrDlgMgr,
+     {$U LibPr/PrMgr         }  PrMgr;
+{ ---------------------------------------------------------------------- }
+(* ----- PrDocStart  = True, If enough disk space for printing.                    *)
+(* ----- PrPageStart = True, If current page is within user requested page range.  *)
+(* ----- PrPageEnd   = True, If current page is >= than user requested page range. *)
+PROCEDURE PrDocEnd   ( Var PrRec : TPrRec; Var PrPort : TPrPort);
+Function  PrDocStart ( Var PrRec : TPrRec; Var PrPort : TPrPort; LDSN : INTEGER;DoSpoolAlert:Boolean):Boolean;
+Function  PrPageEnd  ( Var PrRec : TPrRec; Var PrPort : TPrPort):Boolean;
+Function  PrPageStart( Var PrRec : TPrRec; Var PrPort : TPrPort):Boolean;
+Procedure PrSpoolAbort;
+{ -------------------------------------------------------------------------------------------------- }
+(*                        Print File Format                              PrDataSeg Contents         *)
+(*
+                     +------------------------+                   +-----------------------------+
+          +----------!  File  Ptr to PrRec    !                   !        PrHz(TheHeap)        !
+          !          !------------------------!                   !  +------------------------+ !
+          !   +------!  File Ptr to Page      !                   !  !  hPfPages              ! !
+          !   !      !      Directory         !                   !  !  hPrIOBuffer           ! !
+          !   !      !------------------------!                   !  !  hPic                  ! !
+          !   !      !  Picture Frame for Pic !<----+             !  !  QuickDraw's Usage     ! !
+          !   !      !  --------------------- !     !             !  !                        ! !
+          !   !      ! Streamed QD Picture #1 !     !             !  +------------------------+ !
+          !   !      !     .                  !     !             +-----------------------------+
+          !   !      !     .                  !     !
+          !   !      !     .                  !     !
+          !   !      !------------------------!     !
+          !   !      !  Picture Frame for Pic !<-------+
+          !   !      !  --------------------- !     !  !
+          !   !      ! Streamed QD Picture #2 !     !  !
+          !   !      !     .                  !     !  !
+          !   !      !     .                  !     !  !
+          !   !      !     .                  !     !  !
+          !   !      !------------------------!     !  !
+          !   !      !  Picture Frame for Pic !<----------+
+          !   !      !  --------------------- !     !  !  !
+          !   !      ! Streamed QD Picture #N !     !  !  !
+          !   !      !     .                  !     !  !  !
+          !   !      !     .                  !     !  !  !
+          !   !      !     .                  !     !  !  !
+          !   !      !------------------------!     !  !  !
+          +--------->!        PrRec           !     !  !  !
+              !      !                        !     !  !  !
+              !      !------------------------!     !  !  !
+              +----->!    Page Directory      !     !  !  !
+                     !  --------------------  !     !  !  !
+                     !  Picture # 1           ! ----+  !  !
+                     !  Length of Picture #1  !        !  !
+                     !  --------------------  !        !  !
+                     !  Picture # 2           ! -------+  !
+                     !  Length of Picture #2  !           !
+                     !  --------------------  !           !
+                     !  Picture # N           ! ----------+
+                     !  Length of Picture #N  !
+                     +------------------------+
+                     !       End of File      !
+                     +------------------------+
+*)
+{ ---------------------------------------------------------------------- }
+                                IMPLEMENTATION
+{ ---------------------------------------------------------------------- }
+{$S Pr      }
+
+{$IFC PrDeBug}
+   {$R+}
+{$ELSEC}
+   {$R-}
+{$ENDC}
+
+{$IFC PrSymbols}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+{ ---------------------------------------------------------------------- }
+Const HzSize        = 2000;
+      DSName        = 'PRDATASEG';
+      DSSize        = 12000;
+      PrPageLimit   = 5;
+      PrBufSize     = 2000;          {Buffer Size for writing picture to disk.}
+      BytesPerBlock = 512;
+      NilAddr       = -1;
+
+Type
+    TPrIOBuffer  = Packed Array[1..PrBufSize] of -128..127;
+    TPPrIOBuffer = ^TPrIOBuffer;
+    THPrIOBuffer = ^TPPrIOBuffer;
+
+VAR
+    hPfPages       : THPfPages{.PrStdInfo};
+    HPrIOBuffer    : THPrIOBuffer;
+
+    hPic           : PicHandle{.QuickDraw};
+
+    PrHz           : THz;
+    DocCurPage     : Integer;
+    NumCopies      : Integer;
+    CopyAlertWasUp : Boolean;
+    SpoolPageNum   : Integer;
+    PrMaxPage      : Integer;
+
+    PrMakeDSRec    : TPrDSRec   {.PrStdInfo};
+    PrFileRec      : TPrFileRec {.PrStdInfo};
+    PrFileId       : TPrFileId  {.PrStdInfo};
+    PrFileOpen     : Boolean;
+    PutAlertUP     : Boolean;
+    PrAbort        : Boolean;
+    Cleaned        : Boolean;       {Flag set if PrCleanUp has been called since PrDocStart}
+
+    BufIndex       : Integer;
+
+    EndPagePos          : LongInt;  {Location of the end of the last page.}
+    PageDirLoc,PrRecLoc : LongInt;  {Location of the Page Directory and the PrRec on the file}
+    PageDirPos,PrRecPos : LongInt;  {File Addresses for storing PageDirLoc and PrRecLoc respectivly}
+
+{ ---------------------------------------------------------------------- }
+{                         Forward Declarations                           }
+{ ---------------------------------------------------------------------- }
+Function  PrAllocate      (Var Error:Integer;RefNum:Integer;BlocksNeeded:LongInt;
+                           Var BlocksAllocated:LongInt)                :Boolean;  Forward;
+Function  PrCheckAbort                                                 :Boolean;  Forward;
+Procedure PrCleanUp       (VAR PrPort : TPrPort;VAR PrRec : TPrRec);              Forward;
+Procedure PrCloseFile     (Var PrRec:TPrRec);                                     Forward;
+Procedure PrDiskFull;                                                             Forward;
+Procedure PrDSClose       (DSRec:TPrDSRec);                                       Forward;
+Procedure PrFlushBuffer;                                                          Forward;
+Procedure PrHideSpoolAlert;                                                       Forward;
+Procedure PrNullPutPicProc(DataPtr:QDPtr;ByteCount:Integer);                      Forward;
+Function  PrOpenFile                                                   :Boolean;  Forward;
+Procedure PrPutPicProc    (DataPtr:QDPtr;ByteCount:Integer);                      Forward;
+Procedure PrShowSpoolAlert;                                                       Forward;
+Procedure PrSubmitBuf     (DataPtr:QDPtr;ByteCount:Integer);                      Forward;
+{ ---------------------------------------------------------------------- }
+Function PrAllocate{(Var Error:Integer;RefNum:Integer;BlocksNeeded:LongInt;
+                    Var BlocksAllocated:LongInt):Boolean};
+Var NumJobs:Integer;
+   AlertResult : Integer;
+   thepath     : PathName;
+   Info        : Fs_Info;
+   DiskFull,
+   Done        : Boolean;
+   WaitTime    : Timestmp_interval;
+   DummyVar    : Time_Rec;
+
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  NumJobs:=0;
+  Done:=False;
+  DiskFull:=False;
+  Get_Working_Dir(error,thepath);
+
+  While Not(Done or PrCheckAbort) do Begin
+    LookUp(error,ThePath,info);
+    (* ----- Error is set to zero here so that we are only checking the error from the call to Allocate. *)
+    error:=0;
+    If ((info.freeCount-128)>=BlocksNeeded) then  Allocate(error,RefNum,False,BlocksNeeded,BlocksAllocated);
+    DiskFull:=( (Error=826) or (info.freeCount-128<BlocksNeeded));
+
+    If (DiskFull) then Begin
+       (* ----- If there is not enough disk space FOR WHATEVER REASON, we will only allow one copy. *)
+       If (NumCopies>1) then Begin
+         If (CopyAlertWasUp=False) then Begin
+           (* ----- Tell client that only one copy is being made. *)
+           AlertResult:=PrOtherAlert(hPrAlert,CaxOneCopy,NoteProc,FALSE{Not Bgd});
+           CopyAlertWasUp:=True;
+           If (AlertResult = CancelOpt) then Begin
+             PrSpoolAbort;
+           End
+           Else Begin
+             PrShowSpoolAlert;
+             NumCopies:=1;
+           End;
+         End;
+       End;
+
+       (* ----- If there is not enough space then check if there are some print processes running. *)
+       PrJobCount(LParentId,NumJobs);
+     End;
+
+     Done:=((NumJobs<=0) or Not(DiskFull) );
+     IF (Done = FALSE) THEN BEGIN
+         WaitTime.sec:=0;
+         WaitTime.MSec:=10000;
+         Delay_Time(error,WaitTime,DummyVar);
+     END;
+  End;
+
+  PrAllocate:=Not(DiskFull or PrCheckAbort);
+End;
+{ ---------------------------------------------------------------------- }
+Function PrCheckAbort{:Boolean};
+Var Event : KeyEvent;
+    I     : Integer;
+    BailOut:Boolean;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  IF (PrAbort = FALSE) THEN BEGIN
+    BailOut:=FALSE;
+    I:=1;
+    (* ----- Loop through the event queue and check for Apple Key Plus a period. *)
+    (* ----- I is an index in the event queue.                                   *)
+    While (KeyBdPeek(False, I, Event) and Not(BailOut) ) do Begin
+      BailOut:=( (Event.Ascii = '.') and (PrAnd(Event.State, $08) = $08) );
+      I:=I+1;
+    End;
+    (* ----- Important!! PrAbort is set to false ONLY at the beginning of PrDocStart.                   *)
+    (* ----- This procedure (PrCheckAbort) should only be allowed to set PrAbort to true (it should     *)
+    (* ----- never set it to false). Since PrCheckAbort is called at each of the four printing          *)
+    (* ----- bracket procs, we do not want PrAbort to be overridden to False once it has been detected. *)
+    (* ----- PrAbort can also be set to true in PrDocStart if we can not open the data segment, and in  *)
+    (* ----- PrOpenFile (via PrDiskFull Procedure) if we can not open a file.                                                      *)
+    If BailOut then Begin
+       PrAbort:=True;
+       {PrCleanUp(PrPort,PrRec); No longer called here, must be done outside this proc}
+    End;
+  END;
+  PrCheckAbort:=PrAbort;
+End;
+{ ---------------------------------------------------------------------- }
+Procedure PrCleanUp{(VAR PrPort : TPrPort;VAR PrRec : TPrRec))};
+Var Error:Integer;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- Exit if cleanup has already been accomplished once since PrDocStart *)
+  IF Cleaned Then EXIT(PrCleanUp);
+  Cleaned:=True;
+  (* ----- It is time to bail out campers! Lets close up everything we can. PrDocStart does the     *)
+  (* ----- following major tasks that need to be cleaned up:                                        *)
+  (* -----      1. Makes PrDataSeg, 2. Makes the PrHz (HeapZone), 3. Opens the PrPort, 4. Allocates *)
+  (* -----      handles to the IOBuffer and the Picture directory, 5. Opens a print file.           *)
+  (* ----- Lets close these items:
+
+  (* ----- Delete the data segment and the heap zone *)
+  If (PrMakeDsRec.BegAddr<>NilAddr) then Begin
+    PrMakeDsRec.BegAddr:=NilAddr;
+    PrDSClose(PrMakeDSRec);
+  End;
+
+  PrHZ       :=Nil;
+  hPfPages   :=Nil;
+  hPrIOBuffer:=Nil;
+  hPic       :=Nil;
+
+  (* ----- Send message to print driver to abort. *)
+  WITH PrRec DO PrCall(Error,lParentID,EPrintTerminate,PrFileID.LongID,NumCopies,PrInfo.PrinterID,PrInfo.Port);
+
+  (* ----- Blow out old QD Grafport. Insures no open picture state and handles are Nil. *)
+  With PrPort do OpenPort(Pointer(Ord4(@GPort)));
+
+  (* ----- Default all global variables local to unit. *)
+  DocCurPage     :=0;
+  NumCopies      :=1;
+  CopyAlertWasUp :=False;
+  PutAlertUp     :=True;
+  SpoolPageNum   :=0;
+  PrMaxPage      :=PrPageLimit;
+
+  If PrFileOpen then Kill_Object(error,PrFileRec.FileName);
+  PrFileOpen:=False;
+
+  With PrFileRec do Begin
+    FileName:='PrNilFileName';
+    RefNum  :=0;
+  End;
+
+  With PrFileId do Begin
+    sFileName:='PrNilFileName';
+    LongId:=0;
+  End;
+
+  PrHideSpoolAlert;
+
+  BufIndex  :=1;
+  EndPagePos:=0;
+  PageDirLoc:=0;
+  PrRecLoc  :=0;
+  PageDirPos:=0;
+  PrRecPos  :=0;
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrCloseFile{(Var PrRec:TPrRec)};
+Var Error:Integer;
+    FldrName:STR255;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrFlushBuf;                                      {Make sure buffered commands are sent to disk.}
+  PfSavePos( error, PrRecLoc, PrFileRec.RefNum );  {Save the position of the PrRec}
+
+  (* ----- Update the number of Pages spooled. Trim empty page off end, zero reference is OK. *)
+  PrRec.PrJobInfo.SpooledPages:=SpoolPageNum;
+  WHILE (SpoolPageNum > 0 ) AND (hPfPages^^[SpoolPageNum].Length <= 8) DO  SpoolPageNum:=SpoolPageNum-1;
+
+  If SpoolPageNum>0 then Begin
+    (* ----- Write out the PrRec Record. *)
+    WriteBlock ( error, POINTER(ORD(@PrRec)), SizeOf(PrRec), PrFileRec.RefNum );
+
+    (* ----- Save the position of the Page Directory. *)
+    PfSavePos( error, PageDirLoc, PrFileRec.RefNum );
+
+    (* ----- Write out the page Directory.*)
+    WriteBlock( error, POINTER(ORD(hPfPages^)), SpoolPageNum*SIZEOF(TPfPage), PrFileRec.RefNum );
+
+    (* ----- Position the File Marker, and write the location of the PrRec.*)
+    PfSetPos  ( error, PrRecPos, PrFileRec.RefNum);
+    WriteBlock( error, POINTER(ORD(@PrRecLoc)), SIZEOF(LongInt), PrFileRec.RefNum );
+
+    (* ----- Position the File Marker, and write the location of the Page Directory.*)
+    PfSetPos  ( error, PageDirPos, PrFileRec.RefNum);
+    WriteBlock( error, POINTER(ORD(@PageDirLoc)), SIZEOF(LongInt), PrFileRec.RefNum );
+
+    (* ----- Compact file to the amount of space actually used and close file *)
+    Compact{.SysCall}(error,PrFileRec.RefNum);
+    Close_Object( error, PrFileRec.RefNum );
+
+    (* ----- Send Folder title to Father if first block *)
+    IF (PrFileID.BlockNum = 0) THEN BEGIN
+      GetFldrTitle(ActiveFolder,FldrName);
+      PrStuffData(lParentID,@FldrName,LENGTH(FldrName)+1);
+    END;
+
+    (* ----- Send message to Father Process to Spool this file if it is not empty. *)
+    (* ----- NumCopies is initially set in PrDocStart as per user request. It can be overridden in  *)
+    (* ----- PrAllocate. NumCopies is referenced in PrCLoseFile and PrDocEnd to tell the father how *)
+    (* ----- many copies. *)
+    WITH PrRec DO PrPrintRequest(lParentID,PrFileID.LongID,NumCopies,PrInfo.PrinterID,PrInfo.Port);
+
+    (* ----- Update the Block Number . *)
+    PrFileId.BlockNum := PrFileId.BlockNum+1;
+  End  {If SpoolPageNum>0 then Begin...}
+
+  Else Begin
+    Close_Object( error, PrFileRec.RefNum );
+    Kill_Object(error,PrFileRec.FileName);
+  End;
+
+  PrFileOpen   := False;
+  SpoolPageNum := 0;
+
+  (* ----- Reset HeapZone size for 1 page.  *)
+  ChangeSizeH( prHz, POINTER(ORD( hPfPages )), SIZEOF(TPfPage) );
+  With hPfPages^^[1] do Begin
+    Length:=0;
+    Start :=0;
+  End;
+
+End;
+{ ---------------------------------------------------------------------- }
+Procedure PrDiskFull;
+(* ----- PrDiskFull can currently be called from PrOpenFile or PrDocStart (when making the *)
+(* ----- printing data segment).                                                           *)
+VAR
+   AlertResult    : Integer;
+Begin
+   {$IFC fTracePR}    LogCall;     {$ENDC}
+   AlertResult:=PrOtherAlert(hPrAlert,cAxDiskFull,StopProc,FALSE{Not Background});
+   PrShowSpoolAlert;
+   PrAbort:=True;
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PrDocEnd{( Var PrRec : TPrRec; Var PrPort : TPrPort)};
+Type Byte         = -128..127;
+VAR SaveHeap     : THz;
+    AlertResult  : Integer;
+(* How and where page range errors are handled:                                                            *)
+(* Min and Max are equal to PrRec.PrJobInfo.DocPgFst and  PrRec.PrJobInfo.DocPgLst.                        *)
+(* Min is always assured to be less than max by the dialogs.                                               *)
+(* Document Page Number Range ==>               1                            Last                          *)
+(*                                              |----------------------------|                             *)
+(* Case 1:                 |Min-----------Max|                                                             *)
+(* Case 2:                              |Min-----------Max|                                                *)
+(* Case 3:                                          |Min-----------Max|                                    *)
+(* Case 4:                                                       |Min-------------Max|                     *)
+(* Case 5:                                                                       |Min-----------Max|       *)
+(* Case 6:           |Min---------------------------------------------------------------------------Max|   *)
+(*                                                                                                         *)
+(* Case 1,2  The Printer dialogs prevent the user from specifing page numbers less than 0.                 *)
+(* Case 3:   Normal case. Pages Min through Max of the document are printed. No Error.                     *)
+(* Case 4:   Pages min through the last page of the document are printed. No alert is raised               *)
+(* Case 5:   No Pages are printed. PrDocEnd rasies Note alert to tell user of Page range error.            *)
+(* Case 6:   Case 6 breaks down into  Case 2 and  Case 4.                                                  *)
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- If the spool file is open then close it. *)
+  If (PrFileOpen) then PrCloseFile(PrRec);
+
+  (* ----- Try to close up the data segment. No need to call FreeH for PrHz. When data segment goes, PrHz *)
+  (* ----- goes with it.*)
+  (* ----- Delete the data segment and the heap zone *)
+  PrDSClose(PrMakeDSRec);
+  PrHz:=Nil;
+
+  (* ----- If the Wait alert for Spooling is up, take it down. *)
+  PrHideSpoolAlert;
+
+  IF (PrCheckAbort = FALSE) THEN BEGIN
+  (* ----- Put up Note Alert to warn user of page range problem. *)
+    With PrRec.PrJobInfo do
+      If (DocCurPage<DocPgFst) then AlertResult:=PrOtherAlert(hPrAlert,cAxPageRange,NoteProc,FALSE{Not Bgd});
+
+  (* ----- Send message to Father Process to indicate last block was sent. *)
+    PrFileId.BlockNum := LastBlock;
+    WITH PrRec DO PrPrintRequest(lParentID,PrFileID.LongID,NumCopies,PrInfo.PrinterID,PrInfo.Port);
+  END
+  ELSE PrCleanUp(PrPort,PrRec);
+END;
+{ ---------------------------------------------------------------------- }
+Function PrDocStart {( Var PrRec : TPrRec; Var PrPort : TPrPort; LDSN : INTEGER; DoSpoolAlert:Boolean):Boolean};
+VAR
+    SaveHz         : THz{.UnitHz};
+    GPSave         : GrafPtr;
+    Error          : Integer;
+    BadDataSeg     : Boolean;
+    FileOpened     : Boolean;
+    NilProc        : TProc;
+    NumJobs        : Integer;
+    WaitTime       : Timestmp_interval;
+    DummyVar       : Time_Rec;
+
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- Set handles to nil so that they can be deallocated when aborting or at the end of the *)
+  (* ----- print loop.                                                                           *)
+  PrHZ       :=Nil;
+  hPfPages   :=Nil;
+  hPrIOBuffer:=Nil;
+  hPic       :=Nil;
+  BufIndex   :=1;
+  PrMakeDSRec.BegAddr:=NilAddr;
+  Cleaned    :=FALSE;      {-----PrCleanUp has not been called this trip yet}
+
+  (* ----- Assign input parameter to the PrRec. *)
+  PrRec.PrLDSN:=LDSN;
+
+  (* ----- Set the Flag that indicates if the 'We are spooling document XYZ' alert is up. This variable is       *)
+  (* ----- defaulted here, set to True in PrShowSpoolAlert, and checked and set to false in PrHideSpoolAlert. *)
+  PrAlertUp:=False;
+
+  (* ----- PutAlertUp is a global flag, used to indicate if we should put up the 'We are spooling document *)
+  (* ----- XYZ' alert. Certain applications may not want this to happen.                                   *)
+  PutAlertUp:=DoSpoolAlert;
+
+  (* ----- Set the Flag that indicates if the 'Number of copies not possible - Disk Full'. This variable is *)
+  (* ----- defaulted here and checked and set in  PrAllocate.                    *)
+  CopyAlertWasUp:=False;
+
+  (* ---- Set local variable to indicate the success of opening the spool file. *)
+  FileOpened:=False;
+  BadDataSeg:=True;
+
+  (* ----- Check for user requested abort. *)
+  PrAbort:=False;
+  If Not(PrCheckAbort) then Begin
+
+     Error:=0;
+     (* ----- Make the Data Segment. Using constants in this unit. *)
+     With PrMakeDSRec do Begin
+         SegName  := DSName;
+         InitSize := DSSize;
+         LDSN     := PrRec.PrLDSN;
+     End;
+     Error:=0;
+     With PrMakeDSRec do MAKE_DATASEG(error, SegName, {PrMakeDSRec.}InitSize, {PrMakeDSRec.}InitSize, RefNum,
+                                      BegAddr,{PrMakeDSRec.}LDSN, ds_private);
+     (* ----- If disk is full keep trying until no more jobs are printing.                                *)
+     If (Error=309) then
+     Repeat
+       PrJobCount(LParentID,NumJobs);
+       Error:=0;
+       With PrMakeDSRec do MAKE_DATASEG(error, SegName, {PrMakeDSRec.}InitSize, {PrMakeDSRec.}InitSize, RefNum,
+                                        BegAddr,{PrMakeDSRec.}LDSN, ds_private);
+       IF ((NumJobs>0)and(Error>0)) THEN BEGIN
+           WaitTime.sec:=0;
+           WaitTime.MSec:=500;
+           Delay_Time(error,WaitTime,DummyVar);
+       END;
+       PrShowSpoolAlert;
+     until ( (NumJobs<=0)or(Error=0)or(PrCheckAbort) );
+     BadDataSeg:=(Error<>0);
+
+     IF (PrCheckAbort = FALSE) THEN If Not(BadDataSeg) then Begin
+        (* ----- Save the users port and Heap  *)
+        GetPort(GPSave);
+        SaveHz:=TheHeap;
+        PrMaxPage:=PrPageLimit{.PrSpool};
+
+        (* ----- Initialize the Heap Zone in the data segment. Set the Printing Heap as TheHeap. *)
+        (* ----- NilProc must be set to Pointer(1) as per documentation in UnitHz. *)
+        NilProc:=Pointer(1);
+        prHz:=HzInit(Pointer(Ord(PrMakeDSRec.BegAddr)), Pointer(Ord(PrMakeDSRec.BegAddr)+HzSize), Nil, 64, 0,
+                     NilProc,Pointer(Ord(ProcNil)), Pointer(Ord(ProcNil)), Pointer(Ord(ProcNil)) );
+        theHeap:=prHz;
+
+        (* ----- Open up the port, set QuickDraw Capture procedure to stream picture to disk.*)
+        With PrPort do Begin
+          OpenPort ( Pointer(Ord4(@GPort)) );
+          gPort.grafprocs:=@gProcs;
+          SetStdProcs(gProcs);
+          gProcs.PutPicProc  :=@PrPutPicProc;
+          GrafDevice( PrRec.PrInfo.Adev.Dev );
+        End; {With PrPort do Begin}
+
+        (* ----- Set picture handle to nil.*)
+        hPic{.PrSpool} := Nil;
+
+        (* ----- Get the handle to the Page array. Allocate info for one page. Default the record.*)
+        hPfPages:=POINTER(ORD( HAllocate( prHz, Sizeof(TPfPage) ) ));
+        With hPfPages^^[1] do Begin
+          Length:=0;
+          Start :=0;
+        End;
+
+        (* ----- Get the handle to the IOBuffer   *)
+        hPrIOBuffer:=POINTER(ORD( HAllocate( prHz, SizeOf(TPrIOBuffer) ) ));
+        BufIndex     :=1;
+
+        (* ----- Initialize the documents page number,the number of pages spooled and number of copies.*)
+        (* ----- The Number of copies is referenced if we can not allocate disk space for the whole    *)
+        (* ----- document.                                                                             *)
+        DocCurPage   :=0;
+        SpoolPageNum :=0;
+        NumCopies    :=PrRec.PrJobInfo.Copies;
+
+        (* ----- Get the file name for this print job.  *)
+        With PrFileId do Begin
+          sFileName:='';
+          LongId   := Timer DIV 1000;      { the millisecond counter divided down to seconds }
+          Id       := BlockNum;
+          BlockNum := 0;
+        End;
+        (* ----- Make the spool file . Spool files are created in PrPageStart and Here.                *)
+        (* ----- They can be closed in DocEnd (for last page of Doc), PageEnd (When PrMaxPage has      *)
+        (* ----- been reached)  and in StartPage (Lack of file space for another picture).             *)
+        FileOpened:=PrOpenFile;
+
+        (* ----- Switch back the heap and the port. *)
+        SetPort (GPSave);
+        theHeap:=SaveHz;
+    End{If Not(BadDataSeg...}
+    Else Begin
+      (* ----- User is FUBAR, no more disk space . Sound the bells and whistles. *)
+      PrDiskFull;
+    End;
+  End; {If Not(PrCheckAbort) then ..}
+
+  IF PrCheckAbort THEN PrCleanUp(PrPort,PrRec);
+
+  PrDocStart:=( FileOpened and not(BadDataSeg) );
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PrDSClose{(DSRec:TPrDSRec)};
+VAR Error: TC;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+   CLOSE_DATASEG(Error, DSRec.RefNum);
+END;
+{ ---------------------------------------------------------------------- }
+Procedure PrFlushBuffer;
+Var Error:Integer;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  If (BufIndex>1) then WriteBlock( error, Pointer(Ord(hPrIOBuffer^)), BufIndex-1, PrFileRec.RefNum);
+  BufIndex:=1;
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrHideSpoolAlert;
+Begin
+   {$IFC fTracePR}    LogCall;     {$ENDC}
+   If PrAlertUp then Begin
+     HideFolder( Alertfolder );
+     PrAlertUp:=False;
+   End;
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrNullPutPicProc{( DataPtr:QDPtr;ByteCount:Integer)};
+Var Error  : Integer;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+End;
+{ ---------------------------------------------------------------------- }
+Function PrOpenFile{:Boolean};
+Var Error:Integer;
+    Open:Boolean;
+    MinFileSize    : LongInt;
+    BlocksAllocated: LongInt;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- Put up the wait alert if it is not already up. *)
+  PrShowSpoolAlert;
+
+  (* ----- Open the File. *)
+  GetFileName(PrFileId);
+  With PrFileRec do FileName:=PrFileId.sFileName;
+  OpenBlock  ( error, PrFileRec, [dwrite, dread, private] );
+  Open:=(Error<=0);
+
+  (* ----- Allocate the minimum amount of space needed for 1 printed page. The minimum file size needs to   *)
+  (* ----- accomodate a picture frame (8 Bytes) + 2 QuickDraw maximum size pictures (32767 each) + a TPrRec *)
+  (* ----- + a one page file directory + 4 byte pointer to the File directory + 4 Byte pointer to TPrRec .  *)
+  (* ----- The 256 is added to insure the size is rounded Up. 16294 bytes are added  for the backround      *)
+  (* ----- printing data segments, 2 segments @ 8192 bytes each.                                            *)
+  MinFileSize:=(8+(2*Ord4($00007FFF))+Sizeof(TPrRec)+Sizeof(TPfPage)+4+4+256+16294) div BytesPerBlock;
+  If Not(PrAllocate(error,PrFileRec.RefNum,MinFileSize,BlocksAllocated)) then Begin
+    If (Open) then Begin
+      Kill_Object(error,PrFileRec.FileName);
+      Open:=False;
+    End;
+    If Not PrCheckAbort then Begin
+      (* ----- User is FUBAR, no more disk space . Sound the bells and whistles. *)
+      PrDiskFull;
+    End;
+  End;
+  PrOpenFile:=Open;
+  PrFileOpen:=Open;              {Update the global variable}
+
+ If Open then Begin
+    (* ----- Make sure buffered commands are sent to disk.*)
+    PrFlushBuf;
+
+    (* ----- Save the File position for the pointer to the PrRec.*)
+    PrRecLoc:=0;
+    PfSavePos  ( error, PrRecPos, PrFileRec.RefNum );
+    WriteBlock ( error, POINTER(ORD(@PrRecLoc)), SizeOf(LongInt), PrFileRec.RefNum );
+
+    (* ----- Save the File position for the pointer to the Page Directory.*)
+    PageDirLoc:=0;
+    PfSavePos  ( error, PageDirPos, PrFileRec.RefNum );
+    WriteBlock ( error, POINTER(ORD(@PageDirLoc)), SizeOf(LongInt), PrFileRec.RefNum );
+  End;
+End;
+{ ---------------------------------------------------------------------- }
+Function PrPageEnd{( Var PrRec : TPrRec; Var PrPort : TPrPort):Boolean};
+VAR
+    SaveHz  : THz;
+    GPSave  : GrafPtr;
+    PageDir : LongInt;
+    Error   : Integer;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- Check for newly requested abort -PrCheckAbort or previously detected abort -PrAbort  *)
+  (* ----- set in PrCheckAbort.                                                                 *)
+  If (PrCheckAbort = FALSE) then Begin
+    Error:=0;
+
+    (* Show spooling alert if required *)
+    PrShowSpoolAlert;
+
+    (* Save users port and heap. Set Printing port and heap *)
+    GetPort(GPSave);
+    SetPort( Pointer(Ord4(@PrPort.GPort)) );
+
+    (* ----- Close the picture and save it*)
+    IF hPic<>nil THEN BEGIN
+      ClosePicture;
+
+      (* ----- Save the position of the end of page for computing and storing the length. Update the page record.*)
+      WITH hPfPages^^[SpoolPageNum] DO BEGIN
+        PrFlushBuf;                                      {Make sure buffered commands are sent to disk.}
+        PfSavePos(error,EndPagePos,PrFileRec.RefNum);
+        Length:=EndPagePos-Start;
+      END;
+
+      KillPicture( hPic );
+      hPic := NIL;
+
+     (* Check if the Maximum pages have been created. If so, close up the print file.*)
+     If ( ((SpoolPageNum Mod PrMaxPage)=0) and PrFileOpen) then PrCloseFile(PrRec);
+
+    END Else Begin
+      (* -----If Picture was hidden then Make visable again. Picture visability is checked in PrDocStart*)
+      ShowPen;
+    End;
+
+    (* ----- PrPageEnd returns true if this is the last page requested by the user or if the application is *)
+    (* ----- controlling the page range i.e. DocPgfst=1 and DocPgLst =19999.                                *)
+    With PrRec.PrJobInfo do PrPageEnd:=(DocCurPage>=DocPgLst);
+
+    (* ----- Restore the user's port *)
+    SetPort(GPSave);
+  End
+  Else Begin
+    PrPageEnd:=True;
+    PrCleanUp(PrPort,PrRec);
+  End; {If Not(PrCheckAbort...}
+  PsYieldCPU;     { Give background printing a chance to run a little if needed }
+END;
+{ ---------------------------------------------------------------------- }
+Function PrPageStart{( Var PrRec : TPrRec; Var PrPort : TPrPort):Boolean};
+VAR
+    SaveHz  : THz;
+    GpSave  : GrafPtr;
+    FileInfo: FS_Info{.SysCall};
+    FreeBlocks,
+    MinNeeded,
+    BlocksAllocated:LongInt;
+    Error   : Integer;
+    PageInRange : Boolean;      { Page is in user specified  range via Dialogs. }
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  (* ----- Check for newly requested abort -PrCheckAbort or previously detected abort -PrAbort *)
+  (* ----- set in PrCheckAbort.                                                                 *)
+  If (PrCheckAbort = FALSE) then Begin
+    Error:=0;
+
+    (* Show spooling alert if required *)
+    PrShowSpoolAlert;
+
+    (* Save users port and heap. Set Printing port and heap *)
+    GetPort(GPSave);
+    SetPort( Pointer(Ord4(@PrPort.GPort)) );
+
+    (* ----- Increment global page counter *)
+    DocCurPage :=DocCurPage + 1;
+
+    (* ----- The page is in range if : 1. The current page is within the user specified page range or      *)
+    (* ----- 2. I if the application is controlling the page range (i.e. DocPgFst =1 ,DocPgLst=1999.       *)
+    With PrRec.PrJobInfo do PageInRange:=( (DocCurPage >= DocPgFst)AND(DocCurPage <= DocPgLst) );
+    PrPageStart:=PageInRange;
+
+    (* ----- Check if the current page is in the requested range of the document.*)
+    IF PageInRange THEN BEGIN
+
+      (* ----- If a spool file is open then reserve the minimum amount of space needed for another    *)
+      (* ----- page. If there is not enough space left, then close the file.                          *)
+      If (PrFileOpen=True) then Begin
+
+        (* ----- Check if there is enough free space IN THE FILE for another page. *)
+        Info(error,PrFileRec.RefNum,FileInfo);
+        With FileInfo do FreeBlocks:=( (PSize-Size) div BytesPerBlock);
+
+        (* ----- Since the space for the PrRec and the file pointers have been accounted for in opening   *)
+        (* ----- this file (in PrOpenFile) we only need to insure that there is enough space for a maximum*)
+        (* ----- picture and its directory information. The 256 is added to insure blocksneeded is rounded*)
+        (* ----- up. If we can not allocate disk space then close the file. The file will get sent to the *)
+        (* ----- parent process and printed. After printing it will be deleted thereby releasing file     *)
+        (* ----- space for the next picture/page. The call to PrOpenfile in this procedure will call      *)
+        (* ----- PrAllocate which wait until the number of printing jobs is reduced to zero so that it    *)
+        (* ----- can grab file space. *)
+        MinNeeded:=( (2*Ord4($00007fff))+SizeOf(TPfPage) + (256)) div BytesPerBlock;
+        If MinNeeded>FreeBlocks then Begin
+          MinNeeded:=MinNeeded-FreeBlocks;
+          If Not(PrAllocate(error,PrFileRec.RefNum,MinNeeded,BlocksAllocated)) then PrCloseFile(PrRec);
+        End; { If MinNeeded .. }
+
+      End;{ If (PrFileOpen=True)... }
+
+      (* ----- Make the spool file if one is not open. Spool files are created in DocStart and Here. *)
+      (* ----- They can be closed in DocEnd (for last page of Doc), PageEnd (When PrMaxPage has      *)
+      (* ----- been reached)  and in PrPageStart (Lack of file space for another picture).           *)
+      If (PrFileOpen=False) then PrPageStart:=(PrOpenFile and PageInRange);
+
+      (* ----- Install Valid QuickDraw Bottle neck procedure for Storing picture. *)
+      PrPort.GProcs.PutPicProc:=@PrPutPicProc;
+
+      (* ----- Allocate another page record in the heap zone. *)
+      SpoolPageNum:=SpoolPageNum+1;
+      ChangeSizeH( prHz, POINTER(ORD( hPfPages )), SpoolPageNum*SIZEOF(TPfPage) );
+
+      (* ----- Save the absolute position in the file where the picture starts. *)
+      WITH hPfPages^^[SpoolPageNum] DO BEGIN
+          (* ----- Do not hit the disk if we know the file marker postion from the end of the last *)
+          (* ----- picture made. If this is the first picture in the file we must hit the disk and get *)
+          (* ----- the file position. EndPagePos is recorded in PrPageEnd. *)
+          If SpoolPageNum>1 then Start:=EndPagePos
+          Else Begin
+            PrFlushBuf;                                      {Make sure buffered commands are sent to disk.}
+            PfSavePos( error, Start, PrFileRec.RefNum );
+          End;
+          Length:=0;
+      END; (* With hPfPagtes *)
+
+      SaveHz :=TheHeap;
+      TheHeap:=PrHz;
+
+      (* ----- Write out the picture frame as first entity in picture file.*)
+      PrPutPicProc(Pointer(Ord(@PrRec.PrInfo.rPrintable)), 8);
+
+      hPic:= OpenPicture( PrRec.PrInfo.rPrintable );
+      (* ----- Rh procs assumes the clip is at least set to the port rect.*)
+      SetRectRgn( PrPort.GPort.clipRgn, -32000, -32000, 32000, 32000 );
+      TheHeap:=SaveHz;
+    END (* IF (DocCurPage >= PrRec.PrJobInfo.DocPgFst)...  *)
+    ELSE BEGIN
+      WITH PrPort DO BEGIN
+        (* ----- We are skipping pages. *)
+        HidePen; {Make QuickDraw suppress drawing users images}
+        hPic:=Nil;
+        Gprocs.PutPicProcs:=@PrNullPutProc;
+      End;
+    END;
+  End
+  (* ----- If User aborted,PrCleanUp is called from  PrCheckError *)
+  Else Begin
+    PrPageStart:=False;
+  End;  {If Not(PrCheckAbort...}
+  If PrCheckAbort then PrCleanUp(PrPort,PrRec);
+END;
+{-----------------------------------------------------------------------------}
+Procedure PrPutPicProc{( DataPtr:QDPtr;ByteCount:Integer)};
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrSubMitBuf(DataPtr,ByteCount);
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrShowSpoolAlert;
+Var  DocName : Str255;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  If (Not(PrAlertUp) and (PutAlertUp)) then Begin
+    GetFldrTitle(ActiveFolder,DocName);
+    ArgAlert(1,DocName);
+    WaitAlert(hPrAlert,caxSpooling);
+    PrAlertUp:=True;
+  End;
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrSpoolAbort;
+Begin
+   PrAbort:=TRUE;
+End;
+{-----------------------------------------------------------------------------}
+Procedure PrSubmitBuf{(DataPtr:QDPtr;ByteCount:Integer)};
+Var I : Integer;
+    TempPtr:QDPtr;
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  If ByteCount>0 then Begin
+    I:=0;
+    Repeat
+      If (BufIndex>=PrBufSize) then PrFlushBuffer;
+      TempPtr:=Pointer(Ord(DataPtr)+I);
+      hPrIOBuffer^^[BufIndex]:=TempPtr^;
+      BufIndex:=BufIndex+1;
+      I:=I+1;
+    Until (I=ByteCount);
+  End;
+End;
+{ ---------------------------------------------------------------------- }
+END.
+{
+UNIT PrFile CHANGE LOG:
+   04/13/84 BH:   Changed loops that are waiting for disk space, so they automatically
+                  put up the spooling alert when it is down and needs to be up.
+                  Also put in test for abort if user types apple period during one of these loops.
+                  Removed prcleanup from prcheckabort so it must be called explicitly after
+                  a call to PrCheckAbort.
+   02/06/84 BH:   Changed send messages to use PrEvents when sending print requests to background.
+   03/07/84 EZ:   Put procs in alphabetical order. Added parameter to Prdocstart for Suppressing
+                  'We are spooling file xyz' alert.
+}
+
+
+ÿ

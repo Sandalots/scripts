@@ -1,0 +1,898 @@
+unit Proc_Mgmt;     { Process Management Routines }
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+interface
+uses
+  (*$U object/driverdefs.obj *)  DriverDefs,
+  (*$U object/hwint.obj *)       HWInt,
+  (*$U object/sysglobal.obj *)   GLOBALDATA,
+  (*$U object/procprims.obj *)   Proc_Prims,
+  (*$U object/mmprim.obj *)      MMPRIMITIVES,
+  (*$U object/asynctr.obj *)     asynctr,
+  (*$U object/clock.obj *)       clock,
+  (*$U object/genio.obj *)       genio,
+  (*$U object/twiggy.obj *)      twiggy,
+  (*$U object/vmstuff.obj *)     vmstuff,
+  (*$U object/sfileio.obj *)     sfileio,
+  (*$U object/fsprim.obj *)      fs_primitives,
+  (*$U object/fsui.obj *)        FS_Interface,
+  (*$U object/mm0.obj *)         MEMORYMANAGER,
+  (*$U object/ds0.obj *)         DATASEGS,
+  (*$U object/objio.obj *)       ObjIO,
+  (*$U object/load.obj *)        Loader,
+  (*$U object/measure.obj *)     Measure,
+  (*$U object/exceprim.obj *)    exceprim,
+  (*$U object/eventchn.obj *)    eventchn,
+  (*$U object/excepmgr *)        excepmgr,
+  (*$U object/timemgr.obj *)     timemgr,
+  (*$U object/scavenger.obj *)   scavnger,
+  (*$U object/volcheck.obj *)    volcheck,
+  (*$U object/fsinit.obj *)      Initialize,
+  (*$U object/pmem.obj *)        pm_interface,
+  (*$U object/cd.obj *)          CD;
+
+
+const
+  maxUserPri = 225;                      { maximum allowable user priority }
+
+  term_excep = 'SYS_TERMINATE';          { the 'terminate' exception name }
+
+
+type
+  {namestring = string[20];}
+
+  procinfoRec = record
+                  progpathname : pathname;
+                  global_id    : longint;
+                  father_id    : longint;
+                  priority     : 1..255;
+                  state        : (pactive, psuspended, pwaiting);
+                  data_in      : boolean
+                end;
+
+    vers_info = record  { version information record }
+                  PPrim_V : int2;
+                  PM_V    : int2;
+                  GDV     : int2;
+                  MMPrimV : int2;
+                  MMV     : int2;
+                  DSV     : int2;
+                  ExprmV  : int2;
+                  ExmgrV  : int2;
+                  ECV     : int2;
+                  TimeV   : int2;
+                  VMV     : int2;
+                  SFV     : int2;
+                  PrimV   : int2;
+                  UIV     : int2;
+                  InitV   : int2;
+                  CUR_V   : int2;
+                  OSVers  : int2
+                end;
+
+
+  function PM_Version : int2;
+    { function to return the number of this version of module Proc_Mgmt }
+
+
+  procedure Init_gplist;
+    { procedure to initialize the global process list during startup }
+
+
+  procedure Recv_SoftInt;
+    { procedure executed by a process to handle a soft interrupt }
+
+
+  procedure Bad_SCall;
+    { procedure that a process ends up in if it makes an illegal system call }
+
+
+  function My_ID : int4;
+    { system call function to return a global id to the process for itself }
+
+
+  procedure Yield_CPU (var errnum : int2;  to_any : boolean);
+    { system call routine to give up the CPU to another process }
+
+
+  procedure SetPriority_Process (var errnum : int2;  proc_id : int4;
+                                 new_priority : int2);
+    { system call routine to set priority values for processes }
+
+
+  procedure Sched_Class (var errnum : int2;  non_preempt : boolean);
+    { system call procedure to set the value of the scheduling fence }
+
+
+  procedure Info_Process (var errnum : int2;  proc_id : int4;
+                          var proc_info : procinfoRec);
+    { system call procedure to return information about a process }
+
+
+  procedure Suspend_Process (var errnum : int2;  proc_id : int4;
+                             susp_family : boolean);
+    { system call procedure to suspend a process and possibly its descendants }
+
+
+  procedure Activate_Process (var errnum : int2;  proc_id : int4;
+                              act_family : boolean);
+    { system call procedure to activate a process and possibly its descendants }
+
+
+  procedure Kill_Process (var errnum : int2;  proc_id : int4);
+    { system call procedure to remove the specified process from the system }
+
+
+  procedure Terminate_Process  (var errnum : int2;  event_ptr : p_s_eventblk);
+    { system call procedure for a process to remove itself from the system }
+
+
+  procedure Hit_End;
+    { procedure executed by a process when it hits the 'end.' statement }
+
+
+  procedure Make_Process (var errnum : int2;  var proc_id : int4;
+                          var progfile : pathname;  var entryname : namestring;
+                          evnt_chn_refnum : int2);
+    { system call procedure to create a new process in the operating system }
+
+
+  procedure Make_SProcess (var errnum : int2;  var pcb_ptr : ptr_PCB;
+                           stk_size : int4;  start_PC : int4;  priValue : int2;
+                           resident : boolean);
+    { procedure to create a system process }
+
+
+  procedure List_Versions (var info : vers_info);
+    { procedure to list the version numbers of the various portions of the
+      operating system }
+
+
+  procedure Set_DebugMode (var errnum : int2;  on_off : boolean);
+    { procedure to turn the process debug flag on or off }
+
+
+  procedure OSQ;
+    { procedure to do necessary work for OSQuit }
+
+
+  procedure Root;
+    { procedure to implement the Root process of the operating system }
+
+
+
+implementation
+
+
+const
+  vercode = 90;                             { version code }
+  nospace = 10701;                          { err - no sys space during StartUp }
+
+  { error return bases/values for the Process Handling service calls }
+  proc_errbase    = 100;                    { error base for process handling }
+
+  eb_setpri       = 10;                     { error base - SetPriority_Process }
+  eb_suspend      = 15;                     { error base - Suspend_Process }
+  eb_activate     = 20;                     { error base - Activate_Process }
+  eb_kill         = 25;                     { error base - Kill_Process }
+  eb_make         = 30;                     { error base - Make_Process }
+  eb_scfence      = 60;
+
+  { errors from Make_Process }
+  e_prog_open = 0;                          { error opening program file }
+  e_fsread = 1;                             { error reading program file }
+  e_protected = 12;                         { error opening protected file }
+  e_inv_progfile = 2;                       { error invalid program file }
+  e_makestk = 3;                            { error in Make_Dataseg for stack }
+  e_makesysloc = 4;                         { error in Make_Dataseg for syslocal }
+  e_nosysglob = 5;                          { error no sysglobal space }
+  e_commchan = 6;                           { error setting up comm channel }
+  e_nounit = 13;                            { error looking for IU }
+  e_badunit = 14;                           { error matching name/type of IU }
+  e_noobjblock = 17;                        { error no sysloc space for ObjDesc }
+  e_noshrspace = 18;                        { error no space for shared IU globs }
+
+  { errors from Load_Program }
+  e_progfile = 8;                           { error accessing program file }
+  e_noseg = 15;                             { error looking for shared seg }
+  e_badseg = 16;                            { error matching name of shared seg }
+  e_segfile = 11;                           { error accessing a shared seg file }
+  w_progscaved = -19;                       { warning program file was scavenged }
+  w_lfscaved = -20;                         { warning library file was scavenged }
+
+
+
+type
+  segHandle = record  { descriptor of a segment }
+                seg_size   : int4;        { size of segment }
+                disk_size  : int4;        { disk size of segment }
+                seg_refnum : int2;        { refnum for segment }
+                seg_ptr    : absptr       { ptr to start of segment }
+              end;
+
+
+  init_stack = record
+                 start_addr  : int4;     { PC of start up stk frame }
+                 glob_base   : int4;     { base of program global data }
+                 In_buffptr  : int4;     { buffer ptr for Input }
+                 Out_buffptr : int4;     { buffer ptr for Output }
+                 units_size  : int4;     { size in stack for reg & IUs }
+                 OSorMonitor : int4;     { indicates execution world }
+                 C_parms     : int4;     { count of parameters to prog }
+                 V_parms     : int4      { ptr to program parameters }
+               end;
+
+
+
+(*$S init *)
+
+  procedure Init_GPList;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to initialize the global process list during  *)
+        (*   startup.                                                *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is intended to be used only during       *)
+        (*   startup.  It is in the 'init' segment.                  *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   A system error is generated if space can't be obtained  *)
+        (*   from sysglobal.                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      glob_list_head : ptr_gplisthead;    { ptr to global list head }
+
+    begin
+      if not Getspace (Sizeof (glist_head), b_sysglobal_ptr, glob_pcb_list) then
+        System_Error (nospace)
+      else
+        begin
+          glob_list_head := pointer(glob_pcb_list);
+          with glob_list_head^ do
+            begin
+              gplist_head_ptr := nil;
+              Init_sem (gplist_sem, 1)   { initialize for mutual exclusion }
+            end
+        end
+    end { Init_GPList };
+
+
+(*$S ProcStart *)
+
+  function PM_Version; (* : int2 *)
+    { function to return the number of this version of Proc_Mgmt }
+
+    begin
+      PM_Version := vercode
+    end { PM_Version };
+
+
+(*$S kr_prims *)
+
+  function Stopped (pcb_ptr : ptr_PCB) : boolean;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Function to determine whether a process is 'stopped'.   *)
+        (*   A process is considered 'stopped' if it will not        *)
+        (*   execute from the user's point of view.  This is the     *)
+        (*   case if the process is blocked waiting for an Activate  *)
+        (*   or if there's a pending 'suspend' soft interrupt for    *)
+        (*   the process.                                            *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process to be     *)
+        (*             checked for being 'stopped'.                  *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This function is intended to be called only from        *)
+        (*   within the kernel of the operating system.              *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      with pcb_ptr^ do
+        if blk_state = [act_call] then
+          Stopped := true
+        else if susp in softints then
+          Stopped := true
+        else
+          Stopped := false
+    end { Stopped };
+
+
+  procedure Stop_Proc (pcb_ptr : ptr_PCB);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to 'stop' a process.  A process is stopped    *)
+        (*   by blocking it directly (waiting for an Activate) if    *)
+        (*   it's not in system code or by sending it a 'suspend'    *)
+        (*   soft interrupt that will be handled as soon as the      *)
+        (*   process is not in system code.                          *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr :  a pointer to the PCB of the process to be    *)
+        (*              'stopped'.                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from within  *)
+        (*   the kernel of the operating system.                     *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      if pcb_ptr^.domain <> 0 then
+        Block_Process (pcb_ptr, [act_call])
+      else
+        Send_SoftInt (pcb_ptr, susp)
+    end { Stop_Proc };
+
+
+  procedure Unstop_Proc (pcb_ptr : ptr_PCB);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to 'unstop' a process.  A process is          *)
+        (*   'unstopped' by either unblocking it directly (from the  *)
+        (*   Activate wait) if the process is, in fact, blocked or   *)
+        (*   by clearing the 'suspend' soft interrupt that was sent  *)
+        (*   to it.                                                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process that is   *)
+        (*             to be 'unstopped'.                            *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from within  *)
+        (*   the kernel of the operating system.                     *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      if pcb_ptr^.blk_state = [act_call] then
+        Unblock_Process (pcb_ptr, [act_call])   { w/ preemption he could go now }
+      else
+        Clear_SoftInt (pcb_ptr, susp)
+    end { Unstop_Proc };
+
+
+  procedure Invoke (proc : ptr_prcedure;  parm : ptr_PCB);  external;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Assembly language procedure to invoke a procedure       *)
+        (*   specified by a pointer to the procedure.  This routine  *)
+        (*   will be used until the SVS compiler implements passing  *)
+        (*   procedures as parameters.                               *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   proc : a pointer to the procedure which is to be        *)
+        (*          executed.                                        *)
+        (*                                                           *)
+        (*   parm : the parameter (a PCB pointer) to be passed to    *)
+        (*          procedure to be invoked.                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   This procedure does not set a stack frame.  It changes  *)
+        (*   the stack to look as though the invoked procedure had   *)
+        (*   been directly called by the caller of Invoke.  Thus,    *)
+        (*   when the invoked procedure returns, it goes directly    *)
+        (*   back to the caller of Invoke.                           *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Invoke expects the procedure to be invoked to take 1    *)
+        (*   parameter (a PCB pointer) only.                         *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+
+
+  procedure Scan_Family (pcb_ptr : ptr_PCB;  Visit : ptr_prcedure);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to scan through a family of processes,        *)
+        (*   visiting each process once.  The n-ary tree traversal   *)
+        (*   is accomplished by treating the tree as a binary tree   *)
+        (*   where the son ptr of a given node (PCB) is the left     *)
+        (*   subtree and the brother ptr is the right subtree.  A    *)
+        (*   simple (recursive) post order traversal is done on the  *)
+        (*   binary tree which roughly corresponds to visiting the   *)
+        (*   general tree in a bottom-up, right-left fashion.  Note  *)
+        (*   that the recursive tree traversal may later be          *)
+        (*   implemented in a non-recursive form if necessary for    *)
+        (*   efficiency purposes.                                    *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process which is  *)
+        (*             the root of the family to be scanned.         *)
+        (*                                                           *)
+        (*   Visit : a pointer to the procedure which is to be       *)
+        (*           executed at (on) each of the nodes (processes)  *)
+        (*           encountered in the scan.  Note that until the   *)
+        (*           compiler implements passing procedures as       *)
+        (*           parameters, Visit must be called by using the   *)
+        (*           assembly language procedure Invoke.             *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   The procedure Visit is executed for each process        *)
+        (*   encountered in the scan.  Stop_Proc and Unstop_Proc     *)
+        (*   are examples of procedures that are executed in the     *)
+        (*   scan.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be used to scan a subtree   *)
+        (*   of the process hierarchy and execute a procedure at     *)
+        (*   each node.  It could, however, be used to scan any      *)
+        (*   binary tree if the pointer variable names are changed   *)
+        (*   as needed.                                              *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      son_ptr : ptr_PCB;                  { ptr to left son's PCB }
+      brother_ptr : ptr_PCB;              { ptr to right brother's PCB }
+
+    begin
+      with pcb_ptr^ do
+        begin
+          if sonptr <> 0 then
+            begin  { visit left son }
+              son_ptr := pointer(sonptr + b_sysglobal_ptr);
+              Scan_Family (son_ptr, Visit)
+            end;
+
+          if brotherptr <> 0 then
+            begin  { visit right brother }
+              brother_ptr := pointer(brotherptr + b_sysglobal_ptr);
+              Scan_Family (brother_ptr, Visit)
+            end
+        end;
+
+      { now visit self }
+      Invoke (Visit, pcb_ptr)
+    end { Scan_Family };
+
+
+(*$S ProcStart *)
+
+  procedure Add_PCBglist (pcb_ptr : ptr_PCB);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to add a process to the global process list.  *)
+        (*   This list is the data structure that allows processes   *)
+        (*   to be found by their global ID rather than by PCB       *)
+        (*   pointer.  The specified PCB is added to the head of     *)
+        (*   the linked list resulting in a list that is in          *)
+        (*   descending order of global process IDs.                 *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   pcb_ptr : a pointer to the PCB of the process to be     *)
+        (*             added to the global list.                     *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      glob_list_head : ptr_gplisthead;    { ptr to global list head }
+
+
+    begin
+      glob_list_head := pointer(glob_pcb_list);
+
+      with glob_list_head^ do
+        begin
+          Wait_sem (gplist_sem, []);
+
+          pcb_ptr^.gplist_ptr := gplist_head_ptr;
+          gplist_head_ptr := pcb_ptr;
+
+          Signal_sem (gplist_sem)
+        end
+    end { Add_PCBglist };
+
+
+(*$S ProcComm *)
+
+  procedure Bad_SCall;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to handle 'bad' system calls.  Bad system     *)
+        (*   calls are those which are made with a subcode that is   *)
+        (*   either out of the valid range or for which no system    *)
+        (*   call procedure exists.  In either case, the process     *)
+        (*   making the invalid system call is aborted with an       *)
+        (*   indication that it made a bad system call (e.g. in the  *)
+        (*   info block of its terminate exception handler).         *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from the     *)
+        (*   Trap(1) handler.                                        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                  { ptr to current process's PCB }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+      AbortProcess (pcb_ptr, true, bad_syscall)
+    end { Bad_SysCall };
+
+
+(*$S kr_spare *)
+
+  function My_ID (* : int4 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Function to return a global id to the calling process   *)
+        (*   which can be used in other process handling service     *)
+        (*   calls to indicate the process itself.                   *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.  The function return is the global id of the      *)
+        (*   calling process itself.                                 *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                  { ptr to current PCB }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+      My_ID := pcb_ptr^.glob_id
+    end { My_ID };
+
+
+  procedure Yield_CPU (* var errnum : int2;  to_any : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure to give up the CPU to another     *)
+        (*   process.  The CPU can be given up to a process of       *)
+        (*   equal or greater priority than the current (calling)    *)
+        (*   process or it can be given up to any other ready        *)
+        (*   process regardless of priority.  Successive calls to    *)
+        (*   Yield_CPU with to_any set to false by a set of          *)
+        (*   processes at a given priority results in round-robin    *)
+        (*   scheduling of those processes.  Note that because of    *)
+        (*   the currently non-preemptive nature of scheduling in    *)
+        (*   the 1st release Lisa operating system,  applications    *)
+        (*   should frequently call this routine to prevent any      *)
+        (*   single user process from monopolizing the CPU.          *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   to_any : a flag indicating whether the processor        *)
+        (*            should be yielded to any other process         *)
+        (*            regardless of the priority, or whether it      *)
+        (*            should be yielded only to processes of = or >  *)
+        (*            priority.                                      *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this system     *)
+        (*            call procedure.  Always returns 0.             *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.  This routine may be called by any process at     *)
+        (*   any time.  It is designed to be as fast as possible     *)
+        (*   while still adhering to the basic operating system      *)
+        (*   philosophy.                                             *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.  Calling this routine can cause no errors.        *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;                 { current interrupt level }
+      pcb_ptr : ptr_PCB;                       { ptr to current or next PCB }
+      sysloc_ptr : slocal_ptr;   { temp }
+
+    begin
+      errnum := 0;
+      pcb_ptr := pointer(c_pcb_ptr);
+      sysloc_ptr := pointer(b_syslocal_ptr);  { temp }
+      with sysloc_ptr^ do
+        if recordFaults then recordFaults := false;      { temp }
+      Intsoff (allints, int_level);
+      Queue_Process (pcb_ptr, Ready);
+      Intson (int_level);
+
+      if not Invoke_sched and to_any then
+        begin  { see if there's an eligible lower priority process }
+          pcb_ptr := pcb_ptr^.next_schedPtr;
+          { there might be a better choice lower in the queue - e.g. a preemptive
+            process when there is an 'active' non-preemptive process }
+          if pcb_ptr^.priority > 0 then
+            begin  { force scheduling of a lower priority ready process }
+              sched_attn := ord(pcb_ptr);
+              Invoke_sched := true
+            end
+        end { eligible process };
+
+      if Invoke_sched then
+        begin
+          if nonPreempt = c_pcb_ptr then
+            nonPreempt := ord(nil)
+        end
+    end { Yield_CPU };
+
+
+  procedure SetPriority_Process (* var errnum : int2;  proc_id : int4;
+                                   new_priority : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure to set the priority of the        *)
+        (*   calling process or any other process to the specified   *)
+        (*   value.  Note that this routine is used by the           *)
+        (*   cooperating user processes to schedule the various      *)
+        (*   applications for execution as desired by the user.      *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   proc_id : the global id of the process whose priority   *)
+        (*             is to be changed.  Note that if the priority  *)
+        (*             of the calling process is to be changed, the  *)
+        (*             global id of the process itself should be     *)
+        (*             used.                                         *)
+        (*                                                           *)
+        (*   new_priority : the new priority value for the           *)
+        (*                  specified process.                       *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this system     *)
+        (*            call procedure (see values below).             *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.  Scheduling changes only occur if a new process   *)
+        (*   is queued ahead of the calling process in the Ready     *)
+        (*   queue as a result of calling this routine.              *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   errnum = 0              successfully completed          *)
+        (*          = e_noprocess    no such process                 *)
+        (*          = e_invprocess   invalid process (system)        *)
+        (*          = e_badpri       specified pri is < 1            *)
+        (*                             or > maxUserPri               *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      e_badpri = 0;                       { error: bad priority specified }
+
+    var
+      pcb_ptr : ptr_PCB;                  { ptr to PCB of process being changed }
+      int_level : intson_type;            { current interrupt level }
+
+    begin
+      Find_PCB (errnum, Sys_Called, proc_id, pcb_ptr);
+
+      if errnum = 0 then
+        begin  { proc_id is valid }
+          if (new_priority < 1) or (new_priority > maxUserPri) then
+            errnum := proc_errbase + eb_setpri + e_badpri
+          else
+            begin  { everything is ok }
+              Intsoff (allints, int_level);
+
+              with pcb_ptr^ do
+                begin
+                  norm_pri := new_priority;
+                  if sems_owned = 0 then
+                    begin
+                      priority := new_priority;
+                      if blk_state = [] { active } then
+                        Queue_Process (pcb_ptr, Ready)
+                    end
+                end { with pcb_ptr^ };
+
+              Intson (int_level)
+            end
+        end { valid proc_id }
+    end { SetPriority_Process };
+
+
+  procedure UBR;  external;
+    { for debugging use in Sched_Class }
+
+  procedure Sched_Class (* var errnum : int2;  non_preempt : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure to move a process from the        *)
+        (*   preemptive class to the non-preemptive class or vice    *)
+        (*   versa.                                                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   non_preempt : if true then calling process should be    *)
+        (*                 added to the non-preemptive class.        *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this system     *)
+        (*            call procedure (always 0).                     *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   Calls to Sched_Fence 'nest' for use in libraries that   *)
+        (*   may call other libraries, etc.  Note that the count of  *)
+        (*   the # of calls to make the process non-preemptive is    *)
+        (*   not allowed to go below 0.                              *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.  But it is intended that this procedure be        *)
+        (*   removed after 1st release and replaced with a general   *)
+        (*   locking mechanism that the applications can use to      *)
+        (*   protect shared data appropriately.                      *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                  { ptr to PCB of current process }
+
+    begin
+      pcb_ptr := pointer(c_pcb_ptr);
+
+      if non_preempt then
+        begin  { joining non-preemptive class }
+          with pcb_ptr^ do
+            begin
+              np_count := np_count + 1;
+              (*$IFC debug1 *)
+              if Trace (pm, 95) then
+                begin
+                  if np_count > 1 then
+                    begin
+                      writeln ('*** Process called Sched_Class (err, true) ',
+                               '2 times consecutively ***');
+                      UBR   { set break point @ user's return address }
+                    end
+                end;
+              (*$ENDC *)
+
+              if np_count = 1 then
+                begin
+                  if nonPreempt = ord(nil) then
+                    nonPreempt := c_pcb_ptr
+                  else
+                    { there is currently an 'active' non-preemptive process }
+                    Invoke_sched := true
+                end
+            end { with }
+        end { non-preemptive }
+      else
+        begin  { joining preemptive class }
+          with pcb_ptr^ do
+            begin
+              np_count := np_count - 1;
+              if (np_count = 0) and (nonPreempt = c_pcb_ptr) then
+                nonPreempt := ord(nil)
+            end
+        end { preemptive };
+
+      errnum := 0
+    end { Sched_Class };
+
+
+(*$I source/pmcntrl.text *)
+
+(*$I source/pmterm.text *)
+
+(*$I source/pmmake.text *)
+
+(*$I source/pmsprocs.text *)
+
+end.
+
+ÿ

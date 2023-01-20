@@ -1,0 +1,1912 @@
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+{File source/cdconfig}
+
+program cdconfig; {Configuration tool}
+(********************************************************)
+(*
+(* Description:
+(*   This program maintains CDD/PM/drivers, and their association one another.
+(*
+(*   See the H)elp command text for temporary restrictions.
+(*
+(*   Possible future enhancements:
+(*     On shutdown, gripe if the 'current' config is silly (terminal non-io)
+(*     or dangerous (detached boot device).
+(*
+(********************************************************)
+
+uses
+    {$U object/Syscall}     SysCall;
+
+(*$SETC DEBUG := TRUE*)
+
+const
+   cdd_version = 5; {current version of the CDD data.}
+   ch_version = 5;
+
+   ESC = 27;                                { <ESC> character }
+
+  {possible replies from GETYESNO: }
+   yes = 1;
+   no = -1;
+
+  {possible cd make/kill/info errors: }
+   cdbadparms = 750;     {parameters corrupt/out of range}
+   cdnodev = 751;        {no device at selected position}
+   cdbusy = 752;         {device is busy}
+   cdnotterm = 753;      {device is not a terminal node}
+   cdbuiltin = 754;      {builtin device is operating there}
+   cdisolated = 755;     {position is an isolated node}
+   cdoccupied = 756;     {position is already occupied}
+   cdtoomany = 758;      {too many configured devices (configinfo entries full) }
+   cdnospace = 701;      {sysglobal space not available}
+
+   empty = -1;
+   maxpm    = 20; {maximum index of the array describing each position}
+   maxcdd   = 50; {top legit member of elks}
+
+  {maximum legit index of dimension (in parameter memory):}
+   max_slot = 14;
+   max_chan = 6;
+   max_dev = 30;
+
+  {index showing showing dimension is empty/irrelevant (in parameter memory)}
+   emptyslot = 15;
+   emptychan = 7;
+   emptydev = 31;
+
+   conn_space = 50000;  {amount of allocated connector list dataseg space}
+type
+
+(*$I source/icdd.text*)  {shared declarations}
+
+{runtime connector list image: }
+   conn_list = record
+      this_drvr: e_name;
+      conn_count: integer;
+   {  next_att:  typeconnect;  (optional repeating group) }
+   {  next_conn: typeconnect;  (  "            "      " ) }
+   end; {of conn_list}
+
+   conn_image = record
+      conn_ptr: ^conn_list; {insertion point for new drivers}
+      drvr_count: integer;
+   {  drvr_info: conn_list; (optional repeating group) }
+   end; {of conn_image}
+
+   prompter = string[64];
+   absptr = longint;
+   ptr_conn_list = ^conn_list;
+
+var
+   prompt: prompter;                      {getyesno parameter}
+   ans:    integer;
+   peter:  pmemrec;                       {parameter memory image}
+   paul:   array [1..maxpm] of configdev; {known drivers}
+   mary:   array [1..maxcdd] of cddentry; {known positions}
+   conn_dump : ^conn_image;
+
+   debug: integer;
+   cmd:   char;
+
+ {maintain sense of 'current' CDD, and character files: }
+   bootprefix, prefix: e_name;
+   opencdd,                {whether system.cdd is open}
+   dirtycdd : boolean;     {even if not open, live copy may exist}
+   refcdd, refconn: integer;        {refnums}
+   namecdd, converter: pathname;
+
+
+procedure CHECKDEBUG;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+var x: char;
+begin
+
+(*$IFC DEBUG*)
+   if (debug > 0) then
+      begin
+         writeln;
+         writeln(
+'Debugging cdconfig...hit space to continue, or ''?'' get into an infinite loop.');
+         repeat
+            read(x);
+            if (x='?') then
+               repeat {nothing} until false {infinite loop (allows local NMI)};
+         until (x=' ');
+      end;
+(*$ENDC*)
+
+end; {of checkdebug}
+
+
+
+function GETYESNO(tickle: prompter) : integer;
+(*****)
+(* Description:
+(*    GETYESNO writes a prompt and returns the sort of 1 char response
+(*      gotten for the user:
+(*         'Y'/'y' : yes;
+(*         'N'/'n' : no;
+(*****)
+var
+   answer: char;
+begin
+   repeat
+      write(tickle,'? ');
+      read(answer);
+      writeln;
+      if (answer='Y') or (answer='y') then
+         begin
+            getyesno := yes;
+            EXIT(getyesno);
+         end
+      else if (answer='N') or (answer='n') then
+         begin
+            getyesno := no;
+            EXIT(getyesno);
+         end;
+   until {never} false;
+end; {of getyesno}
+
+
+
+procedure SHIFTNAME (var namestring : pathname);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert the string to upper case.
+       (*
+       (* Input/Output Parameters:
+       (*    Namestring - the string.
+       (*
+       (*************************************************************)
+var i, diff : integer;
+begin
+  diff := ord ('a') - ord ('A');
+  for i := 1 to LENGTH(namestring) do
+  begin
+    if namestring [i] in ['a'..'z'] then namestring [i] :=
+          chr (ord (namestring [i]) - diff);
+  end;
+end;    (* of shiftname*)
+
+
+
+(*$R-*) {these (few) procs like range checking off}
+
+procedure MAKE_INTERNAL(var this_pos: cd_position);
+   (*****)
+   (* Translate position name from the public to internal format.
+   (*****)
+begin
+   with this_pos do
+      begin
+         slot := slot - 1; {doesn't check for 'empty' slot}
+         chan := chan - 1;
+         if (chan = empty) then
+            begin
+               chan := emptychan;
+               dev  := emptydev;
+            end
+         else
+           begin
+              dev :=  dev - 1;
+              if (dev = empty) then dev := emptydev;
+           end;
+      end;
+end; {of make_internal}
+
+
+
+function POS_RESERVED(var this_pos: cd_position) : boolean;
+   (*****)
+   (* Report whether the given position is 'intrinsic' to parameter memory,
+   (*   ie, can't/needn't be explicitly written.
+   (*****)
+begin
+   with this_pos do
+      pos_reserved := ( (slot >= cd_intdisk-1) ) or
+                      ( (slot = cd_scc-1) and (chan = emptychan) );
+end; {of pos_reserved}
+
+
+
+procedure MAKE_EXTERNAL(var this_pos: cd_position);
+   (*****)
+   (* Translate position name from the internal to public format.
+   (*****)
+begin
+   with this_pos do
+      begin
+         slot := slot + 1; {doesn't check for 'empty' slot}
+         chan := chan + 1;
+         if (chan = emptychan+1) then
+            begin
+               chan := 0;
+               dev := 0;
+            end
+         else
+           begin
+              dev :=  dev + 1;
+              if (dev = emptydev+1) then dev := 0;
+           end;
+      end;
+end; {of MAKE_EXTERNAL}
+
+(*$R+*) {restore range checking}
+
+
+
+procedure KILL_IT(var error: integer; var itsname: pathname);
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+begin
+   KILL_OBJECT(error, itsname);
+   if (error > 0) then
+      begin
+         writeln('Trouble killing file ',itsname,', error = ',error,'.');
+         CHECKDEBUG;
+      end
+end; {of kill_it}
+
+
+
+procedure OPEN_IT(var error: integer;
+                  var opened: boolean;
+                  var named: pathname;
+                  var refed: integer;
+                      ick: mset);
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+   {The caller should check whether OPEN_IT succeedes, by examining the
+    value of the 'opened' parameter.}
+begin
+   OPEN(error, named, refed, ick);
+   opened := (error <= 0);
+   if (error = 948) or (error = 946) then
+      error := 0; {that's no error, it's just not there}
+   if (error > 0) then
+      begin
+         writeln('Couldn''t open ',named,', error =',error,'.');
+         CHECKDEBUG;
+      end;
+end; {of open_it}
+
+
+
+procedure MAKE_IT(var error: integer;
+                  var opened: boolean;
+                  var itsname: pathname;
+                  var itsrefnum: integer;
+                      verify_kill: boolean);
+(********************************************************)
+(*
+(* Description:
+(*   Blah.
+(*
+(********************************************************)
+   {The caller should check whether MAKE_IT succeedes, by examining the
+    value of the 'opened' parameter.}
+var
+   openerr: integer;
+begin
+   MAKE_FILE(error, itsname, 0 {label});
+   if (error=890 {file already exists}) then
+      begin
+         error := 0; {already exists not considered an error}
+         if verify_kill then
+            begin
+               write('File ',itsname,' already exists.  ');
+               opened := (GETYESNO('OK to overwrite it') = yes);
+               if not opened then EXIT(make_it);
+            end
+         else opened := true; {verify not needed}
+         OPEN(error, itsname, itsrefnum, [dread, dwrite]);
+      end {of file already exists}
+   else if (error = 921) then {disk not found}
+      begin
+         opened := false;
+         writeln('Disk not found (for file ',itsname:1,').');
+         EXIT(make_it);
+      end
+   else if (error <= 0) then {now that it exists: }
+      begin
+         OPEN_IT(openerr, opened, itsname, itsrefnum, [dread, dwrite]);
+         if not opened {Shouldn't be possible:} then
+            begin
+               writeln('Something STRANGE is going on here (Error = ',openerr,').');
+               CHECKDEBUG;
+               KILL_IT(openerr, itsname); {Don't EVEN check to see if this goes...}
+               EXIT(make_it);
+            end;
+      end; {opening newly made file}
+   if (error > 0) then {from EITHER make or open}
+      begin
+         opened := false;
+         writeln('Couldn''t make ',itsname,', error = ',error,'.');
+         CHECKDEBUG;
+      end;
+ end; {of make_it}
+
+
+
+procedure CLOSE_IT(itsrefnum: integer; var itsname: pathname);
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+var error: integer;
+begin
+   CLOSE_OBJECT(error, itsrefnum);
+   if (error > 0) then
+      begin
+         writeln('Couldn''t close ',itsname,', error = ',error,'.');
+         CHECKDEBUG;
+      end;
+end; {of close_it}
+
+
+
+function NEW_CONN(cddindex, ref: integer) : boolean;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+var
+   actual: longint;
+   error: integer;
+   maxconns, total: integer;
+begin
+   new_conn := true;
+   with mary[cddindex], conn_dump^ do
+      begin
+         conn_ptr^.this_drvr  := drvr_name;
+         conn_ptr^.conn_count := info.numAttach + info.numConnectors;
+         maxconns := conn_ptr^.conn_count;
+         conn_ptr := pointer( ord(conn_ptr) + sizeof(conn_list) );
+         if maxconns > 0 then
+            for total := 1 to maxconns do
+               begin
+                  if (ord(conn_ptr) - ord(conn_dump) > conn_space -
+                           sizeof(typeconnect) ) then
+                     begin
+                        writeln('Connector list space exhausted.');
+                        new_conn := false;
+                        CHECKDEBUG;
+                        EXIT(new_conn);
+                     end;
+                  READ_DATA(error, ref, ord(conn_ptr),
+                         sizeof(typeconnect), actual, sequential, 0);
+                  if (error > 0) or (actual <> sizeof(typeconnect) ) then
+                     begin
+                        write('Trouble reading connector list  ');
+                        if (error > 0) then writeln('(Error = ',error,')')
+                        else writeln;
+                        new_conn := false;
+                        CHECKDEBUG;
+                        EXIT(new_conn);
+                     end;
+                  conn_ptr := pointer( ord(conn_ptr) + sizeof(typeconnect) );
+               end; {of for all connections}
+         drvr_count := drvr_count + 1;
+      end; {of with}
+end; {of new_conn}
+
+
+
+function FIND_CONN(var itsname: e_name;var where: ptr_conn_list) : boolean;
+(********************************************************)
+(*
+(* Description:
+(*    Find a name in the connector list.
+(*
+(********************************************************)
+var
+   i, total, index: integer;
+begin
+   find_conn := false;
+   where := pointer( ord(conn_dump) + sizeof(conn_image) );
+   with conn_dump^ do
+      begin
+         i := 0;
+         while (i < drvr_count) do
+            begin
+               if ord(where) >= ord(conn_ptr) then {whoops}
+                  begin
+                     writeln;
+                     writeln('BANG!  The connector list is damaged.');
+                     EXIT(find_conn);
+                  end;
+               if itsname = where^.this_drvr then {bingo}
+                  begin
+                     find_conn := true;
+                     EXIT(find_conn);
+                  end
+               else {wrong one found, so keep looking}
+                  begin
+                     if (where^.this_drvr <> '') then {it counts}
+                        i := i + 1;
+                     total := where^.conn_count;
+                     where := pointer( ord(where) + sizeof(conn_list) );
+                     if total > 0 then
+                        for index := 1 to total do
+                           where := pointer( ord(where) + sizeof(typeconnect) );
+                  end;
+            end; {of looking}
+      end; {of with}
+      writeln;
+      writeln('BANG!  Connector list entry ',itsname,'is missing.');
+end; {of find_conn}
+
+
+
+procedure KILL_CONN(itsname: e_name);
+(********************************************************)
+(*
+(* Description:
+(*    Destroy a driver's connector list.
+(*
+(********************************************************)
+var
+   poker: ptr_conn_list;
+begin
+   if FIND_CONN(itsname, poker) then
+      with conn_dump^ do {Kill it}
+         begin
+            drvr_count := drvr_count - 1;
+            poker^.this_drvr := '';
+         end;
+end; {of kill_conn}
+
+
+
+procedure INIT_CDCONFIG;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+label 1; {for retrying the procedure}
+var
+   ax: mset;
+   found: boolean;
+   cdd_descr: cddheader;
+   cddentries, error, i, total, maxconns, nextpm, nextcd: integer;
+   actual, id, key: longint;
+   passwd, vname: e_name;
+   conn_name: pathname;
+
+begin
+
+1:
+   debug := 0;
+   ax := [dread, dwrite];
+   for i := 1 to maxpm do
+      paul[i].pos.slot := emptyslot; {empty/available}
+   for i := 1 to maxcdd do
+      mary[i].drvr_name := '';
+
+  {init runtime image of connectors: }
+   conn_name := '';
+   MAKE_DATASEG(error, conn_name, conn_space, 0 {no disk space},
+        refconn, actual, 1 {ldsn}, ds_private);
+   conn_dump := pointer(actual);
+   with conn_dump^ do
+      begin
+         conn_ptr := pointer( ord(conn_dump) + sizeof(conn_image) );
+         drvr_count := 0;
+      end;
+
+   writeln;
+   writeln;
+   OSBOOTVOL(error, bootprefix);
+   bootprefix := CONCAT('-', bootprefix);
+   repeat
+      found := true;
+      writeln('Configuring which disk (ie, ''-mydisk'') [<CR> for the boot device] ');
+      write('   [<clear> to leave CDCONFIG]? ');
+      prefix := 'x';
+      readln(prefix);
+      if (ord(prefix[1]) = esc) then {without flushing/closing anything}
+         EXIT(cdconfig);
+      if (LENGTH(prefix) = 0) then
+         begin
+            prefix := bootprefix;
+            writeln('Using ',prefix,'.');
+         end {of using boot volume}
+      else
+         begin
+            if (prefix[1] = '-') then
+               DELETE(prefix, 1, 1); {pull it, for a VERY short time.}
+           {make disk exists by mounting it:}
+            passwd := ''; {avoid uninited password, even though it's ignored NOW.}
+            MOUNT(error, vname {ignored}, passwd, prefix);
+            found := (error = 1052 {already exists} ) or (error <= 0);
+            if not found then
+               begin
+                  writeln('Disk not found (error = ',error,').');
+               end;
+            prefix := CONCAT('-',prefix);
+         end;
+      writeln;
+   until found;
+   namecdd := CONCAT(prefix, '-SYSTEM.CDD');
+
+ {read PM: }
+   key := 0;
+   i := 1;
+   READ_PMEM(error, peter);
+   repeat
+      GETNXTCONFIG(error, key, peter, paul[i]);
+      if (error > 0) then paul[i].pos.slot := emptyslot
+      else with paul[i] do
+         begin
+            if debug>0 then
+               begin
+                  writeln('  (debug) GOT s/c/d/id/pm#:  ',
+pos.slot:3,' ',pos.chan:3,' ',pos.dev:3,' ',driverid,' ',nextwords:2);
+               end;
+            MAKE_INTERNAL(pos);
+            if (devname <> '') then devname := CONCAT('-', devname);
+            i := i + 1;
+            if (i=maxpm) then
+               begin
+                  writeln('Parameter memory has more entries than I can remember.');
+                  writeln('  (the rest are forgotten)');
+                  writeln;
+                  error := 1; {force us out of the loop}
+               end;
+         end;
+   until (error > 0); {done unpacking pm}
+
+ {read cdd: }
+   OPEN_IT(error, opencdd, namecdd, refcdd, ax);
+   if opencdd then
+      begin
+         dirtycdd := false; {assuming the read will work}
+         READ_DATA(error, refcdd, ord(@cdd_descr), sizeof(cddheader), actual,
+                 sequential, 0);
+         if (error > 0) or (actual <> sizeof(cddheader)) then
+            begin
+               write('Trouble reading from file ',namecdd,', using defaults.');
+               if (error > 0) then writeln('  (Error = ',error,')')
+               else writeln;
+               dirtycdd := true; {since using defaults}
+               CHECKDEBUG;
+            end
+         else {suceeded in reading cdd header descriptor}
+            begin {descriptor looks good in cdd file}
+               cddentries := cdd_descr.cdcount;
+               if (cdd_descr.version <> cdd_version) or (cddentries < 0) or
+                        (cddentries > maxcdd) then
+                  begin {reject file contents}
+                     writeln('File ',namecdd,' is in the wrong format, using defaults.');
+                     writeln;
+                     dirtycdd := true;
+                     CHECKDEBUG;
+                  end {of rejecting cdd file contents}
+               else
+                  if (cddentries > 0) then
+                     for i := 1 to cddentries do {read in all cdd entries}
+                        begin
+                           READ_DATA(error, refcdd, ord(@mary[i]),
+                                    sizeof(cddentry), actual, sequential, 0);
+                           if (error > 0) or (actual <> sizeof(cddentry)) then
+                              begin
+                                 write(
+'Trouble reading from file ',namecdd,' using defaults.');
+                                 if (error > 0) then writeln('  (Error = ',error,')')
+                                 else writeln;
+                                 dirtycdd := true; {anticipating use of defaults}
+                                 i := cddentries; {forcing exit from for loop}
+                                 CHECKDEBUG;
+                              end; {file contents are broken}
+                           if not NEW_CONN(i, refcdd) then
+                              begin
+                                 dirtycdd := true;
+                                 i := cddentries;  {pull rip-cord}
+                              end; {of adding connector list}
+                        end; {of reading in CDD contents}
+            end; {of processing cdd file}
+      end {of reading in cdd}
+   else
+      begin {init cdd image to 'defaults': }
+         dirtycdd := true; {since using defaults}
+         writeln('Setting ',namecdd,' to defaults.');
+         writeln;
+         MAKE_IT(error, opencdd, namecdd, refcdd, true);
+         if not opencdd  then
+            GOTO 1;
+      end;  {initing cdd image}
+
+   for i := 1 to maxcdd do with mary[i] do
+      if dirtycdd then {defaults requested} drvr_name := ''
+      else active := 0; {inactive until position found for it}
+
+  {find which CDs are 'active'}
+   for nextpm := 1 to maxpm do
+      if (paul[nextpm].pos.slot <> emptyslot) then
+      begin
+         id := paul[nextpm].driverid;
+         found := false;
+         nextcd := 1;
+         repeat
+            with mary[nextcd] do
+               if (id = info.driver_id) then
+                  begin
+                     found := true;
+                     active := active + 1;
+                  end
+               else
+                  nextcd := nextcd + 1;
+         until found or (nextcd > maxcdd);
+      end;
+end; {of init_cdconfig}
+
+
+
+procedure NEW_DRIVER;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+label
+   1, {for retrying}
+   2; {for quitting}
+const
+   char = 1; {indexes into arrays for each type of file:}
+   srcboot = 2;
+   srccode = 3;
+   destboot = 4; {MUST be 2 greater than srcboot}
+   destcode = 5; {MUST be 2 greater than srccode}
+
+   lastfile = 5;
+var
+   buffer: array[1..256] of integer;
+   newcddentry, i, error, found: integer;
+   ax, shield: mset;
+   charprefix: e_name;
+   nick: e_name;
+   update: ch_info;
+   actual, BytesRead, BytesWritten: longint;
+   name: array[1..5] of pathname;
+   ref: array[1..5] of integer;
+   opened: array[1..5] of boolean;
+   madecode, madeboot, initialpass: boolean;
+begin
+   ax := [dwrite, dread]; {read/writable is agressive, while }
+   shield := [dread];     { a shield is only passive mode.}
+   for i := 1 to lastfile do opened[i] := false;
+   initialpass := true;
+   madecode := false;
+   madeboot := false;
+
+1: {read label: 'try again'}
+   repeat
+      if madecode then
+         begin
+            writeln('Removing partially installed driver file ',name[destcode],'.');
+            KILL_IT(error, name[destcode]);
+            madecode := false;
+         end;
+      if madeboot then
+         begin
+            writeln('Removing partially installed driver file ',name[destboot],'.');
+            KILL_IT(error, name[destboot]);
+            madeboot := false;
+         end;
+      for i := 1 to lastfile do
+         if opened[i] then
+            begin
+               opened[i] := false;
+               CLOSE_IT(ref[i], name[i]);
+            end;
+
+      if initialpass then initialpass := false
+      else
+         begin {not the first time through}
+            writeln;
+            writeln;
+         end;
+
+      charprefix := 'x';
+      writeln('Which disk has the new driver (ie, ''-delivery'') [<CR> for boot device]');
+      write('   [<clear> to give up]? ');
+      readln(charprefix);
+      if (ord(charprefix[1]) = esc) then GOTO 2;
+      if (LENGTH(charprefix) = 0) then
+         begin
+            charprefix := bootprefix;
+            writeln('Using ',charprefix,'.');
+            writeln;
+         end
+      else
+         begin
+            writeln;
+            if (charprefix[1] <> '-') then
+               charprefix := CONCAT('-',charprefix);
+         end;
+
+      repeat
+         nick := 'x'; {not same as 'clear'}
+         write('Driver name [<clear> to give up]? ');
+         readln(nick);
+         if (ord(nick[1]) = esc) then GOTO 2;
+      until LENGTH(nick)>0;
+      converter := nick;
+      SHIFTNAME(converter); {damn type compulsion}
+      nick := converter;
+      name[char] := CONCAT(charprefix, '-SYSTEM.CH_', nick);
+      OPEN_IT(error, opened[char], name[char], ref[char], shield);
+      if not opened[char] and (error = 0) then
+         begin
+            writeln('Driver file ',name[char],' doesn''t exist.');
+            GOTO 1;
+         end;
+
+      READ_DATA(error, ref[char], ord(@update), sizeof(ch_info), actual,
+                        sequential, 0);
+      if (error > 0) or (actual <> sizeof(ch_info)) or
+             (update.version <> ch_version) then
+         begin
+            write('Trouble reading ',name[char],', the contents are not usable.');
+            if (error > 0) then writeln('  (error = ',error,')')
+            else writeln;
+            CHECKDEBUG;
+            GOTO 1 {loop};
+         end;
+
+      with update do
+         for i := 1 to maxcdd do
+            if (mary[i].drvr_name <> '' {important for driver_id check}) then
+               begin
+                  if (mary[i].drvr_name = nick) then
+                     begin
+                        writeln('Driver ',nick,' already exists.');
+                        GOTO 1;
+                     end;
+                  if (mary[i].info.driver_id = driver_id) then
+                     begin
+                        writeln('Driver ID ',driver_id:1,' already exists (for driver "',
+                              mary[i].drvr_name,'").');
+                        GOTO 1;
+                     end;
+               end;
+   until opened[char];
+
+  {create a cdd entry for the new driver, and fill it in from char file:}
+   newcddentry := empty; {meaning not yet found}
+   for found := 1 to maxcdd do with mary[found] do
+      if (drvr_name = '') then
+         begin
+            newcddentry := found;
+            drvr_name := nick;
+            found := maxcdd; {get us OUT of here}
+         end;
+   if (newcddentry = empty) then {cdd FULL}
+      begin
+         writeln('There isn''t room for ',name[char],' in ',namecdd,'.');
+         GOTO 1;
+      end;
+
+   name[srccode]  := CONCAT(charprefix, '-SYSTEM.CD_', nick);
+   name[destcode] := CONCAT(prefix,     '-SYSTEM.CD_', nick);
+   name[srcboot]  := CONCAT(charprefix, '-SYSTEM.BT_', nick);
+   name[destboot] := CONCAT(prefix,     '-SYSTEM.BT_', nick);
+
+   for i := srcboot to srccode do {install driver code and boot files: }
+      if ( (i = srccode) or update.bootable) then
+         begin {make sure driver file exists: }
+            OPEN_IT(error, opened[i], name[i], ref[i], shield);
+            if not opened[i] and (error = 0) then
+               begin
+                  if (error = 0) then
+                     writeln('Driver file ',name[i],' doesn''t exist.');
+                  GOTO 1;
+               end;
+
+            if (name[i] <> name[i+2]) then
+               begin
+                  writeln;
+                  writeln('Installing driver file ',name[i+2],'.');
+                  MAKE_IT(error, opened[i+2] {destination}, name[i+2], ref[i+2], true);
+                  if not opened[i+2] then GOTO 1
+                  else
+                     if (i+2 = destboot) then madeboot := true
+                                         else madecode := true;
+                  repeat
+                     READ_DATA(error, ref[i], ord(@buffer), 512, BytesRead, sequential, 0);
+                     if (error <= 0) and (BytesRead > 0) then
+                        WRITE_DATA(error, ref[i+2], ord(@buffer), BytesRead, BytesWritten,
+                                 Sequential, 0);
+                  until (BytesRead = 0) or (BytesWritten = 0) or (error > 0);
+                  if (error = 956) then error := 0; {not really an error, just done!}
+                  if (error > 0) then
+                     begin
+                        writeln('Error copying driver ',name[i],' to ',name[i+2],
+                                '.  (Error = ',error,')');
+                        CHECKDEBUG;
+                        GOTO 1;
+                     end;
+               end; {of installing driver}
+         end; {of making sure driver file exists}
+
+   dirtycdd := true;
+   mary[newcddentry].info := update;
+   writeln;
+   if not NEW_CONN(newcddentry, ref[char]) then
+      begin
+         mary[newcddentry].drvr_name := '';
+         GOTO 1;
+      end
+   else writeln('Driver ',mary[newcddentry].drvr_name,' is installed in ',namecdd,'.');
+2:
+   for i := 1 to lastfile do
+      if opened[i] then
+         begin
+            opened[i] := false;
+            CLOSE_IT(ref[i], name[i]);
+         end;
+end; {of new_driver}
+
+
+
+procedure STUFF_CDPOS(parm_slot, parm_chan, parm_dev: integer;
+                      var position: cd_position);
+begin
+   with position do
+      if parm_slot=emptyslot {which isn't EVEN kosher} then
+         begin
+            slot := 0;
+            chan := 0;
+            dev := 0;
+         end
+      else
+         begin
+             slot := parm_slot + 1;
+             if parm_chan=emptychan then
+                begin
+                   chan := 0;
+                   dev  := 0;
+                end
+             else
+                begin
+                   chan := parm_chan + 1;
+                   if parm_dev=emptydev then dev := 0
+                                        else dev := parm_dev + 1;
+                end;
+         end;
+end; {of stuff_cdpos}
+
+
+
+function FOUND_CD(parm_slot, parm_chan, parm_dev: integer;
+                  var where: integer) : boolean;
+   (***********)
+   (*
+   (* Returns whether pm has anything configured at a given position.
+   (*
+   (*  If the function returns TRUE, found_cd also return the index (into paul),
+   (*  where the match was found.
+   (*
+   (**********)
+var
+   i: integer;
+begin
+   found_cd := false; {till proven otherwise}
+   for i := 1 to maxpm do
+      WITH paul[i] do
+         begin
+            if (pos.slot <> emptyslot) then {this pm entry is significant}
+               if (pos.slot = parm_slot) and (pos.chan = parm_chan) and
+                  (pos.dev = parm_dev) then
+                  begin
+                     found_cd := true;
+                     where := i;
+                     EXIT(found_cd);
+                  end;
+         end; {of for/with loop}
+end; {of found_cd}
+
+
+
+function HAS_KIDS(parm_slot, parm_chan, parm_dev: integer) : boolean;
+   (***********)
+   (*
+   (* Returns whether anything is configured BENEATH a given position.
+   (*
+   (**********)
+var i: integer;
+begin
+   has_kids := false; {til proven otherwise}
+   if (parm_dev <> emptydev) then EXIT(has_kids); {babies can't have babies}
+   for i := 1 to maxpm do
+      WITH paul[i] do
+         if (pos.slot <> emptyslot) then   {this pm entry is significant}
+            if (parm_slot = pos.slot) then {slot matches}
+               if ( (parm_chan = emptychan)  and (pos.chan <> emptychan) ) or
+                  ( (parm_chan <> emptychan) and (parm_chan = pos.chan) and
+                    (pos.dev <> emptydev) ) then {found a baby}
+                     begin
+                        has_kids := true;
+                        EXIT(has_kids);
+                     end;
+end; {of has_kids}
+
+
+
+procedure ATT_DEVICE;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+label
+   1; {retry path}
+const
+   pmmaxindex=50; {highest legit (byte) index into the CD_Info part of PM}
+var
+   found, first_pass: boolean;
+   devsname,uppercdname: pathname;
+   error, bytes_used, i, which_drv, which_pm, value: integer;
+   biggie: longint;
+   where_to: configdev;
+   position: cd_position;
+   attributes: cd_infobuf;
+
+
+   function PM_ENTRYSIZE(var itsy: configdev) : integer;
+     {report the byte size of a pm entry}
+   const
+      pm_shortform = 511; {highest legit pm id to keep in the short format}
+   var idsize: integer;
+   begin
+      with itsy do
+         begin
+            if (driverid <= pm_shortform) then IDsize := 0 else idSIZE := 1;
+            pm_entrysize := 3 + IDsize + 2 * nExtWords;
+         end;
+   end; {of pm_entrysize}
+
+
+
+begin
+   first_pass := true;
+
+1:  {retry}
+
+   if first_pass then first_pass := false
+   else
+      begin
+         writeln;
+         writeln;
+      end;
+
+   with where_to do
+      begin
+         writeln('Where does the device go:');
+         write('   Slot [enter -1 to quit trying to attach a device]? ');
+         readln(value);
+         if (value = empty) then EXIT(att_device);
+         if (value < 1) or (value > emptyslot) then
+            begin
+               writeln('Slot must be in the range 1 to ',emptyslot:2);
+               GOTO 1;
+            end;
+         case value of {only attach to meaningful slot range:}
+            cd_slot1, cd_slot2, cd_slot3, cd_scc, cd_twiggy, cd_sony,
+            cd_paraport, cd_console, cd_intdisk: pos.slot := value-1;
+            otherwise
+               begin
+                  writeln('That slot number is meaningless.');
+                  GOTO 1;
+               end;
+         end; {of cases}
+
+         write('   Channel [enter 0 if the rest of the position doesn''t matter]? ');
+         readln(value);
+         if (value = 0) then
+            begin
+               pos.chan := emptychan;
+               pos.dev := emptydev;
+            end
+         else
+            begin
+               if (value < 1) or (value > emptychan) then
+                  begin
+                     writeln('Must be 0 or in the range 1 to ',emptychan:2);
+                     GOTO 1;
+                  end;
+               pos.chan := value - 1;
+            end;
+
+         if (pos.chan <> emptychan) then
+            begin
+               write('   Device [enter 0 if the rest of the position doesn''t matter]? ');
+               readln(value);
+               if (value = 0) then pos.dev := emptydev
+               else
+                  begin
+                     if (value < 1) or (value > emptydev) then
+                        begin
+                           writeln('Must be 0 or in the range 1 to ',emptydev:2);
+                           GOTO 1;
+                        end;
+                     pos.dev := value - 1;
+                  end;
+            end;
+
+        if POS_RESERVED(pos) then
+           begin
+              writeln;
+              writeln('That position isn''t changable.');
+              GOTO 1;
+           end;
+
+        for i := 1 to maxpm do
+            if (paul[i].pos.slot <> emptyslot) then
+             if  (paul[i].pos.slot = pos.slot) then
+              if (paul[i].pos.chan = pos.chan) then
+               if (paul[i].pos.dev =  pos.dev) then
+                  begin
+                     writeln;
+                     writeln('That position is already taken.');
+                     GOTO 1;
+                  end;
+
+      end; {of reading device's position (with where_to}
+
+   devsname := 'x';
+   repeat
+      writeln;
+      write('Driver for this device [<clear> to give up]? ');
+      readln(devsname);
+      if ( ord(devsname[1]) = esc) then EXIT(att_device);
+   until LENGTH(devsname) > 0;
+
+   SHIFTNAME(devsname);
+   which_drv := 0;
+   found := false;
+   repeat
+      which_drv := which_drv + 1;
+      uppercdname := mary[which_drv].drvr_name;
+      SHIFTNAME(uppercdname);
+      if (uppercdname = devsname) then found := true;
+   until found or (which_drv >= maxcdd);
+   if not found then
+      begin
+         writeln('Driver ',devsname,' is not found in ',namecdd,'.');
+         GOTO 1;
+      end;
+
+   with where_to, mary[which_drv].info do
+      begin
+         if (pos.chan <> emptychan) {means: is NOT a moma} then
+            begin {prohibit connecting to NOT non_io by finding parents position}
+               if (pos.dev = emptydev)
+                  then STUFF_CDPOS(pos.slot, emptychan, emptydev, position) {firstborn}
+                  else STUFF_CDPOS(pos.slot, pos.chan,  emptydev, position); {adopted}
+               CDINFO(error, position, attributes);
+               if (error = 0 {parent exists}) AND
+                  ({parent's} attributes.cd_devt <> non_io) then
+                     begin
+                        writeln;
+                        writeln('No driver can be attached there.');
+                        GOTO 1;
+                     end;
+            end; {of this is NOT a moma}
+
+         writeln;
+         driverid := driver_id;
+
+         writeln;
+         if (yes = GETYESNO('Want to override the default extension words'))
+         then
+            begin
+               repeat
+                  write('How many default extension words [0 to 3]? ');
+                  readln(value);
+               until (value >= 0) and (value <= 3);
+               nExtwords := value;
+               for i := 1 to 3 do
+                  if (i <= nExtwords) then
+                     begin
+                        repeat
+                           write('Default value for cell ',i:2,' [0 to 65535] ? ');
+                           readln(biggie);
+                        until (biggie >=0 ) and (biggie <= 65535);
+                        extwords[i] := biggie;
+                        if i < nExtwords then writeln; {omits LAST pass}
+                     end
+                  else Extwords[i] := 0;
+            end {of overriding defaults}
+         else
+            begin
+               nExtwords := size_exten;
+               for i := 1 to 3 do
+                  if (i <= nExtwords) then
+                       extwords[i] := def_cdinfo[i]
+                  else extwords[i] := 0;
+            end;
+
+     {avoid: overflowing pm space,      }
+     {       running out of pm entries, }
+         bytes_used := 0;
+         which_pm := empty;
+         for i := 1 to maxpm do
+            if (paul[i].pos.slot <> emptyslot) then
+                bytes_used := bytes_used + PM_ENTRYSIZE(paul[i])
+            else if (which_pm = empty) then which_pm := i;
+         if (which_pm = empty) then
+            begin
+               writeln;
+               writeln('No free entries in parameter memory.');
+               GOTO 1;
+            end;
+         if (bytes_used + PM_ENTRYSIZE(where_to) > pmmaxindex + 1) then
+            begin
+               writeln;
+               writeln('Parameter memory is full.');
+               GOTO 1;
+            end;
+
+         STUFF_CDPOS(pos.slot, pos.chan, pos.dev, position);
+         CDINFO(error, position, attributes);
+         if  (error = 0) and (attributes.cd_driverid < 0)then
+            begin
+               writeln;
+               writeln('That position is already taken (by a builtin driver).');
+               GOTO 1;
+            end;
+         with attributes do
+            begin
+               cd_driverid := driver_id;
+               cd_start_block := start_block;
+               cd_fs_start := fs_start_block;
+               cd_devt := devicetype;
+               cd_drvrname := mary[which_drv].drvr_name;
+               cd_perm := permanent;
+               cd_ejectable := ejectable;
+               cd_removable := removable;
+               cd_preload := preload;
+            end;
+         CDMAKE(error, position, attributes);
+         if (error = cdisolated) then
+            begin
+               writeln;
+               writeln('Can''t attach to an isolated position.');
+               GOTO 1;
+            end
+         else if (error = cdoccupied) then
+            begin
+               if HAS_KIDS(pos.slot, pos.chan, pos.dev) then
+                  begin
+                     writeln;
+                     writeln('Other devices are still attached there.');
+                     goto 1;
+                  end;
+              {ELSE announce deferred attach: }
+               writeln;
+               writeln('The new driver takes over once you reboot.');
+            end
+         else if (error = cdnospace) then
+            begin
+               writeln;
+               writeln('Necessary buffer space is not available.');
+               EXIT(att_device);
+            end
+         else if (error = cdtoomany) then
+            begin
+               writeln;
+               writeln('Maximum number of devices already exist.');
+               EXIT(att_device);
+            end
+         else if (error > 0) then
+            begin
+               writeln;
+               writeln('Unknown error (',error:4,') trying to attach the device.');
+               EXIT(att_device)
+            end;
+
+         paul[which_pm] := where_to; {fill device into pm}
+         mary[which_drv].active := mary[which_drv].active + 1;
+
+      end; {of with where_to and mary}
+
+   writeln;
+   writeln('Device attached.');
+end; {of att_device}
+
+
+
+procedure DET_DEVICE;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+label
+   1; {retry path}
+var
+   error, i, which_pm, which_drv, value: integer;
+   where_to: configdev;
+   first_pass, found: boolean;
+   position: cd_position;
+   attributes: cd_infobuf;
+   message: prompter;
+begin
+   first_pass := true;
+
+1:  {retry}
+
+   if first_pass then first_pass := false
+   else
+      begin
+         writeln;
+         writeln;
+      end;
+
+   with where_to do
+      begin
+         writeln('Where is the device to detach?');
+         write('   Slot [enter -1 to quit trying to detach a device]? ');
+         readln(value);
+         if (value = empty) then EXIT(det_device);
+         if (value < 1) or (value > emptyslot) then
+            begin
+               writeln('Slot must be in the range 1 to ',emptyslot:2);
+               GOTO 1;
+            end;
+         pos.slot := value-1;
+
+         write('   Channel [enter 0 if the rest of the position doesn''t matter]? ');
+         readln(value);
+         if (value = 0) then
+            begin
+               pos.chan := emptychan;
+               pos.dev := emptydev;
+            end
+         else
+            begin
+               if (value < 1) or (value > emptychan) then
+                  begin
+                     writeln('Must be 0 or in the range 1 to ',emptychan:2);
+                     GOTO 1;
+                  end;
+               pos.chan := value-1;
+            end;
+
+         if (pos.chan <> emptychan) then
+            begin
+               write('   Device  [enter 0 if the rest of the position doesn''t matter]? ');
+               readln(value);
+               if (value = 0) then pos.dev := emptydev
+               else
+                  begin
+                     if (value < 1) or (value > emptydev) then
+                        begin
+                           writeln('Must be 0 or in the range 1 to ',emptydev:2);
+                           GOTO 1;
+                        end;
+                     pos.dev := value-1;
+                  end;
+            end;
+
+        if POS_RESERVED(pos) then
+           begin
+              writeln;
+              writeln('That position isn''t changable.');
+              GOTO 1;
+           end;
+
+         STUFF_CD(pos.slot, pos.chan, pos.dev, position);
+         CDINFO(error, position, attributes);
+         if (error = 0) and (attributes.cd_driverid < 0 {means is builtin} ) then
+            begin
+               writeln('Builtin drivers can''t be detached.');
+               GOTO 1;
+            end;
+         which_pm := empty;
+         for i := 1 to maxpm do {look for that position}
+            if  (paul[i].pos.slot = pos.slot) then
+             if (paul[i].pos.chan = pos.chan) then
+              if(paul[i].pos.dev =  pos.dev)  then
+               if (which_pm = empty)          then
+                  which_pm := i; {found position in pm}
+         if (which_pm = empty) then
+            begin
+               writeln;
+               writeln('Nothing is configured there.');
+               GOTO 1;
+            end;
+      end; {of reading device's position (with where_to}
+
+   with paul[which_pm] do
+      begin
+         CDKILL(error, position);
+         if (error = cdnotterm) or (error = cdbusy) then
+            begin {NOTE: builtin case already detected, above.}
+               if (error = cdnotterm)                    then
+                if HAS_KIDS(pos.slot, pos.chan, pos.dev) then
+                  begin
+                     writeln('Other devices are still connected to this one.');
+                     goto 1;
+                  end;
+              {ELSE explore doing deferred detach: }
+               writeln;
+               writeln(
+'The device at that position is busy.  It''s possible to ''deferred'' detach the device,');
+               writeln(
+'effective once you reboot, with continued use of the present device until then.');
+               writeln;
+               message := 'Do you want to deferred detach the device';
+               if GETYESNO(message)=no then goto 1;
+            end
+         else if (error = cdnodev {means deferred detach} ) then
+            {NADA!}
+         else if (error > 0) then
+            begin
+               writeln;
+               writeln('Unknown error (',error:4,') trying to detach the device.');
+               EXIT(det_device)
+            end;
+
+        {decrement active count for the corresponding driver, if found: }
+         pos.slot := emptyslot; {mark pm entry as free (FIRST irreversible step)}
+         which_drv := 0;
+         found := false;
+         repeat
+            which_drv := which_drv + 1;
+            with mary[which_drv] do
+               if (info.driver_id = driverid) then
+                  begin
+                     found := true;
+                     active := active - 1;
+                  end;
+         until found or (which_drv >= maxcdd);
+         if not found then
+            begin
+               writeln('BANG!  The driver for that device is missing.');
+               writeln('   (Driver ID =',driverid:6,'.)');
+            end;
+
+      end; {of with paul}
+
+   writeln;
+   writeln('Device is detached.');
+
+end; {of det_device}
+
+
+
+procedure RM_DRIVER;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+label 1; {for retrying}
+var
+   itsname, codename, uppercdname: pathname;
+   found, which_cdd, err: integer;
+   firstpass: boolean;
+begin
+
+1: {read label: 'try again'}
+
+   if firstpass then firstpass := false
+   else
+      begin {not the first time through}
+         writeln;
+         writeln;
+      end;
+
+   itsname := 'x';
+   repeat
+      write('Destroy what driver [<clear> to give up]? ');
+      readln(itsname);
+      if ( ord(itsname[1]) = esc) then EXIT(rm_driver);
+   until LENGTH(itsname) > 0;
+
+  {find the driver: }
+   SHIFTNAME(itsname);
+   which_cdd := empty; {meaning not yet found}
+   for found := 1 to maxcdd do
+   begin
+      uppercdname := mary[found].drvr_name;
+      SHIFTNAME(uppercdname);
+      if (uppercdname = itsname) then
+         begin
+            which_cdd := found;
+            found := maxcdd; {get us OUT of here}
+         end
+   end;
+   if (which_cdd = empty) then {driver not found}
+      begin
+         writeln('That driver doesn''t exist.');
+         GOTO 1;
+      end;
+
+   with mary[which_cdd] do
+      begin
+
+         if (active > 0) then
+            begin
+              writeln('The driver can''t be removed until it''s detached.');
+              goto 1;
+            end;
+
+        {zap driver files: }
+         codename := CONCAT(prefix, '-SYSTEM.CD_', drvr_name);
+         KILL_IT(err, codename);
+         if (info.devicetype=diskdev) and info.bootable then
+            begin
+               codename := CONCAT(prefix, '-SYSTEM.BT_', drvr_name);
+               KILL_IT(err, codename);
+            end; {of zipping boot file}
+         KILL_CONN(drvr_name);
+         drvr_name := ''; {mark cdd entry as free}
+
+      end; {of with}
+
+   dirtycdd := true;
+   writeln;
+   writeln('Driver ', itsname,' is removed.');
+end; {of rm_driver}
+
+
+
+procedure SHOW_CONFIG;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+var
+   it: e_name;
+   biggie: longint;
+   nextslot, nextchan, nextdev: integer;
+   error, nextcd, nextpm, i: integer;
+   position: cd_position;
+   attributes: cd_infobuf;
+   got_builtin, isolated: boolean;
+
+
+   procedure DUMP_PM(which_pm: configdev);
+   var i: integer;
+   its_name: e_name;
+   begin
+      with which_pm do
+         begin
+            write('  ',pos.slot+1:2);
+            case pos.slot+1 of
+               cd_scc:      write('/Serial        ');
+               cd_twiggy:   write('/Twiggy        ');
+               cd_sony:     write('/Sony          ');
+               cd_paraport: write('/Paraport      ');
+               cd_console:  write('/Console       ');
+               cd_intdisk:  write('/Internal Disk ');
+               otherwise    write('               ');
+            end; {of case}
+            if (pos.chan = emptychan) then write('   ')
+            else write(' ',pos.chan+1:2);
+            if (pos.dev = emptydev) or (pos.chan = emptychan) then
+                 write('       ')
+            else write('     ',pos.dev+1:2);
+            its_name := '<MISSING>';
+            if (driverid = empty) or (driverid = 0) then its_name := '<built-in>'
+            else
+               for i := 1 to maxcdd do with mary[i] do
+                  if (drvr_name <> '') then
+                     if (info.driver_id = driverid) then
+                        its_name := drvr_name;
+            write('      ',its_name:22,'    ');
+            for i := 1 to nExtWords do
+               begin
+                  biggie := extwords[i];
+                  if (biggie < 0) then biggie := biggie + 65536; {go unsigned}
+                  write(biggie:5);
+                  if (i < 3) then write('    '); {avoid passing column 80}
+               end;
+            writeln;
+         end;
+   end; {of dump_pm}
+
+
+
+   procedure POST_IT(parm_slot, parm_chan, parm_dev: integer);
+   var psuedo_pm: configdev;
+   begin
+      with psuedo_pm do
+         begin
+            pos.slot := parm_slot;
+            if (parm_chan = empty)
+               then pos.chan := emptychan
+               else pos.chan := parm_chan;
+            if (parm_dev = empty)
+               then pos.dev  := emptydev
+               else pos.dev  := parm_dev;
+            driverid := empty;
+            nExtwords := 0;
+         end;
+      DUMP_PM(psuedo_pm);
+   end; {of post_it}
+
+
+begin                   { Here starts the body of SHOW_CONFIG: }
+
+   writeln;
+   writeln;
+   writeln('Installed drivers:');
+   writeln;
+   writeln(
+'        Driver             ID   PSBA     Device   First  First');
+   writeln(
+'         Name                             Type    Block FS Block');
+   writeln;
+   for nextcd := 1 to maxcdd do with mary[nextcd].info do
+      begin
+         if (mary[nextcd].drvr_name <> '') then
+            begin
+               write(mary[nextcd].drvr_name:22,'  ');
+               write(driver_id:6,'  ');
+               if preload then      write('P')  else write(' ');
+               if permanent then    write('S')  else write(' ');
+               if bootable then     write('B')  else write(' ');
+               if (mary[nextcd].active > 0) then write('A ') else write('  ');
+               case devicetype of
+                  diskdev:  it := 'diskdv';
+                  pascalbd: it := 'pascal';
+                  seqdev:   it := 'seqdev';
+                  non_io:   it := 'non_io';
+                  otherwise it := ' weird';
+               end; {of case}
+               write('    ',it,'  ');
+               if (devicetype=diskdev) then
+                  begin
+                     write(start_block:5,' ');
+                     write(fs_start_block:5);
+                  end;
+               writeln;
+            end;
+      end; {of for each driver show its stuff}
+
+   writeln;
+   writeln;
+   writeln('Configured and builtin devices:');
+   writeln;
+   writeln(
+'    Slot            Chan Device                  Driver     Word 1   Word 2   Word 3');
+   writeln;
+   for nextslot := 0 to max_slot do
+      begin
+         STUFF_CDPOS(nextslot, emptychan, emptydev, position);
+         CDINFO(error, position, attributes);
+         got_builtin := (error = 0) and (attributes.cd_driverid < 0 {= builtin});
+         isolated := (nextslot = cd_twiggy-1);
+         if FOUND_CD(nextslot,emptychan,emptydev,nextpm) or got_builtin or isolated then
+            begin
+               if not isolated then {don't display missing links}
+                  if got_builtin then POST_IT(nextslot, empty, empty)
+                                 else DUMP_PM(paul[nextpm]);
+               for nextchan := 0 to max_chan do
+                  begin
+                     STUFF_CDPOS(nextslot, nextchan, emptydev, position);
+                     CDINFO(error, position, attributes);
+                     got_builtin := (error = 0) and
+                                      (attributes.cd_driverid < 0 {= builtin});
+                     if FOUND_CD(nextslot,nextchan,emptydev,nextpm) or got_builtin then
+                        begin
+                           if got_builtin then POST_IT(nextslot, nextchan, empty)
+                                          else DUMP_PM(paul[nextpm]);
+                           for nextdev := 0 to max_dev do
+                              begin
+                                 STUFF_CDPOS(nextslot, nextchan, nextdev, position);
+                                 CDINFO(error, position, attributes);
+                                 got_builtin := (error = 0) and
+                                      (attributes.cd_driverid < 0 {= builtin});
+                                 if got_builtin then
+                                    POST_IT(nextslot, nextchan, nextdev);
+                                 if FOUND_CD(nextslot, nextchan, nextdev, nextpm) then
+                                    DUMP_PM(paul[nextpm]);
+                              end; {of for each dev}
+                        end; {of chan exists}
+                  end; {of for each chan}
+            end; {of slot exists}
+      end; {of for each slot}
+end; {of show_config}
+
+
+
+procedure EDIT_DRIVER;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+begin
+   writeln('The E)dit driver command is not yet implemented');
+end; {of edit_driver}
+
+
+
+procedure COPY_CONFIG;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+begin
+   writeln('The C)opy configuration command is not yet implemented');
+end; {of copy config}
+
+
+
+procedure SHUTDOWN;
+   (********************************************************)
+   (*
+   (*  Description:
+   (*
+   (*  Here's the shutdown sequence for cdd:
+   (*     if dirty and not open:  make; flush; close;
+   (*     if dirty and open:            flush; close;
+   (*     if not dirty and open:               close;
+   (*     if not dirty and not open           {nada};
+   (*
+   (********************************************************)
+var
+   cdd_descr: cddheader;
+   i, error, total, index: integer;
+   actual, key: longint;
+   pmptr: absptr;
+   where: ptr_conn_list;
+begin
+
+   if dirtycdd and not opencdd then
+      begin
+         writeln;
+         writeln('Creating configuration file ',namecdd,'.');
+         MAKE_IT(error, opencdd, namecdd, refcdd, true);
+         if not opencdd  then
+            begin
+               writeln('Changes LOST!');
+               EXIT(cdconfig);
+            end;
+      end;
+   if dirtycdd then {write it out}
+      begin
+         writeln;
+         writeln('Updating ',namecdd,'.');
+         with cdd_descr do
+            begin
+               cdcount := 0;
+               version := cdd_version;
+               for i := 1 to maxcdd do
+                  if (mary[i].drvr_name <> '') then
+                     cdcount := cdcount + 1;
+            end; {of with cdd_descr}
+         WRITE_DATA(error, refcdd, ord(@cdd_descr), sizeof(cddheader),
+                     actual, absolute, 0);
+         if (error > 0) or (actual <> sizeof(cddheader) ) then
+            begin
+               write('Error writing out file ',namecdd,'.');
+               if (error > 0) then writeln('  (error = ',error,')')
+               else writeln;
+               CHECKDEBUG;
+               EXIT(cdconfig);
+            end; {of trouble writing out the header}
+         for i := 1 to maxcdd do with mary[i] do
+            if (drvr_name <> '') then
+               begin
+                  WRITE_DATA(error, refcdd, ord(@mary[i]), sizeof(cddentry),
+                          actual, sequential, 0);
+                  if (error > 0) or (actual <> sizeof(cddentry) ) then
+                     begin
+                        write('Error writing out file ',namecdd,'.');
+                        if (error > 0) then writeln('  (error = ',error,')')
+                        else writeln;
+                        CHECKDEBUG;
+                        EXIT(cdconfig);
+                     end;
+                  total := info.numAttach + info.numConnectors;
+                  if not FIND_CONN(drvr_name, where) then {nada};
+                  where := pointer( ord(where) + sizeof(conn_list) );
+                  if total > 0 then
+                     for index := 1 to total do
+                        begin
+                           WRITE_DATA(error, refcdd, ord(where), sizeof(typeconnect),
+                                   actual, sequential, 0);
+                           if (error > 0) or (actual <> sizeof(typeconnect) ) then
+                              begin
+                                 write('Error writing out connector list');
+                                 if (error > 0) then writeln('  (error = ',error,')')
+                                 else writeln;
+                                 CHECKDEBUG;
+                                 EXIT(cdconfig);
+                              end;
+                           where := pointer( ord(where) + sizeof(typeconnect) );
+                        end; {of writing connectors}
+               end; {of this entry exists}
+      end; {of writing out System.CDD}
+   if opencdd then CLOSE_IT(refcdd, namecdd);
+
+  {store away the pm entries: }
+   key := 0; {next spot in pm to stash info (WORD index) }
+   PUTNXTCONFIG(error, key, peter, paul[1]); {ONLY inits key}
+   for i := 1 to maxpm do with paul[i] do
+      begin
+         if (pos.slot <> emptyslot) then {stash this one: }
+            begin
+               if not POS_RESERVED(paul[i].pos) then
+                  begin
+                     MAKE_EXTERNAL(paul[i].pos);
+                     if (debug > 0) then with paul[i] do
+                        begin
+                           writeln('  (debug) PUT s/c/d/id/pm#:  ',
+pos.slot:3,' ',pos.chan:3,' ',pos.dev:3,' ',driverid,' ',nextwords:2);
+                        end;
+                     PUTNXTCONFIG(error, key, peter, paul[i]);
+                     if (error > 0) then
+                       begin
+                          writeln;
+                          writeln(
+'Error writing out parameter memory, error = ',error,'.');
+                          WRITE_PMEM(error, peter); {flush pmem changes}
+                          CHECKDEBUG;
+                          EXIT(cdconfig);
+                       end;
+               end;
+            end;
+      end;
+   WRITE_PMEM(error, peter); {flush pmem changes}
+
+   writeln;
+   writeln;
+   writeln('Cdconfig complete.');
+   EXIT(cdconfig);
+end; {of shutdown}
+
+
+
+(*$IFC DEBUG*)
+
+procedure MAGIC;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+begin
+   writeln('CONGRATULATIONS, you found the debug command!');
+   writeln;
+   write('Debug level? ');
+   readln(debug);
+   writeln('calling checkdebug, just to keep you on your toes.');
+   CHECKDEBUG;
+end; {of magic}
+
+(*$ENDC*)
+
+
+
+procedure SHOW_HELP;
+(********************************************************)
+(*
+(* Description:
+(*
+(********************************************************)
+begin
+   writeln('Temporary restrictions/bug list:');
+   writeln;
+   writeln('  The E)dit attributes and C)opy configuration commands don''t work.');
+   writeln;
+   writeln;
+   writeln;
+   writeln('COMMANDS:');
+   writeln;
+   writeln('N)ew device driver:');
+   writeln('   Installs device driver code and characteristics to a boot disk.');
+   writeln;
+   writeln('A)ttach device:');
+   writeln('   Associates a device, and it''s driver, with a position.');
+   writeln;
+   writeln('D)etach device:');
+   writeln('   Reverses an attach.');
+   writeln;
+   writeln('R)emove driver:');
+   writeln('   Removes all rememberance of a driver, deleting the code and boot files.');
+   writeln;
+   writeln;
+   if yes = GETYESNO('Want more help') {prompt #2} then
+      begin
+   writeln;
+   writeln('S)how configuration:');
+   writeln('   Shows all configurable devices/drivers, and where any are configured.');
+   writeln('   The ''PSBI'' fields show driver attributes:');
+   writeln('     ''P'' - Preloaded, ''S'' - Stays Resident, ''B'' - Bootable, ''A'' - Attached');
+   writeln;
+   writeln('E)dit attributes:');
+   writeln('   Lets you change a driver''s characteristics, ie, the driver''s,');
+   writeln('   name, whether its preloaded, whether it stays in memory permanently.');
+   writeln;
+   writeln('C)opy configuration:');
+   writeln('   Copies all configuration data and drivers, whether attached or not,');
+   writeln('   to another disk.');
+   writeln;
+   writeln('H)elp:');
+   writeln('   These command descriptions.  For more help, see the users guide.');
+   writeln;
+   writeln('Q)uit:');
+   writeln('   Stores updated configuration info, and exits from this program.');
+   writeln;
+   writeln;
+   if yes = GETYESNO('Want more help') {prompt #2} then
+      begin
+   writeln;
+   writeln('Current ''slot'' assignments:');
+   writeln('   1-3 stands for the real slots.');
+   writeln('   ',cd_scc:1,      ' is serial access.');
+   writeln('   ',cd_paraport:1, ' is the (lisa) parallel port.');
+   writeln('   ',cd_intdisk:1,  ' is the (pepsi) internal disk.');
+   writeln('   ',cd_sony:1,     ' is sony.');
+   writeln('   ',cd_twiggy:1,   ' is twiggy.');
+   writeln('   ',cd_console:1,  ' is console.');
+      end; {of more help (innermost)}
+      end; {of more help (outermost}
+end; {of show_help}
+
+
+
+begin          {*********************CDCONFIG STARTS HERE**********************}
+  writeln;
+  writeln;
+  writeln(
+'See the H)elp command for temporary shortcomings of this version of Cdconfig.');
+  writeln;
+  writeln;
+  INIT_CDCONFIG;
+  repeat
+     writeln;
+     writeln;
+     writeln('CDCONFIG:  N)ew driver, A)ttach device, D)etach device, R)emove driver,');
+     write('           S)how config, E)dit attributes, C)opy config, H)elp, ');
+     write('Q)uit? ');
+     read(cmd);
+     writeln;
+     writeln;
+     writeln;
+     case cmd of
+       'n','N': NEW_DRIVER;
+       'a','A': ATT_DEVICE;
+       'd','D': DET_DEVICE;
+       'r','R': RM_DRIVER;
+       's','S': SHOW_CONFIG;
+       'e','E': EDIT_DRIVER;
+       'c','C': COPY_CONFIG;
+       'h','H': SHOW_HELP;
+       'q','Q': SHUTDOWN;
+   (*$IFC DEBUG*)
+       '*':     MAGIC;
+   (*$ENDC*)
+      otherwise writeln('Huh?');
+     end; {of case cmd}
+  until false {never hoppen};
+
+
+end. {of main}
+
+ÿ

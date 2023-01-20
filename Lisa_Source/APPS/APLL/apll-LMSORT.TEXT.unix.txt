@@ -1,0 +1,992 @@
+{#f     in:lmsort.text }
+{$S lmsort }
+{*****************************************************************************
+
+                                movr_inc
+
+        used for updating record offsets after a delete or insert
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the right, po2,po1 point at right ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movr_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+
+{*****************************************************************************
+
+                                movl_inc
+
+        used for updating record offsets after a delete or insert
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the left, po2,po1 point at left ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movl_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+
+{^T20}
+{************************************************************************
+
+                          BuildNonleafPages
+
+        Specialized for building differential files.
+
+        Takes as input a file of sorted leaf pages.
+
+        1) if the last page is less than half full, then the entries
+           in the last two pages are redistributed.
+
+        2) if this is a keysort, then we strip the sort key off of each
+           entry to produce tretrieve records.
+
+        3) builds nonleaf pages above the leaf pages
+
+        Input Parameters
+                difffile - differential file
+                sort_code - tretrieve (key sort) or tsorted (whole records)
+                must_shift - if sort_code = tsorted and there are var.
+                    len. fields in sort key then we must move all the records
+                    down by sizeof(preamble) to make room for the preambles.
+                    (note the we are just shifting data with the already
+                    allocated space - the records do not get larger)
+
+        Output Parameters
+                lmresult - return result
+
+        Return Results
+                noerr
+                nomem
+                ioerr
+                noroom
+                nobuffs
+                inconsistent
+
+*************************************************************************}
+
+procedure BuildNonleafPages(var lmresult : integer;
+                                difffile : integer;
+                                sort_code : integer;
+                                must_shift : boolean);
+label
+        1,2,3,100;
+
+type
+
+        LevelDesc =
+            record
+                ikey : integer;
+                ThisAddr : fileptr;
+            end;
+var
+        loc_compact_state : states_de_compact;
+        pldesc,
+        pld  : ^ leveldesc;
+
+        pd1,pd2 : ptrpagedesc;
+        po1,po2 : ptroffsets;
+        pb1,pb2 : ptrdata;
+        buffer1,buffer2 : integer;
+
+        pfd : ptrfiledesc;
+        pfileptr : ptrfileptr;
+
+        pream : preamble;
+
+        cur_handle,
+        Npages,
+        newroot,
+        ifirstpage,
+        ilastpage,
+        Sibling,
+        LeafAddr,
+        NextLeaf,
+        PostAddr,
+        WriteAddr,
+        LowerAddr : fileptr;
+
+        relprio,
+        tresult,
+        cursize,
+        total,
+        rem,
+        nper,
+        offoff,
+        levels,
+        maxlevels,
+        lresult,
+        ipagesize,
+        i : integer;
+
+        fit : boolean;
+
+        {*******************************************************************
+
+                                new_page
+
+         1) if the previous page has not been written yet, force it out
+
+         2) computes the address of the new_page and increments the write
+            address
+
+         3) gets a buffer and initializes the page in it
+
+         4) sets up the leveldesc for this page
+
+        *****************************************************************}
+
+        procedure new_page(var ld : leveldesc);
+        label
+                1;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                if PostAddr <> nilptr then
+                    begin
+                    force_out(lresult,difffile,PostAddr);
+                    PostAddr := nilptr;
+                    if lresult <> noerr then goto 1;
+                    end;
+                with ld do
+                    begin
+                    ThisAddr := WriteAddr;
+                    WriteAddr := WriteAddr + ipagesize;
+                    lockbuff(lresult,buffer2);
+                    if lresult <> noerr then goto 1;
+                    PostAddr := ThisAddr;
+                    ikey := 0;
+                    with buffpool^[buffer2] do
+                        begin
+                        pb2 := pbuff;
+                        po2 := pointer(ord(pb2)+offoff);
+                        pd2 := pointer(ord(po2)+sizeof(integer));
+                        po2^[0] := 0;
+                        pfile := difffile;
+                        page := ThisAddr;
+                        state := dirty;
+                        end;
+                    end;
+                pd2^.nkeys := 0;
+                pd2^.ptype := nonleaftype;
+        1:
+        end;
+
+        {*******************************************************************
+
+                                  do_new_root
+
+         sets up a new root page and returns the address of it.
+
+         1) calls new_page to set up the new page
+         2) if the tree is deeper than 2 levels, copies up the key for
+            the left sibling (the key for the right sibling will be copied
+            up in due course, as for any nonleaf page)
+
+        *******************************************************************}
+
+        function do_new_root : fileptr;
+        var
+                pfileptr : ptrfileptr;
+                pbs : ptrdata;
+                pos : ptroffsets;
+                pds : ptrpagedesc;
+                rsize,
+                sibbuff : integer;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                levels := levels + 1;
+                new_page(pld^);
+                if lresult = noerr then
+                    begin
+                    do_new_root := pld^.ThisAddr;
+                    if levels <> 1 then { copy up left sibling key }
+                        begin
+                        getpage(lresult,sibbuff,difffile,Sibling,true);
+                        if lresult = noerr then
+                            begin
+                            with buffpool^[sibbuff] do
+                                begin
+                                state := dirty;
+                                pbs := pbuff;
+                                pos := pointer(ord(pbs)+offoff);
+                                pds := pointer(ord(pos)+sizeof(integer));
+                                end;
+                            rsize := pos^[-1]-pos^[0];
+                            movelf(pbs,pb2,rsize);
+                            pfileptr := @pb2^;
+                            pfileptr^ := Sibling;
+                            pld^.ikey := 1;
+                            po2^[-1] := rsize;
+                            pd2^.nkeys := 1;
+
+                            relbuff(lresult,sibbuff,-1);
+                            if lresult <> noerr then
+                                relbuff(lresult,buffer2,0);
+                            end;
+                        end;
+                    end;
+        end;
+
+        {*******************************************************************
+
+                                        fix_preamble
+
+         adds diff_code and handles to leaf pages.  if this is a keysort,
+         also deletes the sort key to make tretrieve records.
+
+        *******************************************************************}
+
+        procedure fix_preamble;
+        var
+                i,
+                oldoff,
+                newoff : integer;
+                poo : ^ integer;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                with buffpool^[buffer1] do
+                    begin
+                    state := dirty;
+                    pb1 := pbuff;
+                    end;
+                po1 := pointer(ord(pb1)+offoff);
+                pd1 := pointer(ord(po1)+sizeof(integer));
+
+                { if necessary, shift down data to open up place for preamble}
+
+                if must_shift then
+                    moverf(pb1,pointer(ord(pb1)+sizeof(preamble)),
+                           po1^[-pd1^.nkeys]-sizeof(preamble));
+
+                {  fill in the preamble for the records in this page  }
+
+                newoff := sizeof(range_rec);
+                poo := @po1^;
+                for i := pd1^.nkeys-1 downto 0 do
+                    begin
+                    movelf(@pream,pointer(ord(pb1)+poo^),sizeof(preamble));
+                    poo := pointer(ord(poo)-sizeof(integer));
+                    if (sort_code = tretrieve) then
+                        begin
+                        oldoff := poo^;
+                        poo^ := newoff;
+                        if i <> 0 then
+                            begin
+                            movelf(pointer(ord(pb1)+oldoff),
+                                   pointer(ord(pb1)+newoff),
+                                   sizeof(range_rec));
+                            newoff := newoff + sizeof(range_rec);
+                            end;
+                        end;
+                    pream.handle.high := pream.handle.high + 1;
+                    end;
+        end; { fix_preamble }
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        levels := 0;
+        with pfiletable^[difffile]^ do
+            begin
+            ipagesize := pagesize;
+            ilastpage := lastpage;
+            ifirstpage := firstpage;
+            root := ifirstpage;
+            LeafAddr := ifirstpage;
+            end;
+        offoff := ipagesize - (sizeof(pagedesc)+sizeof(integer));
+
+        pream.handle.low := 0;
+        pream.handle.high := 1;
+        pream.code := 0;
+        deposit(sort_code,@pream.code,diff_nbits,diff_sbit);
+
+    {   check for a one page differential file }
+
+        Npages := div424(ilastpage-ifirstpage,ipagesize,rem);
+        if Npages = 1 then
+            begin
+            getpage(lresult,buffer1,difffile,LeafAddr,true);
+            if lresult <> noerr then goto 1;
+            fix_preamble;
+            relbuff(lresult,buffer1,isleaf);
+            goto 1;
+            end;
+
+    {   compute the worst case height of the tree and allocate the array
+        of level descriptors. note that the nonleaf entries are fixed size }
+
+        nper := offoff div (sizeof(lmhandle)+sizeof(integer)+sizeof(fileptr));
+        maxlevels := 2;
+        while comp44(nper,Npages) = lt do
+            begin
+            maxlevels := maxlevels + 1;
+            Npages := div424(Npages,nper,rem);
+            if rem <> 0 then Npages := Npages + 1;
+            end;
+
+        loc_compact_state := init_compact_state;
+
+100 :   lresult := nnew(@czone,maxlevels*sizeof(leveldesc),@pldesc);
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+        if lresult <> noerr then goto 1;
+
+        pfd := pfiletable^[difffile];
+        PostAddr := nilptr;
+        WriteAddr := ilastpage;
+        Sibling := nilptr;
+        cur_handle := 1;
+
+        {  now we build the non leaf pages levels above the leafs   }
+
+        repeat
+            getpage(lresult,buffer1,difffile,LeafAddr,true);
+            if lresult <> noerr then goto 2;
+
+            fix_preamble;
+
+            LowerAddr := LeafAddr;
+            NextLeaf := pd1^.next;
+
+
+            {   copy up the key and ripple up if necessary }
+
+            i := 0;
+            pld := pldesc;
+            repeat
+                with pld^ do
+                    begin
+                    if levels = i then newroot := do_new_root
+                    else getpage(lresult,buffer2,difffile,ThisAddr,true);
+                    if lresult <> noerr then goto 3;
+                    with buffpool^[buffer2] do
+                        begin
+                        state := dirty;
+                        pb2 := pbuff;
+                        po2 := pointer(ord(pb2)+offoff);
+                        pd2 := pointer(ord(po2)+sizeof(integer));
+                        end;
+
+                    cursize := po2^[-ikey];
+                    fit := offoff >= (cursize+
+                         (sizeof(fileptr)+sizeof(lmhandle)+sizeof(integer)));
+
+                    if not fit then
+                        begin
+                        Sibling := ThisAddr;
+                        relbuff(lresult,buffer2,-1);
+                        if lresult <> noerr then goto 3;
+                        new_page(pld^);
+                        if lresult <> noerr then goto 3;
+                        cursize := 0;
+                        end;
+
+                    {  copy entry }
+
+                    pb2 := pointer(ord(pb2)+cursize);
+                    if i <> 0 then relprio := isnonleaf
+                    else relprio := -1;
+                    movelf(pb1,pointer(ord(pb2)+sizeof(fileptr)),
+                           sizeof(lmhandle));
+
+                    pfileptr := @pb2^;
+                    pfileptr^ := LowerAddr;
+                    LowerAddr := ThisAddr;
+                    ikey := ikey + 1;
+                    po2^[-ikey] := cursize+(sizeof(lmhandle)+sizeof(fileptr));
+                    pd2^.nkeys := ikey;
+                    relbuff(lresult,buffer1,relprio);
+                    buffer1 := buffer2;
+                    if lresult <> noerr then goto 3;
+                    pb1 := pb2;
+                    pd1 := pd2;
+                    po1 := po2;
+                    end; { with }
+                i := i + 1;
+                pld := pointer(ord(pld)+sizeof(LevelDesc));
+            until fit;
+            LeafAddr := NextLeaf;
+            relbuff(lresult,buffer1,-1);
+            if lresult <> noerr then goto 2;
+        until LeafAddr = nilptr;
+
+        with pfiletable^[difffile]^ do
+            begin
+            lastpage := WriteAddr;
+            depth := levels+1;
+            root := newroot;
+            end;
+        goto 2;
+
+
+3 :     relbuff(tresult,buffer1,-1);
+        if tresult <> noerr then lresult := tresult;
+2 :     ndispose(@czone,@pldesc^);
+1 :     lmresult := lresult;
+        (*dbif lmdebug then writeln(dumpfile,'BuildNon:',lresult);*)
+end; { BuildNonleafPages }
+{******************************************************************************
+
+                             readrecord
+
+        procedure parameter for sort.
+
+        if we need the next record, reads it.  returns eos if there aren't
+        any more records.  returns the size of the current record.  leaves
+        the record in psort_globals^.buffer for copyrec.  pegs
+        psort_globals^.pinput to the start of the record and sets
+        psort_globals^.rsize to it's size. sets havebuff to true, iff buffer
+        is left allocated.
+
+        Return Results
+                noerr
+                eos
+                ioerr
+                nobuffs
+                inconsistent
+
+******************************************************************************}
+
+function readrecord(var result : integer) : integer;
+label
+        1;
+var
+        pb : ptrdata;
+        po : ptroffsets;
+        index : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with psort_globals^ do
+            begin
+            if needrecord then
+                begin
+                select_next(result,scanid,which,buffer,index);
+                if result <> noerr then goto 1;
+                needrecord := false;
+                havebuff := true;
+                with buffpool^[buffer] do
+                    begin
+                    pb := pbuff;
+                    physaddr := page + index;
+                    end;
+                po := pointer(ord(pb)+offoff);
+                pinput := pointer(ord(pb)+po^[-index]);
+                if sort_code = tsorted then
+                    rsize := po^[-index-1] - po^[-index] + sizeof(preamble)
+                else
+                    rsize := entrysize(v1st,vnth,v1st,vflds,pxdesc,pinput);
+                end;
+
+            if rsize > maxrsize then result := rectoobig;
+            readrecord := rsize;
+            end;
+1 :
+end;
+
+{****************************************************************************
+
+                             copyrec
+
+        procedure parameter for sort.
+
+        copies the current record.
+
+****************************************************************************}
+
+procedure copyrecord(prec : ptrdata);
+var
+        tresult : integer;
+        prange : ptrrange_rec;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        prange := @prec^;
+        with psort_globals^ do
+            begin
+            if sort_code = tsorted then
+                movelf(pinput,
+                       pointer(ord(prange)+shift),
+                       rsize-sizeof(preamble))
+            else
+                begin
+                prange^.physaddr := physaddr;
+                extractkey(pxdesc,psdesc,ifields,pinput,@prange^,vflds);
+                end;
+            needrecord := true;
+            relbuff(tresult,buffer,isleaf);
+            havebuff := false;
+            end;
+end;
+{****************************************************************************
+
+                             closeinput
+
+        procedure parameter for sort.
+
+        if the buffer is still allocated, frees it.
+
+        return results
+
+        noerr
+        inconsistent
+
+****************************************************************************}
+procedure closeinput(var result : integer);
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with psort_globals^ do
+            if havebuff then relbuff(result,buffer,isleaf)
+            else result := noerr;
+end;
+{^T 20}
+{***************************************************************************
+
+                                forcebyte
+
+        aligns aoffset and abit to a byte boundary (abit = 15 or 7)
+
+****************************************************************************}
+
+procedure forcebyte(var aoffset,abit : integer);
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        if (15 > abit) and (abit >= 8) then abit := 7
+        else if (7 > abit) and (abit >= 0) then
+            begin
+            abit := 15;
+            aoffset := aoffset + 2;
+            end;
+end; {forcebyte}
+{^T 30}
+{*************************************************************************
+
+                                assignoffset
+
+        assigns offset for field, packing fields with the following
+        constraints:
+
+        1. byte objects (ftypbset,ftypint1,ftypstr) begin on byte boundary
+        2. integers (16 bit and 32 bit) and var. len. field descriptors
+           begin on word boundary
+        3. packed integers (n bit, 1<=n<=15) packed wherever they
+           fit, but do not cross word boundaries
+
+        Input Parameters
+                aoffset - current allocation offset
+                abit - current allocation bit
+                pfdesc - descriptor for field whose offset is to be assigned:
+                    pfdesc must have the proper ftype and size fields.
+
+        Output Parameters
+                aoffset - current allocation offset
+                abit - current allocation bit
+                pfdesc - descriptor for field whose offset is to be assigned:
+                    offset and (if packed) sbit filled in
+
+
+**************************************************************************}
+
+procedure assignoffset(var aoffset,
+                           abit : integer;
+                           pfdesc : ptrflddesc);
+var
+        fldtype : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with pfdesc^ do
+            begin
+            fldtype := ftype;
+            if fldtype = ftypint1 then
+                begin
+                forcebyte(aoffset,abit);
+                if abit = 7 then
+                    begin
+                    offset := aoffset + 1;
+                    abit := 15;
+                    aoffset := aoffset + 2;
+                    end
+                else
+                    begin
+                    offset := aoffset;
+                    abit := 7
+                    end;
+                end
+            else if fldtype = ftyppack2 then
+                begin
+                if ((abit - bo.nbits) < - 1) and (abit <> 15) then
+                        begin
+                        abit := 15;
+                        aoffset := aoffset + 2;
+                        end;
+                bo.sbit := abit - bo.nbits + 1;
+                offset := aoffset;
+                if (bo.sbit = 0) and (abit <> 15) then
+                    begin
+                    abit := 15;
+                    aoffset := aoffset + 2;
+                    end
+                else abit := bo.sbit - 1;
+                end
+            else if (fldtype = ftypstr) or (fldtype = ftypnull) then
+                begin
+                forcebyte(aoffset,abit);
+                if abit = 7 then offset := aoffset + 1
+                else offset := aoffset;
+                if odd(size) then abit := 22-abit;
+                aoffset := offset + size;
+                if abit = 7 then aoffset := aoffset - 1;
+                end
+            else { various types that must be word alligned }
+                begin
+                if abit <> 15 then
+                    begin
+                    abit := 15;
+                    aoffset := aoffset + 2;
+                    end;
+                offset := aoffset;
+                aoffset := aoffset + size;
+                end;
+            end; { with }
+end; { assignoffset }
+{^T 20}
+{**********************************************************************
+
+                                makesdesc
+
+        creates a complete in memory descriptor for sort key. sets up
+        psort_globals.
+
+        Input Parameters
+                scanid - differential scan index
+                nskeys - number of fields in sort key
+                piflds - describes sort key
+                sort_code - type of sort tretrieve (key sorted) or
+                    tsorted (whole records)
+
+        Output Parameters
+                lmresult - return results
+                nsort - number of fields in record to be sorted (if
+                    key sort, we add physaddr)
+                psdesc - recptr for sort record
+
+         Return Result
+                noerr
+                nomem
+                rectoobig
+
+***********************************************************************}
+
+procedure makesdesc(var lmresult : integer;
+                        scanid : integer;
+                        nskeys : integer;
+                        piflds : ptridesc;
+                        sort_code : integer;
+                    var nsort : integer;
+                    var psdesc : ptrrecptr);
+label
+        1,100;
+var
+        loc_compact_state : states_de_compact;
+
+        pxdesc : ptrrecptr;
+        pindexseg : ^isegment;
+        pkflddesc,
+        pflddesc : ptrflddesc;
+        locshift,
+        lfirstvfld,llastvfld,
+        i,
+        lresult,
+        nisort,
+        evflds,
+        eflds,
+        tresult,
+        toffset,
+        tbit,
+        aoffset,
+        abit : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        if sort_code = tretrieve then
+            begin
+            abit := 15;
+            aoffset := sizeof(range_rec);
+            eflds := nskeys;
+            nisort := nskeys + 1;
+            end
+        else
+            begin
+            eflds := 0;
+            nisort := nskeys;
+            end;
+        nsort := nisort;
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+        lresult := nnew(@czone,(nisort+eflds)*sizeof(flddesc),@psdesc);
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+        if lresult <> noerr then goto 1;
+        pxdesc := @psdesc^[nisort];
+
+    {   lay out sort record.  there are two cases:
+
+        1) key sort.  layout a new record, as for an index. also layout
+           recptr to extract the needed fields of the datarecord (pxdesc)
+        2) whole records. simply add the size of the preamble to the data
+           record offsets }
+
+        with pfiletable^[pdifftable^[scanid]^.on]^ do
+            begin
+            locshift := sizeof(preamble);
+            psort_globals^.offoff:=pagesize-(sizeof(pagedesc)+sizeof(integer));
+            pflddesc := @psdesc^;
+            pkflddesc := @pxdesc^;
+            pindexseg := @piflds^;
+            for i := 1 to nskeys do
+                begin
+                with pflddesc^ do
+                    begin
+                    pflddesc^ := pedesc^[pindexseg^.field];
+                    if sort_code = tretrieve then
+                        begin
+                        pkflddesc^ := pflddesc^;
+                        assignoffset(aoffset,abit,pflddesc);
+                        end
+                    else
+                        begin
+                        offset := offset + sizeof(preamble);
+                        if ftype >= ftypvstr then locshift := 0;
+                        end;
+                    direction := pindexseg^.aord;
+                    end;
+                pflddesc := pointer(ord(pflddesc)+sizeof(flddesc));
+                pkflddesc := pointer(ord(pkflddesc)+sizeof(flddesc));
+                pindexseg := pointer(ord(pindexseg)+sizeof(isegment));
+                end;
+
+            if sort_code = tretrieve then
+                begin
+                forcebyte(aoffset,abit);
+                if abit = 7 then aoffset := aoffset + 1;
+                evflds := aoffset;
+                end
+            else
+                begin
+                pflddesc := @psdesc^;
+                if locshift = 0 then
+                    for i := 1 to nskeys do
+                        begin
+                        with pflddesc^ do
+                            begin
+                            offset := offset - sizeof(preamble);
+                            end;
+                        pflddesc := pointer(ord(pflddesc)+sizeof(flddesc));
+                        end;
+
+                evflds := vflds + sizeof(preamble);
+                end;
+            end; { with }
+
+        if evflds > maxrsize then
+            begin
+            lresult := rectoobig;
+            ndispose(@czone,@psdesc^);
+            goto 1;
+            end;
+
+        if sort_code = tretrieve then
+            begin
+            with pflddesc^ do
+                begin
+                ftype := ftypfptr;
+                size := sizeof(fileptr);
+                offset := sizeof(preamble);
+                direction := ascending;
+                end;
+
+            {   compute first and last var. len. field (optimization)
+                for whole record }
+
+            lfirstvfld := -1;
+            for i := 0 to nskeys-1 do with psdesc^[i] do
+                if ftype >= ftypvstr then
+                    begin
+                    if lfirstvfld = -1 then
+                        begin
+                        lfirstvfld := i;
+                        llastvfld := i;
+                        end
+                    else llastvfld := i;
+                    end;
+            end;
+
+
+        psort_globals^.shift := locshift;
+        psort_globals^.which := pdifftable^[scanid]^.whichway;
+        if psort_globals^.which = noway then psort_globals^.which := next;
+        psort_globals^.scanid := scanid;
+        psort_globals^.ifields := nskeys;
+        psort_globals^.psdesc := psdesc;
+        psort_globals^.pxdesc := pxdesc;
+        psort_globals^.vflds := evflds;
+        psort_globals^.v1st := lfirstvfld;
+        psort_globals^.vnth  := llastvfld;
+        psort_globals^.needrecord := true;
+        psort_globals^.havebuff := false;
+        psort_globals^.sort_code := sort_code;
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'shift:',psort_globals^.shift);
+            writeln(dumpfile,'which:',psort_globals^.which);
+            writeln(dumpfile,'scanid:',psort_globals^.scanid);
+            writeln(dumpfile,'ifields:',psort_globals^.ifields);
+            for i := 0 to nisort-1 do
+                with psort_globals^.psdesc^[i] do
+                    begin
+                    writeln(dumpfile,'ftype:',ftype);
+                    writeln(dumpfile,'offset:',offset);
+                    end;
+            writeln(dumpfile,'vflds:',psort_globals^.vflds);
+            writeln(dumpfile,'v1st:',psort_globals^.v1st);
+            writeln(dumpfile,'vnth:',psort_globals^.vnth);
+            writeln(dumpfile,'need:',ord(psort_globals^.needrecord));
+            writeln(dumpfile,'have:',ord(psort_globals^.havebuff));
+            writeln(dumpfile,'sort_code:',psort_globals^.sort_code);
+            end;*)
+1 :     lmresult := lresult;
+end; { makesdesc }
+{^T 30}
+{************************************************************************
+
+                                sort_diff
+
+        sorts the selected records, putting them in sorted order in the
+        differential file. sorts whole records or just keys.
+
+        Input Parameters
+                scanid - differential scan index
+                nskeys - number of fields in sort key
+                piflds - describes sort key
+                sort_code - type of sort tretrieve (key sorted) or
+                    tsorted (whole records)
+                tempdir1,
+                tempdir2 - scratch space directories for sort
+                temp_ldsn - ldsn for temporary segment for sort
+
+        Output Parameters
+                lmresult - return results
+
+         Return Result
+                noerr
+                eos
+                ioerr
+                nobuffs
+                inconsistent
+                temperror
+                nullfile
+                OS(make_dataseg,close_dataseg)
+                rectoobig
+
+************************************************************************}
+
+procedure sort_diff(var lmresult : integer;
+                        scanid : integer;
+                        sort_code : integer;
+                        nskeys : integer;
+                        piflds : ptridesc;
+                        tempdir1,
+                        tempdir2 : ptrpathname;
+                        temp_ldsn : integer);
+label
+        1;
+var
+        locsort_globals : sort_globals;
+        pd : ptrpagedesc;
+        psdesc : ptrrecptr;
+        pifile : ptrfiledesc;
+        nirecords,
+        oldlastpage,
+        ilastpage : fileptr;
+        buff,
+        nisort,
+        difffile,
+        ipagesize,
+        lresult,
+        tresult,
+        viafile,
+        i : integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        pstack_validate(lresult);
+        if lresult <> noerr then goto 1;
+
+        psort_globals := @locsort_globals;
+        difffile := pscantable^[pdifftable^[scanid]^.diffid]^.onfile;
+
+        makesdesc(lresult,scanid,nskeys,piflds,sort_code,nisort,psdesc);
+        if lresult <> noerr then goto 1;
+
+        pifile := pfiletable^[difffile];
+        oldlastpage := pifile^.lastpage;
+
+        PageInvalidates(difffile);
+        sort(lresult,nirecords,ilastpage,pifile^.frefno,temp_ldsn,
+             tempdir1,tempdir2,pifile^.firstpage,pifile^.pagesize,
+             nisort,psdesc,copyrecord,readrecord,closeinput,true);
+        ndispose(@czone,@psdesc^);
+        if lresult = noerr then
+            begin
+            pifile^.nrecs := nirecords;
+            pifile^.lastpage := ilastpage;
+            BuildNonLeafPages(lresult,difffile,sort_code,
+                              locsort_globals.shift = 0);
+            pifile := pfiletable^[difffile];
+            if comp44(pifile^.lastpage,oldlastpage) <> lt then
+                begin
+                pifile^.freelist := nilptr;
+                end
+            else
+                begin
+                getpage(tresult,buff,difffile,pifile^.lastpage,true);
+                pifile^.lastpage := oldlastpage;
+                if tresult = noerr then
+                    begin
+                    pd := pointer(ord(buffpool^[buff].pbuff)+
+                                  pifile^.pagesize-sizeof(pagedesc));
+                    pd^.free := nilptr;
+                    buffpool^[buff].state := dirty;
+                    relbuff(tresult,buff,isleaf);
+                    end;
+                if tresult <> noerr then lresult := tresult;
+                end;
+            end
+        else if lresult = nullfile then lresult := noerr;
+
+1 :     lmresult := lresult;
+        (*dbif lmdebug then writeln('bi:',lmresult);*)
+
+end; { sortdiff }
+
+
+ÿ

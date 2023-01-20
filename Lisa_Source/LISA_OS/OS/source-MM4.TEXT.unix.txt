@@ -1,0 +1,484 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+     (* MM4 *)
+
+(*$s     dsegs*)         {force to the segment that uses it}
+procedure CVT_NAME(* fs_refnum: int2; var unitno, sfileid: int2;
+                      var fcbptr: sfcb_ptr *);
+   var
+     refdbaddr: absptr;
+     refdb_ptr: fref_ptr;
+     errnum: int2;
+
+   begin
+     CHK_REFNUM(errnum,fs_refnum,frefdb,refdbaddr);
+     refdb_ptr:=pointer(refdbaddr);
+     fcbptr:=refdb_ptr^.fcbptr;
+     sfileid:=fcbptr^.sfilenum;
+     unitno:=fcbptr^.curdev;
+   end (* CVT_NAME *);
+
+(*$s     init*)         {initialization functions belong in init segment}
+
+procedure INIT_SWAPIN(* aSeg_sdb_ptr: sdb_ptr *);
+   (* NOTE: this procedure is used only during system initialization.     *)
+   (* Insures the segment defined by aSeg_sdb_ptr is in memory and not an *)
+   (* overlay candidate.                                                  *)
+
+   var
+     error: int2;
+     c_mmrb: mmrb_ptr;
+
+   begin
+     error:=0;
+     c_mmrb:=pointer(mmrb_addr);
+     with aSeg_sdb_ptr^ do
+       begin
+         if sdbstate.memoryF then
+           begin (* already in memory *)
+             if sdbstate.overlayF
+               then SAVE_OC(aSeg_sdb_ptr,ord(c_mmrb^.req_pcb_ptr));
+             if sdbtype <> code
+               then if newlength <> 0 then ALT_DS_SIZE(error,aSeg_sdb_ptr);
+           end
+          else
+           begin (* not in memory *)
+             GET_SEG(error,aSeg_sdb_ptr);
+           end;
+         if error > 0 then SYSTEM_ERROR(10594);
+       end; (* with *)
+   end; (* INIT_SWAPIN *)
+
+
+function GetFree(* size: int2; var allocaddr: int2) : boolean*);
+       (**********************************************************)
+       (*
+       (* Description:
+       (*    Allocate the given number of pages from the high end
+       (*    of freespace.  Returns whether space could be found
+       (*    as the function result and the page address.
+       (*
+       (**********************************************************)
+  var
+    f_sdb: sdb_ptr;
+    c_mmrb: mmrb_ptr;
+  begin
+    getfree := true; {assume success}
+    c_mmrb:=pointer(mmrb_addr);
+   (* get the last free area from the free memory list *)
+    f_sdb:=pointer(ord(c_mmrb^.tail_sdb.freechain.bkwd_link) - oset_freechain);
+    with f_sdb^ do
+      begin
+        if memsize < size then
+           begin
+              getfree := false;
+              EXIT(getfree);
+           end;
+        TAKE_FREE(f_sdb,true);
+        (* take required space from end *)
+        allocaddr:=memaddr + memsize - size;
+        (* make remainder free again *)
+        MAKE_FREE(memaddr,memsize - size);
+      end;(*with*)
+  end;(*GetFree*)
+
+
+procedure MOVE_MEMMGR;
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Move the memory manager's stack and syslocal to the *)
+       (*    high end of physical memory.                        *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  mmsl_sdb, mmstk_sdb, sysg_sdb: sdb_ptr;
+  c_mrbt: mrbt_ptr;
+  mmsl_addr: absptr;
+  mmsl_ptr: slocal_ptr;
+  c_pcb: ptr_pcb;
+  c_mmrb: mmrb_ptr;
+
+
+  procedure MOVE_IT(c_sdb: sdb_ptr);
+    (* move the segment defined by c_sdb to the high end of the last *)
+    (* free area of physical memory                                  *)
+
+    var
+      allocaddr: int2;
+      old_memaddr, old_memsize: int2;
+
+    begin
+      with c_sdb^ do
+        begin
+          if not GetFree(memsize,allocaddr) then SYSTEM_ERROR(10593);
+
+          (* move data to new location *)
+          MOVER(ord4(memaddr)*hmempgsize*2 + logrealmem,
+                ord4(allocaddr)*hmempgsize*2 + logrealmem,
+                ord4(memsize)*hmempgsize*2);
+          (* remove c_sdb from the allocated memory chain *)
+          REMOVESDB(c_sdb);
+          (* make the old location of the segment free *)
+          MAKE_FREE(memaddr,memsize);
+          (* requeue c_sdb into the allocated memory chain at its new location *)
+          old_memaddr:=memaddr;
+          old_memsize:=memsize;
+          memaddr:=allocaddr;
+          INSERTSDB(c_sdb);
+
+          {change mapping in all domains}
+          REMAP_SEGMENT(c_sdb,old_memaddr,old_memsize);
+        end;(*with*)
+    end;(*MOVE_IT*)
+
+begin
+  c_mmrb:=pointer(mmrb_addr);
+
+  (* get sdb for syslocal for memory manager process *)
+  c_pcb:=pointer(mm_pcb_ptr);
+  mmsl_sdb:=pointer(c_pcb^.slocal_sdbRP + b_sysglobal_ptr);
+  (* get sdb for stack for memory manager process *)
+  mmsl_addr:=ord4(mmsl_sdb^.memaddr)*hmempgsize*2 + logrealmem;
+  mmsl_ptr:=pointer(mmsl_addr);
+  c_mrbt:=pointer(mmsl_ptr^.mrbt_addr - MMU_BASE(syslocmmu) + mmsl_addr);
+  mmstk_sdb:=pointer(c_mrbt^[stackmmu].sdbRP + b_sysglobal_ptr);
+
+  (* move the stack and the syslocal segments *)
+  MOVE_IT(mmstk_sdb);
+  MOVE_IT(mmsl_sdb);
+
+  with c_mmrb^ do
+    begin
+      with driverCode_sdb do
+        begin
+          if not GetFree(1,memaddr) then SYSTEM_ERROR(10593);
+          memsize:=1;
+          length:=512;
+          sdbstate.memoryF:=true;
+        end;
+      INSERTSDB(@DriverCode_sdb);
+
+      (* now able to compute amount of swap space available on system *)
+      sysg_sdb:=pointer(sdb_sysglobal);
+      sys_swap_space:=ord4(hmempgsize)*2*(DriverCode_sdb.memaddr -
+                      (sysg_sdb^.memaddr + sysg_sdb^.memsize));
+    end;
+end; (*MOVE_MEMMGR*)
+
+
+procedure SET_SEGPRIORITY(* c_sdb_ptr: sdb_ptr; spriority: seg_priority *);
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Change the priority of a segment.                   *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb_ptr - is the pointer to the segment descriptor*)
+       (*         block which defines the segment.               *)
+       (*                                                        *)
+       (*    spriority - the priority of the segment.            *)
+       (*                                                        *)
+       (**********************************************************)
+begin
+  with c_sdb_ptr^ do
+    begin
+      if spriority <> ok_to_swap
+        then lockcount:=lockcount+1
+        else if lockcount > 0 then lockcount:=lockcount-1;
+    end;
+end; { of set_segpriority}
+
+
+procedure MM_INIT;
+       (**********************************************************)
+       (*                                                        *)
+       (*  Initialize data for the memory manager process.       *)
+       (*                                                        *)
+       (**********************************************************)
+const
+   nospace=10701;
+var
+    c_mmrb : mmrb_ptr;
+    c_mrbt: mrbt_ptr;
+    ord_c_lcb : absptr;
+    i: int2;
+    resSize : int2;
+    c1_mmlist : ptr_1mmlist;
+
+begin
+(* initialize mmrb entry *)
+  if not GETSPACE(SIZEOF(mmrb), b_sysglobal_ptr, mmrb_addr) then
+      SYSTEM_ERROR(nospace);
+  c_mmrb := pointer(mmrb_addr);
+  with c_mmrb^ do
+    begin
+      sys_swap_space:=4000000;  (* preliminary value - real value calculated in *)
+                                (* move_memmgr*)
+
+      memmgr_busyF := false;
+      numbRelSegs:=0;
+
+      INIT_SEM(memmgr_sem, 0);(* initialize semaphore so memory manager *)
+                              (* process will block until signaled by   *)
+                              (* PREPARE_PROCESS                        *)
+      req_pcb_ptr := nil;
+
+      hd_sdscb_list.fwd_link:=ord(@hd_sdscb_list.fwd_link)-b_sysglobal_ptr;
+      hd_sdscb_list.bkwd_link:=hd_sdscb_list.fwd_link;
+      INIT_SEM(sds_sem,1);    (* initialize semaphore so first wait will*)
+                              (* get the semaphore                      *)
+
+      hd_qioreq_list.fwd_link:=ord(@hd_qioreq_list.fwd_link)-b_sysglobal_ptr;
+      hd_qioreq_list.bkwd_link:=hd_qioreq_list.fwd_link;
+
+      INIT_SEM(seg_wait_sem,0); (* initialize semaphore so first wait will block *)
+
+      with head_sdb do
+        begin
+          memchain.fwd_link:=@memchain.fwd_link;
+          memchain.bkwd_link:=@memchain.fwd_link;
+          freechain.fwd_link:=@freechain.fwd_link;
+          freechain.bkwd_link:=@freechain.fwd_link;
+          memaddr:=0;
+          memsize:=0;
+          sdbtype:=header;
+          lockcount:=1;
+          sdbstate.releaseF:=false;
+        end;
+
+      with tail_sdb do
+        begin
+          memaddr:=4096;
+          memsize:=0;
+          lockcount:=1;
+          sdbtype:=free; (* use this type so linking will succeed *)
+          P_ENQUEUE(memchain,head_sdb.memchain); (* link into allocated chain *)
+          P_ENQUEUE(freechain,head_sdb.freechain); (* link into free chain *)
+          sdbtype:=header; (* change type to header *)
+          sdbstate.releaseF:=false;
+        end;
+
+      with DriverCode_sdb do
+        begin
+          sdbstate.memoryF:=false;
+          sdbstate.overlayF:=false;
+          memaddr:=0;
+          memsize:=0;
+          lockcount:=1;
+          length:=0;
+          sdbtype:=DCode;
+          sdbstate.releaseF:=false;
+
+          srbRP := ord(@DC_srblist) - b_sysglobal_ptr;
+          Init_MMList (@DC_srblist, 1);
+          c1_mmlist := @DC_srblist;
+          c1_mmlist^.sdscb_addr := ord(nil)
+        end;
+
+      avail_space:=0;
+      clock_ptr:=@head_sdb;
+
+      for i:= fMRdataMMU to lMRdataMMU do mrdata[i]:=nil;
+
+      resSize := 2 * (Sizeof (reqblk) + Sizeof (disk_extend));
+      if not GetSpace (resSize, b_sysglobal_ptr, resReqBlks) then
+        resReqBlks := ord(nil)
+    end;(*with*)
+
+(* initialize system mrbt entry *)
+  if not GETSPACE(SIZEOF(mrbt), b_sysglobal_ptr, s_mrbt_addr) then
+      SYSTEM_ERROR(nospace);
+  c_mrbt := pointer(s_mrbt_addr);
+  for i:=minmmu to maxmmu do
+    begin
+      c_mrbt^[i].access:=mmuabsent;
+      c_mrbt^[i].sdbRP:=0;
+    end;
+
+  stataddr:=ord(nil);
+
+  Load_Init;
+end; {of MM_INIT}
+
+
+procedure MAKE_REGION(* var c_sdb_ptr : sdb_ptr;
+                          c_memaddr,
+                          c_memsize,
+                          c_packedSize,
+                          c_unpackedSize,
+                          c_offset: int4;
+                          c_priority : seg_priority;
+                          c_sdbtype : Tsdbtype
+                          link_sdb: boolean*);
+
+    (*************************************************************)
+    (*                                                           *)
+    (* Description:                                              *)
+    (*    Create an sdb for a memory region.                     *)
+    (*                                                           *)
+    (* Input Parameters:                                         *)
+    (*    C_memaddr - the region's unmapped base address.        *)
+    (*    C_memsize - the region's size in bytes                 *)
+    (*    C_packedSize - the byte size of the segment in packed  *)
+    (*                   form (0 for data segments)              *)
+    (*    C_unpackedSize - the byte size of the segment in       *)
+    (*                     unpacked form (true size for data seg *)
+    (*    C_offset - the offset into file for start of segment   *)
+    (*               (0 for data segment)                        *)
+    (*    C_priority - swapping priority of segment, if resident.*)
+    (*    C_sdbtype - whether the region is code or data.        *)
+    (*    Link_sdb - whether to link sdb into swappable memory   *)
+    (*                  image.                                   *)
+    (*                                                           *)
+    (* Output Parameters:                                        *)
+    (*    C_ord_sdb_ptr - returns the address of the inited sdb. *)
+    (*                                                           *)
+    (*************************************************************)
+var
+   c_mmrb: mmrb_ptr;
+   disca: addrdisc;
+begin
+   disca.fid := 0;
+   disca.offset := c_offset;
+   BLD_SEG(c_sdbtype,c_unpackedSize,0,disca,0,c_packedSize,c_sdb_ptr);
+   c_sdb_ptr^.memaddr := c_memaddr div mempgsize;
+   c_sdb_ptr^.memsize:=c_memsize div mempgsize;
+
+   if c_memaddr <> 0 then
+     begin (* the segment already occupies memory space *)
+       with c_sdb_ptr^ do
+       begin
+          (* change sdb to present state with allocated memory *)
+          sdbstate.memoryF:=true;
+          SET_SEGPRIORITY(c_sdb_ptr,c_priority);
+
+        (* consider inserting sdb into chain of segments with allocated memory *)
+          if link_sdb then
+             INSERTSDB(c_sdb_ptr);
+
+          (* update clock_ptr *)
+          c_mmrb:=pointer(mmrb_addr);
+          c_mmrb^.clock_ptr:=c_sdb_ptr;
+       end; {of with}
+     end;
+end; {of make_region}
+
+
+
+function BLDPGLEN(* length:absptr):absptr *);
+    (*************************************************************)
+    (*                                                           *)
+    (* Description:                                              *)
+    (*    Find the page length of a segment, when rounded up     *)
+    (*      from the byte length to a multipe of the page size.  *)
+    (*      (Also has the effect of rounding a base address      *)
+    (*       up to a page boundary.)                             *)
+    (*                                                           *)
+    (* Input Parameters:                                         *)
+    (*    Length - the byte length of the segment.               *)
+    (*                                                           *)
+    (* Output Parameters:                                        *)
+    (*    Bldpglen - returns the segment length, as a multiple   *)
+    (*        of the memory page size.                           *)
+    (*                                                           *)
+    (*************************************************************)
+begin
+    bldpglen := ( (length + mempgsize - 1) div mempgsize ) * mempgsize;
+end; {of bldpglen }
+
+
+procedure MEM_CLEANUP(* stksdb_ptr, slsdb_ptr: sdb_ptr *);
+    (*************************************************************)
+    (*                                                           *)
+    (* Description:                                              *)
+    (*   Cleanup the psuedo-outer process resources:             *)
+    (*    1) Mark as free the psuedo outer process stack,        *)
+    (*         syslocal.                                         *)
+    (*                                                           *)
+    (* Input Parameters:                                         *)
+    (*   Stksdb_ptr - the sdb defining the segment allocated for
+    (*               POP's stack.                                *)
+    (*   Slsdb_ptr - the sdb defining the segment allocated for  *)
+    (*               POP's syslocal.                             *)
+    (*                                                           *)
+    (*************************************************************)
+
+label 10;
+
+var
+  sysname: pathname;
+  swappable: boolean;
+  errnum, i, maxi: int2;
+  sfileid, unitno: int2;
+  fcbptr: sfcb_ptr;
+  c_mrbt: mrbt_ptr;
+  c_sdb: sdb_ptr;
+  manip: mset;
+  refnum_fs: int2;
+  sysloc_ptr : slocal_ptr;
+
+begin
+  (* Set up program file containing SYSTEM.OS so that *)
+  (* system code segments can be swapped.             *)
+  sysname:='SYSTEM.OS';
+
+  swappable:=false;
+  manip:=[dread];
+  OPEN(errnum,sysname,refnum_fs,manip);
+  if errnum > 0 then goto 10; (* OS cannot be swapped *)
+  CVT_NAME(refnum_fs,sfileid,unitno,fcbptr);
+  swappable:=true;
+
+10: (* an error prevents the OS code segments from being swapped *)
+
+  (* complete construction of disk address for system code segments *)
+  c_mrbt:=pointer(s_mrbt_addr);
+  maxi:=kernelmmu+no_syscodesegs-1;
+  for i:=kernelmmu to maxi do
+    begin (* fix each system code segment *)
+      with c_mrbt^[i] do
+        begin
+          if sdbRP <> 0 then
+            begin
+              c_sdb:=pointer(sdbRP+b_sysglobal_ptr);
+              with c_sdb^ do
+                begin
+                  if swappable
+                    then discaddr.fid:=ord(fcbptr)-b_sysglobal_ptr
+                    else lockcount:=lockcount+1;
+                end;
+            end;
+        end;
+    end;(*for*)
+
+  { remove pseudo outer process from shared segment's SRB list so it can expand }
+  sysloc_ptr := pointer(b_syslocal_ptr);
+  c_mrbt := pointer(sysloc_ptr^.mrbt_addr);
+  c_sdb := pointer(c_mrbt^[shrsegmmu].sdbRP + b_sysglobal_ptr);
+  Del_SRB (c_sdb, c_pcb_ptr);
+
+  { remove pseudo outer process from IUDirectory's SRB list }
+  c_sdb := pointer(IUDsdb_ptr);
+  Del_SRB (c_sdb, c_pcb_ptr);
+
+  REL_SEG(slsdb_ptr);
+
+  {Stack can't be 'relseg'-ed, since that would unmap the stack}
+  DEALLOC_MEM(stksdb_ptr);
+  RELSPACE(ord4(stksdb_ptr), b_sysglobal_ptr);
+
+ (*$IFC DEBUG2 *)
+ if TRACE(init,50) then writeln('mem_cleanup done.');
+ (*$ENDC*)
+
+end; {of mem_cleanup}
+
+
+
+(*$s     mmgr*)         {return to previous segment}
+
+
+
+
+ÿ

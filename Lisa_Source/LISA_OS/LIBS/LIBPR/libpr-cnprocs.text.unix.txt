@@ -1,0 +1,734 @@
+{                Copyright 1984, Apple Computer Inc.                     }
+UNIT CNProcs;
+{=====================================================================================}
+                                     INTERFACE
+{=====================================================================================}
+
+USES
+     {$U LibHW/HWInt     }  HWInt,           {!DC 4/9/84, for PrSpool}
+     {$U LibOS/SysCall   }  SysCall,
+     {$U LibPM/PMDecl    }  PMDecl,
+     {$U LibSM/UnitStd   }  UnitStd,
+     {$U LibSM/UnitHz    }  UnitHz,
+     {$U LibQD/Storage   }  Storage,
+     {$U LibQD/QuickDraw }  QuickDraw,
+     {$U LibFM/FontMgr   }  FontMgr,
+     {$U LibWM/Events    }  Events,
+     {$U LibWM/Menus     }  Menus,
+     {$U LibWM/Windows   }  Windows,
+     {$U LibWM/Folders   }  Folders,
+     {$U libSB/WmlStd    }  WmlStd,
+     {$U libSB/WmlCrs    }  WmlCrs,
+     {$U LibAM/AlertMgr  }  AlertMgr,
+     {$U LibPr/PrStdInfo }  PrStdInfo,
+     {$U LibPr/PrStdProcs}  PrStdProcs,
+     {$U LibPr/PrFileProcs} PrFileProcs,
+     {$U LibPr/Queues    }  Queues,
+     {$U LibPr/PrEvents  }  PrEvents,
+     {$U LibPr/PrDlgMgr  }  PrDlgMgr,
+     {$U LibPr/PrMgr     }  PrMgr,
+     {$U LibPr/PrSpool   }  PrSpool,         {!DC 4/9/84, for PrOtherAlert, to be moved to PrMgr}
+     {$U-}
+     {$U LibPr/CNGlobals   }  CNGlobals,
+     {$U LibPr/CNStdQdProcs}  CNStdQdProcs;
+CONST
+      LF = 10; {ASCII line feed}
+
+VAR
+      SegPtr    : Ptr;
+      SegRefNum : TC;
+
+PROCEDURE CNCleanup;
+FUNCTION  CNAlert       (AlertFile: TAlertFile; AlertNumber: TC; AlertKind: TAlertKind): TC;
+PROCEDURE CNPrintPict   (VAR error: TC; pPrRec: TpPrRec; PHandle: PicHandle; PicRec: Rect);    {!DC 5/2/84}
+PROCEDURE CNBytesOut    (VAR error: TC; DataPtr: TL; DataLength: TC);
+PROCEDURE CNReadPicture (VAR error: TC; Length: TL; RefNum: TC);
+PROCEDURE CNGetPicProc  (DataPtr:  QDPtr; ByteCount: TC);
+PROCEDURE CNMetrics     (VAR PrRec: TPrRec);                                                   {!DC 5/2/84}
+PROCEDURE CNDfMetrics   (VAR PrRec: TPrRec);
+PROCEDURE CNOpenFile    (FName: Str255; VAR PrRec: TPrRec);                                    {!DC 5/2/84}
+PROCEDURE CNEndPage     (VAR error: TC; doAlert: TF);
+PROCEDURE CNDocBegin    (FName: Str255; VAR PrRec: TPrRec);                                    {!DC 5/2/84}
+PROCEDURE CNDocEnd      (VAR error: TC; pPrRec: TpPrRec);                                      {!DC 5/2/84}
+{=====================================================================================}
+                                   IMPLEMENTATION
+{=====================================================================================}
+CONST
+      PicDSName     = 'PicDATASEG';
+      PicSizeInit   = $2000;
+      PicDSLDSN     = 6;
+
+VAR deltaVPic, deltaHPic,
+    deltaVBand, deltaHBand:   TC;       {Set in CNDocStart. Used in CNPrintPage, CNBand.}
+    CNBandPtr:                QDPtr;    {Points to the printing band. It is allocated in CNPrint.}
+    Numbands:                 TC;
+    PicDSRec:                 TPrDSRec;
+    PrPicPtr:                 QDPtr;    {Used to point to picture elements in Picture Data Seg.}
+    PicBegPtr:                QDPtr;
+    DSResized:                TF;       {!DC 4/23/84}
+    DeltaDSSize:              TL;       {!DC 4/23/84}
+    connAbort:                TF;       {!DC 4/27/84}
+
+{------------------------------DIRECTORY--------------------------------}
+PROCEDURE CNDevInit (VAR error: TC; fDraft: TF);                 FORWARD;
+PROCEDURE CNDrawPicture (Pic_Handle: PicHandle; Pic_Rect: Rect); FORWARD;  {!DC 5/2/84}
+PROCEDURE CNBand (VAR error: TC; pDevRec: TpDevRec;                        {!DC 5/2/84}
+                  Pic_Handle: PicHandle; Pic_Rect: Rect);        FORWARD;
+FUNCTION  CNEqualCfg (VAR PgSize1, PgSize2: TPgSize;
+                      Feeder1, Feeder2: TCNFeeder): TF;          FORWARD;
+PROCEDURE CNYSkip;                                               FORWARD;
+PROCEDURE CNVBytes (pIn: QDPtr; bitNum, cRowBytes, cScans: TC;
+                    pOut: TP);                                   EXTERNAL;
+{ ---------------------------------------------------------------------- }
+
+FUNCTION CNAlert {AlertFile: TAlertFile; AlertNumber: TC; AlertKind: TAlertKind): TC};
+VAR result, error: TC;                                                {!DC 4/30/84}
+BEGIN
+  result := PrOtherAlert (AlertFile, AlertNumber, AlertKind, TRUE);   {!DC 4/9/84}
+  IF (result = 0) AND (AlertKind = CautionProc) THEN BEGIN
+    CNAbort := TRUE;
+    WITH CNPrinter^^.PrRec.PrInfo DO PrCall (error, lParentid, ePrintTerminate,
+                                             PrFileId.Id, 1, PrinterID, port);  {!DC 4/30/84}
+  END;
+  IF AlertKind = StopProc THEN CNAbort := TRUE;   {!DC 5/3/84}
+  CNAlert := result;
+END;
+{ ---------------------------------------------------------------------- }
+
+FUNCTION CNEqualCfg {VAR PgSize1, PgSize2: TPgSize; VAR Feeder1, Feeder2: TCNFeeder): TF};
+BEGIN
+  CNEqualCfg := (PgSize1.Width       = PgSize2.Width ) AND
+                (PgSize1.Height      = PgSize2.Height) AND
+                (Feeder1             = Feeder2       );
+END;
+
+{-----------------------------------------------------------------------}
+
+PROCEDURE CNDevInit {VAR error: TC; fDraft: TF};  {!DC 4/26/84}
+VAR Buf:       STRING[2];
+    BufAddr:   TL;
+BEGIN
+  error := 0;
+  BufAddr := ORD(@Buf)+1;
+
+  { ---- Clear buffer  }
+  Buf     := 'X';
+  Buf[1]  := CHR(24);              {CAN clears buffer}
+  CNBytesOut (error, BufAddr, 1);
+
+  { ---- Double-pass or single-pass command. }
+  Buf     := 'XG';
+  Buf[1]  := CHR(27);              {ESC G is command for double pass}
+  IF fDraft THEN Buf[2] := 'H';    {ESC H is command for single pass}
+  CNBytesOut (error, BufAddr, 2);
+
+  {Global command buffer 'Esc e', to be followed by number of white scans to be skipped}
+  skipCom   := 'XeX';
+  skipCom[1]  := CHR(27);
+  skipComAddr := ORD(@skipCom)+1;
+
+END;
+{ ---------------------------------------------------------------------- }
+{$S }
+PROCEDURE CNCleanup;
+VAR buf:       STRING[1];
+    feedY,
+    error:     TC;
+    pDevRec:   ^TDevRec;
+BEGIN
+  feedY := (CNResTruth * 5) DIV 4; {1-1/4 inch}
+  IF CNAbort THEN BEGIN
+    IF CNPrinter <> NIL THEN BEGIN
+      pDevRec := @CNPrinter^^.PrRec.PrDevInfo;
+      IF pDevRec^.CNInfo.Feeder = feedCut
+      THEN ySkip := yBottom - yPos   {from here to bottom}
+      ELSE ySkip := feedY;
+      CNYSkip;
+    END;
+  END;
+  buf := 'X';
+  buf[1] := CHR (24);                   {CAN}
+  CNBytesOut (error, ORD(@Buf) + 1, 1); {clear printer's buffer}
+END;
+{ ----------------------------------------------------------------}
+PROCEDURE CNEndPage {VAR Error: TC; doAlert: TF};
+VAR alertResult: TC;
+BEGIN
+  error := 0;
+  IF NOT CNAbort THEN BEGIN
+    ySkip := yBottom - yPos;         {!DC 4/25/84}
+    CNYSkip;                         {!DC 4/25/84}
+    IF doAlert THEN alertResult := CNAlert (BgdAlertFile, CNNextSheet, CautionProc);
+  END;
+END;
+{ ----------------------------------------------------------------}
+PROCEDURE CNOpenFile {FName: Str255; VAR PrRec: TPrRec};    {!DC 5/2/84}
+VAR
+    alertResult,
+    Error:          TC;
+    LocPrRec:       TL;           {Location of the PrRec in the spool file.}
+    LocPageDir:     TL;           {Location of the PageDir in the spool file.}
+    DirLength:      TC;           {Number of bytes needed in the picture directory. This is the size
+                                    of the object pointed to by hPfPages.}
+    pDevRec:        ^TDevRec;
+BEGIN
+  PrFileRec.FileName := Fname;
+
+  { ----- Open the print file. }
+  OpenBlock (error, prfilerec, [DRead,Private]);
+  OpenFile := (Error <= 0);
+
+  { ----- Read the File Positions of the PrRec and the Page Directory.}
+  ReadBlock (error, POINTER(ORD(@LocPrRec)), 4, PrFileRec.RefNum);
+  ReadBlock (error, POINTER(ORD(@LocPageDir)), 4, PrFileRec.RefNum);
+
+  { ----- Position File Marker and read in the PrRec.}
+  PfSetPos (error, LocPrRec, PrFileRec.RefNum);
+  ReadBlock (error, POINTER(ORD(@PrRec)), Sizeof(PrRec), PrFileRec.RefNum);
+
+  { ----- Stuff the port designated by the father process. }
+  PrRec.PrInfo.Port := CNPrinter^^.PrRec.PrInfo.Port;
+
+  { ----- Isolate the DevRec portion of the PrRec. }
+  pDevRec := @PrRec.PrDevInfo;
+
+  { ----- Check if the PrRec and the DevRec are O.K.}
+  IF pDevRec^.version <> CNRecVersion
+  THEN AlertResult := CNAlert (BgdAlertFile, CNBadSpoolFile, StopProc)
+  ELSE CNMetrics (PrRec);                                          {!DC 4/30/84, 5/2/84}
+
+  IF NOT CNAbort THEN BEGIN
+    { ----- Position File Marker and read in the Page Directory. File marker is probably already
+            at the correct position, but we are keeping a pointer to it until file structure settles. }
+    PfSetPos (error, LocPageDir, PrFileRec.RefNum);
+
+    NumPages := PrRec.PrJobInfo.SpooledPages;
+
+    { ----- Allocate the handle array in TheHeap. }
+    DirLength := NumPages*SizeOf(TPfPage);
+    hPfPages := POINTER(ORD(NewHandle(DirLength)));
+
+    ReadBlock (error, POINTER(ORD(hPfPages^)), DirLength, PrFileRec.Refnum);
+    IF error > 0 THEN AlertResult := CNAlert (BgdAlertFile, CNBadSpoolFile, StopProc);    {!DC 5/3/84}
+  END;
+END;
+{ ----------------------------------------------------------------}
+PROCEDURE CNDocBegin {FName: Str255; VAR PrRec: TPrRec};    {!DC 5/2/84}
+VAR error, remainder,
+    alertResult:         TC;
+    pDevRec:             TpDevRec;                          {!DC 2/5/84}
+BEGIN
+  pDevRec := @PrRec.PrDevInfo;                              {!DC 5/2/84}
+  CNAbort := FALSE;
+  connAbort := FALSE;
+
+  { ----- Open up the file and get the PrRec. }
+  CNOpenFile (FName, PrRec);
+
+  IF NOT CNAbort THEN BEGIN
+    IF NOT CNEqualCfg (LastJob.PgSize, PrRec.PrInfo.PgSize,
+                       LastJob.Feeder, pDevRec^.CNInfo.feeder)             {!DC 5/2/84}
+    THEN AlertResult := CNAlert (BgdAlertFile, CNNewConfig, NoteProc);
+    SetUnitGlobals (pDevRec^);     {!DC 5/2/84}
+
+    { ----- Make the data segment for the Picture. This is
+            where we reserve the space for the printing band. }
+    WITH PicDSRec DO BEGIN
+      SegName  := PicDSName;
+      InitSize := PicSizeInit + pDevRec^.CNInfo.lSegSize;   {!DC 5/2/84}
+      LDSN     := PicDSLDSN;
+      Make_DataSeg (error, SegName, InitSize, InitSize, refnum, BegAddr, ldsn, ds_private);
+      IF error > 0 THEN alertResult := CNAlert (BgdAlertFile, CNNoDiskSpace, StopProc);   {!DC 5/3/84}
+    END;
+
+    IF NOT CNAbort THEN BEGIN
+      { ----- Set up the pointers to the beginning of the printing Band and the picture. }
+      CNBandPtr := POINTER(ORD4(PicDSRec.BegAddr));
+      PicBegPtr := POINTER(ORD4(CNBandPtr) + pDevRec^.CNInfo.lSegSize); {!DC 5/2/84}
+      PrPicPtr  := PicBegPtr;
+
+      GrafDevice( PrRec.prInfo.ADev.Dev );
+
+      { ----- Build portbits. }
+      WITH PrPort.gport, portBits DO BEGIN
+        bounds   := pDevRec^.CNInfo.rBounds;                            {!DC 5/2/84}
+        rowBytes := ((bounds.right - bounds.left + 15) DIV 16) * 2;
+        baseAddr := CNBandPtr;
+
+        portRect := pDevRec^.CNInfo.rBand;          {!DC 5/2/84}
+        RectRgn (visRgn, PrRec.prInfo.rPrintable);
+        RectRgn (ClipRgn, PrRec.prInfo.rPrintable);
+      END;
+
+      { ----- Compute the number of bands and the remainder for the last band. }
+      WITH PrRec.prInfo.rPrintable DO BEGIN
+        deltaVPic := Bottom - Top;
+        deltaHPic := Right - Left;
+      END;
+      WITH pDevRec^.CNInfo, rBand DO BEGIN     {!DC 5/2/84}
+        deltaVBand := Bottom - Top;
+        deltaHBand := Right - Left;
+        CASE tyScan OF
+          tyscanTB: BEGIN
+                      NumBands  := deltaVPic DIV deltaVBand;
+                      Remainder := deltaVPic MOD deltaVBand;
+                    END;
+          tyscanLR: BEGIN
+                      NumBands  := deltaHPic DIV deltaHBand;
+                      Remainder := deltaHPic MOD deltaHBand;
+                    END;
+        END;
+      END;
+      IF Remainder > 0 THEN NumBands := NumBands + 1;
+
+      { ----- Close Port in case workshop or preferences left it open . Open the OS port.  }
+      {------ Initialize the Printer.}
+      PsCLosePort( error, PrRec.PrInfo.Port);  {!Ez 5/10/84}
+      PsOpenPort (error, PrRec.PrInfo.Port);
+      CNDevInit (error, pDevRec^.CNInfo.fDraft);    {!DC 5/2/84}
+    END;
+  END;
+END;
+{ ----------------------------------------------------------------}
+PROCEDURE CNDocEnd {VAR Error: TC; pPrRec: TpPrRec};   {!DC 2/5/84}
+VAR Buf:       STRING[1];     {!DC 4/24/84}
+    BufAddr:   TL;
+    pDevRec:                  TpDevRec;      {!DC 5/2/84}
+BEGIN
+  pDevRec := @pPrRec^.PrDevInfo;             {!DC 5/2/84}
+
+  Error := 0;
+  BufAddr := ORD(@Buf)+1;     {!DC 4/24/84}
+
+  { ---- Clear buffer  }      {!DC 4/24/84}
+  Buf     := 'X';
+  Buf[1]  := CHR(24);              {CAN clears buffer}
+  CNBytesOut (error, BufAddr, 1);
+
+  { ----- Update feeder and PgSize information. }
+  LastJob.feeder := pDevRec^.CNInfo.feeder;  {!DC 2/5/84}
+  LastJob.PgSize := pPrRec^.PrInfo.PgSize;   {!DC 2/5/84}
+  PsClosePort (error, pPrRec^.PrInfo.Port);  {!DC 2/5/84}
+  { ----- Close & delete the pic data seg }
+  Close_DataSeg (error, PicDSRec.RefNum);
+  FMCacheSize (minCache, error)
+END;
+{ ----------------------------------------------------------------}
+PROCEDURE CNGetPicProc {DataPtr: QDPtr; ByteCount: TC};
+VAR MyPtr:QDPtr;
+    I: TC;
+BEGIN
+  MyPtr := POINTER(ORD(DataPtr));
+  FOR I := 0 TO ByteCount - 1 DO BEGIN
+    MyPtr    := POINTER(ORD(DataPtr) + I);
+    MyPtr^   := PrPicPtr^;
+  (*MyPtr    := POINTER(ORD(MyPtr) + 1);          {???unnecessary???}*)
+    PrPicPtr := POINTER(ORD(PrPicPtr) + 1);
+  END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CNReadPicture {VAR Error: TC; Length: TL; RefNum: TC};
+VAR delta,
+    DSMemSize, DSDiskSize:    TL;
+    alertResult:              TC;
+BEGIN
+  { ----- The reading of the picture is done in this unit because the Picture Data Segment
+          is not visible outside of the CNProcs Unit.}
+  { ----- Check if we need to increase the size of the data segment for large pictures. Pictures must
+          be memory resident, so that we do not hit the disk for every band. }
+  IF Length > picSizeInit THEN BEGIN                                   {!DC 4/23/84}
+    Delta := Length - picSizeInit;
+    Size_DataSeg (error, PicDSRec.RefNum, Delta, DSMemSize, Delta, DSDiskSize);
+    IF (error > 0) OR (DSMemSize <> DSDiskSize) THEN BEGIN
+                        alertResult := CNAlert (BgdAlertFile, CNNoDiskSpace, StopProc);
+                        DSResized := FALSE;
+                      END
+                 ELSE BEGIN
+                        DeltaDSSize := DSMemSize - PicDSRec.InitSize;
+                        DSResized := TRUE;
+                      END;
+  END
+  ELSE DSResized := FALSE;
+
+  IF NOT CNAbort THEN BEGIN
+    ReadBlock (error, POINTER(ORD4(PicBegPtr)), Length, Refnum);
+    IF error > 0
+    THEN AlertResult := CNAlert (BgdAlertFile, CNBadSpoolFile, StopProc);  {!DC 5/3/84}
+
+    { ----- Initialize the picture pointer to the begining of the picture. First eight bytes of
+            the picture are the picture frame, which is artifically stuffed by the print spooler.
+            The frame is picked off by a call to CNGetPicProc in CNPrint. CNGetPicProc advances
+            the PrPicPtr to point past the frame, thus QuickDraw never knows about the picture frame. }
+    PrPicPtr := POINTER(ORD(PicBegPtr));
+  END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CNDfMetrics {VAR PrRec: TPrRec};
+VAR I:       TC;
+    pDevRec: ^TDevRec;
+BEGIN
+WITH PrRec, PrInfo DO BEGIN
+  pDevRec := @PrDevInfo;
+  WITH pDevRec^.CNInfo DO BEGIN
+    fDraft := FALSE;
+    feeder := feedRoll;
+  END;
+  PrVersion:=cPrPrfVersion ;
+  PrJobInfo.Immediate:=False;
+  FOR I:=1 TO 128 DO PrDevInfo[I]:=0;  {zero the dev record}
+  WITH PgSize DO BEGIN
+    Height:= 11 * PrPgFract;            {Default 8.5x11 inch paper.}
+    Width := (17 * PrPgFract) DIV 2;
+    paperDirect := portrait;
+    printdirect := portrait;
+  END;
+  CNMetrics (PrRec);
+END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CNMetrics {VAR PrRec: TPrRec};     {!DC 5/2/84}
+VAR vPaperBits, hPaperBits,
+    bandBits:                 TC;
+    rTemp:                    Rect;
+    pDevRec:                  TpDevRec;      {!DC 5/2/84}
+BEGIN
+  pDevRec := @PrRec.PrDevInfo;               {!DC 5/2/84}
+  { ----- Set up the rPrintable, rBand rectangles and the scanning direction. }
+  WITH PrRec.prInfo, pDevRec^, CNInfo, PgSize DO BEGIN {!DC 5/2/84}
+    version     := CNRecVersion;
+    NumColors   := 3;
+    aDev.eDev   := edev1;
+    hRes        := CNRes;
+    vRes        := CNRes;
+
+    IF PrintDirect = Portrait THEN BEGIN
+      tyScan := tyscanTB;
+
+      WITH PrRec.PrInfo.PgSize DO BEGIN     {device paper size}
+        vPaperBits := Height * ORD4(vRes) DIV prPgFract;
+        hPaperBits := Width  * ORD4(hRes) DIV prPgFract;
+      END;
+
+      SetRect (rPaper, 0, 0, hPaperBits, vPaperBits);
+
+                {In the following, rPrintable is formed from rPaper such that:
+                    - the origins coincide at 0,0
+                    - width is forced down to cPlaten
+                    - if cut sheet, height is reduced by cBottomGap}
+
+      SetRect (rPrintable, 0, 0, cPlaten, vPaperBits);
+      IF feeder = feedCut THEN WITH rPrintable DO bottom := bottom - cBottomGap;
+      IF SectRect (rPaper, rPrintable, rTemp) THEN rPrintable := rTemp;
+
+                {In the following, rBand is formed from rPaper such that:
+                    - the origins coincide at 0,0
+                    - width is forced up to a word boundary
+                    - height is MaxVBand}
+
+      bandBits := CMIN(((hPaperBits + 15) DIV 16) * 16, cPlaten);
+      SetRect (rBand, 0, 0, bandBits, MaxVBand);
+      lBandSize := (ORD4(MaxVBand) * bandBits) DIV 8;
+    END
+
+    ELSE BEGIN                               {Landscape}
+      tyScan:=tyscanLR;
+
+      WITH PrRec.PrInfo.PgSize DO BEGIN                {Note switched height and width}
+        hPaperBits := Height* ORD4(hRes) DIV prPgFract;
+        vPaperBits := Width * ORD4(vRes) DIV prPgFract;
+      END;
+
+      SetRect (rPaper, 0, 0, hPaperBits, vPaperBits);
+
+                {In the following, rPrintable is formed from rPaper such that:
+                    - the origins coincide at 0,0
+                    - height is forced down to cPlaten
+                    - if height < cPlaten, height is forced down
+                      to a byte boundary
+                    - if cut sheet, width is reduced by cBottomGap}
+
+      SetRect (rPrintable, 0, 0, hPaperBits, cPlaten);
+      IF feeder = feedCut THEN WITH rPrintable DO right := right - cBottomGap;
+      IF SectRect (rPaper, rPrintable, rTemp) THEN rPrintable := rTemp;
+      WITH rPrintable DO bottom := (bottom DIV 8) * 8;
+
+                {In the following, rBand is formed from rPaper such that:
+                    - the origin is at 0,0
+                    - width is MaxVBand}
+
+      SetRect (rBand, 0, 0, MaxVband, rPrintable.bottom);
+      lBandSize := (ORD4(MaxVBand) * rPrintable.bottom) DIV 8;
+    END;
+
+    rBounds:=rBand;
+    lSegSize := lBandSize * NumColors;
+
+    { ----- Set QD parameters. }
+    cULThick := 1; cPatScale := 1; cULOffset := 1; cULShadow := 1;
+
+  END; { With PrRec.PrInfo, pDevRec^, CNInfo...}
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE CNDrawPicture {Pic_Handle: PicHandle; Pic_Rect: Rect}; {!DC 5/2/84}
+VAR SaveColor:      TL;
+    SaveClip,
+    SaveVis,
+    SavePR,
+    SaveBounds:     Rect;
+BEGIN
+  PsYieldCpu;
+  { ----- Initialize the picture pointer to point to the begining of the picture. Add 8 bytes to }
+  { ----- point past the picture frame. }
+  PrPicPtr :=POINTER(ORD(PicBegPtr)+8);
+
+  PsNonPreemptive;       {!DC 4/10/84}
+  { ----- White out the port's bitmap: }
+  WITH thePort^, portBits DO BEGIN
+    SaveColor := bkColor;
+    SaveClip  := clipRgn^^.rgnBBox;
+    SaveVis   := visRgn^^.rgnBBox;
+    SavePR    := portRect;
+    SaveBounds:= bounds;
+
+    bounds.right := bounds.left + (rowbytes * 8);
+    portRect := bounds;
+    RectRgn (clipRgn, bounds);
+    RectRgn (visRgn, bounds);
+
+    BackColor (whiteColor);
+    EraseRect (bounds);
+
+    portRect := SavePR;
+    BackColor (SaveColor);
+    RectRgn (clipRgn, saveClip);
+    RectRgn (visRgn, saveVis);
+    bounds := SaveBounds;
+  END;
+
+  DrawPicture (Pic_Handle, Pic_Rect);
+  PsPreemptive;
+  PsYieldCpu;
+END;
+{-----------------------------------------------------------------------}
+PROCEDURE CNYSkip;
+VAR error, i: TC;
+BEGIN
+  IF ySkip > 0 THEN BEGIN
+    IF ySkip > 255 THEN BEGIN
+      SkipCom[3] := CHR(255);
+      FOR i := 1 TO ySkip DIV 255 DO CNBytesOut (error, skipComAddr, 3);
+      SkipCom[3] := CHR(ySkip MOD 255);
+    END
+    ELSE SkipCom[3] := CHR(ySkip);
+    CNBytesOut (error, skipComAddr, 3);
+    yPos := yPos + ySkip;
+    ySkip := 0;
+  END;
+END;
+{-----------------------------------------------------------------------}
+PROCEDURE CNBand {VAR error: TC; pDevRec: TpDevRec; Pic_Handle: PicHandle; Pic_Rect: Rect};   {!DC 5/2/84}
+TYPE TByteRow =   PACKED ARRAY[1..cPlatenBytes] OF QDByte;
+     TPByteRow = ^TByteRow;
+VAR grafCom:        STRING[3];
+    grafComAddr,
+    saveAddr,
+    bitsAddr:       TL;
+    bitsPtr:        TP;
+    colorPlane,
+    stripeNum,
+    cStripes,
+    CNBytes:        TC;
+    buffer:         ARRAY[1..3] OF TByteRow;
+
+  PROCEDURE StripeOut;
+  VAR i, j:         TC;
+      whiteFlag:    TF;
+  BEGIN
+    whiteFlag := TRUE;
+    i := 1;
+    WHILE (i <= 3) AND whiteFlag DO BEGIN
+      j := 1;
+      WHILE (j <= CNBytes) AND whiteFlag DO BEGIN
+        whiteFlag := buffer[i, j] = -1;
+        j := j + 1;
+      END;
+      i := i + 1;
+    END;
+    IF whiteFlag
+    THEN ySkip := ySkip + 1
+    ELSE BEGIN
+           IF ySkip > 0 THEN CNYSkip;
+           grafCom[3]  := CHR(CNBytes);
+           CNBytesOut (error, grafComAddr, 3);
+           FOR i := 1 TO 3 DO CNBytesOut (error, ORD(@buffer[i]), CNBytes);
+           yPos := yPos + 1;
+         END;
+  END;
+
+BEGIN
+  IF cPrError <> prErrAbort THEN BEGIN;
+    error := 0;
+    ySkip := 0;
+    saveAddr := ORD(ThePort^.PortBits.BaseAddr);
+
+    {Set up command buffer 'Esc X', to be followed by number of bytes in row}
+
+    grafCom   := 'XXX';
+    grafCom[1]  := CHR(27);
+    grafComAddr := ORD(@grafCom)+1;
+
+  {Image the picture into 3 color planes}
+    colorPlane := 4;
+    REPEAT
+      PSNonPreemptive;        {!DC 4/10/84}
+      ColorBit (colorPlane);
+      PSPreemptive;           {!DC 4/10/84}
+      CNDrawPicture (Pic_Handle, Pic_Rect);  {!DC 5/2/84}
+      WITH ThePort^.PortBits
+        DO BaseAddr := POINTER(ORD(BaseAddr) + ORD(pDevRec^.CNInfo.lBandSize)); {!DC 5/2/84}
+      colorPlane := colorPlane - 1;
+    UNTIL colorPlane < 2;
+    ThePort^.PortBits.BaseAddr := POINTER(ORD(saveAddr));
+
+  {Strip off printer stripes and send to printer.  Each stripe is really 3 stripes, red/green/blue}
+    bitsAddr := ORD(ThePort^.PortBits.BaseAddr);
+    stripeNum := 0;
+    CASE pDevRec^.CNInfo.tyscan OF {!DC 5/2/84}
+      tyscanTB: BEGIN
+                  WITH thePort^.portRect DO cStripes := bottom - top;
+                  CNBytes := ThePort^.PortBits.RowBytes;
+                  REPEAT
+                    saveAddr := bitsAddr;
+                    FOR colorPlane := 1 TO 3 DO BEGIN
+                      bitsPtr := POINTER (bitsAddr);
+                      MOVELEFT (bitsPtr^, buffer[colorPlane], CNBytes);
+                      bitsAddr := bitsAddr + pDevRec^.CNInfo.lBandSize;    {!DC 5/2/84}
+                    END;
+                    stripeNum := stripeNum + 1;
+                    StripeOut;
+                    bitsAddr := saveAddr + ThePort^.PortBits.RowBytes;
+                  UNTIL (stripeNum >= cStripes) OR (error <> 0) OR CNAbort;
+                END;
+      tyscanLR: BEGIN
+                  WITH thePort^.portRect DO cStripes := right - left;
+                  CNBytes := deltaVBand DIV 8;
+                  REPEAT
+                    saveAddr := bitsAddr;
+                    FOR colorPlane := 1 TO 3 DO BEGIN
+                      CNVBytes (POINTER(bitsAddr), (stripeNum MOD 16) + 1, ThePort^.PortBits.RowBytes,
+                                                    deltaVBand, POINTER(ORD(@buffer[colorPlane])));
+                      bitsAddr := bitsAddr + pDevRec^.CNInfo.lBandSize;    {!DC 5/2/84}
+                    END;
+                    stripeNum := stripeNum + 1;
+                    StripeOut;
+                    bitsAddr := saveAddr;
+                    IF (stripeNum MOD 16) = 0 THEN bitsAddr := bitsAddr + 2;
+                  UNTIL (stripeNum >= cStripes) OR (error <> 0) OR CNAbort;
+                END;
+    END;
+    IF ySkip > 0 THEN IF NOT CNAbort THEN CNYSkip;
+  END; {if cPrError ...}
+END;   { CNBand }
+{-----------------------------------------------------------------------}
+PROCEDURE CNPrintPict {VAR error: TC; pPrRec: TpPrRec; PHandle: PicHandle; PicRec: Rect}; {!DC 2/5/84}
+VAR
+    ignore:              TL;
+    NextBand:            Rect;
+    BandNumber:          TC;
+    pDevRec:             TpDevRec; {!DC 2/5/84}
+BEGIN
+  pDevRec := @pPrRec^.PrDevInfo;
+  IF NOT CNAbort THEN BEGIN
+    { ----- Set up the initial band: }
+    WITH pPrRec^.PrInfo, NextBand DO BEGIN   {!DC 2/5/84}
+      top    := rPrintable.top;
+      left   := rPrintable.left;
+      bottom := CMIN (top + deltaVBand, rPrintable.bottom);
+      right  := CMIN (left + deltaHBand, rPrintable.right);
+    END;
+
+    BandNumber := 1;
+    WITH pPrRec^.PrInfo, rPrintable DO IF pgSize.printDirect = portrait    {!DC 2/5/84}
+    THEN yPos := top
+    ELSE yPos := left;                                              {!DC 4/18/84}
+    IF (NumBands >= BandNumber) AND NOT CNAbort THEN REPEAT
+      ThePort^.PortRect        := NextBand;
+      ThePort^.PortBits.Bounds := NextBand;
+      CNBand (error, pDevRec, PHandle, PicRec);  {!DC 2/5/84}
+      WITH NextBand, pPrRec^.PrInfo DO CASE pDevRec^.CNInfo.tyScan OF   {!DC 2/5/84}
+        tyscanTB: BEGIN
+                    top    := bottom;
+                    bottom := CMIN (bottom + deltaVBand, rPrintable.bottom);
+                  END;
+        tyscanLR: BEGIN
+                    left  := right;
+                    right := CMIN (right + deltaHBand, rPrintable.right);
+                  END;
+      END;
+      BandNumber := BandNumber + 1;
+    UNTIL (BandNumber > NumBands) OR (error <> 0) OR CNAbort;
+  END; {if not CNAbort}
+
+  { ----- Shrink down the data segment if we had a large picture. }
+  IF DSResized                                         {!DC 4/23/84}
+  THEN Size_DataSeg (error, PicDSRec.RefNum, -DeltaDSSize, ignore, -DeltaDSSize, ignore);
+END; { PrintPict }
+{-----------------------------------------------------------------------}
+PROCEDURE CNBytesOut {VAR error: TC; DataPtr: TL; DataLength: TC};
+  {This is the only IO for the Canon}
+VAR alertResult:    TC;
+BEGIN
+  error:=0;
+    IF (DataLength > 0) THEN PSOutPort (error, POINTER(dataPtr), DataLength);
+
+  IF NOT connAbort THEN BEGIN                               {!DC 4/27/84}
+    IF error > 0 THEN REPEAT
+      alertResult := CNAlert (BgdAlertFile, CNDisconnect, CautionProc); {put up alert}
+      IF (alertResult = 1)
+      THEN PSOutPort (error, POINTER(dataPtr), DataLength)  {retry}
+      ELSE connAbort := TRUE;                               {!DC 4/27/84}
+    UNTIL connAbort OR (error = 0);                         {cancel, or no error in PsOutPort}
+  END;
+
+  PSYieldCPU;
+END; {CNBytesOut}
+{=====================================================================================}
+END.
+
+{              CHANGE LOG:
+      5/03/84 DC:   CNAlert - set the abort flag on a stop alert.
+      5/03/84 DC:   CNReadPicture - abort added for failure to read picture.
+      5/03/84 DC:   CNDocBegin - abort added for failure to make data seg.
+      5/03/84 DC:   CNOpenFile - abort added for failure to read handle array.
+      5/02/84 DC:   CNDocBegin - eliminated DevRec param.
+      5/02/84 DC:   CNOpenFile - eliminated DevRec param.
+      5/02/84 DC:   CNMetrics - eliminated DevRec param.
+      5/02/84 DC:   CNDocEnd - changed PrRec param to pPrRec; eliminated DevRec param.
+      5/02/84 DC:   CNBand - changed DevRec param to pDevRec.
+      5/02/84 DC:   CNPrintPict - changed PrRec to pPrRec; eliminated PrDev param and added
+                    pPrDev variable.
+      5/02/84 DC:   CNDrawPicture - removed DevRec parameter (not used).
+      4/30/84 DC:   CNOpenFile: call CNMetrics to kosher the PrRec, in case the application
+                    has messed it up.
+      4/30/84 DC:   CNAlert: add error variable, call PrCall instead of PrNotify.
+      4/27/84 DC:   Added connAbort flag: set FALSE in CNDocBegin, TRUE in CNBytesOut if user
+                    cancels on disconnect alert.  Used only in CNBytesOut, to prevent further
+                    alerts from attempts to send data to printer when it's really dead.
+      4/26/84 DC:   CNMetrics - removed all references to cTopGap
+      4/26/84 DC:   CNDevInit - reset, online and perf skip cancel commands removed
+      4/25/84 DC:   CNEndPage - skip to bottom of rPrintable (for roll paper this = bottom
+                    of rPaper)
+      4/24/84 DC:   CNDocEnd - send a CAN to clear printer's buffer.
+      4/23/84 DC:   CNReadPicture - move the DS growing code here from CNPrintPict, calculate
+                    delta correctly, alert if growing fails.
+      4/23/84 DC:   CNPrintPict - move the DS growing code to CNReadPicture, do shrinking
+                    correctly.  Remove PictLength param.
+      4/18/84 DC:   CNPrintPict - initialize yPos.
+      4/10/84 DC:   CNBand - made ColorBit call nonpreemptive, CNVBytes preemptive.
+      4/10/84 DC:   CNDrawPicture - moved PsNonPreemptive call up to include all QD calls.
+      4/09/84 DC:   USES - Add PrSpool (for PrOtherAlert) and HwInt (for PrSpool).
+      4/09/84 DC:   CNAlert - call PrOtherAlert instead of BackGroundAlert.
+      4/06/84 DC:   CNPrintPict - band size term in calculating Delta.
+
+}
+ÿ

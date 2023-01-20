@@ -1,0 +1,461 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+UNIT excepmgr;          (* Exception Manager  *)
+                        (* to be used by eventmgr and other units *)
+INTERFACE
+
+  USES
+  (*$U object/driverdefs.obj*)
+       driverdefs,
+  (*$U object/hwint.obj*)
+       hwint,
+  (*$U object/sysglobal.obj*)
+       globalda,
+  (*$U object/procprims.obj *)
+       proc_prims,
+  (*$U object/mmprim.obj *)
+       mmprimitives,
+  (*$U object/asynctr.obj *)
+       asynctr,
+  (*$U object/genio.obj *)
+       genio,
+  (*$U object/twiggy.obj *)
+       twiggy,
+  (*$U object/vmstuff.obj *)
+       vmstuff,
+  (*$U object/sfileio.obj *)
+       sfileio,
+  (*$U object/fsprim.obj *)
+       fs_primitives,
+  (*$U object/fsui.obj *)
+       FS_Interface,
+  (*$U object/exceprim.obj*)
+       exceprim,
+  (*$U object/clock.obj *)
+       clock,
+  (*$U object/eventchn.obj*)
+       eventchn;
+
+
+
+  procedure declare_excep_hdl (var errnum : integer;
+                               var excep_name : t_ex_name;
+                               entry_point : longadr);
+
+  procedure disable_excep (var errnum : integer;
+                           var excep_name : t_ex_name;
+                           queue : boolean );
+
+  procedure enable_excep (var errnum : integer;
+                          var excep_name : t_ex_name );
+
+  procedure info_excep (var errnum : integer;
+                        var excep_name : t_ex_name;
+                        var excep_status : t_ex_sts);
+
+  procedure flush_excep (var errnum : integer;
+                         var excep_name : t_ex_name );
+
+  procedure excep_setup (b_sloc_ptr : slocal_ptr);
+
+
+  procedure init_excep (adr_return_excep : longint);
+
+  procedure force_term_excep (excep_data : t_ex_data);
+
+  procedure hard_excep (superstack : boolean; excep_kind : integer;
+                        save_info_ptr : p_term_ex_data);
+
+  procedure rangeerror (valuecheck, lowerbound, upperbound : integer;
+                        rangekind : boolean);
+
+  {function nmi_excep (superstack : boolean;
+                      save_info_ptr : p_hard_ex_data) : boolean; }
+
+
+  procedure Pexcep_prolog (var c_exenvblk : env_blk;
+                           var c_exdatablk : t_ex_data;
+                           var terminate_f : integer;
+                           user_pc : longint);
+
+  procedure return_excep;
+
+  function exmgrversion : integer;
+
+
+IMPLEMENTATION
+
+
+  CONST
+    curversion = 5;             (* alpha 5.2 version *)
+
+
+
+(*$S kr_prims*)              (* resident stuff *)
+
+
+(* Exception management resident : internal service routines *)
+
+
+
+  procedure return_excep;  external;
+
+
+
+
+
+  function ex_q_empty (ecb_ptr : exctrb_ptr) : boolean;
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   checks to see if the exception data queue is empty.               *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ecb_ptr : pointer to the exception control block.                 *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   ex_q_empty : true if exception queue is empty, false otherwise.   *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by find_excep (called by Pexcep_prolog), and setup_state.  *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      ex_sts : t_ex_sts;
+
+    begin
+        (*$IFC DEBUG2*)
+        if trace (em, hard_prolog_level) then
+          writeln ('  ex_q_empty : ecb =', ord (ecb_ptr));
+        (*$ENDC*)
+        ex_q_empty := false;
+        with ecb_ptr^ do
+            if num_excep <= 0 then
+                if ec_refnum <> 0 then
+                  begin
+                    tr_ex_ec (ec_refnum, ex_sts, false, true); (* get from eccb *)
+                    if ex_sts.num_excep <= 0 then
+                        ex_q_empty := true;
+                  end
+                else
+                  ex_q_empty := true;
+
+    end;  (* function ex_q_empty *)
+
+
+
+
+
+  procedure setup_state (ecb_ptr : exctrb_ptr;
+                         state : t_ex_state );
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   sets up the state of the exception in both ecb and the event      *)
+    (*   channel control block if it is for event-call channel.            *)
+    (*   Also raise exception if state is set to enabled.                  *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ecb_ptr : pointer to the exception control block.                 *)
+    (*   state : new state to be set.                                      *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by declare_excep_hdl, disable_excep, enable_excep, and     *)
+    (*   Pexcep_prolog, and force_term_excep only.                         *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      ex_sts : t_ex_sts;
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('setup_state : ecb =', ord (ecb_ptr));
+      (*$ENDC*)
+      with ecb_ptr^ do
+          begin
+              ex_state := state;
+
+              if ec_refnum <> 0 then
+                  begin
+                    ex_sts.ex_state := state;
+                    tr_ex_ec (ec_refnum, ex_sts, true, false);
+                                               (* transfer ex_state only to eccb *)
+                  end;
+              if (state = enabled) and (not ex_q_empty (ecb_ptr)) then
+                raise_ex_pending (ecb_ptr);
+          end;  (* with *)
+
+    end;  (* procedure setup_state  *)
+
+
+
+
+(* Exception management resident : contains procedures interface to scheduler *)
+
+
+
+  procedure launchdl (new_sp : longint;
+                      hdl_adr : longadr;
+                      adr_return_excep : longint;
+                      hdl_mode : integer);             external;
+
+  procedure retn_main;  external;
+
+
+  procedure Pexcep_prolog (* var c_exenvblk : env_blk;
+                             var c_exdatablk : t_ex_data;
+                             var terminate_f : integer;
+                             user_pc : longint *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   saves the environment block and exception information block on    *)
+    (*   stack and finds an exception of state enabled to honor.           *)
+    (*   It also saves a flag on stack before goint to handler indicating  *)
+    (*   whether the process should be terminated at the end of handler.   *)
+    (*   (i.e. when sys_terminate exception is to be signalled and terming *)
+    (*   flag in pcb is set. )                                             *)
+    (*   Return_excep will examine this flag and send softint to terminate *)
+    (*   if true.                                                          *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   syslocal variable last_ecb_ptr is cleared after this call.        *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by  scheduler only.                                        *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   system error handler is entered if error return from              *)
+    (*   wait_event_chn call.                                              *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      pcb_ptr : ^pcb;
+      b_sloc_ptr : ^syslocal;
+      pre_state : intson_type;
+      c_ecb_ptr : exctrb_ptr;
+      hdl_mode : integer;
+
+
+
+    function find_excep : boolean;
+
+      (***********************************************************************)
+      (*                                                                     *)
+      (* Description:                                                        *)
+      (*   finds an exception that has state enabled and queue not empty to  *)
+      (*   honor, the search includes the system type exceptions associated  *)
+      (*   to this process.                                                  *)
+      (*                                                                     *)
+      (* Input Parameters:                                                   *)
+      (*   none.                                                             *)
+      (*                                                                     *)
+      (* Output Parameters:                                                  *)
+      (*   find_excep : true if found, false if not.                         *)
+      (*   c_ecb_ptr : pointer of the ecb found.                             *)
+      (*                                                                     *)
+      (* Side Effects:                                                       *)
+      (*   last_ecb_ptr in syslocal is cleared in this function.             *)
+      (*                                                                     *)
+      (* Special Conditions of Use:                                          *)
+      (*   called by excep_prolog only.                                      *)
+      (*                                                                     *)
+      (* Error Conditions:                                                   *)
+      (*   none.                                                             *)
+      (*                                                                     *)
+      (***********************************************************************)
+
+      var
+        head_ptr : exctrb_ptr;
+        data_ptr : exdata_ptr;
+        errnum, w_refnum : integer;
+        found_it : boolean;
+        wait_list : t_waitlist;
+        event_ptr : p_r_eventblk;
+
+      procedure find_ecb;
+                 (* find an ecb that has state enabled and data q not empty *)
+        begin
+          (*$IFC DEBUG2*)
+          if trace (em, hard_prolog_level) then
+            writeln ('  find_ecb : c_ecb =', ord (c_ecb_ptr),
+                     ' head_ptr =', ord (head_ptr));
+          (*$ENDC*)
+
+          found_it := false;
+          while (c_ecb_ptr <> head_ptr) and (not found_it)
+            do
+              if (c_ecb_ptr^.ex_state <> enabled) or ex_q_empty (c_ecb_ptr)
+              then c_ecb_ptr := pointer (c_ecb_ptr^.ecb_link.fwd_link
+                                                  + b_syslocal_ptr)
+              else found_it := true;
+
+          if found_it then
+            begin
+              if c_ecb_ptr^.num_excep > 0 then   (* data in excep q *)
+                begin                      (* deque an data blk and relspace *)
+                  deq_ex_data (c_ecb_ptr, data_ptr);
+                  c_exdatablk := data_ptr^.datablk;
+                  relspace (ord (data_ptr), b_syslocal_ptr);
+                end
+              else                              (* exception from call channel *)
+                begin                           (* get an event from the channel *)
+                  wait_list.length := 1;
+                  wait_list.refnum [0] := c_ecb_ptr^.ec_refnum;
+                  event_ptr := @c_exdatablk;
+                  wait_event_chn (errnum, wait_list, w_refnum, event_ptr);
+                  if errnum > 0 then
+                    begin
+                      (*$IFC DEBUG2*)
+                      writeln ('error from wait_event_chn called in excep_prolog is :',
+                                errnum);
+                      system_error (e_ex_prolog);
+                      (*$ENDC*)
+                    end;
+                end;
+            end;
+        end;  (* procedure find_ecb *)
+
+      begin                             (* function find_excep *)
+        (*$IFC DEBUG2*)
+        if trace (em, hard_prolog_level) then
+          writeln ('e find_excep :');
+        (*$ENDC*)
+
+                                           (* find local ecb's of this process *)
+        head_ptr := @b_sloc_ptr^.head_ecb;
+        if b_sloc_ptr^.last_ecb_ptr = 0 then  (* go thru the whole list *)
+            c_ecb_ptr := pointer (head_ptr^.ecb_link.fwd_link
+                                        + b_syslocal_ptr)
+        else
+            c_ecb_ptr := pointer (b_sloc_ptr^.last_ecb_ptr);
+        find_ecb;
+        if found_it then
+          if c_ecb_ptr^.insysmode then
+            hdl_mode := 1           (* handler to be executed in system mode *)
+          else
+            hdl_mode := 2;          (* handler to be executed in user mode *)
+
+        find_excep := found_it;
+        b_sloc_ptr^.last_ecb_ptr := 0;     (* clear last_ecb_ptr *)
+
+      end;  (* function find_excep *)
+
+
+
+
+    begin                               (* begin procedure excep_prolog
+                                           procedure entry code will do LINK *)
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('e Pexcep_prolog :');
+      (*$ENDC*)
+
+      terminate_f := 0;                   (* not to siganl terminate exception *)
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      c_exenvblk := b_sloc_ptr^.env_save_area;
+                                        (* copy environment form syslocal *)
+                                        (* and then put it in env block   *)
+      with c_exenvblk do
+        begin
+          a5 := b_sloc_ptr^.scb.a5value;
+          a7 := a7 + 4;                 (* adjust sp back to user's sp, since the
+                                           scheduler pushed pc on user stack first  *)
+          pc := user_pc;               (* get user pc from stack on top of link,*)
+        end;
+
+      pcb_ptr := pointer (c_pcb_ptr);
+      { intsoff (allints, pre_state); }
+      with pcb_ptr^ do
+        excep_pending := excep_pending - 1;
+      { intson (pre_state); }
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('  excep_pnding =', pcb_ptr^.excep_pending);
+      (*$ENDC*)
+
+      if find_excep then                (* found an exception to honor *)
+        begin
+            if (c_ecb_ptr^.ex_name = sys_terminate) and (pcb_ptr^.terming) then
+              terminate_f := 1;           (* to terminate when return from handler *)
+
+            setup_state (c_ecb_ptr, queued);
+                                        (* the state is changed to queued *)
+            launchdl (ord(@terminate_f) - 12,     (* new sp should be here,*)
+                                            (* 8 bytes for env_ptr and data_ptr*)
+                                            (* and 4 bytes for pc when entering
+                                               return_excep *)
+                      c_ecb_ptr^.hdl_adr,
+                      b_sloc_ptr^.adr_return_excep,
+                      hdl_mode);
+                                   (* launch exception handler, remove extra local
+                                      vars on stack, then call the handler, when
+                                      the handler returns, it will do trap to
+                                      get to return_excep *)
+
+        end
+      else                              (* no exception to be honored *)
+          retn_main;                    (* just return to user main line *)
+                        (* This case could happen after flush is called when there
+                           were some exceptions queued. So, it is not an error. *)
+    end;  (* procedure excep_prolog *)
+
+
+
+
+
+
+(*$I source/excepres.text *)            (* additional resident stuff *)
+
+
+
+(*$S excep_nr *)                   (* non-resident segment *)
+
+
+  function exmgrversion (* : integer *);
+    begin
+      exmgrversion := curversion;
+    end;  (* funtion exmgrversion *)
+
+
+(*$I source/excepnr1.text *)
+
+
+
+  end.
+
+
+
+ÿ

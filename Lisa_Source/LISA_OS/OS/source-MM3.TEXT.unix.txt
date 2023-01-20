@@ -1,0 +1,1080 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+(*  MM3   *)
+
+procedure RECORD_SEG_FAULT(c_sdb_ptr: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Record in the pcb and syslocal that a segment fault *)
+       (*    has occurred.                                       *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb_ptr - the segment faulted for.                *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    c_pcb: ptr_pcb;
+    c_syslocal_ptr: slocal_ptr;
+
+  begin
+    (* mark pcb as needing a segment *)
+    c_pcb:=pointer(c_pcb_ptr);
+    c_pcb^.need_mem := true;
+
+    (* save segment required in syslocal *)
+    c_syslocal_ptr:=pointer(b_syslocal_ptr);
+    with c_syslocal_ptr^ do
+      begin
+        csreq_addr:=ord(c_sdb_ptr);
+        if c_sdb_ptr^.sdbtype = code
+          then csreq_type:=0
+          else csreq_type:=1;
+      end;(*with*)
+  end;(*RECORD_SEG_FAULT*)
+
+
+
+procedure CHECK_DS(* c_sdb_ptr: sdb_ptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Checks that a data segment being bound is in memory *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb_ptr - the sdb of the required data segment    *)
+       (*                                                        *)
+       (**********************************************************)
+label 10;
+
+begin
+  with c_sdb_ptr^ do
+    begin
+      (*$IFC DEBUG2*)
+      if TRACE(mm,17) then writeln('data seg fault - sdb= ',ord(c_sdb_ptr));
+      (*$ENDC*)
+
+      while not sdbstate.memoryF or
+            (newlength <> 0) do
+        begin (* not in memory or size change required *)
+          if init_in_progress then
+            begin (* execute memmgr on startup's stack during initialization *)
+              INIT_SWAPIN(c_sdb_ptr);
+            end
+           else
+            begin (* execute memmgr process when not in initialization *)
+              RECORD_SEG_FAULT(c_sdb_ptr);
+              (* enter scheduler so memory manager can run *)
+              ENTER_SCHEDULER;
+              if c_sdb_ptr^.sdbstate.swaperrF then goto 10; (* take error exit *)
+            end;
+        end;(*while*)
+
+      (* in memory and no size change required *)
+      if sdbstate.overlayF
+        then SAVE_OC(c_sdb_ptr,c_pcb_ptr) (* save overlay *)
+        else ADDTO_SRB(c_sdb_ptr,c_pcb_ptr); (* make process referencer of seg*)
+
+10: (*error exit*)
+
+    end; (* with *)
+end; (* CHECK_DS *)
+
+
+
+function CHECK_CS(* seg_numb: int2; offset: int4): int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Uses the seg number and offset causing bus error to *)
+       (*    determine if a valid absence request has occurred.  *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    seg_numb = segment number faulted for               *)
+       (*    offset   = offset within segment faulted for        *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    This function returns:                              *)
+       (*         -1 -- The absence request is invalid           *)
+       (*               (true bus error)                         *)
+       (*          0 -- Return to user (segment now mapped)      *)
+       (*         +1 -- Enter scheduler (memory manager must run)*)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*    This procedure is called by bus error trap handler  *)
+       (*    and is thus executing on the supervisor's stack.  It*)
+       (*    must not do anything to cause a block of the process*)
+       (*    while still on the supervisor's stack.              *)
+       (*                                                        *)
+       (**********************************************************)
+
+  (*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 28 }
+             ev_segT: int1;             { seg type 1=private code }
+                                        {          2=data }
+                                        {          3=stack}
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_segno: int2;            { segment number }
+             ev_offset: int4;           { offset }
+           end;
+  (*$ENDC*)
+
+var
+  c_syslocal_ptr: slocal_ptr;
+  c_mrbt: mrbt_ptr;
+  c_sdb: sdb_ptr;
+  c_pcb: ptr_pcb;
+  d: integer;
+
+  (*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+  errnum: int2;
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG2*)
+  if TRACE(mm,99)
+    then writeln(' faulting for code seg ',seg_numb,' offset ',offset);
+  (*$ENDC*)
+
+  c_syslocal_ptr:=pointer(b_syslocal_ptr);
+  c_pcb:=pointer(c_pcb_ptr);
+  if c_pcb^.domain = 0
+    then c_mrbt:=pointer(s_mrbt_addr) (* in system code - use system's mrbt *)
+    else c_mrbt:=pointer(c_syslocal_ptr^.mrbt_addr); (* use process mrbt *)
+
+  if (seg_numb < codespacemmu) or
+     (seg_numb > lusercodemmu) or
+     ((c_pcb^.domain = 0) and (seg_numb > lsyscodemmu))
+    then check_cs:=-1 (* invalid segment number *)
+    else
+     begin
+       with c_syslocal_ptr^ do
+         if recordFaults then
+           if d <> 0 then initSegMap[seg_numb]:=true;
+
+       with c_mrbt^[seg_numb] do
+         begin
+           (* check the memory state of the segment *)
+           if sdbRP = 0
+             then check_cs:=-1 (* error condition- no segment defined by mrbt entry *)
+             else
+              begin (* segment is defined by mrbt entry *)
+                c_sdb:=pointer(sdbRP + b_sysglobal_ptr);
+                with c_sdb^ do
+                  begin
+                    (*$IFC DEBUG2*)
+                    if TRACE(mm,17) then writeln('code seg fault - sdb=',ord(c_sdb));
+                    (*$ENDC*)
+
+                    if offset >= length
+                      then check_cs:=-1 (* error - faulting beyond end of segment *)
+                      else
+                       begin
+                         (*$IFC DEBUG1*)
+                         if TRACE(spare2,9) then
+                           begin
+                             if LOGGING then
+                               begin
+                                 with c_event do
+                                   begin
+                                     ev_type:=28;
+                                     ev_segT:=ord(sdbtype);
+                                     ev_sdb:=c_sdb;
+                                     ev_segno:=seg_numb;
+                                     ev_offset:=offset;
+                                     LOG(errnum,ord(@c_event));
+                                   end;
+                               end;
+                           end;
+                         (*$ENDC*)
+                        if sdbstate.memoryF then
+                           begin (* segment is in memory *)
+                             (* check if segment is an overlay candidate *)
+                             if sdbstate.overlayF then SAVE_OC(c_sdb,c_pcb_ptr);(*P*)
+                             (* map the segment *)
+                             MAP_SEGMENT(c_sdb,seg_numb,c_pcb^.domain,access);
+
+                             if anyBPs then Set_BP (c_pcb^.glob_id);
+
+                             check_cs:=0;  (* return to user code *)
+                           end
+                          else
+                           begin (* segment is not in memory *)
+                             RECORD_SEG_FAULT(c_sdb);
+                             check_cs:=1;  (* enter_scheduler code *)
+                           end;
+                       end;
+                  end;(*with*)
+              end;
+         end;(*with*)
+     end;
+end; (*CHECK_CS *)
+
+
+
+function Check_Stack (* overflow_addr : absptr ) : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Function to determine whether a stack overflow fault    *)
+        (*   for the current process can be handled, and if so,      *)
+        (*   begin the expansion operation.  The amount the stack    *)
+        (*   should be expanded is determined and, if it can be      *)
+        (*   done, the SDB for the stack segment is set up for       *)
+        (*   memory manager to do the expansion.  If the size        *)
+        (*   needed exceeds the limit specified in the program       *)
+        (*   file, the stack will be expanded by an amount to allow  *)
+        (*   the process to be aborted (can always done).            *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   overflow_addr : the address in the stack segment that   *)
+        (*                   caused the bus error which signalled    *)
+        (*                   the stack expansion.  This address is   *)
+        (*                   used to determine how much the stack    *)
+        (*                   should be expanded.                     *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   Check_Stack : if false, the error should be reported    *)
+        (*                 to the user as a bus error (for           *)
+        (*                 debugging purposes).  Otherwise, normal   *)
+        (*                 stack overflow handling (continue or      *)
+        (*                 abort) should follow.                     *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This function can only be called from the bus error     *)
+        (*   handler executing on the Supervisor's stack.            *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+  const
+    extraPages = 2;                       { 1K additional space on each expansion }
+    abortPages = 6;                       { 3K space for aborting a process }
+
+  var
+    pcb_ptr : ptr_PCB;                    { ptr to PCB of faulting process }
+    sysloc_ptr : slocal_ptr;              { ptr to syslocal of faulting process }
+    mymrbt_ptr : mrbt_ptr;                { ptr to MRBT of faulting process }
+    stksdb_ptr : sdb_ptr;                 { ptr to sdb of stack for process }
+    needed_size : int4;                   { new min stk seg size needed (bytes) }
+    needed_pages : int2;                  { new min stk seg size needed (pages) }
+
+  begin
+    sysloc_ptr := pointer(b_syslocal_ptr);
+    mymrbt_ptr := pointer(sysloc_ptr^.mrbt_addr);
+    stksdb_ptr := pointer(mymrbt_ptr^[stackmmu].sdbRP + b_sysglobal_ptr);
+    pcb_ptr := pointer(c_pcb_ptr);
+    Check_Stack := false;
+
+    if pcb_ptr^.domain = 0 then
+      { no automatic stack expansion in system code }
+      System_Error (10197);
+
+    with stksdb_ptr^ do
+      begin
+        needed_size := MMU_Base (stackmmu+1) - overflow_addr;
+        needed_pages := (needed_size + mempgsize - 1) DIV mempgsize;
+
+        (*$IFC debug2 *)
+        if Trace (mm, 95) then
+          begin
+            writeln (' stack expansion: current size = ', length DIV mempgsize:1);
+            writeln ('                  required size = ', needed_pages:1);
+          end;
+        (*$ENDC *)
+
+        if (needed_pages > sysloc_ptr^.maxStk_pages) and not pcb_ptr^.terming then
+          begin  { start the process terminating }
+            (*$IFC debug2 *)
+            if Trace (mm, 95) then
+              writeln ('                  maximum allowed = ',
+                       sysloc_ptr^.maxStk_pages:1);
+            (*$ENDC *)
+            AbortProcess (pcb_ptr, true { allow term handler }, stk_overflow);
+            if lb_enabled then
+              { due to strange behavior of Exception Mgmt }
+              Clear_SoftInt (pcb_ptr, die)
+          end
+        else if needed_pages > maxpgmmu - abortPages then
+          begin  { abort the process }
+            (*$IFC debug2 *)
+            if Trace (mm, 95) then
+              writeln ('                  expanding by abortPages');
+            (*$ENDC *)
+            newlength := length DIV mempgsize + abortPages;
+            pcb_ptr^.need_mem := true;
+
+            AbortProcess (pcb_ptr, false, stk_overflow)
+          end
+        else
+          begin  { allow the expansion }
+            newlength := needed_pages;
+
+            if newlength + extraPages <= sysloc_ptr^.maxStk_pages then
+              { make it really worthwhile }
+              newlength := newlength + extraPages;
+
+            if not Data_Lockout (stksdb_ptr, true) then
+              begin
+                pcb_ptr^.need_mem := true;
+                Check_Stack := true
+              end
+            else
+              begin  { can't really do it }
+                newlength := 0;   { forget it }
+                AbortProcess (pcb_ptr, true, data_overflow);
+                if lb_enabled then
+                  { due to strange behavior of Exception Mgmt }
+                  Clear_SoftInt (pcb_ptr, die)
+              end
+          end { allow expansion };
+      end { with stksdb_ptr^ };
+
+    if not lb_enabled then Check_Stack := true
+  end { Check_Stack };
+
+
+
+procedure Size_Stack (* var errnum : int2;  delta_size : int4 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to ensure that at least delta_size stack      *)
+        (*   space exists from the current A7 to the end of the      *)
+        (*   stack segment so that automatic stack expansion won't   *)
+        (*   occur as long as the process stays within the           *)
+        (*   delta_size bounds.                                      *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   delta_size : the additional size (in bytes) required    *)
+        (*                from the curent A7 to the end of the       *)
+        (*                stack segment.                             *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this            *)
+        (*            privileged system call.                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is provided only through the privilged     *)
+        (*   system interface.  It is currently intended only to be  *)
+        (*   used by the Filer to prevent automatic stack expansion  *)
+        (*   while the boot volume is unmounted for certain Filer    *)
+        (*   operations.                                             *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   e_stktoobig - stack expansion would exceed maximum      *)
+        (*                 specified by user.                        *)
+        (*                                                           *)
+        (*   e_dataoverflow - stack expansion would cause a data     *)
+        (*                    lockout.                               *)
+        (*                                                           *)
+        (*   e_nostkdisk - insufficient disk space for stack         *)
+        (*                 expansion.                                *)
+        (*                                                           *)
+        (*************************************************************)
+
+  const
+    OSstackSize = 6144;                   { 6K any system calls later }
+
+  var
+    pcb_ptr : ptr_PCB;                    { ptr to PCB of calling process }
+    sysloc_ptr : slocal_ptr;              { ptr to syslocal of calling process }
+    mymrbt_ptr : mrbt_ptr;                { ptr to MRBT of calling process }
+    stksdb_ptr : sdb_ptr;                 { ptr to sdb of stack for process }
+    needed_size : int4;                   { stack seg size needed (bytes) }
+    needed_pages : int2;                  { stack seg size needed (pages) }
+    current_pages : int2;                 { current stack seg size (pages) }
+    stkfcb_ptr : sfcb_ptr;                { ptr to FCB for file behind stk seg }
+    delta_diskPages : int2;               { additional disk pages needed for stk }
+
+  begin
+    sysloc_ptr := pointer(b_syslocal_ptr);
+    mymrbt_ptr := pointer(sysloc_ptr^.mrbt_addr);
+    stksdb_ptr := pointer(mymrbt_ptr^[stackmmu].sdbRP + b_sysglobal_ptr);
+    pcb_ptr := pointer(c_pcb_ptr);
+    errnum := 0;
+
+    with stksdb_ptr^ do
+      begin
+        needed_size := MMU_Base (stackmmu+1) - ord(@pcb_ptr);
+        needed_size := needed_size + delta_size + OSstackSpace;
+        needed_pages := (needed_size + mempgsize - 1) DIV mempgsize;
+        current_pages := length DIV mempgsize;
+
+        (*$IFC debug2 *)
+        if Trace (mm, 95) then
+          begin
+            writeln ('   Size_Stack : delta_size = ', delta_size:1);
+            writeln ('                needed_pages = ', needed_pages:1,
+                     '     current_pages = ', current_pages:1)
+          end;
+        (*$ENDC *)
+
+        if needed_pages > sysloc_ptr^.maxStk_pages then
+          { not enough room to do the expansion }
+          errnum := e_mmbase + e_stktoobig
+        else if needed_pages > current_pages then
+          begin  { must expand the segment }
+            newlength := needed_pages;
+
+            if Data_Lockout (stksdb_ptr, true) then
+              begin  { can't do it }
+                newlength := 0;
+                errnum := e_mmbase + e_dataoverflow;
+                exit (Size_Stack)
+              end;
+
+            { make sure there's sufficient disk space }
+            if needed_pages > disclength DIV mempgsize then
+              begin  { get more disk space }
+                if discaddr.fid <> 0 then
+                  begin  { stack has disk space }
+                    stkfcb_ptr := pointer(discaddr.fid + b_sysglobal_ptr);
+                    delta_diskPages := needed_pages - (disclength DIV mempgsize);
+                    newlength := 0;   { in case process gets swapped out }
+                    AllocPages (errnum, stkfcb_ptr, delta_diskPages);
+                    if errnum = 0 then
+                      disclength := ord4(needed_pages) * hmempgsize * 2
+                    else
+                      begin
+                        errnum := e_mmbase + e_nostkdisk;
+                        exit (Size_Stack)
+                      end
+                  end { stack has disk space }
+              end { more disk space };
+
+            newlength := needed_pages;
+            pcb_ptr^.need_mem := true;
+            Enter_Scheduler   { let memory mgr do the expansion }
+          end { expand segment }
+      end { with stksdb_ptr^ }
+  end { Size_Stack };
+
+
+
+(*$s     kr_mmgr*)         {restore normal memory manager segmentation}
+procedure FLUSH_SEG(* var errnum: int2; c_sdb_ptr: sdb_ptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The segment defined by c_sdb_ptr will be written to *)
+       (*    disc if the segment is a data segment and present in*)
+       (*    memory.                                             *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    c_sdb_ptr is pointer to sdb defining the segment    *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success of the operation       *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful flush.                        *)
+       (*           <>0 Write error.                             *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  actual: int4;
+  bufaddr: absptr;
+  c_mmrb: mmrb_ptr;
+
+begin
+  errnum:=0;
+  c_mmrb:=pointer(mmrb_addr);
+  with c_sdb_ptr^, c_mmrb^ do
+    begin
+      (* if data segment and present in memory then write to disc *)
+      if sdbstate.memoryF then
+        begin
+          (*If this code is executing then memory mgr is not moving the *)
+          (*data segment so the freeze will always be successful.  This *)
+          (*will prevent memory mgr from moving it during the I/O.      *)
+          FREEZE_SEG(errnum,ord(c_sdb_ptr),0,ord(nil),bufaddr);
+          SEG_IO(errnum,writeop,discaddr,                                    (*P*)
+                        ord4(memaddr)*hmempgsize*2 + logrealmem,length);     (*P*)
+          UNFREEZE_SEG(ord(c_sdb_ptr));
+        end;
+    end; (* with c_sdb_ptr, c_mmrb*)
+end; (* FLUSH_SEG *)
+
+
+procedure ALT_DS_SIZE(var error: int2; c_sdb_ptr: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+label 10;
+
+  (*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 21 }
+             ev_segT: int1;             { seg type  }
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_length: int4;           { current seg length (bytes) }
+             ev_newlength: int2;        { newlength (pages) }
+           end;
+(*$ENDC*)
+
+var
+  oldmemaddr, holeAddr, delta_size: int2;
+  free_sdb: sdb_ptr;
+  old_addr, new_addr : absptr;
+  c_mmrb: mmrb_ptr;
+  errnum: int2;
+  GrowInFront: boolean;
+
+  (*$IFC DEBUG1*)
+  c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+begin
+  with c_sdb_ptr^ do
+    begin
+      (*$IFC DEBUG2*)
+      if TRACE(mm,20) then
+        begin
+          writeln('ALT_DS_SIZE for sdb_ptr = ',ord(c_sdb_ptr),
+                  ' size = ',memsize,' new size = ',newlength);
+        end;
+      (*$ENDC*)
+
+      (*$IFC DEBUG1*)
+      if TRACE(spare2,10) then
+        begin
+          if LOGGING then
+            begin
+              with c_event do
+                begin
+                  ev_type:=21;
+                  ev_segT:=ord(sdbtype);
+                  ev_sdb:=c_sdb_ptr;
+                  ev_length:=length;
+                  ev_newlength:=newlength;
+                  LOG(errnum,ord(@c_event));
+                end;
+            end;
+        end;
+      (*$ENDC*)
+
+      {
+      RECORDIT(56,ord(sdbtype),memaddr,memsize,ord(c_sdb_ptr));               (*P*)
+      }
+      error:=e_mmbase+e_nomem;
+      lockcount:=lockcount+1; (* ensure segment will not be swapped out *)
+      GrowInFront:=(sdbtype = DCode) or (sdbtype = stack);
+      delta_size:=newlength - memsize;
+      if delta_size > 0 then
+        begin  (* size expansion *)
+          CREATE_SPACE(delta_size); (* create free space *)
+          c_mmrb:=pointer(mmrb_addr);
+          if c_mmrb^.avail_space < delta_size then goto 10; (* not enough space *)
+
+          holeAddr:=memaddr;    (*hole at front of seg*)
+          if not GrowInFront
+            then holeAddr:=holeAddr+memsize; (*hole at end of seg*)
+          Clear_Space(holeAddr,delta_size,true);
+          if not Find_Free(delta_size,free_sdb) then goto 10;
+          Take_Free(free_sdb,true);
+          if free_sdb^.memsize > delta_size then
+            begin (* release excess *)
+              holeAddr:=free_sdb^.memaddr;   (*release front of free area*)
+              if not GrowInFront
+                then holeAddr:=holeAddr+delta_size;(*release end of free *)
+              Make_free(holeAddr,free_sdb^.memsize-delta_size);
+            end;
+          oldmemaddr:=memaddr; (*get its old location*)
+          If GrowInFront then memaddr:=memaddr-delta_size;(*adjust seg start*)
+        end
+       else
+        begin  (* size reduction *)
+          oldmemaddr:=memaddr; (*get its old location*)
+          (* release excess space *)
+          if GrowInFront then
+            begin
+              REMOVESDB(c_sdb_ptr); (*so linkage will remain consistent*)
+              MAKE_FREE(memaddr,-delta_size);
+              memaddr:=memaddr-delta_size;(*adjust seg start*)
+              INSERTSDB(c_sdb_ptr);
+            end
+           else MAKE_FREE(memaddr + newlength,-delta_size);
+        end;
+
+      (* update sdb *)
+      length:=ord4(newlength) * hmempgsize*2;
+      memsize:=newlength;
+      newlength:=0;
+
+      if sdbtype <> DCode
+        then REMAP_SEGMENT(c_sdb_ptr,oldmemaddr,memsize);{fix mapping all domains}
+      error:=0;
+
+      if (length > disclength) and ((sdbtype = stack) or (sdbtype = slocal)) then
+        Exp_SegDiskSize (c_sdb_ptr);
+      {
+      RECORDIT(57,ord(sdbtype),memaddr,memsize,ord(c_sdb_ptr));               (*P*)
+      }
+10: (* error exit *)
+
+      lockcount:=lockcount-1; (* count back to proper value *)
+    end; (* with *)
+end; (* ALT_DS_SIZE *)
+
+
+
+procedure MEMMGR;
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    this is the main loop of the memory manager process.*)
+       (*    It is used to swap in data segments which cannot be *)
+       (*    done on the requesting process's stack (i.e. stack, *)
+       (*    syslocal, and proclocal.  As long as these segments *)
+       (*    are being swapped in all other required data segs   *)
+       (*    are also swapped in.  An absent code segment which  *)
+       (*    has been faulted for will also be swapped in.       *)
+       (*                                                        *)
+       (**********************************************************)
+
+   label 20,30;
+
+   var
+     error: int2;
+     c_mmrb_ptr: mmrb_ptr;
+     c_sl_sdb_ptr: sdb_ptr;
+     i: int2;
+     aSeg_ptr_ds_refdb: ptr_ds_refdb;
+     aSeg_sdb_ptr, sl_sdb_ptr: sdb_ptr;
+     u_syslocal_ptr: slocal_ptr;
+     mm_mrbt_ptr, c_mrbt_ptr: mrbt_ptr;
+     mm_pcb_ptr: ptr_pcb;
+     daddr: addrdisc;
+     dummysdb: sdb_ptr;
+
+   procedure EXP_SYSGLOBAL;
+     (* this procedure will expand the sysglobal area.  The segment immediately *)
+     (* following sysglobal will be tossed from memory.  A maximum of 2 memory  *)
+     (* pages will added to sysglobal each expansion request.                   *)
+
+     var
+       sg_sdb: sdb_ptr;
+       offset1, poolsize, size: int2;
+       base: absptr;
+
+     begin
+       sg_sdb:=pointer(sdb_sysglobal);
+       base:=MMU_BASE(sysglobmmu);
+       size:=c_mmrb_ptr^.inc_sysglobal;(* size in pages *)
+       offset1:=(b_sysglobal_ptr - base) div mempgsize;
+       with sg_sdb^ do
+         begin
+           poolsize:=memsize - offset1 + size; (* current size of pool *)
+           if poolsize < 64 then
+             begin (* room to grow *)
+               if poolsize+6 < 64 then size:=size+6;
+               newlength:=memsize+size;
+               base:=base+ord4(memsize)*hmempgsize*2;
+               ALT_DS_SIZE(error,sg_sdb); (* expand it *)
+               if error = 0 then
+                 begin
+                   NEWSPACE(base,size*hmempgsize*2,b_sysglobal_ptr);
+                   with c_mmrb_ptr^
+                     do sys_swap_space:=sys_swap_space-size*hmempgsize*2;
+                 end;
+             end;
+         end;(*with*)
+       grow_sysglobal:=false;
+       c_mmrb_ptr^.inc_sysglobal:=0;
+
+     end;(*EXP_SYSGLOBAL*)
+
+   procedure SWAPIN_SEG(var error: int2);
+      (* insures the segment defined by aSeg_sdb_ptr is in memory and not an *)
+      (* overlay candidate.                                                  *)
+
+      begin
+        error:=0;
+        with aSeg_sdb_ptr^ do
+          begin
+            if sdbstate.memoryF then
+              begin (* already in memory *)
+                if sdbstate.overlayF
+                  then SAVE_OC(aSeg_sdb_ptr,ord(c_mmrb_ptr^.req_pcb_ptr));
+                if sdbtype <> code
+                  then if newlength <> 0 then ALT_DS_SIZE(error,aSeg_sdb_ptr);
+              end
+             else
+              begin  { not in memory }
+                GET_SEG(error,aSeg_sdb_ptr);
+                {
+                RECORDIT(55,15,0,ord(c_mmrb_ptr^.req_pcb_ptr),ord(aSeg_sdb_ptr));(*P*)
+                }
+              end { not in memory }
+          end; (* with *)
+
+        (*$IFC DEBUG2*)
+        if TRACE(mm,0)
+          then if error > 0
+                 then writeln(' memory manager swap error - errnum = ',error);
+        (*$ENDC*)
+
+      end; (* SWAPIN_SEG *)
+
+
+   procedure Check_CodeSwap (var error : int2);
+     { procedure to verify that a code segment has been successfully swapped in
+       and report any abnormal results.  If a code swap error has, in fact,
+       occurred, the process is aborted. }
+    var
+      checkByte : ^int1;                    { 1st byte of seg in mem for checking }
+
+     begin
+       { check for system segment swap failure? }
+       checkByte := pointer(logrealmem + ord4(aSeg_sdb_ptr^.memaddr)*hmempgsize*2);
+
+       if (error > 0) or (checkByte^ <> -123 { $85 }) then
+         begin  { recover from the code swap error }
+           with c_mmrb_ptr^ do
+             if req_pcb_ptr^.domain = 0
+               then SYSTEM_ERROR(10599) (*error trying to swap in OS*)
+               else AbortProcess (req_pcb_ptr, true, swap_error);
+
+           if error = 0 then Toss_Seg (error, aSeg_sdb_ptr, false)
+
+           (*$IFC debug2 *)
+           CodeSwapError (aSeg_sdb_ptr, error, c_mrbt_ptr)
+           (*$ENDC *)
+         end { recover from swap error }
+     end { Check_CodeSwap };
+
+
+   procedure SET_LDSN(c_sdb: sdb_ptr; ldsnMMU: int2; c_access: int1);
+     (* bind the segment to the specified ldsn with the specified access *)
+     begin
+       with mm_mrbt_ptr^[ldsnMMU] do
+         begin
+           access:=c_access;
+           if c_sdb = nil then sdbRP := 0
+             else sdbRP := ord(c_sdb) - b_sysglobal_ptr;
+         end;
+       MAP_SEGMENT(c_sdb,ldsnMMU,mm_pcb_ptr^.domain,c_access);
+       if c_sdb <> nil then c_sdb^.lockcount:=c_sdb^.lockcount+1;
+     end;(*SET_LDSN*)
+
+
+  procedure PreloadCode;
+    (*try to preload the code segments used by the process*)
+
+    var
+      lindex, hindex, i, j: integer;
+      error, totlength: integer;
+      sdbtab: array[0..127] of sdb_ptr;
+      disctab: array[0..127] of int4;
+      temp: int4;
+      c_sdb, temp2: sdb_ptr;
+      fcbptr: sfcb_ptr;
+
+    begin
+      lindex:=-1;
+      hindex:=128;
+      totlength:=1; (*the 1 extra page needed for I/O*)
+      i:= codespacemmu;
+
+      with u_syslocal_ptr^ do
+        repeat
+          if initSegmap[i] then
+            if c_mrbt_ptr^[i].sdbRP <> 0 then
+              begin
+                c_sdb:=pointer(c_mrbt_ptr^[i].sdbRP + b_sysglobal_ptr);
+                with c_sdb^ do
+                  if sdbtype = code then
+                    begin
+                      if sdbstate.memoryF then
+                        begin (*seg already in memory*)
+                          lockcount:=lockcount+1;
+                          hindex:=hindex-1;
+                          sdbtab[hindex]:=c_sdb; (*record for unlock later*)
+                        end
+                       else
+                        begin (*seg needs to be fetched*)
+                          lindex:=lindex+1;
+                          sdbtab[lindex]:=c_sdb; (*record for prefetch*)
+                          totlength:=totlength+(length+mempgsize-1) div mempgsize;
+                          fcbptr:=pointer(discaddr.fid + b_sysglobal_ptr);
+                          disctab[lindex]:=fcbptr^.sent.fileaddr + discaddr.offset;
+                        end;
+                    end;(*with c_sdb*)
+              end;
+          i:=i+1;
+        until i > lusercodemmu;
+      (* sdbtab has been constructed and all segs already in memory locked down*)
+      if totlength > 1 then
+        begin
+          (*use the dummy sdb to create a free region as large as totlength*)
+          with dummysdb^ do
+            begin
+              length:=0;
+              newlength:=totlength;
+              sdbstate.memoryF:=false;
+            end;
+          aSeg_sdb_ptr:=dummysdb;
+          SWAPIN_SEG(error);
+          if error <= 0 then
+            begin (*got the space*)
+              TOSS_SEG(error,aSeg_sdb_ptr,false);
+              (*sort segments to be preloaded by disc address*)
+              for i:=0 to lindex-1 do
+                for j:=i+1 to lindex do
+                  if disctab[j] < disctab[i] then
+                    begin
+                      temp2:=sdbtab[i];
+                      sdbtab[i]:=sdbtab[j];
+                      sdbtab[j]:=temp2;
+                      temp:=disctab[i];
+                      disctab[i]:=disctab[j];
+                      disctab[j]:=temp;
+                    end;
+              (*segs are now sorted in disc address order - swap them in*)
+              i:=0;
+              repeat
+                aSeg_sdb_ptr:=sdbtab[i];
+                SWAPIN_SEG(error);
+                i:=i+1;
+              until i > lindex;
+            end;
+        end;
+      (*unlock segments that were locked at start of preload*)
+      i:=hindex;
+      while i < 128 do
+        begin
+          with sdbtab[i]^ do lockcount:=lockcount-1;
+          i:=i+1;
+        end;
+    end;(*PreloadCode*)
+
+
+
+begin
+  c_mmrb_ptr:=pointer(mmrb_addr);
+  u_syslocal_ptr:=pointer(b_syslocal_ptr);
+  mm_mrbt_ptr:=pointer(u_syslocal_ptr^.mrbt_addr);
+  mm_pcb_ptr:=pointer(c_pcb_ptr);
+
+  (*build dummy sdb for preloading code segments*)
+  with daddr do
+    begin
+      fid:=0;
+      offset:=0;
+    end;
+  BLD_SEG(data,0,0,daddr,0,0,dummysdb);
+
+  while true do (* forever *)
+    begin
+      (* wait for a signal on the memory manager process semaphore *)
+      with c_mmrb_ptr^ do
+        begin
+          memmgr_busyF:=false;
+          req_pcb_ptr:=nil;
+
+          (*$IFC DEBUG2*)
+          if TRACE(mm,0) then writeln(' memory manager blocking ');
+          (*$ENDC*)
+
+          WAIT_SEM(memmgr_sem,[]); (*Wait till something to do*)
+          memmgr_busyF:=true;
+        end;(*with*)
+
+      (* semaphore has been signaled and we are the memory manager*)
+
+      if grow_sysglobal
+        then EXP_SYSGLOBAL  (* sysglobal needs expansion *)
+        else
+         begin              (* a process needs service *)
+           if c_mmrb_ptr^.req_pcb_ptr <> nil then
+             begin          (* valid request *)
+               (* get user's syslocal data segment and map it *)
+               (* into LDSN 1 of the memory manager process   *)
+               aSeg_sdb_ptr:=pointer(c_mmrb_ptr^.req_pcb_ptr^.slocal_sdbRP
+                                                               +b_sysglobal_ptr);
+               sl_sdb_ptr:=aSeg_sdb_ptr;
+               SWAPIN_SEG(error);
+               if error > 0 then
+                 begin (* swap in failed *)
+                   if error = 901 then
+                     { couldn't allocate pages for a syslocal expansion }
+                     AbortProcess (c_mmrb_ptr^.req_pcb_ptr, true, swap_error)
+                   else if error <> 550 then
+                     { take system down due to a syslocal swap-in error }
+                     RemoveProcess(c_mmrb_ptr^.req_pcb_ptr);
+                   goto 30; (* take error exit *)
+                 end;
+               SET_LDSN(sl_sdb_ptr,ldsn1mmu,mmureadwrite);
+
+               u_syslocal_ptr:=pointer(MMU_BASE(ldsn1mmu));
+               with u_syslocal_ptr^ do
+                 begin
+                   c_mrbt_ptr:=pointer(ord(u_syslocal_ptr)+mrbt_addr
+                                                      -MMU_BASE(syslocmmu));
+
+                   (*$IFC debug1 *)
+                   if Trace (spare3, 90) then
+                     begin  { do memory display }
+                       if mm_mrbt_ptr^[maxsysldsnmmu].sdbRP = 0 then
+                         begin  { get IUDirectory in and mapped }
+                           aSeg_sdb_ptr := pointer(IUDsdb_ptr);
+                           SwapIn_Seg (error);
+                           if error > 0 then
+                             begin
+                               writeln ('***** Error swapping IUDir = ', error:1);
+                               goto 20
+                             end;
+                           Set_LDSN (aSeg_sdb_ptr, maxsysldsnmmu, mmureadwrite)
+                         end { map IUDirectory };
+
+                       MemoryContents (c_mrbt_ptr)
+                     end
+                   else if mm_mrbt_ptr^[maxsysldsnmmu].sdbRP <> 0 then
+                     begin  { free up the IUDirectory }
+                       aSeg_sdb_ptr := pointer(IUDsdb_ptr);
+                       with aSeg_sdb_ptr^ do
+                         lockcount := lockcount - 1;
+                       Set_LDSN (nil, maxsysldsnmmu, mmuabsent)
+                     end;
+                   (*$ENDC *)
+
+                   { lock data space to prevent thrashing during mem scheduling }
+                   for i := minsysldsnmmu to shrsegmmu do
+                     if c_mrbt_ptr^[i].sdbRP <> 0 then
+                       begin  { a segment is mapped }
+                         aSeg_sdb_ptr:=pointer(c_mrbt_ptr^[i].sdbRP
+                                                           + b_sysglobal_ptr);
+                         if aSeg_sdb_ptr^.sdbtype <> code then
+                           with aSeg_sdb_ptr^ do
+                             lockcount := lockcount + 1
+                       end;
+
+                   (* check each data segment mrbt entry and *)
+                   (* swap in any absent data segment *)
+                   for i:=minsysldsnmmu to shrsegmmu do
+                     begin
+                       if c_mrbt_ptr^[i].sdbRP <> 0 then
+                         begin (* a segment is mapped *)
+                           aSeg_sdb_ptr:=pointer(c_mrbt_ptr^[i].sdbRP
+                                                             + b_sysglobal_ptr);
+                           if aSeg_sdb_ptr^.sdbtype <> code then
+                             begin
+                               SWAPIN_SEG(error);
+                               if error > 0 then
+                                 begin (* swap in of seg failed *)
+                                   if error <> 550 then
+                                     begin (* error not due to nomem state *)
+                                       (* force system down if seg is stack *)
+                                       if (i = stackmmu) and (error <> 901) then
+                                         { fatal error swapping in a stack }
+                                         RemoveProcess(c_mmrb_ptr^.req_pcb_ptr)
+                                       else
+                                         begin (* data seg error *)
+                                           ABORTPROCESS(c_mmrb_ptr^.req_pcb_ptr,
+                                                         true,swap_error);
+                                           with aSeg_sdb_ptr^ do
+                                             begin
+                                               sdbstate.swaperrF:=true;
+                                               lockcount:=lockcount-1;
+                                             end;
+                                           if (i <> stackmmu) and (error <> 901) then
+                                             c_mrbt_ptr^[i].sdbRP:=0;
+                                         end (* data seg error *)
+                                     end (* not a nomem *);
+                                   goto 20; (* take error exit *)
+                                 end (* swap in failed *);
+                             end;
+                         end;
+                     end; (*for*)
+
+                   (* check if code segments should be preloaded*)
+                   if not preLoaded then
+                     begin
+                       preLoaded:=true;
+                       if Trace (pm, 99) then PreLoadCode;
+                     end;
+
+                   (* check if an absent segment has been faulted for *)
+                   if csreq_addr <> ord(nil) then
+                     begin  (* a segment is needed *)
+                       aSeg_sdb_ptr:=pointer(csreq_addr);
+                       SWAPIN_SEG(error);
+                       csreq_addr:=ord(nil);
+
+                       if error <> 550 then
+                         begin (* swap in did not result in nomem state *)
+                           if aSeg_sdb_ptr^.sdbtype = code
+                             then Check_CodeSwap (error)
+                             else if error > 0
+                                    then aSeg_sdb_ptr^.sdbstate.swaperrF:=true;
+                         end;
+                       error := 0;
+                     end;
+
+                 end; (* with *)
+
+               (* the process is ready for execution *)
+
+20:  (* error exit when ldsn1 has user's syslocal bound *)
+
+               { unlock data space since memory scheduling is now done }
+               for i := minsysldsnmmu to shrsegmmu do
+                 if c_mrbt_ptr^[i].sdbRP <> 0 then
+                   begin  { a segment is mapped }
+                     aSeg_sdb_ptr:=pointer(c_mrbt_ptr^[i].sdbRP
+                                                       + b_sysglobal_ptr);
+                     if aSeg_sdb_ptr^.sdbtype <> code then
+                       with aSeg_sdb_ptr^ do
+                         lockcount := lockcount - 1
+                   end;
+
+               sl_sdb_ptr^.lockcount:=sl_sdb_ptr^.lockcount-1;
+               SET_LDSN(nil,ldsn1mmu,mmuabsent); (* unmap user's syslocal segment *)
+
+30:  (* error exit when ldsn1 does not have user's syslocal bound *)
+             end;
+         end;
+      if grow_sysglobal then EXP_SYSGLOBAL;  (* sysglobal needs expansion *)
+    end; (* while-forever *)
+end; (* MEMMGR *)
+
+
+ÿ

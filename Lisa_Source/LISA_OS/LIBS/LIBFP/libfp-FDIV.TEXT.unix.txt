@@ -1,0 +1,548 @@
+         .title 'FDIV (1.8) SUBROUTINE  - 6/17/81 - 14:29:56 - 2.3'
+         PAGE
+         .proc  mc%FDIV   ; 0,0
+         .def   mc%div_opt
+         .ref   mc%vld_long
+;
+;************************************************************************
+;
+;       revision      date        description
+;       --------      ----        -----------
+;         1.1        6.oct.80      original
+;
+;         1.2        9.oct.80      removed stack frame references
+;                                  optimized sign-exponent calc
+;
+;         1.3        6.jan.81      chg FPRB pointer from reg a6 to reg a3;
+;                                  chg to return unrounded result in d0-d2
+;                                  with g-r-s bits in d3 (caller must round);
+;                                  chg 'masquerade zero' test.
+;
+;         1.4       13.jan.81      modified for EXORMACS download
+;
+;         1.5       29.jan.81      ***  MICROSYSTEMS RELEASE  ***
+;                                  inserted call to 'valid' at very end
+;
+;         1.6       13.feb.81      permanently converted to resident asm form
+;
+;         1.7        1.apr.81      added 'mc%div_opt' entry point
+;
+;         1.8       23.apr.81      added exception bit table
+;
+;       Hough       18 Jan 83      Reorganized so div_main uses full 32 bit exponent.
+;                                  mc%fdiv entry will call mc%vld_long.
+;************************************************************************
+;
+;               mc%fdiv  -  68k floating point divide routine
+;
+;
+;       This subroutine has two entry points to allow the caller to
+;       divide either with or without rounding.
+;
+;       The two entry points are:
+;
+;          mc%fdiv      - After the quotient is calculated, 'VALID' subroutine
+;                      is called to round the result and check for OVF or UNF.
+;
+;          mc%div_opt  - The unrounded quotient is returned without any checks
+;                      for OVF or UNF.
+;
+;
+;
+;       enter with:    d0-d2    contains source_argument
+;       ==========              (does not need to be properly typed).
+;
+;                      d3       cleared  (these will be g-rnd-stiky bits)
+;
+;                      a3       points to fp register block (FPRB)
+;
+;                      a2       points to destination_FP_reg in FPRB
+;                               containing destination_argument
+;
+ PAGE
+;
+;
+;
+;             31              15              0
+;             |---------------|---------------|
+;        d0   | s |   |  tag  |  exponent     | <--+
+;             |---------------!---------------|    |
+;        d1   | mantissa MSW  | mantissa NMSW |    |-  source_argument
+;             |---------------|---------------|    |
+;        d2   | mantissa NLSW | mantissa LSW  | <--+
+;             |---------------|---------------|
+;        d3   |           $00000000           |
+;             |---------------|---------------|
+;
+;
+;
+;
+;             31              15              0
+;             |               |               |   lo memory
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;      a2 --> | s |   |  tag  |   exponent    | <--+
+;             |---------------|---------------|    |
+;             | mantissa MSW  | mantissa NMSW |    |- destination_FP_reg
+;             |---------------|---------------|    |
+;             | mantissa NLSW | mantissa LSW  | <--+
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;             |               |               |   hi memory
+;
+;
+;
+;
+;
+;
+;
+;
+;       exit with:     d0-d3    If (entry point = mc%fdiv) then
+;       =========                  Contains rounded result in reg. d0-d2
+;                                  written over source argument; reg. d3
+;                                  cleared by valid.  (result is not typed,
+;                                  tag field is trash).
+;                               Else  (entry point = mc%div_opt)
+;                                  Contains unrounded result in reg. d0-d2;
+;                                  reg. d3 contains g-r-s bits.  No OVF or
+;                                  UNF checking is performed.  (result is
+;                                  not typed, tag field is trash).
+;                               Endif
+;
+;                      a0       destroyed
+;
+;                      d4-d7    destroyed
+;
+;                      a1-a7    unchanged
+;
+;
+;
+;       Subroutines Called:   Valid
+;       ==================
+;
+;
+;***********************  F L A G S   ******************************
+;
+;  This procedure is called by: decbin (mc%fdiv)
+;                               bindec (mc%div_opt)
+;
+;
+;  Exception    Set by     Reason
+;  =========    ======     ======
+;
+;  rsvx         ---        Not affected by this routine
+;
+;  iovf         ---        Not affected by this routine
+;
+;  inex         Valid %    Result can not be exactly represented
+;                          using the current rounding precision.
+;
+;  dz           ---        Not affected by this routine
+;
+;  unfl         Valid %    Result too small for internal extended
+;                          precision.
+;
+;  ovfl         Valid %    Result too large for internal extended
+;                          precision.
+;
+;  iop          ---        Not affected by this routine
+;
+;  % - These exception bits can be set ONLY when the mc%fdiv entry point used.
+;
+;
+;
+;******************************************************************************
+  PAGE
+;
+;
+;
+;
+;******************************************************************************
+;
+;
+;               OVERVIEW  OF  PROCEDURE  FOR  mc%fdiv
+;               -----------------------------------
+;
+;       Divides destination_arg by source_arg.  Figuratively this is:
+;
+;                          Dividend        FP_reg        Destination_Arg
+;            Quotient  =   --------   =   --------   =   ---------------
+;                           Divisor         <ea>           Source_Arg
+;
+;       As shoown above, the FP_reg operand is always the Dividend and the <ea>
+;       operand is always the Divisor.  mc%fdiv will be called only in those
+;       cases where the Divisor is a normalized number and the Dividend is an
+;       unnormalized or normalized number as shown below.
+;
+;                          Destination_Arg        Norm. #          Unnorm. #
+;            Quotient  =   ---------------   =   ---------   or   -----------
+;                            Source_Arg           Norm. #           Norm. #
+;
+;       The Quotient's mantissa, therefore, will always be of the form
+;       (1.xx...xx) or (0.xx...xx).
+;
+;
+;
+;       SIGN
+;       ----
+;          The sign of the result = (sign source_arg)  EOR  (sign destin_arg)
+;
+;       EXPONENT
+;       --------
+;          The result exponent = (exponent destin_arg) - (exponent source_arg)
+;
+;       MANTISSA
+;       --------
+;          The result mantissa is formed by dividing (destin_arg mantissa) by
+;          (source_arg mantissa) using a modified non-restoring binary division.
+;
+;          mc%fdiv calculates the quotient's mantissa bits beginning with
+;          the MSB and proceeds toward the LSB.  The number of bits
+;          calculated will depend upon the rounding mode in effect and
+;          whether the quotient is exact, i.e. no remainder.  Since only
+;          one guard bit, one round bit, and one stiky bit need be calc-
+;          ulated to insure a correctly rounded result, the maximum
+;          number of bits calculated for a given rounding mode is:
+;
+ PAGE
+;
+;           Rounding mode          Maximum Number of Bits Calculated
+;          ---------------        -----------------------------------
+;
+;             Single                         26 + 1 stiky
+;
+;             Double                         56 + 1 stikky
+;
+;            Extended                        66 + 1 stiky
+;
+;          If the remainder becomes zero before the maximum number of
+;          quotient bits has been calculated, the quotient is exact
+;          and all subsequent bits would be zero; therefore, mc%fdiv will
+;          terminate quotient bit generation once an exact result is
+;          detected.
+;
+;******************************************************************************
+;
+;       ALGORITHM FOR mc%fdiv
+;
+;       Calculate result sign and exponent in reg. D0.
+;
+;       Save result sign and exponent in reg. A0.
+;
+;       Load reg. D4 with the maximum number of quotient bits needed
+;       for the rounding mode in effect minus one. (BITCNT)
+;
+;       Move dividend mantissa from the destination_FP_reg to regs. D6 and D7
+;
+;       The FP_reg which originally contained the dividend, pointed to
+;       by reg. A2 will be used to accumulate the quotient bits as they
+;       are generated.  Clear this FP_reg.
+;
+;       Each quotient bit which is to become a '1' will be set in the
+;       FP_reg using a BSET instruction utilizing a data reg to indicate
+;       which byte in the FP_reg contains the quotient bit currently
+;       being generated and another data reg to indicate which bit in this
+;       byte .
+;       Initialize reg. D0 (SETBIT) to 7.
+;       Initialize reg. D3 (WHATBYTE) to 0. (Note: reg D3 was cleared by caller)
+;
+;       The dividend will be considered to be 129 bits wide while the
+;       divisor is only 128 bits wide.  The MSB of the 129 bit dividend,
+;       (VBIT) will be kept in reg. D4.
+;       Initialize reg. D4 (VBIT) to 0.
+;
+ PAGE
+;
+;       The following figures illustrate these register assignments:
+;
+;       DATA REGISTER USAGES FOR mc%fdiv
+;       ==============================
+;
+;             31              15      7       0
+;             |---------------|-------|-------|
+;        d0   |               |       |   7   |  SETBIT
+;             |---------------!-------|-------|
+;        d1   |     MSW            NMSW       | <-+
+;             |---------------|---------------|   |- DIVISOR MANTISSA
+;        d2   |     NLSW            LSW       | <-+
+;             |---------------|-------|-------|
+;        d3   |               |       |   0   |  WHATBYTE
+;             |---------------|-------|-------|
+;        d4   |               |       |   *   |  BITCNT (* = 26, 56, or 66)
+;             |---------------|-------|-------|
+;        d5   |               |       |   0   |  VBIT
+;             |---------------|---------------|
+;        d6   |     MSW            NMSW       | <-+
+;             |---------------|---------------|   |- DIVIDEND MANTISSA
+;        d7   |     NLSW            LSW       | <-+
+;             |---------------|---------------|
+;
+;
+;       ADDRESS REGISTER USAGES FOR mc%fdiv
+;       =================================
+;
+;             31              15              0
+;             |---------------|---------------|
+;        a0   | s |   |  tag  |     exp       |  Saved result s-tag-exp
+;             |---------------|---------------|
+;        a1   |                               |
+;             |---------------|---------------|
+;        a2   |       pointer to FP_reg       |  Pointer to Quotient Mantissa
+;             |---------------|---------------|
+;
+;
+;             31              15              0
+;             |               |               |   lo memory
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;      a2 --> |   0   |   0   |   0   |   0   | <--+
+;             |---------------|---------------|    |       FP_reg
+;             |   0   |   0   |   0   |   0   |    |- QUOTIENT MANTISSA
+;             |---------------|---------------|    |     ACCUMULATOR
+;             |   0   |   0   |   0   |   0   | <--+
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;             |               |               |   hi memory
+;
+ PAGE
+;       Successively calculate quotient bits starting with MSB as follows:
+;
+;       REPEAT
+;          IF  (VBIT) = 0  THEN
+;             IF  (DIVISOR) = (DIVIDEND)  THEN
+;                Set the q-bit currently pointed to by WHATBYTE and SETBIT
+;                Remainder would be 0 so quotient is now exact.
+;                Go to *ADJUST*
+;             ENDIF
+;
+;             BCS  *SHIFT*          Carry is set if Divisor > Dividend
+;
+;          ENDIF
+;
+;             Set the q-bit currently pointed to by WHATBYTE and SETBIT
+;
+;          *SHIFT*
+;
+;             Shift Dividend left by one bit.
+;
+;             If there is a carry out of dividend, set VBIT
+;
+;             Decrement SETBIT
+;
+;             BNE  *NEXT*
+;
+;             Increment 'WHATBYTE' and reset 'SETBIT' to 7.
+;
+;           *NEXT*
+;
+;             Decrement 'BITCNT'
+;
+;       UNTIL (BITCNT) = 0
+;
+;       IF  (DIVIDEND) <> 0  THEN
+;          Set the q-bit currently pointed to by 'WHATBYTE' and 'SETBIT'.
+;          This is the stiky bit.
+;       ENDIF
+;
+;       *ADJUST*
+;
+;       Move Result s-tag-exp back into reg. D0 from reg. A0.
+;
+;       Move Quotient Mantissa into regs. D1, D2, and D3 from the FP_reg.
+;
+;       IF  (MSB of QUOTIENT MANTISSA) = 0  THEN
+;          Normalize mantissa one bit to the left by shifting
+;          mantissa left by one and decrementing exponent.
+;       ENDIF
+;
+;       IFTST  (unrounded result in d0-d2 looks like normal zero)
+;          Shift mantissa one bit to the left and decrement exponent.
+;          This will force an UNF in 'valid'.
+;       ENDIF
+;
+;       Call valid to check for ovf - unf and to round the result.
+;
+;       return
+;
+;******************************************************************************
+;
+;
+;
+;                     ***********************
+;                     *  mc%fdiv STARTS HERE  *
+;                     ***********************
+;
+;
+;
+        debugbegin
+        bsr.s   div_main
+        jmp     mc%vld_long              ; Validate.
+        debugend 'MC%FDIV',1
+
+;******************************************************************************
+;
+;      TABLE OF MAXIMUM NUMBER OF Q-BITS NEEDED FOR EACH RNDING PREC
+;
+MAXQBITS   EQU   *
+;
+QBIT_EXT   .byte 66              ; MAX NBR OF Q-BITS FOR ROUND TO EXTENDED
+QBIT_SGL   .byte 26              ; MAX NBR OF Q-BITS FOR ROUND TO SINGLE
+QBIT_DBL   .byte 56              ; MAX NBR OF Q-BITS FOR ROUND TO DOUBLE
+           .byte 0               ; PAD TABLE TO EVEN NUMBER OF BYTES
+;
+;******************************************************************************
+;
+;
+
+mc%div_opt
+DIV_MAIN 
+ 
+        debugbegin
+        move.l  d0,d4                   ; D4 gets sign/exponent of ea.
+        move.l  (a2),d5                 ; D5 gets sign/exponent of fpn.
+        eor.l   d5,d4                   ; D4 gets sign of result.
+        andi.l  #$80000000,d4           ; Clear all other bits.
+        move.l  d4,-(sp)                ; Save sign of result on stack.
+;
+;      Calculate result exponent.
+;
+        ext.l   d5                      ; D5 gets 32 bit exponent of fpn.
+        ext.l   d0                      ; 32 bit exponent for ea.
+        sub.l   d0,d5                   ; D5 gets exponent of result.
+        MOVE.L   D5,A0                    ; SAVE RESULT EXP IN REG A0
+        MOVEM.L  4(A2),D6/D7            ; MOVE dividend mtissa into regs d6
+                                        ; and d7
+;
+        MOVE.L   D3,D4                    ; D3 WAS CLEARED BY FRT-END,CLEAR D4
+;                                           (note that d3 will be 'WHATBYTE')
+        MOVE.L   D3,D5                    ; CLEAR D5 (THIS INITS 'VBIT' AS WELL)
+        MOVEM.L  D3/D4/D5,(A2)            ; CLEAR FP_REG TO BE USED AS QUOTIENT
+;                                           accumulator.
+        MOVE.B   MODE(A3),D4              ; GET CURRENT MODE BYTE FROM FPRB
+        ANDI.B   #MDPREC_B,D4             ; MASK OFF ROUNDING PRECISION
+        LSR.B    #4,D4                    ; SHIFT ROUNDING PREC. BITS TO BE LSB'
+;
+;       @@@@@@******************************************************
+;       *                                                          *
+;       *  68kas screws up the following instruction when run with *
+;       *  an 'ORG' instead of a 'RORG'.  Patch the 'LX' file to   *
+;       *  be $183B40DE and upload to the 'KDM' using the '-C'     *
+;       *  option in Macsbug's 'Read' command since the patch will *
+;       *  screw-up the checksum.                                  *
+;       *                                                          *
+;       ************************************************************
+;
+        MOVE.B   MAXQBITS(D4.W),D4           ; *: CONVERT TO (PC,D4.W)
+;                                           get 'BITCNT' from constant table
+;
+        moveq    #7,D0                    ; INITIALIZE 'SETBIT' TO '7'
+;
+;
+;      The various registers are now configured as described in the algorithm
+;      above.  Register A2 points to the FP_reg to be used as the quotient
+;      mantissa accumulator,(QMA).  Register D3, 'WHATBYTE', is an index
+;      to the QMA byte which contains the next quotient bit.  Register D0,
+;      'SETBIT', is an index to the next quotient bit in the QMA byte
+;      pointed at by (WHATBYTE)A2.  Register D4 contains the maximum number
+;      of quotient bits needed to get a correctly rounded result, 'BITCNT'.
+;      All quotient bits in the QMA are currently '0'.
+;
+;
+;       REPEAT
+rpt
+           TST.B    D5
+           bne @2                              ; IF 'VBIT' = 0 THEN
+              cmp.l d1,d6
+              bne   @1
+                 cmp.l d2,d7                   ; IF DIVISOR = DIVIDEND THEN
+                 bne   @1
+                    BSET     D0,0(A2,D3)           ; RESULT IS EXACT, SET
+                    BRA      DIVADJ                ; THIS Q-BIT AND QUIT
+@1                                             ; ENDIF
+;
+              BCS DIVSHIFT                      ; TAKES BRANCH IFF DIVSR > DIVND
+;
+@2                                         ; ENDIF
+;
+;         Get here only when Divisor less than Dividend.  This can
+;         occur either because 'VBIT' is set or because Divisor was
+;         less than Dividend in the above unsigned compare.  Set
+;         the q-bit currently pointed to and subtract Divisor from
+;         Dividend.  Note that 'VBIT' is not involved in this subtrac-
+;         tion since the algorithm insures that when 'VBIT' is set,
+;         it will always be 'borrowed' in the subtraction.
+;
+           BSET     D0,0(A2,D3)              ; SET THIS Q-BIT
+           SUB.L    D2,D7                    ; SUBTRACT DIVISOR FROM DIVIDEND
+           SUBX.L   D1,D6
+;
+;         shift dividend left by one bit
+;
+DIVSHIFT   ASL.L    #1,D7
+           ROXL.L   #1,D6
+           SCS      D5                       ; SAVE CARRY OUT IN 'VBIT'
+;
+;         adjust 'SETBIT' & 'WHATBYTE' to point to next q-bit
+;
+           SUBQ.B   #1,D0                    ; DECREMENT 'SETBIT'
+           bpl      @3                       ; IF  (NEW Q-BIT IN NEXT BYTE)  THE
+              moveq    #7,D0                    ; RE-INITIALIZE 'SETBIT'
+              ADDQ.B   #1,D3                    ; INCREMENT 'WHATBYTE'
+@3                                            ; ENDIF
+           SUBQ.B   #1,D4                    ; DECREMENT 'BITCNT'
+;
+;       UNTIL  <EQ>                       ; REPEAT LOOP UNTIL 'BITCNT' Q-BITS
+;                                           have been calculated
+        bne     rpt
+;
+;      The maximum number of significant quotient bits required by the
+;      current rounding precision have now been calculated.  Now set the
+;      next q-bit (currently pointed to by 'SETBIT' and 'WHATBYTE' if
+;      the remaining dividend is non-zero.
+;
+        OR.B     D5,D7                    ; 'OR' THE 'VBIT' INTO THE DIVIDEND
+        OR.L     D6,D7                    ; 'OR' THE TWO HALVES OF DIVIDEND
+;                                                                  together
+        beq     @4
+           BSET     D0,0(A2,D3)              ; SET A STIKY-Q-BIT
+@4
+;
+;      Get quotient back into regs D1, D2, & D3.  Move result's s-exp
+;      which was saved in reg A0 back into reg D0.  Normalize mantissa
+;      one bit to the left, if needed.
+;
+DIVADJ  MOVEM.L  (A2),D1/D2/D3
+        MOVE.L   A0,D0                  ; D0 gets result exponent.
+        TST.L    D1
+        bmi      @5
+           ASL.L    #1,D3                    ; SHIFT MANTISSA LEFT ONE BIT
+           ROXL.L   #1,D2
+           ROXL.L   #1,D1
+           SUBQ.l   #1,D0                    ; DECREMENT EXPONENT
+@5
+;
+;      Now have unrounded result in d0-d2 with g-rnd-stiky in d3.
+;      Check for unrounded result masquerading as normal zero.
+;
+        cmp.l   #xextminxp,d0
+        bne     @6
+           TST.L    D1
+           bne  @6
+              TST.L    D2
+              bne      @6                       ; IF (LOOKS LIKE NORMAL ZERO)
+                 ASL.L    #1,D3                 ; SHIFT MANTISSA LEFT ONCE
+                 ROXL.L   #1,D2
+                 ROXL.L   #1,D1
+                 SUBQ.l   #1,D0                 ; DECREMENT EXP TO FORCE UNF
+@6                                            ; END
+
+        bclr    #31,d0                  ; Clear sign bit position.
+        or.l    (sp)+,d0                ; Recall sign of result.
+        rts
+        debugend 'MC%DIV_O',0  
+       
+ÿ

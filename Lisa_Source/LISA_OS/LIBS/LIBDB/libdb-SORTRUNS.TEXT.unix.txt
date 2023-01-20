@@ -1,0 +1,568 @@
+{#F     libdbsortruns.text }
+{$S sortseg }
+{***************************************************************************
+
+                                  qsort
+
+        quicksort.  records to be sorted are pointed to by array of ptrs.
+        only the ptrs are moved in the sort.
+
+        Input Parameters
+
+        pfirst - pts to first ptr in the array of ptrs
+        plast - pts to last ptr in the array of ptrs (this element of the
+            array is used for a sentinel ptr)
+        ps - pts to an empty stack of 2 ptr records, used to stack sort
+            intervals.  ps grows downwards (lower addresses).  the stack
+            must contain ceiling (log nrecords) + 1 entries (8 bytes each)
+        pkey - describes records to sort
+        nsflds - number of fields to sort on
+
+*****************************************************************************}
+
+procedure qsort(pfirst,plast : ptrptrdata;
+                ps : ptrptrdata;
+                pkey : ptrrecptr;
+                nsflds : integer);
+        external;
+
+{****************************************************************************
+
+                                MOVERQ
+
+        Does a fast moveright of quads.
+
+        Input Parameters
+
+        P1 - source
+        P2 - destination
+        NBYTES - number of bytes to transfer, multiple of 4 and >= 4
+
+*****************************************************************************}
+
+procedure moverq(p1,p2 : ptrdata;
+                 nbytes : longint);
+        external;
+
+
+{******************************************************************************
+
+                              genruns
+
+         generates the initial set of runs from the source file by using
+         replacement selection and a tree of losers.  see Knuth or
+         Fundamentals of Data Structures, Horowitz and Sahni for the algo.
+         the only difference is that the tree of losers is initialized
+         explicitly for a little performance improvement on small files.
+
+         input parameters
+
+         closeinput     proc parameter to close input stream
+         copyrec        proc parameter to copy next input record
+         readrec        proc parameter to read next record and return the
+                                size
+         pagesize        # bytes in pages
+         firstpage       first data page address in file
+         nsflds          # fields to sort on
+         pkey            ptr to descriptor for sort key
+         tempdir         name of prefix under which runend tempfile can be
+                                 created, if necessary
+         sort_ldsn       ldsn for temporary sort segment
+         keepduplicates  if true, records w/ dupl. keys are retained
+
+         output parameters
+
+         result           result of genruns, noerr if ok
+         sort_segment     refno of temporary sort segment
+         segsize          size of temporary sort segment
+         nrecords         # of records in runfile (if runs = 1)
+         prunend          array of runs runend fmarks
+         runs             number of runs generated
+         temprefno        refno of runfile
+
+         return results
+
+                noerr
+                nomem
+                temperror
+                ioerr
+                open and close errors
+                segment creation and destruction errors
+
+******************************************************************************}
+procedure genruns(var result : integer;
+                      destfile : integer;
+                  var nrecords,
+                      lastpage : fileptr;
+                      procedure closeinput(var result : integer);
+                      function readrecord(var result : integer) : integer;
+                      procedure copyrecord(prec : ptrdata);
+                      firstpage : fileptr;
+                      pagesize,
+                      nsflds : integer;
+                      pkey : ptrrecptr;
+                      sort_ldsn : integer;
+                  var sort_segment : integer;
+                  var segsize : longint;
+                  var prunend : ptrrunend;
+                  var runs : integer;
+                      tempdir : ptrpathname;
+                  var tempfile : pathname;
+                  var temprefno: integer;
+                      keepduplicates : boolean);
+label
+        2,3,4,5;
+
+var
+        heapaddr : longint;    {  address of sort segment }
+        MaxSize,               {  max size we let heap grow to }
+        swapspace,             {  the next four are parameters of mem_info }
+        newsize,               {  used in growing heap }
+        newsize1,              {  used in growing heap }
+        dataspace,
+        cur_codesize,
+        max_codesize,
+        avail,                  {  available space for records }
+        nrecs,                  { counts recs in sort heap }
+        fixed,                  {  size of fixed requirements }
+        bytes_avail,            { bytes available in segment }
+        twopower : longint;     {  2^(ceiling(log2(nrecs)))  }
+        rsize,
+        oldsize,                {  previous # of bytes of data in page }
+        offoff,                 {  offset of record offsets array in page }
+        bytes_left,             {  # of bytes left in output page }
+        winsize,                {  size of winning record }
+        runindex : integer;     {  index into prunend for next entry }
+        runendfile : pathname;  {  name of file for runend pageing }
+        StopGrowing,            {  true iff we aren't growing heap }
+        haverunendfile,         {  have we opened a file for run end
+                                   markers? (only do if > nrunentries runs }
+        have_segment,           {  have we made the sort segment yet? }
+        tempopen,               {  have we opened the runfile? }
+        stopreading : boolean;  {  are we stilling reading from input ? }
+        oldfirst,               {  used in growing heap }
+        oldlast,                {  used in growing heap }
+        pfirst,                 {  pts to first ptr in ptrtable }
+        plast,                  {  pts to last ptr in ptrtable }
+        ppwinner : ptrptrdata;  {  ptr next record in ptrtable }
+        precs,                  {  where records & lengths go }
+        pheap,                  {  pts to start of segment }
+        poutbuff,               {  pts to output buffer }
+        plastrec,               {  pts to last record writen to output }
+        poutrec : ptrdata;      {  pts to current output record }
+        pd : ptrpagedesc;       {  output pagedesc }
+        po : ptroffsets;        {  output record offset array }
+        pnext,                  {  used for reading records }
+        pwinsize,               {  pts to size fld of winner's heapblk }
+        poo : ^integer;         {  pts to current output record offset }
+        currecord : integer;    {  current output record }
+        actual,
+        prevpage,               {  address of last page we wrote (if btree) }
+        rendfmark,              {  fmark for file of runend fmarks  }
+        fmark : fileptr;        {  address for next page to write }
+        outrefno : integer;     {  refno of runfile }
+        rendrefno,              {  refno of runend file }
+        tresult : integer;
+
+
+        {             memory layout
+
+        [  space for prunentries end of runs ptrs ]<--- prunend <--- pheap
+        [  output buffer                          ]<--- poutbuff
+        [                                         ]<--- precs
+        [        var. length records,             ]
+        [        preceded by sizes                ]
+        [                                         ]
+        [        stack used by qsort              ]
+        [                                         ]
+        [  ptr to data for record 0               ]<--- pfirst
+        [  record data for record nrecs-1         ]
+        [  extra ptr used by qsort for sentinel   ]<--- plast
+
+        }
+
+
+{*****************************************************************************
+
+                                pageoutrunend
+
+        if we are going to overflow our nrunentries runend (file marker)
+        array, then we must write the cache out to a temporary file and
+        then reuse the array.  nrunentries is chosen so that this is
+        infrequent.
+
+*****************************************************************************}
+
+procedure pageoutrunend;
+label
+        2;
+var
+        tresult : integer;
+        actual : fileptr;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+    {   if we don't have the runendfile yet create it and open it }
+
+        result := noerr;
+        if not haverunendfile then
+            begin
+            movelf(@tempdir^,@runendfile,length(tempdir^)+1);
+            createuniquefile(tresult,runendfile,rendrefno);
+            if tresult <> noerr then
+                begin
+                result := temperror;
+                goto 2;
+                end;
+            haverunendfile := true;
+            rendfmark := 0;
+            end;
+
+    {   write out the runend array to the runendfile }
+
+        write_data(tresult,rendrefno,ord(prunend),sizeof(runend),actual,
+                   absolute,rendfmark);
+        if tresult <> noerr then
+            begin
+            if no_room(tresult) then result := noroom
+            else result := ioerr;
+            goto 2; { exit }
+            end;
+        rendfmark := rendfmark + sizeof(runend);
+        runindex := 1;
+2:
+end; { pageoutrunend }
+
+{*****************************************************************************
+
+                                pageinrunend
+
+        if we had to write out our cache of runend (file markers),
+        (the flag haverunendfile is true) then we must
+
+        1) make room for all the runend file markers
+        2) move the current cache contents to the end of the total array
+        3) read in from the temporary file the first runs-runindex runends
+
+******************************************************************************}
+
+procedure pageinrunend;
+label
+        2;
+var
+        rinfosize : longint;
+        actual : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        rinfosize := mult424(runs-nrunentries,sizeof(fileptr));
+
+        if (rinfosize+sizeof(runend)) > segsize then
+            begin
+            result := nomem;
+            goto 2;
+            end;
+
+        movelf(@prunend^[1],@prunend^[runs-runindex+1],
+                 (runindex*sizeof(fileptr)));
+        read_data(result,rendrefno,ord(prunend),
+                  mult424(runs-runindex,sizeof(fileptr)),actual,
+                  absolute,0);
+        if result <> noerr then
+            begin
+            result := ioerr;
+            goto 2;
+            end;
+        result := noerr;
+2:
+end; { pageinrunend }
+begin
+
+        have_segment := false;
+        tempopen := false;
+        haverunendfile := false;
+        runindex := 0;
+        runs := 0;
+        stopreading := false;
+
+        fixed := sizeof(runend) + pagesize;
+        segsize := size_sort_segment;
+        mem_info(result,swapspace,dataspace,cur_codesize,max_codesize);
+        if result <> noerr then goto 2;
+        MaxSize := swapspace-cur_codesize-max_codesize-FudgeFactor;
+
+{$IFC PRERELEASE }
+        writeln('MaxSize ',MaxSize);
+{$ENDC }
+
+        if MaxSize < (fixed+size_6_ptrs+maxrsize) then
+            begin
+            result := nomem;
+            goto 2;
+            end;
+        if MaxSize < segsize then segsize := MaxSize;
+        StopGrowing := segsize > (MaxSize-GrowIncrement);
+
+        {   minimum requirements:
+
+            fixed:
+                output buffer
+                runend table
+            variable:
+                2 ptrs
+                1 record (with size)
+                16 bytes of sort stack
+
+        }
+
+        avail := segsize - fixed - size_6_ptrs;
+        runendfile := 'runendf';
+        make_dataseg(result,runendfile,segsize,
+{$IFC NOSWAP }       0,
+{$ELSEC      }
+                     segsize,
+{$ENDC }
+                     sort_segment,
+                     heapaddr,sort_ldsn,ds_private);
+        if result <> noerr then goto 2;
+        pheap := pointer(heapaddr);
+        have_segment := true;
+
+    {   we read the records in increasing addresses from the low end of the
+        segment while we are reading the offsets in decreasing addresses
+        from the high end of the segment.  we stop on eof or when the records
+        threaten to run over the record offsets }
+
+        prunend := @pheap^;
+        poutbuff := pointer(ord(prunend)+sizeof(runend));
+        precs := @poutbuff^[pagesize];
+        plast := pointer(ord(pheap)+segsize-sizeof(ptrdata));
+        offoff := pagesize-(sizeof(pagedesc)+sizeof(integer));
+
+    {   setup output buffer }
+
+        po := @poutbuff^[offoff];
+        pd := pointer(ord(po)+sizeof(integer));
+        po^[0] := 0;
+        pd^.ptype := leaftype;
+        prevpage := nilptr;
+
+        if result <> noerr then goto 2;
+
+        repeat  { generate a run }
+
+{$IFC PRERELEASE }
+            writeln('stopgrowing ',stopgrowing);
+{$ENDC }
+
+            bytes_avail := avail;
+            nrecs := 0;
+            twopower := 2;
+            pfirst := plast;
+            pnext := @precs^;
+
+            repeat {  read in the records }
+                if nrecs = twopower then { log nrecs takes a step }
+                    begin
+                    bytes_avail := bytes_avail - size_2_ptrs;
+                    twopower := mult424(twopower,2);
+                    end;
+
+                rsize := readrecord(result);
+                if result = eos then
+                    begin
+                    stopreading := true;
+                    goto 5;
+                    end;
+                if result <> noerr then goto 3;
+                bytes_avail := bytes_avail - (rsize+sort_overhead);
+                if bytes_avail < 0 then { heap exhausted }
+                    begin
+                    if StopGrowing then goto 5;
+                    size_dataseg(tresult,sort_segment,
+                                 GrowIncrement,newsize,
+{$IFC NOSWAP   }                 0,
+{$ELSEC        }                 GrowIncrement,
+{$ENDC         }
+                                 newsize1);
+                    if tresult <> noerr then goto 5;
+                    segsize := newsize;
+                    bytes_avail := bytes_avail + GrowIncrement;
+                    avail := avail + GrowIncrement;
+                    StopGrowing := segsize > (MaxSize-GrowIncrement);
+                    oldlast := plast;
+                    oldfirst := pfirst;
+                    plast := pointer(ord(pheap)+segsize-sizeof(ptrdata));
+                    pfirst := pointer(ord(plast)-(ord(oldlast)-ord(oldfirst)));
+                    moverq(@oldfirst^,@pfirst^,ord(oldlast)-ord(oldfirst)+4);
+
+{$IFC PRERELEASE }
+                    writeln('stopgrowing,segsize ',stopgrowing,segsize:10);
+{$ENDC }
+
+                    end;
+                pnext^ := rsize;
+                pfirst := pointer(ord(pfirst)-sizeof(ptrdata));
+                pnext  := pointer(ord(pnext)+sizeof(integer));
+                pfirst^ := @pnext^;
+                copyrecord(@pnext^);
+                pnext := pointer(ord(pnext)+rsize);
+                nrecs := nrecs + 1;
+            until false;
+
+        5:  if nrecs <> 0 then
+                begin
+
+                {  if not open, open up the runfile.  if it's a one run
+                   job, then open up the destination file }
+
+                if runs = 0 then
+                    begin
+                    result := temperror;
+                    if stopreading then
+                        begin
+                        fmark := firstpage;
+                        outrefno := destfile;
+                        end
+                    else
+                        begin
+                        fmark := 0;
+                        createuniquefile(tresult,tempfile,temprefno);
+                        if tresult <> noerr then goto 2; { exit }
+                        outrefno := temprefno;
+                        tempopen := true;
+                        end;
+                    end;
+
+                {  sort the run }
+
+                qsort(@pfirst^,@plast^,@pfirst^,pkey,nsflds);
+
+                {  write out the run }
+
+                poo := @po^[-1];
+                currecord := 1;
+                nrecords := 1;
+                plastrec := poutbuff;
+                ppwinner := @pfirst^;
+                pwinsize := pointer(ord(ppwinner^)-sizeof(integer));
+                winsize := pwinsize^;
+                movelf(ppwinner^,plastrec,winsize);
+                poutrec := @plastrec^[winsize];
+                poo^ := winsize;
+                bytes_left := offoff-winsize-sizeof(integer);
+                ppwinner := pointer(ord(ppwinner)+sizeof(ptrdata));
+
+                while ppwinner <> plast do
+                    begin
+                    pwinsize := pointer(ord(ppwinner^)-sizeof(integer));
+                    winsize := pwinsize^;
+
+                {   here is where we eliminate duplicates  }
+
+                    if keepduplicates then goto 4;  { short circuit boolean:
+                                                      keepduplicates or (...) }
+                    if compare(pkey,pkey,nsflds,ppwinner^,plastrec) <> eq then
+                        begin
+                    4 : { short circuit boolean }
+                        bytes_left := bytes_left - winsize - sizeof(integer);
+                        if bytes_left < 0 then
+                            begin
+
+                        {   page exhausted. write it out and start a new one }
+
+                            with pd^ do
+                                begin
+                                nkeys := currecord;
+                                next := fmark + pagesize;
+                                prior := prevpage;
+                                prevpage := fmark;
+                                end;
+
+                            (*printpage(pkey,nsflds,pagesize,poutbuff);*)
+
+                            write_data(result,outrefno,ord(poutbuff),
+                                       pagesize,actual,absolute,fmark);
+                            fmark := fmark + pagesize;
+                            if result <> noerr then
+                                begin
+                                if no_room(result) then result := noroom
+                                else result := ioerr;
+                                goto 3; { exit }
+                                end;
+                            currecord := 0;
+                            poutrec := poutbuff;
+                            poo := @po^;
+                            bytes_left := offoff-winsize-sizeof(integer);
+                            end;
+
+                        nrecords := nrecords + 1;
+                        movelf(ppwinner^,poutrec,winsize);
+                        oldsize := poo^;
+                        poo := pointer(ord(poo)-sizeof(integer));
+                        poo^ := oldsize + winsize;
+                        plastrec := poutrec;
+                        poutrec := @poutrec^[winsize];
+                        currecord := currecord + 1;
+                        end;
+                    ppwinner := pointer(ord(ppwinner)+sizeof(ptrdata));
+                    end; { while }
+
+                {  close off run }
+
+                with pd^ do
+                    begin
+                    nkeys := currecord;
+                    next := nilptr;
+                    prior := prevpage;
+                    end;
+                prevpage := fmark;
+
+                (*printpage(pkey,nsflds,pagesize,poutbuff);*)
+
+                write_data(result,outrefno,ord(poutbuff),pagesize,actual,
+                           absolute,fmark);
+                fmark := fmark + pagesize;
+                if result <> noerr then
+                    begin
+                    if no_room(result) then result := noroom
+                    else result := ioerr;
+                    goto 3; { exit }
+                    end;
+
+                runindex := runindex + 1;
+                if runindex > nrunentries then
+                    begin
+                    pageoutrunends;
+                    if result <> noerr then goto 3; { exit }
+                    end;
+                prunend^[runindex] := fmark;
+
+                (*writeln(dumpfile,'r,ri,fm:',runs,',',runindex,',',
+                        fmark:14,',',currecord:7);*)
+
+                runs := runs + 1;
+                result := noerr;
+                end
+            else result := noerr; { null run }
+        until stopreading;
+
+3:   { exit }
+        if result = noerr then if haverunendfile then pageinrunends;
+        if haverunendfile then
+            begin
+            close_object(tresult,rendrefno);
+            if tresult <> noerr then result := temperror;
+            end;
+
+2:      closeinput(tresult);
+        if tresult <> noerr then result := tresult;
+
+        if ((result <> noerr) or (runs <= 1)) and (have_segment) then
+            close_dataseg(tresult,sort_segment);
+
+        if (result <> noerr) and tempopen then close_object(tresult,outrefno);
+        lastpage := fmark;
+end;   { genruns }
+
+
+ÿ

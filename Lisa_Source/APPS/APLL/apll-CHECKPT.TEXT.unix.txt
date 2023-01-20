@@ -1,0 +1,715 @@
+{#F lm:checkpt.text }
+{$S lmclose }
+
+{***************************************************************
+
+                 delCheckPt
+
+         deletes the old check point.
+
+         Input Parameters
+
+         lscanid - label scan for data file
+
+         Output Parameters
+
+         dresult - return result
+
+         noerr
+         nobuffs
+         ioerr
+         inconsistent
+         nomem
+
+**************************************************************}
+procedure delCheckPt(var dresult : integer;
+                         lscanid : integer);
+var
+        labentry : labelentry;
+        plab : ptrlabelentry;
+        locresult : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        labentry.ltype := queryCheckPoint;
+        lfetch(locresult,lscanid,approx,1,@labentry);
+        while locresult = noerr do
+            begin
+            ldelete(locresult,lscanid,current,0,nil);
+            lfetch(locresult,lscanid,next,0,nil);
+            if locresult = noerr then
+                begin
+                plab := @pscantable^[lscanid]^.ptrcos^;
+                if plab^.ltype <> queryCheckPoint then
+                    locresult := eos;
+                end;
+            end;
+        if locresult <= eos then locresult := noerr;
+        dresult := locresult;
+end; { delCheckPt }
+
+{*************************************************************************
+
+                            getCheckPoint
+
+        called by diffcreate.   looks for the check point entry in the
+        data file's label.  (if there is no check point, it is the same
+        as a Clear check point).  the check point record is used to
+        establish the differential scan in the case the Clear = false:
+        that is, an incomplete scan was suspended.  the scan is
+        positioned exactly as it was when diffdestroy was called.
+
+        if suppressChkPt is true, then the any old checkpt is destroyed.
+        this is necessary if diffcreate makes a new diff file.
+
+        the check point includes all information necessary to return
+        the differential scan record to its previous state.
+
+        returns true, iff Clear = true, that is, there is no scan to
+        resume.
+
+        Input Parameters
+                scanid - id of diff scan
+
+        Output Parameters
+                lmresult - return result
+
+                noerr
+                nomem
+                nobuffs
+                ioerr
+                inconsistent
+                badCheckPoint
+
+*************************************************************************}
+
+function getCheckPoint(var lmresult : integer;
+                            scanid : integer;
+                            suppressChkPt : boolean) : boolean;
+label
+        1,20,30;
+type
+        ReadTypes = (AtQuery,AtLow,AtHigh,Padding);
+var
+        loc_compact_state : states_de_compact;
+        readState : ReadTypes;
+        pvia,
+        chunk,
+        off,
+        hflds,
+        lflds,
+        lowSize,
+        highSize,
+        querySize,
+        totalSize,
+        lresult,
+        tresult,
+        lscanid : integer;
+        plab : ptrlabelentry;
+        labentry : labelentry;
+        plrec,
+        ploclow,
+        plochigh,
+        pquery : ptrdata;
+        pQCkPt : ptrQChkPtDesc;
+
+        {****************************************************************
+
+                                ReadDribble
+
+                reads the next portion of the current label record.
+                used to unpack the various pieces that are tacked
+                together and then broken up into label records.
+
+                if present the pieces are written in this order:
+                     query,lowkey,highkey
+
+                when a type of piece is exhausted, the readState,
+                which tells what piece we are working on, is advanced
+                to the next piece type.
+
+                input parameters
+                        DribbleSize - remaining size of the current
+                            piece
+                        curState - used to sequence through the piece
+                            types, for each label record, we give each
+                            piece type a shot in it's proper order. this
+                            is done just to simplify the case where
+                            several piece types share a single record.
+                        pDribble - pts to where the current piece type
+                            is.
+
+                 significant globals
+                        off - the offset relative to pDribble for the
+                            current piece we are trying to build.
+                        readState - the actual piece we are currently
+                            building
+                        chunk - the remaining data in the current label
+                            record
+                        plrec - pts to the next data byte in the current
+                            label record
+
+        ***************************************************************}
+
+        procedure ReadDribble(var DribbleSize : integer;
+                                  curState : ReadTypes;
+                                  PDribble : ptrdata);
+        var
+                lchunk : integer;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                if readState = curState then
+                    begin
+                    if DribbleSize > 0 then
+                        begin
+                        lchunk := chunk;
+                        if DribbleSize < lchunk then lchunk := DribbleSize;
+                        movelf(plrec,pointer(ord(PDribble)+off),lchunk);
+                        DribbleSize := DribbleSize - lchunk;
+                        chunk := chunk - lchunk;
+                        plrec := pointer(ord(plrec) + lchunk);
+                        if DribbleSize > 0 then off := off + lchunk;
+                        end;
+                     if DribbleSize <= 0 then
+                         begin
+                         readState := succ(readState);
+                         off := 0;
+                         end;
+                    end;
+         end; { ReadDribble }
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+
+    {   open a quick labelreadonly scan and read in the first record of
+        the check point (the fixed information) }
+
+        quick_label_scan(lresult,pdifftable^[scanid]^.realid,
+                         labelreadonly,lscanid);
+        if (lresult = noerr) and suppressChkPt then delCheckPt(lresult,lscanid);
+        if lresult = noerr then
+            begin
+            labentry.ltype := queryCheckPoint;
+            lfetch(lresult,lscanid,approx,1,@labentry);
+            if lresult = noerr then
+                begin
+                pQCkPt := pointer(ord(pscantable^[lscanid]^.ptrcos)+
+                                  sizeof(labelentry));
+
+{$IFC debug }
+                with pQCkPt^ do
+                    begin
+
+                    if lmdebug then
+                        begin
+                        writeln(dumpfile,'CPtDfilterSize ',CPtDfilterSize);
+                        writeln(dumpfile,'CPtLowSize ',CPtLowSize);
+                        writeln(dumpfile,'CPtHighSize ',CPtHighSize);
+                        writeln(dumpfile,'CPtnhflds ',CPtnhflds);
+                        writeln(dumpfile,'CPtnlflds ',CPtnlflds);
+                        writeln(dumpfile,'CPtSize ',CPtSize);
+                        writeln(dumpfile,'CPtwhichway ',CPtwhichway);
+                        writeln(dumpfile,'CPtreversescan ',CPtreversescan);
+                        writeln(dumpfile,'CPtvpage ',CPtvpage);
+                        writeln(dumpfile,'CPtvindex ',CPtvindex);
+                        with CPTcurhandle do
+                            writeln(dumpfile,'CPtcurhandle ',high,low);
+                        writeln(dumpfile,'hasVia ',hasVia);
+                        writeln(dumpfile,'Clear ',Clear);
+                        writeln(dumpfile,'Good ',Good);
+                        writeln(dumpfile,'viaUniqueid ',viaUniqueid);
+                        end;
+                    end;
+{$ENDC }
+            {   Check if check point is good  }
+
+                if not pQCkPt^.Good then
+                    begin
+                    lresult := badCheckPoint;
+                    getCheckPoint := true;
+                    goto 1;
+                    end;
+
+            {    Now it's no longer good }
+
+                loc_compact_state := init_compact_state;
+                repeat {compact retry point }
+                    with pscantable^[lscanid]^ do
+                        begin
+                        lresult := nnew(@czone,cossize,@plrec);
+                        if lresult = noerr then
+                            begin
+                            movelf(ptrcos,plrec,cossize);
+                            pQCkPt := pointer(ord(plrec)+sizeof(labelentry));
+                            pQCkPt^.good := false;
+                            ldelete(lresult,lscanid,current,0,nil);
+                            if lresult = noerr then
+                                linsert(lresult,lscanid,@plrec^,cossize,false);
+                            ndispose(@czone,@plrec^);
+                            end;
+                        end;
+                until not retry_compact(lresult,loc_compact_state);
+                if lresult <> noerr then goto 1;
+
+                pQCkPt := pointer(ord(pscantable^[lscanid]^.ptrcos)+
+                                  sizeof(labelentry));
+                with pQCkPt^ do
+                    begin
+
+
+            {   Check if the check point says the scan was clear }
+
+                    getCheckPoint := Clear;
+                    if Clear then goto 1;
+
+                    querySize := CPtDfilterSize;
+                    lowSize := CPtLowSize;
+                    highSize := CPtHighSize;
+                    hflds := CPtnhflds;
+                    lflds := CPtnlflds;
+                    with pdifftable^[scanid]^ do
+                        begin
+                        CheckPtSize := CPtSize;
+                        whichway := CPtwhichway;
+                        reversescan := CPtreversescan;
+                        vpage := CPtvpage;
+                        vindex := CPtvindex;
+                        curhandle := CPtcurhandle;
+                        pvia := pfiletable^[on]^.pkeyfiles;
+                        have_an_update := true; { be conservative }
+                        end;
+                    totalSize := querySize + lowSize + highSize;
+                    if totalSize = 0 then goto 1;
+
+                {   if there was an index file,search for index of via file }
+
+                    if hasVia then
+                        begin
+                        while pvia <> fnilval do
+                            with pfiletable^[pvia]^ do
+                                begin
+                                if compare(@uiddesc,@uiddesc,1,
+                                           @viaUniqueid,@funiqueid) = eq then
+                                    goto 30;
+                                pvia := pkeyfiles;
+                                end;
+                        lresult := badCheckPoint;
+                        goto 1;
+                    30: pdifftable^[scanid]^.via := pvia;
+                        end;
+                    end;
+
+         {  allocate space for the checkpointed query }
+
+                loc_compact_state := init_compact_state;
+                repeat {compact retry point }
+                    lresult := nnew(@czone,querySize,@pquery);
+                    if lresult = noerr then
+                        begin
+                        if lowSize <> 0 then
+                            lresult := nnew(@czone,lowSize,@ploclow);
+                        if (lresult = noerr) and (highSize <> 0) then
+                            begin
+                            lresult := nnew(@czone,highSize,@plochigh);
+                            if (lresult <> noerr) and (lowSize <> 0) then
+                                ndispose(@czone,@ploclow^);
+                            end;
+                        if lresult <> noerr then ndispose(@czone,@pquery^);
+                        end;
+                until not retry_compact(lresult,loc_compact_state);
+                if lresult <> noerr then goto 1;
+
+                with pdifftable^[scanid]^ do
+                    begin
+                    pdfilter :=  pquery;
+                    if lowSize <> 0 then plow := ploclow;
+                    if highSize <> 0 then phigh := plochigh;
+                    nhflds := hflds;
+                    nlflds := lflds;
+                    end;
+
+         {  read in the rest of the check point (records 1..n) }
+
+                off := 0;
+                readState := AtQuery;
+                repeat
+                    lfetch(lresult,lscanid,next,0,nil);
+                    if lresult <> noerr then
+                        begin
+                        lresult := badCheckPoint;
+                        goto 20;
+                        end;
+                    plab := @pscantable^[lscanid]^.ptrcos^;
+                    if plab^.ltype <> queryCheckPoint then
+                        begin
+                        lresult := badCheckPoint;
+                        goto 20;
+                        end;
+                    chunk := plab^.varfld.size;
+                    if totalSize < chunk then chunk := totalSize;
+                    totalSize := totalSize - chunk;
+                    plrec := pointer(ord(plab)+sizeof(labelentry));
+                    with pdifftable^[scanid]^ do
+                        begin
+                        ReadDribble(querySize,AtQuery,pquery);
+                        ReadDribble(lowSize,AtLow,plow);
+                        ReadDribble(highSize,AtHigh,phigh);
+                        end;
+                until totalSize = 0;
+
+{$IFC debug }
+                if lmdebug and (lresult = noerr) then with pdifftable^[scanid]^ do
+                    begin
+                    if pdfilter <> nil then printquery(scanid,@pdfilter^);
+                    with pfiletable^[via]^ do
+                        begin
+                        if nhflds <> 0 then
+                            begin
+                            if pkdesc = nil then
+                                printkey(pedesc,nhflds,phigh)
+                            else printkey(pkdesc,nhflds,phigh);
+                            end;
+                        if nlflds <> 0 then
+                            begin
+                            if pkdesc = nil then
+                                printkey(pedesc,nlflds,plow)
+                            else printkey(pkdesc,nlflds,plow);
+                            end;
+                        end;
+                    end;
+{$ENDC }
+
+            20: if lresult <> noerr then
+                    begin
+                    with pdifftable^[scanid]^ do
+                        begin
+                        ndispose(@czone,@pquery^);
+                        pdfilter := nil;
+                        if plow <> nil then
+                            begin
+                            ndispose(@czone,@plow^);
+                            plow := nil;
+                            end;
+                        if phigh <> nil then
+                            begin
+                            ndispose(@czone,@phigh^);
+                            phigh := nil;
+                            end;
+                        end;
+                    end;
+                end
+            else if (lresult = eos) or (lresult = notfound) then
+                begin
+
+            {   no check point is treated like a clear check point }
+
+                getCheckPoint := true;
+                lresult := noerr;
+                pdifftable^[scanid]^.CheckPtSize := -1;
+
+{$IFC debug }
+                if lmdebug then writeln(dumpfile,'no checkpt');
+{$ENDC }
+
+                end;
+        1 : closescan(tresult,lscanid);
+            if tresult <> noerr then lresult := tresult;
+            end;
+        lmresult := lresult;
+end; { getCheckPoint }
+{*********************************************************************************
+
+                                CheckPtQuery
+
+        writes out a check point if necessary.  always writes out a check point
+        if called from diffdestroy.  only writes out a check point on diffopen
+        if the check point currently written in the file is not big enough to
+        hold the new scan info (descriptor, query and keys).
+
+        deletes the old check point before inserting the new check point.
+        when a check point is written, the minimum size if always written,
+        even if that much space is not needed to check point this query.
+
+        Input Parameters
+                scanid - diff scan number
+                Destroying - true iff called by diffdestroy
+
+        Output Parameters
+                lmresult - return result
+
+                noerr
+                nomem
+                nobuffs
+                ioerr
+                inconsistent
+                noroom
+
+
+********************************************************************************}
+
+procedure CheckPtQuery(var lmresult : integer;
+                           scanid : integer;
+                           Destroying : boolean);
+
+type
+        WriteTypes = (AtQuery,AtLow,AtHigh,AtPadding);
+var
+        Clear,
+        NotEnoughRoomAlready : boolean;
+
+        writeState : WriteTypes;
+
+        tresult,
+        lresult,
+        lscanid,
+        CPtSize,
+        hflds,
+        lflds,
+        querySize,
+        lowSize,
+        highSize,
+        chunk,
+        off,
+        totalSize : integer;
+
+        plrec : ptrdata;
+
+        CPlab :
+            record
+            lab : labelentry;
+            case boolean of
+            true : (CP : QChkPtDesc);
+            false: (info : array[1..CPPieceSize] of byte)
+            end;
+        {****************************************************************
+
+                                WriteDribble
+
+                writes the next portion of the current label record.
+                used to pack the various pieces that are tacked
+                together and then broken up into label records.
+
+                if present the pieces are written in this order:
+                     query,lowkey,highkey
+
+                when a type of piece is exhausted, the writeState,
+                which tells what piece we are working on, is advanced
+                to the next piece type.
+
+                input parameters
+                        DribbleSize - remaining size of the current
+                            piece
+                        curState - used to sequence through the piece
+                            types, for each label record, we give each
+                            piece type a shot in it's proper order. this
+                            is done just to simplify the case where
+                            several piece types share a single record.
+                        pDribble - pts to where the current piece type
+                            is.
+
+                 significant globals
+                        off - the offset relative to pDribble for the
+                            current piece we are trying to build.
+                        readState - the actual piece we are currently
+                            building
+                        chunk - the remaining data in the current label
+                            record
+                        plrec - pts to the next data byte in the current
+                            label record
+
+        ***************************************************************}
+
+        procedure WriteDribble(var DribbleSize : integer;
+                                   curState : Writetypes;
+                                   PDribble : ptrdata);
+        var
+                lchunk : integer;
+        begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                 if writeState = curState then
+                     begin
+                     if DribbleSize > 0 then
+                         begin
+                         lchunk := chunk;
+                         if DribbleSize < lchunk then lchunk := DribbleSize;
+                         movelf(pointer(ord(PDribble)+off),plrec,lchunk);
+                         DribbleSize := DribbleSize - lchunk;
+                         chunk := chunk - lchunk;
+                         plrec := pointer(ord(plrec) + lchunk);
+                         if DribbleSize > 0 then off := off + lchunk;
+                         end;
+                     if DribbleSize <= 0 then
+                         begin
+                         writeState := succ(writeState);
+                         off := 0;
+                         end;
+                     end;
+         end; { WriteDribble }
+
+         {**************************************************************
+
+                                        hsizeof
+
+                returns the size of a heap block (0 if the ptr is nil)
+
+         ***************************************************************}
+
+         function hsizeof(p : ptrdata) : integer;
+         var
+                ph : heapptr;
+         begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+                if p = nil then hsizeof := 0
+                else
+                    begin
+                    ph := pointer(ord(p)-lhead);
+                    hsizeof := ph^.size - allocover;
+                    end;
+         end; { hsizeof }
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        lresult := noerr;
+        with pdifftable^[scanid]^ do
+            begin
+            if whichway <> noway then { if retrieval not exhausted - save
+                                        query and low and high keys }
+                begin
+                Clear := false;
+                querySize := hsizeof(pdfilter);
+                lowSize := hsizeof(plow);
+                highSize := hsizeof(phigh);
+                hflds := nhflds;
+                lflds := nlflds;
+                end
+            else { if retrieval exhausted - toss query and keys  }
+                begin
+                Clear := pfiletable^[pscantable^[diffid]^.onfile]^.nrecs = 0;
+                querySize := 0;
+                lowSize := 0;
+                highSize := 0;
+                hflds := 0;
+                lflds := 0;
+                end;
+            totalSize := querySize + lowSize + highSize;
+            if totalSize < MinCheckPt then totalSize := MinCheckPt;
+            CPtSize := totalSize;
+            NotEnoughRoomAlready := (CheckptSize < totalSize);
+            end;
+
+
+{$IFC debug }
+        if lmdebug then writeln(dumpfile,'checkpting ', querySize:7,lowSize:7,
+                                highSize:7,totalSize:7);
+{$ENDC }
+
+
+        if Destroying or NotEnoughRoomAlready then
+            begin
+
+{$IFC debug }
+            if lmdebug then writeln('writing checkpt');
+{$ENDC }
+
+
+        {   we must write out the checkpt, first we open a label scan }
+
+            quick_label_scan(lresult,pdifftable^[scanid]^.realid,
+                             labelreadonly,lscanid);
+            if lresult = noerr then
+                begin
+
+            {   next we delete the old checkpt, if any exists }
+
+                delCheckPt(lresult,lscanid);
+
+            {   next we add the new checkpt, being sure to write at
+                least the minimum }
+
+                if lresult = noerr then
+                    begin
+                    with CPlab.lab do
+                        begin
+                        ltype := queryCheckPoint;
+                        seq := 0;
+                        varfld.offset := sizeof(labelentry);
+                        varfld.size := sizeof(QChkPtDesc);
+                        end;
+
+                    with pdifftable^[scanid]^,CPlab do
+                        begin
+                        CP.Good := Destroying;
+                        CP.Clear := Clear;
+                        CP.hasVia := (whichway <> noway) and (on <> via);
+                        if CP.hasVia then
+                            CP.viaUniqueid := pfiletable^[via]^.funiqueid;
+                        CP.CPtDfilterSize := querySize;
+                        CP.CPtKfilterSize := 0;
+                        CP.CPtLowSize := lowSize;
+                        CP.CPtHighSize := highSize;
+                        CP.CPtnhflds := hflds;
+                        CP.CPtnlflds := lflds;
+                        CP.CPtSize := totalSize;
+                        CP.CPtwhichway := whichway;
+                        CP.CPtcurhandle := curhandle;
+                        CP.CPtvpage := vpage;
+                        CP.CPtvindex := vindex;
+                        CP.CPtreversescan := reversescan;
+                        end;
+
+
+{$IFC debug }
+                    if lmdebug then with CPlab.CP do
+                        begin
+                        writeln(dumpfile,'CPtDfilterSize ',CPtDfilterSize);
+                        writeln(dumpfile,'CPtLowSize ',CPtLowSize);
+                        writeln(dumpfile,'CPtHighSize ',CPtHighSize);
+                        writeln(dumpfile,'CPtnhflds ',CPtnhflds);
+                        writeln(dumpfile,'CPtnlflds ',CPtnlflds);
+                        writeln(dumpfile,'CPtSize ',CPtSize);
+                        writeln(dumpfile,'CPtwhichway ',CPtwhichway);
+                        writeln(dumpfile,'CPtreversescan ',CPtreversescan);
+                        writeln(dumpfile,'CPtvpage ',CPtvpage);
+                        writeln(dumpfile,'CPtvindex ',CPtvindex);
+                        with CPTcurhandle do
+                            writeln(dumpfile,'CPtcurhandle ',high,low);
+                        writeln(dumpfile,'hasVia ',hasVia);
+                        writeln(dumpfile,'Clear ',Clear);
+                        writeln(dumpfile,'Good ',Good);
+                        writeln(dumpfile,'viaUniqueid ',viaUniqueid);
+                        end;
+{$ENDC }
+
+                    linsert(lresult,lscanid,@CPlab,sizeof(labelentry)+
+                            CPlab.lab.varfld.size,true);
+
+                    writeState := AtQuery;
+                    off := 0;
+                    while (lresult = noerr) and (totalSize > 0) do
+                        begin
+                        if totalSize < CPPieceSize then chunk := totalSize
+                        else chunk := CPPieceSize;
+                        CPlab.lab.seq := CPlab.lab.seq + 1;
+                        CPlab.lab.varfld.size := chunk;
+                        totalSize := totalSize - chunk;
+                        plrec := @CPlab.info;
+                        with pdifftable^[scanid]^ do
+                            begin
+                            WriteDribble(querySize,AtQuery,pdfilter);
+                            WriteDribble(lowSize,AtLow,plow);
+                            WriteDribble(highSize,AtHigh,phigh);
+                            end;
+                        linsert(lresult,lscanid,@CPlab,sizeof(labelentry)+
+                                CPlab.lab.varfld.size,false);
+                        end;
+
+                    if lresult <> noerr then delCheckPt(tresult,lscanid);
+                    end;
+
+                closescan(tresult,lscanid);
+                if tresult <> noerr then lresult := tresult;
+                if lresult = noerr then
+                    pdifftable^[scanid]^.CheckPtSize := CPtSize;
+                end;
+            end;
+        lmresult := lresult;
+end; { CheckPtQuery }
+ÿ

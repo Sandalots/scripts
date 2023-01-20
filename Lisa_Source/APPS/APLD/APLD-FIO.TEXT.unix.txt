@@ -1,0 +1,713 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE file input/output routines *)
+
+(* ********************************************************************* *)
+
+UNIT FIO;
+
+(* Segment FIO *)
+INTERFACE
+USES
+    (*$U UNITSTD*)     UnitStd,    (* interface dependency  *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/Syscall *)    Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)    Hdr,
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+                                 (* implementation unit   *)
+    (*$U WM.EVENTS*)   Events,
+    (*$U DBENV*)       DbEnv,
+    (*$U FEDEC*)       FEDec,
+    (*$U FLD*)         FieldEdit,
+    (*$U ApLd/DAT*)    Dat,
+    (*$U ApLd/UTL*)    Utl,
+    (*$U apld/uop*)    Uop;
+
+CONST
+    (* FIO Note Alerts for load errors *)
+    iNoteDwgId  = 120;
+    iNoteEVers  = 121;
+    iNoteLVers  = 122;          (* update LoadTheDoc in GE.CT1 if this changes *)
+    iNoteLdErr  = 123;
+    (* FIO Note Alerts for save errors *)
+    iNoteSvErr  = 125;
+
+    procedure LoadGEFile(geRef: Integer; var errNum: Integer);
+    procedure SaveGEFile(geRef: Integer; var errNum: Integer);
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+(*$S IO*)
+
+(* ********************************************************************* *)
+
+const
+    Writing     = TRUE;
+    Reading     = FALSE;
+
+    sHdrSize    = 512;
+    sHdrSM1     = 511;
+    BufSize     = 1024;
+    BlkSize     = 512;
+
+    dwgId       = 18245;                (* ascii 'GE' = hex 4745 *)
+
+type
+    TBytePtr    = ^TByte;
+    TBuffer     = Array[0..1023] of TByte;
+    TBufPtr     = ^TBuffer;
+    T12Byte     = Packed Array[1..12] of TByte;
+    T112Byte    = Packed Array[1..112] of TByte;
+    T206Byte    = Packed Array[1..206] of TByte;
+
+    TGEPrInfo   =
+        record
+            size:  Integer;
+            prRec: TPrRec;
+        end;
+
+
+    (* all files have a sHdrSize byte, two part  header *)
+
+    TOStdHdr     =                       (* Old pre version 36
+                                            standard lisa header         *)
+        record                          (* always 128 bytes             *)
+            password:   Integer;
+            version:    Integer;
+            rsvd1:      T12Byte;
+            rsvd2:      T112Byte;
+        end;
+
+    TStdHdr     =                       (* standard lisa header         *)
+        record                          (* always 222 bytes             *)
+            password:   Integer;
+            version:    Integer;
+            rsvd1:      T12Byte;
+            case Boolean of
+                TRUE: (rsvd2: T206Byte);
+                FALSE:(prRec: TPrRec);
+        end;
+
+    TGEHdr      =                       (* application specific header  *)
+        record                          (* always 384 bytes             *)
+            numBlocks: Integer;         (* total number blocks in file  *)
+            origin2D:  Point2D;         (* drawing origin               *)
+            scale2D:   Point2D;         (* screen resolution dots/inch  *)
+            atrState:  TGEAtrRec;       (* state of GE attributes       *)
+            dwgStats:  TStatRec;        (* drawing statistics           *)
+        end;
+
+(* ********************************************************************* *)
+
+(* File Reading *)
+
+(* ********************************************************************* *)
+
+    procedure LoadGEFile(* geRef: Integer; var errNum: Integer *);
+    var needScale:  Boolean;
+        sFactor:    Point2D;
+        offset:     Integer;
+        stdHdr:     TStdHdr;
+        geHdr:      TGEHdr;
+        objNum:     Integer;            (* count of objects written     *)
+        fOldCLst:   Boolean;            (* have version 34 cLst         *)
+        oldVersion: Boolean;            {  have version 34 or 35         }
+        pSiz,hSiz:  LongInt;
+        oBBox:      Rect;
+
+        errFlag:    Boolean;
+        heapCheck:  TF;
+        cBkStd:     TC;
+
+    (* ***************************************************************** *)
+
+        procedure ReadData(byteAddr: TBytePtr;
+                           numBytes: Integer;
+                           firstBlk: Boolean);
+        var actual: LongInt;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if firstBlk then
+                Read_Data(errNum,geRef,Ord(byteAddr),numBytes,
+                          actual,absolute,0)
+            else
+                Read_Data(errNum,geRef,Ord(byteAddr),numBytes,
+                          actual,sequential,offset);
+            errFlag := (errNum<>0) or (actual<>numBytes);
+            if rangeOn then begin
+                if errNum<>0 then
+                    Error('Read_Data',errNum,NONFATAL)
+                else if actual<>numBytes then
+                    Error('Read_Data actual<>numBytes',errNum,NONFATAL);
+            end;
+        end; (* ReadData *)
+
+    (* ***************************************************************** *)
+
+        procedure ReadHdr;
+        type
+            TGEAtr35=
+                record
+                    msrOn,rlrOn,grdOn,tckOn,pvwOn,pgBOn: Boolean;
+                    rlrKind:    Integer;
+                    rlrUnit:    Integer;
+                    rlrFmts:    Array[TUnits,TRlrKind] of TRlrIndx;
+                    rlrLock:    Array[TUnits,TRlrKind] of Boolean;
+                    rlrZero:    Array[TUnits,TRlrKind] of Point;
+                    dwgSz:      Point;
+                    pageSz:     Point;
+                    scrollPt:   Point;
+                    grdSz2D:    Point2D;
+                    tckSz2D:    Point2D;
+                end;
+            TGEHdr35    =                       (* application specific header  *)
+                record                          (* always 384 bytes             *)
+                    numBlocks: Integer;         (* total number blocks in file  *)
+                    origin2D:  Point2D;         (* drawing origin               *)
+                    scale2D:   Point2D;         (* screen resolution dots/inch  *)
+                    atrState:  TGEAtr35;        (* state of GE attributes       *)
+                    dwgStats:  TStatRec;        (* drawing statistics           *)
+                end;
+        var sHdr:     ^TStdHdr;
+            gHdr:     ^TGEHdr;
+            geBuffer: Array[0..sHdrSM1] of TByte;
+            sizeP:    Integer;
+            sizeH:    Integer;
+            tempP:    TP;
+            tempH:    TH;
+
+            gePrInfo:  TGEPrInfo;
+
+            gHdr35:     ^TGEHdr35;
+            geHdr35:    TGEHdr35;
+
+            units,kind: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* read one block header *)
+            ReadData(@geBuffer,sHdrSize,TRUE);
+            sHdr    := @geBuffer;
+            stdHdr  := sHdr^;
+            If stdHdr.version<36 then begin
+                gHdr    := @geBuffer[SizeOf(TOStdHdr)];
+                                 {PrPrfDefault(curDoc.hPrRec^^); done in NewDoc }
+            end else
+                gHdr    := @geBuffer[SizeOf(TStdHdr)];
+                curDoc.hPrRec^^  := stdHdr.prRec;
+            geHdr   := gHdr^;
+
+            if traceFio then with geHdr.atrState do begin
+                writeln('    ReadHdr, version=',stdHdr.version:2,
+                                  ', dwgSz=',dwgSz.h:2,',',dwgSz.v:2,
+                                  ', scroll=',scrollPt.h:2,',',scrollPt.v:2);
+
+            end;
+
+            (* update old versions *)
+            fOldCLst := FALSE;
+            if stdHdr.version=34 then begin
+                fOldCLst := TRUE;
+                stdHdr.version := 35;
+            end;
+            oldVersion := FALSE;
+            if stdHdr.version=35 then begin
+                oldVersion := TRUE;
+                ghdr35 := Pointer(Ord(gHdr));
+                geHdr35 := gHdr35^;
+                with geHdr.atrState do begin
+                    pgBOn       := geHdr35.atrState.pgBOn;
+                    zoomOn      := 0;
+                    rlrKind     := geHdr35.atrState.rlrKind;
+                    rlrUnit     := geHdr35.atrState.rlrUnit;
+                    for units := iUnitInch to iUnitMtrc do
+                        for kind := iRlrStd to iRlrCustom do begin
+                            rlrFmts[units,kind] := geHdr35.atrState.rlrFmts[units,kind];
+                            rlrLock[units,kind] := geHdr35.atrState.rlrLock[units,kind];
+                            rlrZero[units,kind] := geHdr35.atrState.rlrZero[units,kind];
+                        end;
+                    dwgSz       := geHdr35.atrState.dwgSz;
+                    zoomSz      := geHdr35.atrState.dwgSz;
+                    pageSz      := geHdr35.atrState.pageSz;
+                    scrollPt    := geHdr35.atrState.scrollPt;
+                    grdSz2D     := geHdr35.atrState.grdSz2D;
+                    tckSz2D     := geHdr35.atrState.tckSz2D;
+                end;
+                geHdr.dwgStats := geHdr35.dwgStats;
+                stdHdr.version := fVrsNum;
+            end;
+        end; (* ReadHdr *)
+
+    (* ***************************************************************** *)
+
+        procedure ReadObj(var obj: TObjPtr);
+        Type
+            TObjInf35 =                         (* misc pen info for graphical  *)
+                packed record                   (* obj, field info for text obj *)
+                    case Boolean of
+                        TRUE:  (pnSiz,pnPat,flPat,dat: TPByte);
+                        FALSE: (tLen,fLen,tPat,tAlign: TPByte);
+                end;
+            TObjDat35 =                (* 22 bytes completely specifies object  *)
+                record
+                    kind:     TByte;
+                    locked:   TByte;
+                    inf:      TObjInf35;
+                    case TByte of               (* max variant is 16 bytes      *)
+                        iObjRLin,
+                        iObjSLin:  (p1,p2: Point2D);
+                        iObjRect,
+                        iObjRndR,
+                        iObjOval:  (r2D: Rect2D);
+                        iObjArc:   (arc: TArcHnd);
+                        iObjFHnd,
+                        iObjPoly:  (cLst: TCLstHnd; cSiz: Integer; cSmth: Boolean);
+                        iObjText:  (tLoc: Point2D; tHnd,fHnd: TH);
+                        iObjGroup: (grp: TObjLst);
+                end;
+        var tPtr,fPtr: TBytePtr;
+            thisObj:   TObjRec;
+            bytesRead: Integer;
+            tODat:     TObjDat;
+            tODat35:   TObjDat35;
+            tArc:      TArcRec;
+            tempCSiz:  Integer;
+    (* ***************************************************************** *)
+        procedure RelToAbs(cLst: TCLstHnd);
+        Var i: Integer;
+           lastPt2D: Point2D;
+        begin
+            With cLst^^ do begin
+                lastPt2D := beg2D;
+                c2DLst[0] := beg2D;
+                For i := 1 to crdCnt do begin
+                    {$R-}
+                    c2DLst[i].x := lastPt2D.x + c2DLst[i].x;
+                    c2DLst[i].y := lastPt2D.y + c2DLst[i].y;
+                    lastPt2D := c2DLst[i];
+                end;
+                If cClose=iCLstUsr then begin
+                    c2DLst[crdCnt+1] := c2DLst[0];
+                    c2DLst[crdCnt+2] := c2DLst[1];
+                end;
+                {$IfC rangeOn} {$R+} {$EndC}
+            end;
+        end;{RelToAbs}
+
+    (* ***************************************************************** *)
+
+        procedure FixFonts(obj:TObjPtr);
+        Var i: Integer;
+            thisFmtInfo: HndRuns;
+        begin
+            With obj^.oDat,inf do begin
+                thisFmtInfo := Pointer(Ord(fHnd));
+                For i := 0 to fLen do begin
+                    {$R-}
+                    With thisFmtInfo^^[i] do begin
+                        If font=17 then font := cent12;
+                    end;
+                    {$IfC rangeOn} {$R+} {$EndC}
+                end;
+            end;
+        end;{FixFonts}
+
+    (* ***************************************************************** *)
+
+        begin {ReadObj}
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            {
+            if traceFio then begin
+                writeln('ReadObj(#',objNum:2,')');
+                objNum := objNum+1;
+            end;
+            }
+            If NOT oldVersion then
+                ReadData(@tODat,SizeOf(TObjDat),FALSE)
+            else begin
+                ReadData(@tODat35,SizeOf(TObjDat35),FALSE);
+                If not errFlag then begin
+                    With tODat,inf do begin
+                        kind   := tODat35.kind;
+                        If kind=10 then    {old value for iObjGroup}
+                            kind := iObjGroup;
+                        locked := tODat35.locked;
+                        grp    := tODat35.grp;      {grp is the largest variant}
+                        pnSiz  := tODat35.inf.pnSiz;
+                        If kind = iObjText then
+                            pnPat  := tODat35.inf.pnPat
+                        else if tODat35.inf.pnPat=1 then
+                            pnPat := iPenBlack
+                        else if tODat35.inf.pnPat=2 then
+                            pnPat := 7      {gray}
+                        else if tODat35.inf.pnPat=3 then
+                            pnPat := iPenWhite;
+                        flPat  := tODat35.inf.flPat;
+                        dat    := tODat35.inf.dat;
+                        fgClr  := iClrBlack;         {Set default values}
+                        bgClr  := iClrWhite;
+                    end;
+                end;
+            end;
+            if errFlag or (tODat.kind=iObjNil) then
+               obj := NIL
+            else begin
+                obj := NewObj(iObjNil);
+                obj^.oDat := tODat;
+                with obj^,oDat do begin
+                    cSel := iSelNil;
+                    (* restore auxiliary pointers *)
+                    if kind=iObjArc then begin
+                        arc := NewArc;
+                        ReadData(@tArc,SizeOf(TArcRec),FALSE);
+                        arc^^ := tArc;
+                    end else if (kind=iObjFHnd) OR (kind=iObjPoly) OR
+                                (kind=iObjSPoly) then begin
+                        If traceFio then
+                            writeln('    cLst size = ',cSiz:3);
+                        If oldVersion then
+                            tempCSiz := cSiz+2*SizeOf(Point2D)
+                        else
+                            tempCSiz := cSiz;
+                        cLst := Pointer(Ord(HAllocate(curDoc.hHz,tempCSiz)));
+                        ReadData(Pointer(Ord(cLst^)),cSiz,FALSE);
+                        if fOldCLst then begin
+                            curDoc.dwgChgd := TRUE;
+                            cLst^^.crdKind := kind;
+                            if kind=iObjFHnd then
+                                if cSmth then begin
+                                    SmoothFHnd(obj);
+                                    cSmth := FALSE;
+                                end;
+                        end;
+                        If oldVersion AND (kind=iObjPoly) then
+                            RelToAbs(cLst);   {Transforms relative coordiates to
+                                               absolute coordinates and puts in
+                                               helper points}
+                    end else if kind=iObjText then begin
+                        tHnd := HAllocate(curDoc.hHz,inf.tLen);
+                        fHnd := HAllocate(curDoc.hHz,inf.fLen*runSize);
+                        ReadData(Pointer(Ord(tHnd^)),inf.tLen,FALSE);
+                        ReadData(Pointer(Ord(fHnd^)),inf.fLen*runSize,FALSE);
+                        If oldVersion then FixFonts(obj);
+                    end;
+                end;
+            end;
+        end; (* ReadObj *)
+
+    (* ***************************************************************** *)
+
+        procedure ReadOLst(VAR oDB: TODBLst; VAR lBBox: Rect);
+        var thisObj:  TObjPtr;
+            thisBBox: Rect;
+            thisDB:   TODBLst;
+            origin2D:  Point2D;
+            startFlag: Boolean;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            {
+            if traceFio then
+                writeln('ReadOLst');
+            }
+            InitODB(oDB);
+            origin2D.x := 0;
+            origin2D.y := 0;
+            startFlag  := TRUE;
+            Repeat
+                ReadObj(thisObj);
+                if thisObj<>NIL then begin
+                    if thisObj^.oDat.kind=iObjGroup then begin
+                        InitODB(thisDB);
+                        ReadOLst(thisDB,thisBBox);
+                        thisObj^.oDat.grp := thisDB.lst;
+                        thisObj^.bBox     := thisBBox;
+                    end else begin
+                        if needScale then
+                            ScaleObj(thisObj,origin2D,sFactor.x,sFactor.y);
+                        GetBBox(thisObj);
+                    end;
+                    AddToOEnd(oDB,thisObj);
+                    (* update bBox for the entire oLst *)
+                    if startFlag then begin
+                        lBBox := thisObj^.bBox;
+                        startFlag := FALSE;
+                    end else
+                        UnionRect(lBBox,thisObj^.bBox,lBBox);
+                end;
+            until thisObj=NIL;
+        end; (* ReadOLst *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then begin
+            writeln('LoadGEFile(',geRef:2,')');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, '  cBkStd = ',cBkStd);
+            WriteLn('SizeOf(TPrRec) = ',SizeOf(TPrRec) );
+        end;
+        (* read header *)
+        errNum := 0;
+        ReadHdr;
+
+        If traceFio then begin
+            writeln('Just after ReadHdr in LoadGEFile');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, '  cBkStd = ',cBkStd);
+        end;
+
+        if stdHdr.passWord<>dwgId then
+            errNum := iNoteDwgId
+        else if stdHdr.version<fVrsNum then
+            errNum := iNoteEVers
+        else if stdHdr.version>fVrsNum then
+            errNum := iNoteLVers
+        else begin
+            (* expand the heaps *)
+            GetStatSiz(geHdr.dwgStats,hSiz,pSiz);
+            ExpandHz(curDoc.pHz,pSiz+sHdrSize,errNum);
+            if errNum=0 then
+                ExpandHz(curDoc.hHz,hSiz+sHdrSize,errNum);
+            if errNum in [309,311,312] then
+                errNum := iStopDisk
+            else if errNum=315 then
+                errNum := iStopMem
+            else if errNum>0 then
+                errNum := iNoteLdErr
+            else begin
+                (* delete curDoc.oLst *)
+                DltAll(curDoc.oLst);
+                (* restore dwg attributes *)
+                curDoc.atr := geHdr.atrState;
+                (* see if we need to scale the incoming objects *)
+                with geHdr.scale2D do begin
+                    needScale := (x<>xInchDots) or (y<>yInchDots);
+                    if needScale then begin
+                        sFactor.x := xInchDots/x;
+                        sFactor.y := yInchDots/y;
+                    end;
+                end;
+
+                (* read the objects into curDoc.oLst *)
+                objNum   := 0;
+                errFlag := FALSE;
+                if geHdr.numBlocks>1 then
+                    ReadOLst(curDoc.oLst,oBBox);
+
+                if traceFio then begin
+                    WlnRect('    oBBox',oBBox);
+                    Writeln('    dwgSz',curDoc.atr.dwgSz.h:4,
+                                    ',',curDoc.atr.dwgSz.v:4);
+                end;
+                if errFlag then
+                    errNum := iNoteLdErr;
+            end;
+        end;
+        {
+        if traceFio then
+            DumpDB;
+        }
+    end; (* LoadGEFile *)
+
+(* ********************************************************************* *)
+
+(* File Writing *)
+
+(* ********************************************************************* *)
+
+    procedure SaveGEFile(* geRef: Integer; var errNum: Integer *);
+    var stdHdr:     TStdHdr;
+        geHdr:      TGEHdr;
+        objNum:     Integer;            (* count of objects written     *)
+
+        offset:     Integer;
+        errFlag:    Boolean;
+        heapCheck:  TF;
+        cBkStd:     TC;
+
+    (* ***************************************************************** *)
+
+        procedure WrtData(byteAddr: TBytePtr;
+                          numBytes: Integer;
+                          firstBlk: Boolean);
+        var actual: LongInt;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if firstBlk then
+                Write_Data(errNum,geRef,Ord(byteAddr),numBytes,
+                           actual,absolute,0)
+            else
+                Write_Data(errNum,geRef,Ord(byteAddr),numBytes,
+                           actual,sequential,offset);
+            errFlag := (errNum<>0) or (actual<>numBytes);
+            if rangeOn then begin
+                if errNum<>0 then
+                    Error('Write_Data',errNum,NONFATAL)
+                else if actual<>numBytes then
+                    Error('Write_Data actual<>numBytes',errNum,NONFATAL)
+            end;
+        end; (* WrtData *)
+
+    (* ***************************************************************** *)
+
+        procedure GetHdrInfo;
+        var i: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            with stdHdr do begin
+                (* password and version *)
+                passWord := dwgId;
+                version  := fVrsNum;
+                (* zero out other fields *)
+                for i := 1 to SizeOf(stdHdr.rsvd1) do
+                    stdHdr.rsvd1[i] := 0;
+                for i := 1 to SizeOf(stdHdr.rsvd2) do
+                    stdHdr.rsvd2[i] := 0;
+                (* stuff prRec *)
+                MoveLeft(curDoc.hPrRec^^,stdHdr.rsvd2,SizeOf(TPrRec));
+            end;
+            with geHdr  do begin
+                origin2D.x := 0;
+                origin2D.y := 0;
+
+                scale2D.x  := xInchDots;
+                scale2D.y  := yInchDots;
+
+                atrState  := curDoc.atr;
+
+                GetOLstStats(curDoc.oLst.lst.lBeg,dwgStats);
+                with dwgStats do
+
+                numBlocks := 1+((sizObj+sizArc+sizCrd+sizC2D+sizTxt+sizFmt+blkSize-1)
+                                div blkSize);
+            end;
+            {
+            if traceFio then begin
+                writeln('GetHdrInfo,   numBlks:',geHdr.numBlocks:8);
+                WrtDwgStats(geHdr.dwgStats);
+            end;
+            }
+        end; (* GetHdrInfo *)
+
+    (* ***************************************************************** *)
+
+        procedure WrtHdr;
+        var sHdr:     ^TStdHdr;
+            gHdr:     ^TGEHdr;
+            geBuffer:   Array[0..sHdrSM1] of TByte;
+            i: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* write out one block header *)
+            for i := 0 to sHdrSM1 do
+                geBuffer[i] := 0;
+            sHdr   := @geBuffer;
+            sHdr^  := stdHdr;
+            gHdr   := @geBuffer[SizeOf(TStdHdr)];
+            gHdr^  := geHdr;
+            WrtData(@geBuffer,sHdrSize,TRUE);
+        end; (* WrtHdr *)
+
+    (* ***************************************************************** *)
+
+        procedure WrtObj(obj: TObjPtr);
+        var tODat: TObjDat;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            {
+            if traceFio then begin
+                writeln('WrtObj(#',objNum:2,')');
+                objNum := objNum+1;
+            end;
+            }
+
+            with obj^,oDat do begin
+                if (kind=iObjFHnd) OR (kind=iObjPoly) OR (kind=iObjSPoly) then
+                    cSiz := SizeOfCLst(cLst);
+                (* write out object *)
+                tODat := oDat;
+                WrtData(Pointer(Ord(@tODat)),SizeOf(TObjDat),FALSE);
+                (* write out auxiliary data *)
+                if kind=iObjArc then
+                    WrtData(Pointer(Ord(arc^)),SizeOf(TArcRec),FALSE)
+                else if (kind=iObjFHnd) or (kind=iObjPoly) OR (kind=iObjSPoly)
+                    then begin
+                    WrtData(Pointer(Ord(cLst^)),cSiz,FALSE);
+                    {
+                    if traceFio then
+                        writeln('    cLst(',Ord(cLst):8,') size = ',cSiz:3);
+                    }
+                end else if kind=iObjText then begin
+                    WrtData(Pointer(Ord(tHnd^)),inf.tLen,FALSE);
+                    WrtData(Pointer(Ord(fHnd^)),inf.fLen*runSize,FALSE);
+                end;
+            end;
+        end; (* WrtObj *)
+
+    (* ***************************************************************** *)
+
+        procedure WrtOLst(oLst: TObjLst);
+        var obj: TObjPtr;
+            tObj: TObjRec;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            {
+            if traceFio then
+                writeln('WrtOLst');
+            }
+            obj := oLst.lBeg;
+            while obj<>NIL do begin
+                WrtObj(obj);
+                if errFlag then
+                    obj := NIL
+                else begin
+                    if obj^.oDat.kind=iObjGroup then
+                        WrtOLst(obj^.oDat.grp);
+                    obj := obj^.fLink;
+                end;
+            end;
+            (* end with nilObject *)
+            InitObj(iObjNil,@tObj);
+            WrtObj(@tObj);
+        end; (* WrtOLst *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC} (* SaveGEFile *)
+        if traceFio then
+            writeln('SaveGEFile(',geRef:2,')');
+
+        objNum := 0;
+        errNum := 0;
+        errFlag := FALSE;
+        (* write header info *)
+        GetHdrInfo;
+        WrtHdr;
+        (* don't need to use objStream to sequence *)
+        (* all trfos should already be committed *)
+        if geHdr.numBlocks>1 then
+            WrtOLst(curDoc.oLst.lst);
+        (* respond with the appropriate message *)
+        if errFlag then
+            errNum := iNoteSvErr;
+        If traceFio then begin
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+    end; (* SaveGEFile *)
+
+END. (* unit *)
+
+
+ÿ

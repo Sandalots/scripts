@@ -1,0 +1,731 @@
+UNIT HDISK;
+
+
+      (*  By Dave Offen *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+        (*For Profile compatible drives up to 32 MB.  For larger drives, make
+          the following changes:
+                - change assembly language routine in PROFASM,
+                  so that checksum is not imbedded in header.
+         *)
+
+      (*  By Wendell Henry  1/17/83                                              *)
+      (*  o Convert this driver from a configurable Profile driver to a resident *)
+      (*    generic driver of hard disks of Apple format.  A device specific,    *)
+      (*    configurable driver is called by HDISK.                              *)
+
+INTERFACE
+
+  USES
+      (*$U object/driverdefs.obj*)
+        driverdefs,
+      (*$U object/hwint.obj*)
+        hwint,
+      (*$U object/sysglobal.obj*)
+        globalda,
+      (*$U object/procprims.obj*)
+        proc_prims,
+      (*$U object/mmprim.obj*)
+        mmprimitives,
+      (*$U object/asynctr.obj*)
+        asynctr,
+      (*$U object/genio.obj*)
+        genio;
+
+
+   (*$IFC OS15*)
+
+   procedure USE_HDISK( configptr: ptrdevrec );
+
+   procedure CALL_HDISK( var error: int2; configptr: ptrdevrec;
+                                         parameters: param_ptr );
+
+   procedure IODONE (drivecb_ptr: hdiskcb_ptr; prev_err: integer);
+
+   function OKXFERNEXT(drivecb_ptr: hdiskcb_ptr): integer;
+
+   (*$ENDC*)
+
+   function HDISKIO (parameters: param_ptr): integer;
+
+
+  IMPLEMENTATION
+
+    (*$S krgenio*)
+
+    (*$IFC not debug2*)
+    (*$R-*) (*rangecheck off unless debug mode*)
+    (*$ENDC*)
+
+    CONST
+      syserrbase = 10650;
+      errbase = 650;    (*error number base*)
+      premenderr = 658; (*premature end of file in chained header read*)
+      vfyerr = 659;     (*header read verify error*)
+      ignorerr = 661;   (*error code when get timer interrupt requiring no action*)
+      cserr = -663;     (*data is returned but contains checksum or crc error*)
+      hd_err = 654;     (*hard error from profile itself*)
+      wait_int = 1;     (*wait-for-next-interrupt "error" code*)
+      readcmd = 0;      (*read command*)
+      writecmd= 1;      (*write command*)
+
+
+    function LOGGING: boolean; external;
+
+    procedure LOG (var errnum: integer; ptr_arr: longint); external;
+
+    procedure START_DISK (drivecb_ptr: hdiskcb_ptr); forward;
+
+    procedure START_NEW_REQUEST (drivecb_ptr: hdiskcb_ptr); forward;
+
+    procedure CALL_HDISK; external;
+
+   procedure USE_HDISK(* configptr: ptrdevrec *);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  The device is a hard disk with Apple format *)
+       (*               sectors and will be using HDISK to handle   *)
+       (*               sector headers                              *)
+       (*                                                           *)
+       (* Input Parameters:  configptr points to configinfo entry   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (*************************************************************)
+      var
+        ext_ptr: ^ext_diskconfig;
+
+      begin
+        ext_ptr:=pointer(configptr^.ext_addr);
+        ext_ptr^.hentry_pt:=ord(@HDISKIO); (* HDISKIO can now be called *)
+      end;(*USE_HDISK*)
+
+
+
+    procedure FINISH_REQ (drivecb_ptr: hdiskcb_ptr; success_flag: boolean;
+                          error: integer);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Finish current request                      *)
+       (*                                                           *)
+       (* Input Parameters:  drivecb_ptr points to control block       *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  appropriate interrupts must   *)
+       (*               be off                                      *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+
+      VAR
+        errnum: integer;
+        succ_f: boolean;
+
+      begin
+      WITH drivecb_ptr^, cur_info_ptr^ do
+      begin
+        succ_f := success_flag;
+
+        with req_hd_ptr^ do
+          if operatn <= 1 then
+            begin (* read or write request *)
+              if succ_f then
+                begin
+                  if  io_mode = chained_hdrs then
+                    xfer_count := xfer_count + soft_hdr.dataused
+                  else
+                    xfer_count := xfer_count + 512;
+                  if worstwarning <> 0 then
+                    begin
+                      hard_error := worstwarning;
+                      succ_f := false
+                    end;
+                end
+               else
+                begin (*unsuccessful*)
+                  hard_error:=error;
+
+                  (*$IFC debug2*)
+                  if TRACE (DD, 1) then
+                    WRITELN ('*** PROFILE ERROR #: ',hard_error);
+                  (*$ENDC*)
+
+                end;
+
+            UNFREEZE_SEG (buff_rdb_ptr);       (*allow data to move*)
+            ADJ_IO_CNT (false, buff_rdb_ptr);  (*allow data to be swapped*)
+          end
+        else
+          hard_error := error;
+
+        UNBLK_REQ (req_hd_ptr, succ_f);
+
+        (* remove from the top of the queue *)
+
+        DEQUEUE (req_hd_ptr^.dev_chain, b_sysglobal_ptr);
+        req_hd_ptr := CHAIN_FORWARD (req_hd_ptr^.dev_chain);  (*new head of request list*)
+        cur_num_requests := cur_num_requests - 1;
+        if cur_num_requests > 0 then
+        begin
+          if req_hd_ptr = dummy_req_ptr then
+          begin (*if dummy at head, skip over it and reverse its cylinder number*)
+            dummy_req_ptr^.reqspec_info := dummy_req_ptr^.reqspec_info +
+                                             $80000000;
+            req_hd_ptr := CHAIN_FORWARD (dummy_req_ptr^.dev_chain);
+          end;
+          START_NEW_REQUEST (drivecb_ptr);
+        end
+        else
+          if int_prio = winints then
+            DISKSYNC (false)  (*allow contrast changes after I/O*)
+      end
+      end;
+
+  procedure NEXT_HDR (var info: disk_extend; last: boolean);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Update the next software header             *)
+       (*                                                           *)
+       (* Input Parameters:  Info is the request block extension    *)
+       (*   containing the software header to be updated.  Last is  *)
+       (*   true if this is the last header to be updated this      *)
+       (*   request. Used by WRITEs only.                           *)
+       (*                                                           *)
+       (* Output Parameters:  The updated soft_hdr in the request.  *)
+       (*                                                           *)
+       (* Side Effects:  none                                       *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  begin
+    WITH info.soft_hdr do
+      begin
+        bkwdlink := abspage;
+        abspage := abspage + 1;
+        relpage := relpage + 1;
+        if last then
+        begin
+          fwdlink := info.last_fwd_link;
+          dataused := info.last_data_used
+        end
+        else
+          fwdlink := abspage + 1
+      end
+  end; (*next_hdr*)
+
+
+  function OKXFERNEXT(*drivecb_ptr: hdiskcb_ptr): integer*);
+    (* Called by device specific driver to prepare for transfer of next sector *)
+    (* from the disk.  Headers and data pointers will be updated as needed.    *)
+    (* Any errors found in sector just transferred will be returned as a non-  *)
+    (* zero return which should terminate the transfer.                        *)
+    var
+      error: integer;
+
+    begin
+      with drivecb_ptr^, cur_info_ptr^ do
+        begin
+          error:=0;
+          sect_left := sect_left - 1;
+
+          if io_mode = chained_hdrs then
+            begin (*reading using chained headers*)
+              with soft_hdr do
+                if (version<>soft_header.version) or
+                   (fileid<>soft_header.fileid) or
+                   (relpage<>soft_header.relpage) then
+                  begin (*verify error*)
+                    error := vfyerr;
+                  end
+                 else
+                  begin (*verifies ok*)
+                    if (fwdlink = -1) then
+                      if sect_left > 0 then
+                        begin (*premature end of chain*)
+                          error := premenderr;
+                          xfer_count := xfer_count + dataused;
+                        end;
+                  end;
+            end; (*chained_headers*)
+
+          if error = 0 then
+            begin
+              if read_flag then
+                case raw_header_ptr^.datastat of
+                  datamaybe: if worstwarning = 0 then
+                               worstwarning := -626;
+                  databad:   if worstwarning <> cserr then
+                               worstwarning := -625;
+                end; (*case raw_header*)
+
+              if (sect_left > 0) then
+                begin (*setup for next sector*)
+                  blkno := blkno + 1;
+                  xfer_count := xfer_count + 512;
+                  x_leng:=xfer_count;
+                  case io_mode of
+                    with_header:
+                      NEXT_HDR (cur_info_ptr^, sect_left = 1);
+                    raw_io:
+                      raw_header_ptr := pointer(ord(raw_header_ptr) + 24);
+                    chained_hdrs:
+                      soft_header.relpage := soft_header.relpage + 1
+                  end;(*case io_mode*)
+                end;
+            end;
+
+          okxfernext:=error;
+
+        end;(*with drivecb_ptr,cur_info_ptr*)
+    end;(*OKXFERNEXT*)
+
+
+  procedure IODONE (*drivecb_ptr: hdiskcb_ptr; prev_err: integer*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Continue I/O request after call to driver   *)
+       (*                                                           *)
+       (* Input Parameters:  drivecb_ptr points to control block       *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  appropriate interrupts must   *)
+       (*               be off                                      *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+      LABEL
+        1;
+
+      VAR
+        parm: params;
+        success_flag: boolean;
+        err: integer;
+        disk_log_rec: record
+                        code: int1;
+                        rd_flg: boolean;
+                        slot: int1;
+                        chan: int1;
+                        er: integer;
+                        estat: longint;
+                        dev: integer;
+                      end;
+
+      begin
+        WITH drivecb_ptr^, cur_info_ptr^ do
+        begin
+          if req_hd_ptr^.operatn > 1
+            then FINISH_REQ(drivecb_ptr,prev_err = 0,prev_err)(*non-I/O operation*)
+            else                                              (*I/O operation*)
+1:           case prev_err of
+             0: begin (*successful operation*)
+                  if sect_left = 0 then
+                    begin (* all sectors have been transferred *)
+                      FINISH_REQ(drivecb_ptr,true,0);
+                    end
+                   else
+                    begin (* sectors still to be transferred *)
+                      prev_err:=OKXFERNEXT(drivecb_ptr);
+                      if (sect_left > 0) and (prev_err = 0)
+                        then START_DISK(drivecb_ptr) (* issue req to continue I/O*)
+                        else FINISH_REQ(drivecb_ptr,prev_err = 0,prev_err);
+                    end;(*sectors still to be transferred*)
+                end;
+
+             wait_int:  (* nothing to do but wait for next interrupt *)
+               begin
+               end;
+
+             otherwise
+               begin (*got error*)
+                 restrt_count := restrt_count + 1;
+                 if restrt_count <= restrt_limit then
+                   begin (*try request again from the beginning*)
+                     total_restarts:=total_restarts+1;
+                     worstwarning:=0;
+                     raw_header_ptr:=o_raw_header;
+                     raw_data_ptr:=o_raw_data;
+                     soft_hdr:=o_soft_hdr;
+                     soft_header:=soft_hdr;
+                     xfer_count:=o_xfer_count;
+                     x_leng:=xfer_count;
+                     sect_left:=o_sect_left;
+                     blkno:=o_blkno;
+                     START_DISK(drivecb_ptr);
+                   end
+                  else (*exhausted the retries available*)
+                    if prev_error = cserr then
+                      begin
+                        prev_error := 0;
+                        worstwarning := cserr;
+                        goto 1
+                      end
+                     else
+                      FINISH_REQ(drivecb_ptr, false, prev_err); (*quit if too *)
+                                                             (*many errs*)
+
+             end;
+           end; (*case*)
+        end;
+      end;  (*IODONE*)
+
+
+   procedure START_DISK (*drivecb_ptr: hdiskcb_ptr*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start a read or write of one sector         *)
+       (*            on a hard disk.                                *)
+       (*                                                           *)
+       (* Input Parameters:  drivecb_ptr points to control block    *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  appropriate interrupts must   *)
+       (*               be off                                      *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+      var
+        parm: params;
+        errnum: integer;
+
+      begin
+        parm.fnctn_code:=hdskio;
+        CALLDRIVER(errnum,drivecb_ptr^.config_addr,@parm); (* call driver to start I/O *)
+      end;  (*start_disk*)
+
+
+     procedure START_NEW_REQUEST (*drivecb_ptr: hdiskcb_ptr*);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Initialize control block and make first I/O *)
+       (*   call for the request at the head of the drive's queue.  *)
+       (*                                                           *)
+       (* Input Parameters: drivecb_ptr points to this drive's variables*)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  Unit globals:  num_sectors_left,           *)
+       (*                     cur_info_ptr, req_hd_ptr .            *)
+       (*   Request changed from active to in-service.              *)
+       (*                                                           *)
+       (* Special Conditions of Use:  required ints must be off.    *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+       VAR
+         er: integer;
+
+       begin
+         WITH drivecb_ptr^, req_hd_ptr^ do
+         begin
+
+           (*set up global vars for this request *)
+           er:=0;
+           reqstatus.reqsrv_f := in_service;  (*from active to in_service*)
+           cur_info_ptr := pointer(req_extent);
+           if operatn <= 1 then
+             WITH cur_info_ptr^ do
+               begin
+
+                 (*next try to lock the data buffer in memory*)
+
+                 FREEZE_SEG (er, buff_rdb_ptr, buff_offset, ord(req_hd_ptr),
+                             resolved_addr);
+                 if er=0 then (*lock worked *)
+                   begin
+                     sect_left := num_chunks;
+                     restrt_count := 0;
+                     worstwarning := 0;
+                     raw_header_ptr := @soft_hdr;
+                     raw_data_ptr := resolved_addr;
+                     x_leng:=xfer_count;
+                     case io_mode of
+                       raw_io:
+                         begin
+                           raw_header_ptr :=  pointer(resolved_addr);
+                           if num_chunks = 1 then
+                             raw_data_ptr := resolved_addr + 24 (*speed optimization*)
+                           else
+                             raw_data_ptr := resolved_addr + ord4(24)*num_chunks
+                         end;
+
+                       chained_hdrs: soft_header := soft_hdr;  (*remember which header to match*)
+                     end; (*case*)
+
+                     (* save data necessary to restart request in case of error*)
+                     o_raw_header:=raw_header_ptr;
+                     o_raw_data:=raw_data_ptr;
+                     o_soft_hdr:=soft_hdr;
+                     o_xfer_count:=xfer_count;
+                     o_sect_left:=sect_left;
+                     o_blkno:=blkno;
+                   end;
+               end; (*WITH cur_info_ptr*)
+           if er = 0 then START_DISK (drivecb_ptr);
+        end; (*WITH drivecb_ptr, req_hd_ptr *)
+     end; (*start_new_request*)
+
+
+  function HDISKIO; (*parameters: param_ptr): integer*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description: HDISKIO is the generic device driver for all *)
+       (*              hard disks with the Apple format.  Device    *)
+       (*              specific activities will be passed on to the *)
+       (*              appropriate device driver.                   *)
+       (*                                                           *)
+       (* Input Parameters:  Each function code request has its own *)
+       (*                    input parameters.                      *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  The request is added to the queue for the  *)
+       (*   appropriate drive.  If no request is busy, the request  *)
+       (*   is started up immediately.                              *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:                                         *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    parm: params;
+    p_extdevrec: ^ext_diskconfig;
+    drivecb_ptr: hdiskcb_ptr;
+    ext_ptr: extdptr_type;
+    ints: intson_type;
+    left_sort_ptr, right_sort_ptr, head_sort_ptr: reqptr_type;
+    new_sec, left_sec, right_sec: longint;
+    errnum: integer;
+
+  procedure HINITIT;
+  (**************************************************************)
+  (*  Internal subroutine in initialize segment for profile init*)
+  (**************************************************************)
+  TYPE
+    initrec = record
+                index: integer;
+              end;
+
+  VAR
+    chan: integer;
+    initrec_ptr: ^initrec;
+    newdrivecb, newreqblk: absptr;
+
+  begin
+      errnum:=0;
+      chan:=parameters^.configptr^.iochannel;
+      if chan >= 0 then INTSOFF(slotints,ints)
+                   else INTSOFF(winints,ints);
+      drivecb_ptr:=pointer(parameters^.configptr^.cb_addr);
+      if drivecb_ptr = nil then
+        begin (*not yet initialized *)
+          errnum := errbase + 3; (* insufficient sysglobal space *)
+          if GETSPACE (sizeof(hdisk_cb), b_sysglobal_ptr, newdrivecb) then
+            if GETSPACE (sizeof(reqblk), b_sysglobal_ptr, newreqblk) then
+              begin
+                errnum:=0;
+                parameters^.configptr^.cb_addr:=newdrivecb;
+                drivecb_ptr:=pointer(newdrivecb);
+                with drivecb_ptr^ do
+                  begin
+                    config_addr:=parameters^.configptr;
+                    ext_ptr:=ord(nil);
+                    v_flag := false; (*default is don't re-read all writes*)
+                    total_restarts := 0;
+                    cur_num_requests := 0;
+                    restrt_limit := 4; (*max times an I/O is retried *)
+                    if chan >= 0 then int_prio:=slotints
+                                 else int_prio:=winints;
+                    dummy_req_ptr := pointer(newreqblk);
+                    req_hd_ptr := dummy_req_ptr;
+                    with dummy_req_ptr^ do
+                      begin
+                        dev_chain.fwd_link := newreqblk - b_sysglobal_ptr +
+                                              sizeof(rb_headT);
+                        dev_chain.bkwd_link := dev_chain.fwd_link;
+                        reqspec_info := -1;  (*initialize dummy cylinder # *)
+                        reqstatus.reqsrv_f := active;
+                        reqstatus.reqabt_f := false;
+                      end;
+                  end;
+
+                (* initialize device specific driver *)
+                with parameters^ do
+                  begin (*reuse parameter block*)
+                    fnctn_code:=hdinit;
+                    CALLDRIVER(errnum,configptr,parameters);
+                  end;(*with*)
+                if errnum > 0 then
+                begin
+                  RELSPACE(ord(drivecb_ptr^.req_hd_ptr),b_sysglobal_ptr);
+                  RELSPACE(ord(drivecb_ptr),b_sysglobal_ptr);
+                  parameters^.configptr^.cb_addr:=ord(nil);
+                end
+              end;
+        end;
+      INTSON (ints);
+
+        (*$IFC debug1*)
+        if TRACE (DD,1) then
+          if errnum <> 0 then
+            begin
+              with parameters^.configptr^ do
+                begin
+                  WRITELN('Error ',errnum,' initializing hard disk: ');
+                  WRITELN('Slot=',slot_no,' chan=',iochannel,' dev=',device_no);
+                end;
+            end;
+        (*$ENDC*)
+
+      HDISKIO := errnum
+  end; (*hinitit*)
+
+  (***********************************************************************)
+
+  begin (*hdiskio*)
+    drivecb_ptr:=pointer(parameters^.configptr^.cb_addr);
+
+    case parameters^.fnctn_code of
+
+    dskio: begin
+        HDISKIO := 0;  (*no errors*)
+         with parameters^.req^ do
+           begin
+             ext_ptr:=pointer(req_extent);
+             new_sec := ext_ptr^.blkno;
+             reqspec_info:=new_sec;
+           end;
+
+        (*$IFC debug1*)
+        if TRACE (DD,10) then
+          if ext_ptr^.read_flag then
+            WRITELN ('Reading Profile block# = ',new_sec)
+          else
+            WRITELN ('Writing Profile block# = ',new_sec);
+        (*$ENDC*)
+
+
+        (*Add the new request to the device queue, sorted by sector.
+         *Every queue contains a "dummy" request whose sector number is either
+         *smaller than any valid sector (-1) or larger than any valid sector
+         *($7FFFFFFF).  The sector numbers of the requests along the device queue
+         *monotonically increase or decrease until the dummy is reached.  The sector
+         *numbers then reverse directions and monotonically decrease or increase
+         *until they reach the same sector number as the request at the head of
+         *the queue.  This ordering of the queue allows the interrupt handler to
+         *pull the next request from the top of the queue, maintaining optimal seek
+         *ordering.  The drive will pick up all requests which are in the same
+         *direction of head travel, before it services requests in the other direction.
+         *The dummy request is at the head of the queue only when the queue is empty.*)
+
+        WITH drivecb_ptr^ do
+        begin
+          INTSOFF (int_prio, ints);
+          left_sort_ptr := req_hd_ptr;
+          head_sort_ptr := left_sort_ptr; (*remember where we started*)
+          if cur_num_requests = 0 then (*point head to new req*)
+            req_hd_ptr := parameters^.req
+          else
+          begin
+            left_sec := left_sort_ptr^.reqspec_info;
+            if left_sec = new_sec then (*past dummy if same as current sector*)
+              left_sort_ptr := dummy_req_ptr;
+            right_sort_ptr := CHAIN_FORWARD(left_sort_ptr^.dev_chain);
+            right_sec := right_sort_ptr^.reqspec_info;
+
+            (* look for insertion point *)
+
+            while (right_sort_ptr<>head_sort_ptr) and
+              ( (right_sec=new_sec) or ( (new_sec>right_sec) and (new_sec>left_sec) )
+                             or ( (new_sec<right_sec) and (new_sec<left_sec) ) ) do
+            begin (*chain forward one link if not at insertion point*)
+              left_sort_ptr := right_sort_ptr;
+              left_sec := right_sec;
+              right_sort_ptr := CHAIN_FORWARD (left_sort_ptr^.dev_chain);
+              right_sec := right_sort_ptr^.reqspec_info
+            end
+          end;
+
+          (* insert it *)
+
+          cur_num_requests := cur_num_requests+1;
+          ENQUEUE (parameters^.req^.dev_chain, left_sort_pointer^.dev_chain,
+                   b_sysglobal_ptr);
+          if cur_num_requests = 1 then
+          begin
+            if int_prio = winints then (*built-in parallel port*)
+              DISKSYNC (true);  (*prevent contrast changes during I/O*)
+            START_NEW_REQUEST(drivecb_ptr)
+          end;
+          INTSON (ints)
+        end (*with*)
+      end; (*dskio*)
+
+  dinit: HINITIT; (*call internal subroutine in inititialize segment*)
+
+  ddown:  (*down a device*)
+    begin
+      if parameters^.configptr^.slot_no >= 0 then INTSOFF(slotints,ints)
+                   else INTSOFF(winints,ints);
+      if drivecb_ptr^.cur_num_requests <> 0
+        then hdiskio:=607
+        else
+         begin (*no requests outstanding - shut the device down *)
+           with parameters^ do
+             begin (*reuse parameter block*)
+               fnctn_code:=hddown;
+               CALLDRIVER(errnum,configptr,parameters);
+             end;
+           RELSPACE(ord(drivecb_ptr^.req_hd_ptr),b_sysglobal_ptr);
+           RELSPACE(ord(drivecb_ptr),b_sysglobal_ptr);
+           parameters^.configptr^.cb_addr:=ord(nil);
+           hdiskio:=0;
+         end;
+      INTSON (ints)
+    end;(*ddown*)
+
+  reqrestart: begin
+            HDISKIO := 0;
+
+            (*$IFC debug2*)
+            if TRACE (DD,5) then
+              WRITELN ('  Profile restarting request.');
+            (*$ENDC*)
+
+            INTSOFF (drivecb_ptr^.int_prio, ints);
+            START_NEW_REQUEST (drivecb_ptr);  (*no other requests present*)
+            INTSON (ints);
+  end; (*reqrestart*)
+
+    otherwise
+      HDISKIO := errbase + 6; (*illegal function code, or not implemented yet*)
+
+   end; (*case*)
+ end; (*HDISKIO*)
+
+
+end.
+
+
+ÿ

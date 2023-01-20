@@ -1,0 +1,1575 @@
+
+                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+
+(***************************************.*******.************************************
+   NewSnips
+*)
+(*$S CutPaste *)
+procedure NewSnips
+   (* var rg         : range;           {range of snips to be operated on}
+      source         : srcType;         {type of operation to perform}
+      ignoreUndo     : boolean;         {continue operation even if can't be undone}
+      ignoreProctect : boolean;         {continue operation even if cells are protected}
+      var status     : integer          {error status number}
+    *);
+type pasteOp  = (pCutUndo, pPaste, pPasteUndo, pNone);
+var highsnip    : integer;                      {high/low snipIds to work with}
+    lowsnip     : integer;
+    errNum      : integer;
+    estimate    : longint;
+    saveLastIds : pIdent;
+    snip        : snipKind;                     {type of snipIds}
+    protect     : boolean;                      {protected cell encountered: y/n}
+    insertOcc   : boolean;
+    finishMove  : boolean;
+    transpose   : boolean;                      {transpose data on paste: y/n}
+    origRg      : range;                        {original range sent to "NewSnips"}
+    oper        : undoType;                     {type of undo operation in undo buffer}
+    FBufOrig    : THptrData;                    {temps to save Scrap/undo buffer ptrs}
+    FBufTemp    : THptrData;                    {used to swap FBufPtr ptrs}
+    vector      : mapInfoRec;                   {formula mapping information}
+    tVector     : pMapInfoRec;
+    nUTtabStops : integer;
+    nUTtabCols  : integer;
+    nUTrows     : integer;
+    UTpaste     : boolean;
+    UTrg        : range;
+(*$IFC UCutPaste *)
+    readUnivText: TReadUnivText;
+(*$ENDC *)
+
+(*$IFC TIMEVERSION *)
+    firstFlag   : boolean;
+    secondFlag  : boolean;
+    SaveTime    : longint;
+    SnipTime    : longint;
+    MapTime     : longint;
+    estTime     : longint;
+    tempTime    : longint;
+    allocTime   : longint;
+    testTime    : longint;
+(*$ENDC *)
+
+    (*
+       InformTm - informs the table manager that it needs to remap its snipIds.
+                  RANGEKIND & LOWSNIP are used to compute the snipId where the table
+                  manager should start its update.
+    *)
+    procedure InformTm(snipId : integer);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if snipId <= 1 then snipId := mInfSnip
+       else snipId := snipId - 1;
+       tmNewSnips(snip, snipId, true);
+    end;
+
+
+    (*
+       SaveCells - saves a range of cells, RG, into the undo buffer.  The previous
+                   contents of the undo buffer are erased.  The type of cells that
+                   are saved in the buffer is depended upon the REMAPSRC (i.e., those
+                   that are cut or copied).
+
+                   The saving operation is done in two passes through the matrix.
+                   The first is to save the handle oh's to the cells and the cell's
+                   attributes.  If this pass completes, the operation will be undoable.
+
+                   If for some reason, the information cannot be saved, STATUS could be
+                   set to an UNDOERR if undo errors are not being ignored and the
+                   second pass will not be done.  PROTECT is also set during the first
+                   pass if a protected cell was encountered.
+
+                   The second pass will be to remove the cells from the matrix if the
+                   REMAPSRC operation needs this to be done.
+
+       NOTE: anything which was in the undo buffer will be lost regardless if the
+             operation was not undoable.
+    *)
+    procedure SaveCells;
+    var row, col  : integer;                    {location of a cell}
+        length    : integer;                    {length of data being stuffed}
+        colId     : integer;                    {column snipId}
+        pass      : integer;                    {pass number}
+        clearing  : boolean;                    {clear template or wipe out operation}
+        sourceChk : boolean;                    {source check}
+        cProtect  : boolean;                    {cell is protected}
+        attr      : Tattr;                      {attribute for a cell}
+        rowOh     : ToH;                        {handle oh to a row}
+        hVecCel   : THVecCel;                   {handle to a vector of row handle oh's}
+        opType    : undoType;                   {type of undo operation in undo buffer}
+        pCel      : TPcel;
+        hContents : THContents;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC TIMEVERSION *)
+        tempTime := time;
+(*$ENDC *)
+
+       {reclaim any memory from the undo buffer}
+       claimUndoBuffer(true);
+       expandrange(rg, false);
+
+       {set up undo buffer header}
+       case reMapSrc of
+          mmWipe,
+          mmClear : begin
+                       clearing  := true;
+                       sourceChk := (reMapSrc = mmClear);
+                       if sourceChk then opType := uClear
+                       else opType := uWipe
+                    end;
+          otherwise begin
+                       if reMapSrc = mmCopy then opType := uCopy
+                       else opType := uCut;
+                       clearing  := false;
+                       sourceChk := (reMapSrc = mmValue) or (reMapSrc = mmNull)
+                    end
+       end;
+       if reMapSrc = mmCopy then mmUndoInfo.op := uCopy
+       else mmUndoInfo.op := uCut;
+
+       {write out header to the undo buffer}
+       FBufInit(mmWrite, oMem, @status, false, status);
+       stuffinteger(ord(opType), status);
+       FBufStuff(fRange, @rg, length, status);
+       if status <> ok then status := UndoErr;
+
+       length := rg.loCol;
+       for col := rg.loCol to rg.hiCol do
+          if vecSnip[colKind, col] <> absent then length := col;
+       saveLastIds.start := length;
+       length := rg.loRow;
+       for row := rg.loRow to rg.hiRow do
+          if vecSnip[rowKind, row] <> absent then length := row;
+       saveLastIds.length := length;
+
+(*$IFC DEBUGVERSION *)
+       if debug[30] then
+          writeln('SaveCells: ',saveLastIds.length:1,',',saveLastIds.start:1,' range: ',wrg(rg));
+(*$ENDC *)
+       stuffinteger(saveLastIds.length, status);
+       stuffinteger(saveLastIds.start, status);
+
+       {stuff information about the cell's row and column widths}
+       for col := rg.loCol to rg.hiCol do
+          stuffinteger(vecWid[colKind, col], status);
+       for row := rg.loRow to rg.hiRow do
+          stuffinteger(vecWid[rowKind, row], status);
+
+       {the first pass will be to save the handle oh's and attributes of the
+        cells being cut.  This is accomplised by making an actual copy of the
+        cell's attributes and handle oh's and possibly incrementing a reference
+        count for the cells.  If the first pass does not succeed, the operation
+        will not be undoable and nothing else will be done unless IGNOREUNDO was
+        set.  The second pass will consist of making the cells unknown to the
+        matrix and the resetting of appropriate atrributes.
+       }
+       pass    := 0;
+       protect := false;
+       repeat
+          pass := pass + 1;
+          for row := rg.loRow to saveLastIds.length do begin
+             rowOh := vecSnip[rowKind, row];
+             if rowOh <> absent then hVecCel := hVecOfRow(row);
+
+             for col := rg.loCol to saveLastIds.start do begin
+                colId := vecSnip[colKind, col];
+                if (rowOh <> absent) and (colId <> absent) then begin
+                   with hVecCel^^[colId] do begin
+                      cProtect := isProtected(attributes) and not ignoreProtect;
+                      if pass = 1 then begin
+                         {save the information pertaining to the cell}
+                         if ((oh <> 0) and (reMapSrc = mmCopy)) or
+                            (clearing and cProtect) then begin
+                            if reMapSrc = mmCopy then attributes.pkInCopy := true;
+                            IncRefCnt(GetHContents(@hVecCel^^[colid]), false);
+                            if attributes.pkHasRule then IncRefCnt(GetHContents(@hVecCel^^[colid]), true)
+                         end;
+                         attr := attributes;
+                         attributes.pkCircle := false;
+                         FBufStuff(fPCel, @hVecCel^^[colId], length, status);
+                         hVecCel^^[colId].attributes := attr;
+                         protect := protect or cProtect
+                      end
+                      else if (clearing and not cProtect) or
+                              ((reMapSrc <> mmCopy) and not clearing) then begin
+                              {reset the cell's attributes/remove it from the matrix}
+                              attr       := attributes;
+                              attributes := attrBlank;
+
+                              if ignoreUndo and (source <> mmUndo) then begin
+                                 pCel := @hVecCel^^[colId];
+                                 FreeContents(pCel)
+                              end
+                              else oh := 0;
+
+                              if sourceChk then begin
+                                 attributes.pkFormat := attr.pkFormat;
+                                 attributes.pkProt   := attr.pkProt;
+                                 attributes.pkAlign  := attr.pkAlign
+                              end
+                           end
+                   end
+                end
+                else if pass = 1 then FBufStuff(fPCel, @celBlank, length, status)
+             end
+          end;
+          if pass = 1 then begin
+             FBufClose(status);
+             if protect and (status = ok) and not clearing then
+                case reMapSrc of
+                   mmCopy,
+                   mmNull  : protect := false;
+                   otherwise if source <> mmUndo then status  := ProtectErr
+                             else protect := false
+                end;
+             if status <> ok then begin
+                claimUndoBuffer(false);
+                mmUndoInfo.op := uNone
+             end;
+             if (status = ok) or ignoreUndo then begin
+                status := ok;
+                mmUndoInfo.rg := rg
+             end
+             else begin
+                     if not protect then status := UndoErr;
+                     pass := 2
+                  end
+          end
+       until pass = 2
+(*$IFC TIMEVERSION *)
+       ;saveTime  := saveTime + time - tempTime;
+(*$ENDC *)
+    end;
+
+
+    (*
+       CopyBlock - makes a copy of the data pointed to by the displacement SOURCEOH.
+                   The routine will return a pointer DUPBLOCK which is a displacement
+                   to the block where the copy was made.  The routine also returns
+                   a direct pointer to the new block in FORMULA (which is assuming
+                   that the block copied was actually a formula).  If the block is
+                   said to have a formula via INRULE, the formula will be setup as a
+                   shared formula with the appropriate # of bits set aside for abs/rel
+                   information.  For paste relative these bits are all set to relative
+                   otherwise they are set according to internal references within
+                   the range being pasted.
+
+       NOTE: if the new block cannot be allocated, FORMULA will be returned as nil.
+    *)
+    (*$S CutPaste *)
+    procedure CopyBlock(sourceOh : Toh; var dupBlock : Toh; inrule : boolean;
+                        var formula : TPFmla; row, col : integer);
+    var numBytes  : integer;
+        displace  : integer;
+        numcoords : integer;
+        x         : integer;
+        relInfo   : PRTfmla;
+        aFormula  : ptrData;
+        sFormula  : TPFmla;
+        sourcePtr : THContents;
+        destPtr   : THContents;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       displace  := 0;
+       numcoords := 0;
+
+       {generate handle to data}
+       sourcePtr := pointer(MakeHnd(sourceOh));
+
+       {if in a rule, generate direct pointer to rule and calculate the number of
+        coordinate references that are within the rule.  Every 4 coordinate ref's
+        will require 1 byte of abs/rel info.  The # of bytes needed for the abs/rel
+        info will be stored in DISPLACE and will be used later to set aside space
+        for the abs/rel information.
+       }
+       if inrule then begin
+          sFormula := @sourcePtr^^;
+          if sFormula^.shared = fSingle then begin
+             numcoords := NumOfCoords(@sFormula^.vecOp, rg, nil, vector, false, false, false, relInfo);
+             displace  := sizeof(STFmla) + numcoords div 4
+          end
+       end;
+
+       {calc # of bytes needed for the block + any abs/rel info and alloc the block}
+       numBytes := CbDataOfH(mxHz, @sourcePtr^);
+
+       destPtr  := pointer(ord(allocBlock(numBytes + displace)));
+
+       {if alloc was sucessful, then copy the data from the original to the new block,
+        and generate the information to be returned.
+       }
+       if destPtr <> nil then begin
+          formula  := @destPtr^^;
+          dupBlock := GetOH(ord(destPtr));
+          moveLfast(@sourcePtr^^, pointer(ord(destPtr^) + displace), numBytes);
+
+          {set up its shared information and correct abs/rel information.  If the
+           formula was not already shared, the shared flag is set to fSingle
+           otherwise it will be left to be set later.  It will be set to
+           fShared or fAbsolute by "moveData" after the formula conversion is done.
+          }
+          with formula^ do
+             if inrule then begin
+                if displace <> 0 then begin
+                   {with a previously non-shared formula, the data is found in the
+                    source formula
+                   }
+                   sFormula := @sourcePtr^^;
+(*$IFC DEBUGVERSION *)
+                   if debug[25] then begin
+                      writeln(row:1,',',col:1,' source formula: ');
+                      dumpshared(@sformula)
+                   end;
+(*$ENDC *)
+                   sFormula := @sFormula^.vecOp;
+                   aFormula := pointer(ord(@vecOp) + displace);
+                   shared   := fSingle
+                end
+                else begin
+                        {with a previously shared formula, the formula's coordinates
+                         are first changed to not rely on the abs/rel bits.  Then
+                         abs/rel bits will are changed using the newly converted
+                         formula.
+                        }
+(*$IFC DEBUGVERSION *)
+                        if debug[25] then begin
+                           writeln(row:1,',',col:1,' shared source formula: ');
+                           dumpshared(@formula)
+                        end;
+(*$ENDC *)
+                        convertformula(row, col, formula);
+                        aFormula := pointer(ord(@sData.vecOp) + sData.info.numcoords div 4 + 1);
+                        sFormula := @aformula^
+                     end;
+(*$IFC DEBUGVERSION *)
+                if debug[25] then begin
+                   writeln(row:1,',',col:1,' adjust formula: '); dumpformula(aFormula)
+                end;
+(*$ENDC *)
+                sdata.info.numcoords := NumOfCoords(@sFormula^, rg, aFormula, vector, oper = uCut,
+                                                    source = mmRelative, true, sdata.PRdata)
+(*$IFC DEBUGVERSION *)
+                ;if debug[25] then begin
+                   writeln(row:1,',',col:1,' final formula: '); dumpshared(@formula)
+                end;
+(*$ENDC *)
+             end
+       end
+       else formula := nil
+(*$IFC DEBUGVERSION *)
+      ;if formula=nil then writeln('copyblock = nil ',row:1,',',col:1,'  rule: ',inrule)
+(*$ENDC *)
+    end;
+
+
+    (*
+       moveData - transfers the data from the scrap or undo buffer to the matrix.
+                  REPEATH,REPEATV describes the horiz/vert # of repetitions to make
+                  of the data while DH, DV describes the displacement from the data's
+                  location in the scrap to its new location in the matrix.
+    *)
+    procedure moveData(dh, dv, repeatH, repeatV : integer);
+    label 2;
+    var row, col      : integer;
+        tRow, tCol    : integer;
+        length        : integer;
+        width         : integer;
+        rowcnt        : integer;
+        colcnt        : integer;
+        dispH         : integer;
+        dispV         : integer;
+        colChged      : boolean;
+        putWidths     : boolean;
+        rgIsCol       : boolean;
+        firstRep      : boolean;
+        pCel          : TPCel;
+        Cel           : TCel;
+        lastIds       : pIdent;
+        pCelAttr      : wordptr;
+        number        : valueType;
+        r1FbufPt      : longint;
+        r2FbufPt      : longint;
+        tFBufPt       : longint;
+        FieldOverFlow : boolean;
+        endCh         : char;
+        errRec        : errRecord;
+(*$IFC UCutPaste *)
+        tabType       : TTabTypes;
+(*$ENDC *)
+        numBytes      : integer;
+        tempUndo      : UndoRec;
+        hitEOL        : boolean;
+        hitEOT        : boolean;
+
+        procedure ShareCells;
+        label 2;
+        var x         : integer;
+            dataOh    : integer;
+            allocForm : boolean;
+            tempCel   : TPCel;
+            formula   : TPFmla;
+            hContents : THContents;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           if firstRep then begin
+              {make copy of the data, both cell information and formula}
+              allocForm := false;
+              CopyBlock(pCel^.oh, dataOh, false, formula, row, col);
+              if formula <> nil then begin
+                 pCel      := FindPcel(tRow, tCol, false);
+                 pCel^.oh  := dataOh;
+                 hContents := GetHContents(pCel);
+                 allocForm := true;
+                 CopyBlock(hContents^^.rule.ohFmla, dataOh, true, formula, row, col)
+              end;
+
+              if formula <> nil then begin
+                 with formula^ do begin
+                    sData.info.dv     := dv;
+                    sData.info.dh     := dh;
+                    sData.info.rowId  := row + dv;
+                    sData.info.colId  := col + dh;
+                    sData.info.split  := false;
+                    if Ord4(repeatH) * repeatV > fRefCntMax then x := fRefCntMax
+                    else x := repeatH * repeatV;
+                    sData.info.refCnt := x;
+                    with hContents^^ do begin
+                       rule.ohFmla := dataOh;
+                       vinfo.data.refcnt := 1
+                    end;
+                    for x := 0 to sData.info.numcoords*2-1 do
+                       if sData.PRdata[x] or (source = mmRelative) then begin
+                          shared := fShared;
+                          goto 2
+                       end;
+                    shared := fAbsolute;
+                 2:
+                 end
+              end
+              else begin
+                      {reclaim anything that was allocated and set OutOfMem}
+                      if allocForm then FreeContents(pCel);
+                      status := OutOfMem
+                   end
+           end
+           else begin
+                   tempCel := FindPCel(row+dv, col+dh, false);
+                   if source <> mmValue then begin
+                      {make copy of the cell information}
+                      allocForm := false;
+                      CopyBlock(tempCel^.oh, dataOh, false, formula, row, col);
+                      if formula <> nil then begin
+                         pCel     := FindPcel(tRow, tCol, false);
+                         pCel^.oh := dataOh
+                      end
+                      else status := OutOfMem
+                   end
+                   else begin
+                           pCel^.oh := tempCel^.oh;
+                           IncRefCnt(GetHContents(pCel), false)
+                        end
+                end
+        end;
+
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       {save previous buffer information}
+       FBufTemp  := FBufOrig;
+       FBufOrig  := FBufPtr;
+       FBufPtr   := FBufTemp;
+
+       for rowcnt := 0 to repeatV - 1 do
+          for colcnt := 0 to repeatH - 1 do begin
+
+(*$IFC TIMEVERSION *)
+             tempTime := time;
+(*$ENDC *)
+
+             firstRep := (rowCnt + colCnt = 0);
+             hitEOT   := false;
+
+             if firstRep then begin
+                putWidths := (FBufPtr <> nil);                         {FBufPtr will be nil on a RestoreOH or Paste from UT}
+                status    := ok;
+(*$IFC UCutPaste *)
+                if UTpaste then begin
+                   readUnivText := TReadUnivText.create(nil, @theHeap^, nil, PRStrLength, [UTparagraphs]);
+                   readUnivText.ScanTable(nUTrows, nUTtabCols, nUTtabStops);
+(*$IFC DEBUGVERSION *)
+                   writeln('nUTrows: ',nUTrows:1,'  nUTtabCols: ',nUTtabCols:1,'  nUTtabStops: ',nUTtabStops:1);
+                   if FBUFptr <> nil then writeln(chr(7),'UTpaste: ',FBufPtr = nil);
+(*$ENDC *)
+                   oper := uCopy;
+                   rg   := UTrg
+                end
+(*$ELSEC *)
+                if false then
+(*$ENDC *)
+                else if putWidths then ReadHeader(oper, rg, lastIds, status)
+                else begin
+                        rg := mmUndoInfo.rg;
+                        expandRange(rg, false)
+                     end;
+                rgIsCol  := (rg.rKind = aColRg) or (rg.rKind = aWTBoxRg);
+                r1FbufPt := FBufPt;
+             end
+(*$IFC UCutPaste *)
+             else if UTpaste then readUnivText.restart
+(*$ENDC *)
+             else if not UTpaste then begin
+                    if putWidths then tFBufPt := r1FbufPt
+                    else tFBufPt := r2FbufPt;
+                    length := ord(FBufMoveTo(tFBufPt, @FBufPtr^))
+(*$IFC DEBUGVERSION *)
+                    ;if length <> 1 then FatalMess(51)
+(*$ENDC *)
+                 end;
+
+             PRinfo.rh  := rg.hiCol - rg.loCol + 1;
+             PRinfo.rv  := rg.hiRow - rg.loRow + 1;
+             dispH      := PRinfo.rh * colcnt + dh;
+             dispV      := PRinfo.rv * rowcnt + dv;
+             colChged   := false;
+
+             if firstRep then
+                if transpose then SetDopeInfo(rg.loRow + dispH, rg.hiRow + dispH, true)
+                else SetDopeInfo(rg.loCol + dispH, rg.hiCol + dispH + (repeatH - 1) * PRinfo.rh, true);
+
+             {read row/col width information from the scrap buffer}
+             if putWidths then
+                case oper of
+                   uWipe,
+                   uClear,
+                   uCopy,
+                   uCut  : begin
+                              for col := rg.loCol to rg.hiCol do begin
+                                 unstuffinteger(width, status);
+                                 if rgIsCol and not transpose then begin
+                                    CTChgSnipWidth(width, ScrapInfo^.fWidths.w, TabFWidth.w);
+                                    if vecWid[colKind, col + dispH] <> width then begin
+                                       colChged := true;
+                                       vecWid[colKind, col + dispH] := width
+                                    end
+                                 end
+                              end;
+                              if colChged then begin
+                                 insertOcc := true;
+                                 cWidened(false)
+                              end
+                              else putWidths := false;
+                              for row := rg.loRow to rg.hiRow do unstuffinteger(width, status)
+                           end;
+(*$IFC DEBUGVERSION *)
+                   otherwise
+                           FatalMess(1)
+(*$ENDC *)
+                end;
+
+
+             {Save data for the paste relative dialog, even if there won't be one}
+             PRinfo.rh := PRinfo.rh * ord(repeatH > 1);
+             PRinfo.rv := PRinfo.rv * ord(repeatV > 1);
+
+             if firstRep then begin
+                r2FbufPt   := FBufpt;
+                PRinfo.dh  := dh;
+                PRinfo.dv  := dv;
+                PRinfo.rg  := rg;
+                PRinfo.row := PRinfo.rg.loRow;
+                PRinfo.col := PRinfo.rg.loCol
+             end;
+
+(*$IFC TIMEVERSION *)
+             testTime := testTime + time - tempTime;
+(*$ENDC *)
+
+             for row := rg.loRow to rg.hiRow do begin
+                hitEOL := false;
+                for col := rg.loCol to rg.hiCol do begin
+
+                   pCel := @Cel;
+                   Cel := CelBlank;
+                   if row > lastIds.length then Cel := CelBlank
+                   else if col > lastIds.start then Cel := CelBlank
+                   else if FBufPtr = nil then Cel := CelBlank           {happens with RestoreOH & UT paste}
+                   else FBufStuff(fPCel, @pCel^, length, status);
+
+(*$IFC TIMEVERSION *)
+                   tempTime := time;
+(*$ENDC *)
+                   {allocate space for the new cell if not already allocated}
+                   tRow := row + dispV;
+                   tCol := col + dispH;
+                   if transpose then begin
+                      tRow := col + dispV;
+                      tCol := row + dispH
+                   end;
+                   pCel := FindPcel(tRow, tCol, (Cel.oh <> 0) or UTpaste);
+
+(*$IFC TIMEVERSION *)
+                   allocTime  := allocTime + time - tempTime;
+(*$ENDC *)
+
+                   if pCel <> nil then begin
+
+                      {perform the "paste values" command or pasting Universal Text}
+                      if source = mmValue then begin
+                         with pCel^ do begin
+(*$IFC UCutPaste *)
+                            if UTpaste then begin
+                               tabType  := qLeftTab;
+                               if hitEOT or hitEOL {or (col - rg.loCol + 1 > nUTtabCols)} then numBytes := 0
+                               else if readUnivText.ReadField(PRStrLength, FieldOverFlow, endCH, tabType) then begin
+                                       numBytes := readUnivText.data.size;
+                                       hitEOL   := (endCH = chr(chCR))
+                                    end
+                               else begin
+                                       hitEOT := true;
+                                       numBytes := 0
+                                    end;
+                               case tabType of
+                                  qCenterTAb : Cel.attributes.pkAlign := aCenter;
+                                  qRightTab  : Cel.attributes.pkAlign := aRight;
+                                  otherwise    Cel.attributes.pkAlign := aLeft
+                               end;
+(*$IFC DEBUGVERSION *)
+                               if debug[22] then begin
+                                  write('row,col: ',row:1,',',col:1,' (',numBytes:1,')  endCh: ',ord(endch):1,
+                                  '  tabType:',ord(tabtype):1,'  ');
+                                  for length := 1 to numbytes do write(readUnivText.buffer.at[length]);
+                                  writeln
+                               end
+(*$ENDC *)
+                            end;
+(*$ENDC *)
+                            if app.BusGraph then
+                               case Cel.attributes.pkAlign of
+                                  aRepeating,
+                                  aInVis : Cel.attributes.pkAlign := aStandard
+                               end;
+                            attributes := attrBlank;
+                            attributes.pkFormat := Cel.attributes.pkFormat;
+                            attributes.pkAlign  := Cel.attributes.pkAlign;
+                            if app.LisaCalc then attributes.pkProt := Cel.attributes.pkProt
+                         end;
+
+                         if firstRep then begin
+(*$IFC UCutPaste *)
+                            if UTpaste then begin
+                               tempUndo   := mmUndoInfo;
+                               {preserve undo info since cell value with destroy it.  At the point: FBufPtr = nil,
+                                mmUndoInfo.state = false, numBytes of data in readUnivText.data.ch and the undo
+                                state remembered in tempUndo.
+                               }
+                               readUnivText.data.StopEdit;
+                               if (reMapLevel = 1) and IsCopyCells then begin
+                                  CellFormula(mmWrite, tRow, tCol, pointer(readUnivText.data.AddrMember(1)), numBytes, status, errRec);
+                                  case status of
+                                     OutOfMem,
+                                     DSpaceErr : ;
+                                     otherwise   status := 0
+                                  end
+                               end
+                               else CellValue(mmWrite, tRow, tCol, pointer(readUnivText.data.AddrMember(1)), false, numBytes, status);
+                               mmUndoInfo := tempUndo
+                            end
+(*$ELSEC  *)
+                            if false then
+(*$ENDC *)
+                            else begin
+                                    UsingScrap := true;
+                                    GetValue(row, col, true, number);
+                                    case number.nan of
+                                       syNone,
+                                       syDate : X2D(number.val.xrealvar, number.val.lrealvar)
+                                    end;
+                                    if CellBlank(row, col) then
+                                       with number do begin        {create a blank}
+                                          nan := syText;
+                                          val.textinfo.len       := 0;
+                                          val.textinfo.hContents := @nan;
+                                          val.textinfo.index     := 0
+                                       end;
+                                    UsingScrap := false;
+                                    PutValue(tRow, tCol, number, false, status)
+                                 end
+                         end
+                         else ShareCells
+                      end
+                      else begin
+                              pCel^ := Cel;
+                              if ((source = mmScrap) or (source = mmRelative)) and pCel^.attributes.pkHasRule then ShareCells
+                              else if source <> mmUndo then IncRefCnt(GetHContents(pCel), false)
+                           end
+                   end
+                   else if Cel.oh <> 0 then status := OutOfMem;
+(*$IFC DEBUGVERSION *)
+                   if status = OutOfMem then begin
+                      writeln('movedata: ',row+dispV:1,',',col+dispH:1);
+                      writeln('before claim: cbFree:',mxhz^.cbFree:1,' MxHz ok: ',
+                               FCheckHzOK(mxHz, status),'  # blocks: ',status:1,'/',numHandles:1);
+                      status := OutOfMem
+                   end;
+(*$ENDC *)
+                   if status = OutOfMem then goto 2
+                end
+             end
+          end;
+
+    2: ClrDopeInfo;
+       claimUndoBuffer(false);
+(*$IFC UCutPaste *)
+       if UTpaste then readUnivText.Free;
+(*$ENDC *)
+       FBufPtr := FBufOrig;
+       if insertOcc then begin
+          SetHighLowSnip(origRg, lowsnip, highsnip, snip, 0);
+          InformTm(lowSnip + ord((origRg.rKind = aRowGrid) or (origRg.rKind = aColGrid)));
+          FxRgChged(origRg)
+       end
+    end;
+
+
+    procedure RestoreOHs;
+    var temp : srcType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       FBufOrig  := FBufPtr;
+       FBufPtr   := nil;
+       insertOcc := false;
+       transpose := false;
+       temp      := source;
+       source    := mmUndo;
+       moveData(0, 0, 1, 1);
+(*$IFC DEBUGVERSION *)
+       if status = OutOfMem then FatalMess(47);
+(*$ENDC *)
+       status    := OutOfmem;
+       source    := temp
+    end;
+
+
+    (*
+       InsertSnip - allows snips to be inserted.  The position of the insertion is
+                    determined by RG (which should be aColGrid or aRowGrid).  The
+                    insertion will be done at low value for the snip type (i.e.,
+                    RG.loCol for colKind).  The number of snips to be inserted is
+                    determined by the difference between the HIGHSNIP value and the
+                    LOWSNIP value.
+
+                    Possible STATUS that could be returned:
+                       ok        - everything fine
+                       insertErr - an attempt is made to insert past the last row/col
+                       OutOfMem  - remapping formula's would run out of memory
+
+       NOTE: anything which was in the undo buffer will be lost if the STATUS is not OK
+    *)
+    procedure InsertSnip;
+    var snipId1 : idType;
+        snipId2 : idType;
+        snipCnt : integer;                      {# of snipId to insert}
+        tempRg  : range;
+        alloc   : boolean;
+        x       : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       SetHighLowSnip(rg, lowsnip, highsnip, snip, 0);
+       claimUndoBuffer(true);
+       snipCnt := highsnip - lowsnip;
+       if (CT^.lastsnip[snip]+snipCnt <= idMax) and (lowsnip+snipCnt <= idMax) and (snipCnt > 0) then begin
+          tempRg := rg;
+          {diddle with the range information on the insertion position such that it is
+           meaningful and selects the proper grid line once the insertion is done.
+          }
+          case tempRg.rKind of
+             aColGrid,
+             aColRg    : begin
+                            if rg.loCol = mInfSnip then rg.loCol := 1
+                            else rg.loCol := rg.loCol + 1;
+                            rg.rKind := aColGrid;
+                            FixRange(rg);
+                            reMapRg  := rg;
+                            rg.hiCol := rg.hiCol + 1;
+                            if rg.hiCol > idMax then rg.hiCol := pInfSnip
+                         end;
+             aRowGrid,
+             aRowRg    : begin
+                            if rg.loRow = mInfSnip then rg.loRow := 1
+                            else rg.loRow := rg.loRow + 1;
+                            rg.rKind := aRowGrid;
+                            FixRange(rg);
+                            reMapRg  := rg;
+                            rg.hiRow := rg.hiRow + 1;
+                            if rg.hiRow > idMax then rg.hiRow := pInfSnip
+                         end;
+(*$IFC DEBUGVERSION *)
+             otherwise   FatalMess(17)
+(*$ENDC *)
+          end;
+
+(*$IFC TIMEVERSION *)
+          tempTime := time;
+(*$ENDC *)
+          mmMapFormulas(false, rg, rg, mmEstimate, vector, estimate, alloc);
+(*$IFC TIMEVERSION *)
+          estTime  := estTime + time - tempTime;
+(*$ENDC *)
+
+          if alloc then begin
+             {set up undo information and map all the formulas}
+             mmUndoInfo.op := uInsert;
+             mmUndoInfo.rg := rg;
+(*$IFC TIMEVERSION *)
+             tempTime := time;
+(*$ENDC *)
+             mmMapFormulas(false, rg, rg, mmMarkFirst, vector, estimate, doingMove);
+(*$IFC TIMEVERSION *)
+             mapTime  := mapTime + time - tempTime;
+(*$ENDC *)
+
+             {adjust all the matrix manager vector information}
+             with CT^ do begin
+                snipId1 := lowsnip + 1;
+                snipId2 := snipId1 + snipCnt - 1;
+                {bubble all snip widths & attrs - even unallocated ones}
+                BubbleRight(snipCnt, @dftWidth[snip], sizeOf(integer), @vecWid[snip, 0], snipId2 + 1, idMax);
+                BubbleRight(snipCnt, @attrBlank, sizeOf(Tattr), @vecAttrs[snip, 0], snipId2 + 1, idMax);
+                for x := idMax downto snipId2+1 do
+                   vecAttrTime[snip, x] := vecAttrTime[snip, x - 1];
+                for x := snipId1 to snipId2 do vecAttrTime[snip, x] := 0;
+
+                {bubble matrix vectors - only allocated ones}
+                if snipId1 <= lastSnip[snip] then begin
+                   lastSnip[snip] := lastSnip[snip] + snipCnt;
+                   BubbleRight(snipCnt, @absent, sizeOf(integer),
+                               @vecSnip[snip, 0], snipId2 + 1, lastSnip[snip])
+                end
+             end;
+             if (reMapLevel = 1) and not insertOcc then begin
+                InformTm(lowSnip + 1);
+                FxRgChged(origRg)
+             end
+          end
+          else begin
+                  rg     := tempRg;
+                  status := OutOfMem
+               end
+       end
+       else status := InsertErr
+    end;
+
+
+    (*
+       DeleteSnip - removes consecutive snips from the matrix.
+    *)
+    procedure DeleteSnip;
+    var howMany : integer;
+        tempRg  : range;
+        alloc   : boolean;
+        x       : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       SetHighLowSnip(rg, lowsnip, highsnip, snip, 0);
+
+       {save the matrix information, if necessary}
+       if reMapSrc <> mmRemove then SaveCells;
+
+       alloc := false;
+       if status = ok then
+          case reMapSrc of
+             mmNull,
+             mmRemove : begin
+                           reMapRg := rg;
+                           expandrange(reMapRg, true);
+(*$IFC TIMEVERSION *)
+                           tempTime := time;
+(*$ENDC *)
+                           mmMapFormulas(false, rg, rg, mmEstimate, vector, estimate, alloc);
+(*$IFC TIMEVERSION *)
+                           estTime  := estTime + time - tempTime;
+(*$ENDC *)
+                           if alloc then status := ok
+                           else status := OutOfMem
+                        end
+          end;
+
+
+       if alloc then begin
+
+          {map all the formulas}
+(*$IFC TIMEVERSION *)
+          tempTime := time;
+(*$ENDC *)
+          mmMapFormulas(false, rg, rg, mmMarkFirst, vector, estimate, doingMove);
+(*$IFC TIMEVERSION *)
+          mapTime  := mapTime + time - tempTime;
+(*$ENDC *)
+
+          case rg.rKind of
+             a1CellRg,
+             aRectRg   : SetRgInvalid(rg, false);      {invalidate those cell just changed}
+             aWTBoxRg,
+             aColRg,
+             aRowRg    : begin
+                            with CT^ do begin
+                               {bubble all snip widths & attrs - even unallocated ones}
+                               howMany := highsnip + 1 - lowsnip;
+                               BubbleLeft(howMany, @dftWidth[snip], sizeOf(integer),
+                                          @vecWid[snip, 0], lowsnip, idMax - howMany);
+                               BubbleLeft(howMany, @attrBlank, sizeOf(Tattr),
+                                          @vecAttrs[snip, 0], lowsnip, idMax - howMany);
+                               for x := lowSnip to idMax - howMany do
+                                  vecAttrTime[snip, x] := vecAttrTime[snip, x + 1];
+
+                               {bubble matrix vectors - only allocated ones}
+                               if lowsnip <= lastSnip[snip] then begin
+                                  if lastSnip[snip] < highsnip then highsnip := lastSnip[snip];
+                                  howMany  := highsnip + 1 - lowsnip;
+                                  {may reduce lastSnip[snip]}
+                                  FreeSnips(snip, lowsnip, highsnip);
+                                  if highsnip < lastSnip[snip] then begin
+                                     lastSnip[snip] := lastSnip[snip] - howMany;
+                                     BubbleLeft(howMany, @absent, sizeOf(integer),
+                                        @vecSnip[snip, 0], lowsnip, lastSnip[snip])
+                                  end
+                               end
+                            end;
+
+                            {tell the table manager about what happened}
+                            InformTm(lowSnip);
+                            FxRgChged(origRg);
+
+                            {return the correct range for selection}
+                            if rg.rKind = aRowRg then begin
+                               rg.rKind := aRowGrid;
+                               rg.hiRow := rg.loRow;
+                               if rg.loRow = 1 then rg.loRow := mInfSnip
+                               else rg.loRow := rg.loRow - 1;
+                            end
+                            else begin
+                                    rg.rKind := aColGrid;
+                                    rg.hiCol := rg.loCol;
+                                    if rg.loCol = 1 then rg.loCol := mInfSnip
+                                    else rg.loCol := rg.loCol - 1;
+                                 end;
+                            FixRange(rg)
+                         end
+          end
+       end
+       else rg := origRg;
+
+       {set up undo information}
+       case status of
+          OutOfMem : RestoreOHs;
+          ok       : case reMapSrc of
+                        mmRemove : ;
+                        mmWipe,
+                        mmClear : begin
+                                     SetRgInvalid(rg, false);
+                                     if reMapSrc = mmClear then mmUndoInfo.op := uClear
+                                     else mmUndoInfo.op := uWipe
+                                  end;
+                        otherwise begin
+                                     FBufTemp      := ScrapPtr;
+                                     ScrapPtr      := FBufPtr;
+                                     FBufPtr       := FBufTemp;
+                                     mmUndoInfo.ptr^ := ScrapInfo^;
+                                     with ScrapInfo^ do begin
+                                        SnipBds      := mmUndoInfo.rg;
+                                        TableFont    := CT^.TableFont;
+                                        fWidths      := CT^.fWidths;
+                                        ColTitleHght := CT^.ColTitleHght;
+                                        RowTitleWdth := CT^.RowTitleWdth;
+                                        lastSnip[rowKind] := mmUndoInfo.rg.hiRow;
+                                        lastSnip[colKind] := mmUndoInfo.rg.hiCol;
+                                     end;
+                                  end
+                     end
+       end
+    end;
+
+
+    (*
+       SwapMarkers - swaps the secondary cell movement markers with the primary
+    *)
+    procedure SwapMarkers;
+    var tempRg : range;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       SetRgBits(tempRg, BNone, true, 3)
+    end;
+
+
+    (*
+                pNone      - a normal paste from the scrap.  A copy will be made (if necessary) of the
+                             data pasted over which will go to the undo buffer with the undo operation
+                             set to uPaste/pPaste.
+                pPaste     - an undo of a pNone.  A copy will be made (if necessary) of the data which
+                             was pasted with pNone and the data originally pasted over will be retreived
+                             from the undo buffer.  The undo buffer will be set to the copy snd the undo
+                             operation will be set to uPasteUndo/pPasteUndo.
+                pPasteUndo - an undo of pPaste or undo of an undo of a pNone.  A copy will be made
+                             (if necessary) of the data originally pasted over and the data originally
+                             pasted will be retreived from the undo buffer.  The undo buffer will be set
+                             to the copy and the undo operation will be set to uPaste/pPaste.
+                pCutUndo   - an undo of a cut.  A copy will be made (if necessary) of the area which was
+                             cut and sent to the undo buffer (eventhough it is comprised of empty cell!).
+                             The scrap will be reset to its previous contents and data restored to the
+                             table.  The undo operation will be set to uCutUndo.
+
+        At the end of each paste operation, the pointers should be set as follows:
+
+                 -------
+                | scrap |   for pNone - both SCRAPPTR and FBUFPTR will point to the scrap
+                 -------
+                  ^  ^
+                  S  P
+                 -------
+                | scrap |   for the others -  SCRAPPTR will point at the scrap and
+                 -------                      FBUFPTR will point to the cells pasted over (for undo)
+                  ^
+                  S  P -> undo info
+
+        If there is some problem, the operation will stop and status will be set to:
+            RepeatERR  - a move is being completed but the data is also being repilcated (ie, a1 into a1:a4}
+            PasteErr   - the range of information in the scrap does match the range selected
+            ProtectErr - trying paste over something that is protected.
+            undoErr    - the paste cannot be undone.
+            InsertErr  - table could not be enlarged to accomadAte the new rows/cols.
+            DSpaceErr,
+            OutOfMem   - out a space trying to do the paste
+            FileErr,
+            OpenErr,
+            BadFile,
+            NoScrapErr - Data does not really exist in Scrap.
+    *)
+    procedure pasteScrap(op : pasteOp);
+    var sRg      : range;                       {range found in the scrap}
+        fRg      : range;                       {copy of range found in the scrap}
+        resultRg : range;                       {range that is the result selection}
+        tempRg   : range;
+        origOp   : undoType;                    {undo operation when paste operation started}
+        lastIds  : pIdent;
+        snipDiff : integer;                     {difference in # snips selected and # snips to be pasted}
+        dh, dv   : integer;                     {displacemenets from data's position in the scrap/undo buffer}
+        sdh, sdv : integer;
+        repeatH  : integer;                     {# times to repeat data horiz/vert}
+        repeatV  : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       {The data to be pasted can come from two sources: the scrap (SCRAPPTR and possibly FBUFPTR) or
+        from the undo buffer (FBUFPTR).  Depending on the type of paste operation to be done, set
+        the source from which to receive data in FBUFTEMP.
+       }
+       UTpaste := false;
+       case op of
+          pPaste,
+          pPasteUndo : FBufTemp := FBufPtr;
+          otherwise    FBufTemp := ScrapPtr
+       end;
+       FBufOrig := FBufPtr;                     {save the original place pointed to by FBUFPTR}
+       FBufPtr  := FBufTemp;                    {and start it pointing to the source for data}
+       if FBufPtr = nil then begin              {FBufTemp will only be nil if pasting a Universal Text Scrap}
+(*$IFC UCutPaste *)
+          readUnivText := TReadUnivText.create(nil, @theHeap^, nil, PRStrLength, [UTparagraphs]);
+          readUnivText.ScanTable(nUTrows, nUTtabCols, nUTtabStops);
+(*$IFC DEBUGVERSION *)
+          writeln('nUTrows: ',nUTrows:1,'  nUTtabCols: ',nUTtabCols:1,'  nUTtabStops: ',nUTtabStops:1);
+(*$ENDC *)
+          readUnivText.Free;
+          UTpaste    := true;
+          UTrg.rKind := aRectRg;                 {determine the range of information in the universal text}
+          UTrg.loCol := 1;
+          UTrg.hiCol := CMax(nUTtabStops, nUTtabCols);
+          UTrg.hiCol := nUTtabCols;
+          UTrg.loRow := 1;
+          UTrg.hiRow := nUTrows;
+          oper      := uCopy;
+          source    := mmValue;
+          sRg       := UTrg
+(*$ELSEC  *)
+          sRg.rKind := aNullRg;
+          uTrg      := sRg;
+          oper      := uCopy;
+          source    := mmValue
+(*$ENDC *)
+       end
+       else ReadHeader(oper, sRg, lastIds, status);  {read the header information for the data}
+       fRg    := sRg;                           {and make a copy of the range the data takes up}
+       origOp := mmUndoInfo.op;                 {save a copy of the undo operation - if there is one???}
+
+       {Based on the type of paste to be perform, setup pointers to the data.  FBUFORIG will point
+        to where the data is to come from.  In some, cases, FBUFPTR will also be set to nil such
+        the scrap and the undo buffer will not be affected by "claimUndoBuffer".
+       }
+       case op of
+          pCutUndo : begin               {undoing a cut}
+                        ScrapPtr    := FBufOrig;         {restore original scrap info - if any}
+                        ScrapInfo^  := mmUndoInfo.ptr^;
+                        FBufOrig    := FBufPtr;          {set source to get data from the scrap}
+                        FBufPtr     := nil               {and when done pasting, there will be no undo info}
+                     end;
+          pPasteUndo,                   {undoing a paste}
+          pPaste   : FBufPtr := nil;                    {source was set previously, it could be the scrap
+                                                         or the undo buffer.  When done, there will be no
+                                                         undo information}
+          otherwise  begin              {normal paste}
+                        FBufPtr  := FBufOrig;
+                        if (source <> mmUndo) and (mmUndoInfo.op = uPasteUndo) then
+                           ReadHeader(oper, fRg, lastIds, status);
+                        FBufOrig := ScrapPtr            {source for data is the scrap}
+                     end
+       end;
+
+       {setup pasting displacements and repeat factors}
+       dh      := 0;
+       dv      := 0;
+       repeatH := 1;
+       repeatV := 1;
+       finishMove := doingMove;
+
+       {determine if the range selected can receive data from the source.  The area being pasted
+        over will be saved in the undo buffer (if necessary) and the table size adjusted (if necessary).
+        If there is some problem, the operation will stop and status will be set.
+       }
+       case rg.rKind of
+          a1CellRg,
+          aRectRg  : if (sRg.rKind = aRectRg) or (sRg.rKind = a1CellRg) then begin
+
+                        {the scrap has a compatible type on it.  It is still unclear if the range
+                         selected can hold the data to be pasted.  The next step is to determine
+                         the number of repetitions of the data that must be made to fill the range
+                         selected and also determine the displacement from the locations of the data
+                         in the scrap to the location of the selection.
+                        }
+
+                        transpose := false;
+                        sdh := sRg.hiCol - sRg.loCol + 1;
+                        sdv := sRg.hiRow - sRg.loRow + 1;
+                        if (rg.rKind = a1CellRg) and (sRg.rKind = aRectRg) then begin
+                           rg.rKind := aRectRg;
+                           rg.hiCol := CMin(idMax, rg.hiCol + sdh - 1);
+                           rg.hiRow := CMin(idmax, rg.hiRow + sdv - 1);
+                           origRg   := rg
+                        end;
+                        dh := rg.hiCol - rg.loCol + 1;
+                        dv := rg.hiRow - rg.loRow + 1;
+                        repeatH := dh div sdh;
+                        repeatV := dv div sdv;
+                        status  := PasteErr;
+
+                        {if the pasted cells are to be repeated, make sure that the cells were
+                         not "cut" to the buffer, if they were this would require a replicate
+                         on a move which is undefined.  Also make sure that the number of repetitions
+                         completely fills the range selected.  Also, make sure the selected range is
+                         within the table.
+                        }
+                        if (repeatH * sdh = dh) and (repeatV * sdv = dv) then
+                           if ((repeatH = 1) and (repeatV = 1)) or ((oper <> uCut) or not finishMove) then begin
+                              dh := rg.loCol - sRg.loCol;
+                              dv := rg.loRow - sRg.loRow;
+                              reMapSrc := mmRemove;
+                              status   := ok;
+                              SaveCells
+                           end
+                           else status := RepeatErr
+                     end
+                     else status := PasteErr;
+          aWTBoxRg,
+          aRowRg,
+          aColRg   : if (transpose and ((sRg.rKind = aRowRg) or (sRg.rKind = aColRg))) or
+                        (sRg.rKind = rg.rKind) then begin
+                        transpose := transpose and (sRg.rKind <> rg.rKind);
+                        tempRg    := rg;
+                        resultRg  := rg;
+                        if rg.rKind = aWTBoxRg then sRg := rg;
+                        if rg.rKind <> aRowRg then begin
+                           resultRg.loRow := minfSnip;
+                           resultRg.hiRow := pinfSnip;
+                           snipDiff := rg.hiCol-rg.loCol;
+                           if transpose then begin
+                              snipDiff := snipDiff - (sRg.hiRow-sRg.loRow);
+                              dh := rg.loCol - sRg.loRow
+                           end
+                           else begin
+                                   snipDiff := snipDiff - (sRg.hiCol-sRg.loCol);
+                                   dh := rg.loCol - sRg.loCol
+                                end;
+                           resultRg.hiCol := resultRg.hiCol - snipDiff;
+                           if snipDiff > 0 then tempRg.hiCol   := tempRg.loCol + snipDiff - 1
+                           else begin
+                                   tempRg.loCol := tempRg.hiCol;
+                                   tempRg.hiCol := tempRg.loCol - snipDiff
+                                end
+                        end
+                        else begin
+                                resultRg.loCol := minfSnip;
+                                resultRg.hiCol := pinfSnip;
+                                snipDiff := rg.hiRow - rg.loRow;
+                                if transpose then begin
+                                   snipDiff := snipDiff - (sRg.hiCol - sRg.loCol);
+                                   dv := rg.loRow - sRg.loCol
+                                end
+                                else begin
+                                        snipDiff := snipDiff - (sRg.hiRow - sRg.loRow);
+                                        dv := rg.loRow - sRg.loRow
+                                     end;
+                                resultRg.hiRow := resultRg.hiRow - snipDiff;
+                                if snipDiff > 0 then tempRg.hiRow   := tempRg.loRow + snipDiff - 1
+                                else begin
+                                        tempRg.loRow := tempRg.hiRow;
+                                        tempRg.hiRow := tempRg.loRow - snipDiff
+                                     end
+                             end;
+
+                        if snipDiff < 0 then begin
+                           rg := origRg;
+                           expandRange(rg, false);
+                           if not ignoreProtect then SetRgBits(rg, BNone, false, 9);
+                           if (rg.rkind = aNullRg) or ignoreProtect then begin
+                              reMapSrc  := mmBlank;
+                              rg        := tempRg;
+                              InsertSnip;
+                              reMapRg   := origRg;
+                           end
+                           else status := ProtectErr;
+                           rg := origRg
+                        end;
+                        if status = ok then begin
+                           reMapSrc := mmRemove;
+                           SaveCells;
+                           if status = ok then begin
+                              if snipDiff > 0 then NewSnips(tempRg, mmRemove, true, true, status);
+                              if (status = ok) and (snipDiff <> 0) and finishMove then SwapMarkers;
+                              insertOcc := (snipDiff < 0);
+                              reMapRg.rKind := aRectRg;
+                              rg := resultRg
+                           end
+                        end
+                     end
+                     else status := PasteErr;
+          aColGrid,
+          aRowGrid : begin
+                        if rg.rKind = aRowGrid then begin
+                           transpose := (sRg.rKind = aColRg) and transpose;
+                           if transpose or (sRg.rKind = aRowRg) then begin
+                              if transpose then begin
+                                 dv := rg.hiRow - sRg.loCol;
+                                 rg.hiRow := rg.hiRow + sRg.hiCol - sRg.loCol
+                              end
+                              else begin
+                                      dv := rg.hiRow - sRg.loRow;
+                                      rg.hiRow := rg.hiRow + sRg.hiRow - sRg.loRow
+                                   end
+                           end
+                           else status := PasteErr
+                        end
+                        else begin
+                                transpose := (sRg.rKind = aRowRg) and transpose;
+                                if transpose or (sRg.rKind = aColRg) then begin
+                                   if transpose then begin
+                                      dh := rg.hiCol - sRg.loRow;
+                                      rg.hiCol := rg.hiCol + sRg.hiRow - sRg.loRow
+                                   end
+                                   else begin
+                                           dh := rg.hiCol - sRg.loCol;
+                                           rg.hiCol := rg.hiCol + sRg.hiCol - sRg.loCol
+                                        end
+                                end
+                                else status := PasteErr
+                             end;
+                        if status = ok then begin
+                           NewSnips(rg, mmBlank, true, true, status);
+                           if status = ok then begin
+                              insertOcc := true;
+                              if rg.rKind = aColGrid then begin
+                                 if rg.hiCol = pInfSnip then rg.hiCol := idMax
+                                 else rg.hiCol := rg.hiCol - 1;
+                                 rg.rKind := aColRg
+                              end
+                              else begin
+                                      if rg.hiRow = pInfSnip then rg.hiRow := idMax
+                                      else rg.hiRow := rg.hiRow - 1;
+                                      rg.rKind := aRowRg
+                                   end;
+                              if finishMove then SwapMarkers;
+                              op := pCutUndo
+                           end
+                        end
+                     end
+       end;
+       if status = ok then begin
+          mmUndoInfo.rg := rg;
+          if op = pCutUndo then mmUndoInfo.op := uCutUndo
+          else begin
+                  mmUndoInfo.state := false;
+                  if op = pPaste then mmUndoInfo.op := uPasteUndo
+                  else if (op = pNone) and finishMove then mmUndoInfo.op := uCutUndo
+                  else mmUndoInfo.op := uPaste;
+                  if (source <> mmUndo) or (op = pPasteUndo) then begin
+
+                     {The following line causes any references to the snipIds that are being pasted over
+                      to be sent to an error condition.  The B2Marked bits will be set for those cells
+                      which referenced the cells being pasted over.  NOTE:  this feature has been disabled.
+                      Additionally, the calls to "swapMarker" are now unecssary because this feature is
+                      disabled.
+(*$IFC TIMEVERSION *)
+                     tempTime := time;
+(*$ENDC *)
+                     mmMapFormula(false, rg, rg, mmMarkSecond, vector, estimate, doingMove);
+(*$IFC TIMEVERSION *)
+                     mapTime  := mapTime + time - tempTime;
+(*$ENDC *)
+                     }
+
+
+                     {The following line causes any inner references to snipIds that are coming from the scrap to be
+                      remapped to their correct locations.  It maps all the coordinates that when to error when the
+                      snipIds where cut to the scrap.
+                     }
+(*$IFC TIMEVERSION *)
+                     tempTime := time;
+(*$ENDC *)
+                     mmMapFormula(true, rg, fRg, mmMarkFirst, vector, estimate, doingMove);
+(*$IFC TIMEVERSION *)
+                     mapTime  := mapTime + time - tempTime;
+(*$ENDC *)
+                  end
+                  else if origOp = uClear then mmUndoInfo.op := uClearUndo
+                  else if origOp = uWipe then mmUndoInfo.op := uWipeUndo
+               end;
+          case op of
+             pCutUndo,
+             pPaste : begin
+(*$IFC TIMEVERSION *)
+                         tempTime := time;
+(*$ENDC *)
+                         mmMapFormula(true, rg, fRg, mmMarkFirst, vector, estimate, doingMove);
+(*$IFC TIMEVERSION *)
+                         mapTime  := mapTime + time - tempTime;
+(*$ENDC *)
+                      end
+          end;
+          moveData(dh, dv, repeatH, repeatV);
+          rg := mmUndoInfo.rg;
+          {this call is no longer necessary.  This would have taking the B2marked bits which were set
+           for the cells that reference the cells just pasted over and moved them to the B1Marked bits.
+           This was necessary such that an undo operation would have the correct marked bits to fix
+           the formulas.  Again, this feature is disabled.
+          SwapMarkers;
+          }
+          if status = OutOfMem then begin
+             RestoreOHs;
+             if ignoreUndo then DisplayRange(rg)
+          end
+          else SetRgInvalid(rg, source = mmRelative)
+       end
+       else if status <> ProtectErr then rg := origRg
+    end;
+
+
+    (*$S undoCode *)
+    procedure UndoOper;
+    var attrRec : attrRecord;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       rg      := mmUndoInfo.rg;
+       origRg  := rg;
+       reMapRg := rg;
+       case mmUndoInfo.op of
+          uInsertUndo : begin
+                           reMapSrc := mmBlank;
+                           if rg.rKind = aColGrid then begin
+                              rg.loCol := rg.loCol - 1;
+                              rg.hiCol := rg.hiCol - 1
+                           end
+                           else begin
+                                   rg.loRow := rg.loRow - 1;
+                                   rg.hiRow := rg.hiRow - 1
+                                end;
+                           InsertSnip
+                        end;
+          uInsert     : begin
+                           if rg.rKind = aColGrid then begin
+                              rg.rKind := aColRg;
+                              rg.hiCol := rg.hiCol - 1
+                           end
+                           else begin
+                                   rg.rKind := aRowRg;
+                                   rg.hiRow := rg.hiRow - 1
+                                end;
+                           NewSnips(rg, mmRemove, true, true, status);
+                           mmUndoInfo.op := uInsertUndo
+                        end;
+          uWipe,
+          uClear,
+          uPaste      : if FBufPtr <> nil then begin
+                           reMapSrc := mmScrap;
+                           pasteScrap(pPaste)
+                        end
+                        else begin
+                                rg     := origRg;
+                                status := UndoErr
+                             end;
+          uPasteUndo  : if FBufPtr <> nil then begin
+                           reMapSrc := mmScrap;
+                           pasteScrap(pPasteUndo)
+                        end
+                        else begin
+                                rg     := origRg;
+                                status := UndoErr
+                             end;
+          uWipeUndo   : begin
+                           reMapSrc := mmWipe;
+                           DeleteSnip
+                        end;
+          uClearUndo  : begin
+                           reMapSrc := mmClear;
+                           DeleteSnip
+                        end;
+          uCutUndo    : begin
+                           reMapSrc := mmNull;
+                           DeleteSnip
+                        end;
+          uCopyUndo   : begin
+                           reMapSrc := mmCopy;
+                           DeleteSnip
+                        end;
+          uCopy       : begin
+                           FBufTemp    := FBufPtr;
+                           FBufPtr     := ScrapPtr;
+                           ScrapPtr    := FBufTemp;
+                           ScrapInfo^  := mmUndoInfo.ptr^;
+                           claimUndoBuffer(true);
+                           mmUndoInfo.op := uCopyUndo
+                        end;
+          uCut        : begin
+                           if rg.rKind = aColRg then begin
+                              rg.rKind := aColGrid;
+                              rg.hiCol := rg.loCol;
+                              rg.loCol := rg.loCol - 1
+                           end
+                           else if rg.rKind = aRowRg then begin
+                                   rg.rKind := aRowGrid;
+                                   rg.hiRow := rg.loRow;
+                                   rg.loRow := rg.loRow - 1
+                                end;
+                           reMapSrc := mmScrap;
+                           reMapRg     := rg;
+                           pastescrap(pCutUndo);
+                           {this call is no longer necessary.
+                           SwapMarkers;
+                           }
+                           doingMove := false
+                        end;
+          uWidth      : begin
+                           mmUndoInfo.state := not mmUndoInfo.state;
+                           cWidened(false);
+                           FxRgChged(rg);
+                           FxNewRgImg
+                        end;
+          uBreak,
+          uAttr       : mmUndoInfo.state := not mmUndoInfo.state;
+          otherwise     begin
+                           rg     := origRg;
+                           status := UndoErr
+                        end
+       end
+    end;
+
+(*$S CutPaste *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   TraceMess(31);
+(*$ENDC *)
+
+(*$IFC TIMEVERSION *)
+   SnipTime   := time;
+   MapTime    := 0;
+   testTime   := 0;
+   estTime    := 0;
+   allocTime  := 0;
+   saveTime   := 0;
+   firstFlag  := false;
+   secondFlag := false;
+
+(*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   if not UsingScrap then begin
+(*$ENDC *)
+      reMapSrc    := source;
+      reMapLevel  := reMapLevel + 1;
+      reMapRg     := rg;
+      origRg      := rg;
+      status      := ok;
+      protect     := false;
+      insertOcc   := false;
+      finishMove  := false;
+      transpose   := (source = mmValue) and app.BusGraph;
+      tVector     := pVector;
+      pVector     := @vector;
+
+      case source of
+         mmValue,                                       {Paste Value}
+         mmRelative,                                    {Paste Relative}
+         mmScrap : {if ScrapPtr <> nil then}
+                      pasteScrap(pNone)                 {Paste}
+                   {else Status := PasteErr};
+         mmRemove,                                      {Cut to undo buffer}
+         mmClear,                                       {Cut to undo leaving format}
+         mmWipe,                                        {Cut to undo clearing format}
+         mmCopy,                                        {Copy}
+         mmNull  : DeleteSnip;                          {Cut to scrap}
+         mmBlank : InsertSnip;                          {Insert}
+         otherwise UndoOper                             {Undo}
+      end;
+      case status of
+         ok,
+         ProtectErr : if protect then status := ProtectErr;
+         otherwise    mmUndoInfo.op := uNone
+      end;
+      pVector := tVector;
+      ShrinkSegMemory(mxHz, true, errNum)
+
+(*$IFC DEBUGVERSION *)
+   end
+   else FatalMess(31)
+(*$ENDC *)
+   ;FixRange(rg);
+   reMapLevel  := reMapLevel - 1;
+   calcTime    := 0;
+
+(*$IFC TIMEVERSION *)
+   ;snipTime := time - snipTIme;
+   writeln('NewSnips time: ',snipTime:1, '  Map: ',mapTime:1,'  Est: ',estTime:1,'  save: ',saveTime:1,
+           '  Alloc Time: ',allocTime:1,'  Snip Time: ',(snipTime-(mapTime+estTime+allocTime+saveTime)):1);
+   writeln('   map: ',mapTime*100 div snipTime:1,'  est: ',estTime*100 div snipTime:1,'  save: ',saveTime*100 div snipTime:1,
+           '  alloc: ',allocTime*100 div snipTime:1,'   snip: ',(snipTime-(mapTime+estTime+allocTime+saveTime))*100 div snipTime:1);
+   writeln('testTime: ',testTime:1)
+(*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+  ;TraceMess(32);
+   if true or debug[30] then begin
+      writeln('newsnips: level=',reMapLevel:1,'  ',wrg(rg),' status: ',status:1,'  doingMove: ',doingMove);
+   end;
+   StatusMess(status)
+(*$ENDC *)
+end;
+
+ÿ

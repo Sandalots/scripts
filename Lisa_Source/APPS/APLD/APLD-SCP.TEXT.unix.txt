@@ -1,0 +1,1379 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE Event Handlers *)
+
+(* ********************************************************************* *)
+
+Unit Scp;
+
+(* Segment PIC,SCP *)
+INTERFACE
+USES
+    (*$U UNITSTD*)     UnitStd,     (* implementation unit   *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/Syscall *)    Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)      Hdr,
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+    (*$U WM.EVENTS*)   Events,
+    (*$U WM.FOLDERS*)  Folders,
+    (*$U SCRAP*)       Scrap,
+    (*$U ApLd/SEL*)      Sel,
+    (*$U ApLd/DAT*)      Dat,
+    (*$U ApLd/DRW*)      Drw,
+    (*$U ApLd/TXT*)      Txt,
+    (*$U ApLd/UTL*)      Utl;
+VAR
+    pstLcObj:   TObjPtr;    {Paste location object, set in pasteCmd and used and
+                             updated in FinishObj}
+    txtTTpFl:   Boolean;    {text to top flag used in PasteCmd}
+    outPlLst:   TSelHnd;    {out of place list used in PasteCmd}
+
+    function  PeekGEScrap(VAR bBox: Rect; VAR hSiz,pSiz: LongInt): Integer;
+    function  GetGEScrap(VAR bBox: Rect): Integer;
+    function  PutGEScrap: Boolean;
+    procedure UndoGEScrap;
+    procedure ShowScrap(r: Rect);
+    procedure MkScrapPic;
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+
+(* ********************************************************************* *)
+
+(*
+Scrap implementation:
+    CutCmd, CopyCmd:    Inherit scrap, write curDoc.sLst to scrapHz in
+                        PutGEScrap. (later: Kill geScrapDB.)
+    PasteCmd:           Read scrap into nObjOLst in GetGEScrap if it
+                        is recognizable.  If scrapType=scrapPic then
+                        convert it to oLst.
+    Activate:           Do Nothing.
+    DeActivate:         Do Nothing. (later: Kill geScrapDB.)
+    InheritScrap:       Should call WMKillPicture, assuring that all
+                        update events come to me.
+    ClaimScrap:         Should not WMKillPicture, so can rely on picture
+                        to update if it exists, or send events to me if none.
+
+Future optimization:
+    If scrapType=scrapPic then convert into an oLst and keep it around
+    so don't have to convert on every paste.
+
+    If there is excessive overhead in accessing the scrapHz,
+    it may be advantageous to not write data to scrapHz unless it is large,
+    in which case PutGEScrap would copy to geScrapDB.  Calls to GetGEScrap
+    would simply copy geScrapDB.  Need to Kill geScrapDB on all calls to
+    PutGEScrap and on DeActivate, and write-through on Deactivate.  We write
+    out large scraps to free up curDoc Hz's.
+*)
+
+CONST
+    cPicGEDwg   = 100;
+    {cPicTxtBeg  = 101;
+    cPicTxtEnd  = 102;  in txt}
+    cPicGrpBeg  = 103;
+    cPicGrpEnd  = 104;
+    {cPicBSPoly  = 105;
+    cPicCSPoly  = 106;
+    cPicESPoly  = 107;  in drw}
+TYPE
+    TGEScpHnd = ^TGEScpPtr;
+    TGEScpPtr = ^TGEScrap;
+    TGEScrap =
+        record
+            oLst: TODBLst;
+            bBox: Rect;
+        end;
+
+VAR
+    scpFHnd:     TH;
+    scpTHnd:     TH;
+    scpCLst:     TCLstHnd;
+    scpSPObj:    TObjPtr;
+    sPolyFlag:   Boolean;
+    scpFgClr:    LongInt;
+    scpBgClr:    LongInt;
+    grpDB:       TODBLst;
+    textPicObj:  TObjPtr;
+    lastPicObj:  TObjPtr;
+    lastPicRect: Rect;
+    lastPicKind: Integer;
+    lastPolySize: Integer;
+
+    startPic,
+    geTxtFlag,
+    geGrpFlag,
+    gePicFlag:   Boolean;
+
+    (* make this global, so can test for it in grow proc *)
+    scrapPHz: THz;
+
+(* ********************************************************************* *)
+
+(* Standard Scrap interface private picture interface routines *)
+(*$S PIC*)
+
+(* ********************************************************************* *)
+
+    {function  EqualRect(r1,r2: Rect): Boolean;  now in QD}
+
+(* ***************************************************************** *)
+
+        function  EqPat(pat1,pat2: Pattern): Boolean;
+        type
+            patCheat =
+                record
+                    case Boolean of
+                        TRUE:  (l1,l2: LongInt);
+                        FALSE: (p: Pattern);
+                end;
+        var
+            p1,p2: patCheat;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            p1.p := pat1;
+            p2.p := pat2;
+            EqPat := FALSE;
+            if p1.l1=p2.l1 then
+                if p1.l2=p2.l2 then
+                    EqPat := TRUE;
+        end; (* EqPat *)
+
+(* ***************************************************************** *)
+
+        function GetFill(pat: Pattern): Integer;
+        var i: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            GetFill := 2;               (* white *)
+            for i := 2 to numFStyle do
+                if EqPat(pat,fillPats[i]) then begin
+                    GetFill := i;
+                    i := numFStyle;
+                end;
+        end; (* GetFill *)
+
+(* ********************************************************************* *)
+
+    procedure SetPInf(verb: grafVerb; thisObj: TObjPtr);
+    var i,indx: Integer;
+        ph: Integer;
+        pPat: Pattern;
+
+
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with thisObj^.oDat do
+        case verb of
+            frame:
+                begin
+                    (* penSize *)
+                    ph := thePort^.pnSize.h;
+                    for i := 1 to 4 do begin
+                        indx := i;
+                        if ph<=penSizes[i].h then
+                            i := 4;
+                    end;
+                    inf.pnSiz := indx;
+                    {inf.pnPat := 1;} {this seems superfluous even before}
+                    (* penPat *)
+                    pPat := thePort^.pnPat;
+                    inf.pnPat := iPenBlack;    {default setting}
+                    For i:= 1 to numPnPat do
+                        If EqPat(pPat,penPats[i]) then
+                            inf.pnPat := i;
+
+                    {if EqPat(pPat,black) then
+                        inf.pnPat := 1
+                    else if EqPat(pPat,white) then
+                        inf.pnPat := 3
+                    else
+                        inf.pnPat := 2;}
+                end;
+            paint:  (* set flPat to pnPat *)
+                inf.flPat := GetFill(thePort^.pnPat);
+            fill:   (* set flPat to thePort^.fillPat *)
+                inf.flPat := GetFill(thePort^.fillPat);  {thePat is gone}
+            erase: begin
+                       inf.flPat := GetFill(thePort^.bkPat);
+                       inf.pnPat := iPenClear;
+                   end;
+
+            (* invert: can't handle, do nothing *)
+        end; (* case *)
+    end; (* SetPInf *)
+
+(* ********************************************************************* *)
+
+    procedure CenterRect(VAR r: Rect);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        {
+        if traceCmd then
+            Writeln('        CenterRect');
+        }
+        (* center rect geometry on line thickness *)
+        with thePort^.pnSize do begin
+            r.left   := r.left   + (h DIV 2);
+            r.top    := r.top    + (v DIV 2);
+            r.right  := r.right  - ((h+1) DIV 2);
+            r.bottom := r.bottom - ((v+1) DIV 2);
+        end;
+    end; (* CenterRect *)
+
+(* ********************************************************************* *)
+
+    procedure InsertFt(obj, preObj: TObjPtr);
+    External;
+
+(* ********************************************************************* *)
+    procedure ColorToIndex(color:longInt;Var index:TPByte);
+    Var i: Integer;
+    begin
+        index := iClrBlack; {Default to black}
+        For i := iClrFirst to iClrLast-1 do begin {the last color is mixed}
+            If clrPrCod[i]=color then begin
+                index := i;
+                i := iClrLast-1; {abort the loop}
+            end;
+        end;
+    end;{ColorToIndex}
+
+(* ********************************************************************* *)
+
+    procedure SetColor(thisObj:TObjPtr);
+    Var index: TPByte;
+    begin
+        With thisObj^.oDat.inf do begin
+            ColorToIndex(scpFgClr,index);
+            fgClr := index;
+            ColorToIndex(scpBgClr,index);
+            bgClr := index;
+        end;
+    end;{SetColor}
+
+(* ********************************************************************* *)
+
+    procedure FinishObj(thisObj: TObjPtr);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+
+        If traceCmd then
+            Writeln('        FinishObj');
+        If NOT (thisObj=lastPicObj) then begin
+            SetColor(thisObj);
+            thisObj^.cSel := iSelNml;
+            (* add to DB *)
+            if geGrpFlag then
+                AddToOEnd(grpDB,thisObj)
+
+            {Insert in oLst or add to out of place list}
+            else if (txtTTpFl AND (thisObj^.oDat.kind=iObjText)) OR
+                ((NOT txtTTpFl) AND (thisObj^.oDat.kind<>iObjText)) then
+
+                AddToSEnd(outPlLst,thisObj)
+            else begin
+                InsertFt(thisObj,pstLcObj);
+                pstLcObj := thisObj;
+            end;
+
+            (* remember last obj *)
+            lastPicObj  := thisObj;
+            lastPicKind := thisObj^.oDat.kind;
+        end;
+    end; (* FinishObj *)
+
+(* ********************************************************************* *)
+
+    function  GetGERect(kind: Integer; verb: GrafVerb; r: Rect): Boolean;
+
+    (* ***************************************************************** *)
+
+        procedure GetPicRect(obj: TObjPtr);
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* center rect geometry on line thickness *)
+            CenterRect(r);
+            (* set obj geometry *)
+            RectToR2D(r,obj^.oDat.r2D);
+        end; (* GetPicRect *)
+
+    (* ***************************************************************** *)
+
+        procedure GetPicObj;
+        var thisObj: TObjPtr;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* remember rect *)
+            lastPicRect := r;
+            (* get new obj *)
+            thisObj := NewObj(iObjRect);
+            (* set the geometry *)
+            GetPicRect(thisObj);
+            (* finish object *)
+            FinishObj(thisObj);
+        end; (* GetPicObj *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then begin
+            Write('        GetGERect(',kind:2,',',Ord(verb):2,',');
+            WrtRect(r);
+            Writeln(')');
+            Write('            last:',lastPicKind:2,',');
+            WlnRect('',lastPicRect);
+        end;
+        startPic := FALSE;
+        GetGERect := FALSE;
+        if NOT geTxtFlag then
+            if verb<>invert then begin
+                GetGERect := TRUE;
+                (* see if we need new obj *)
+                if kind=lastPicKind then begin
+                    if EqualRect(r,lastPicRect) then begin
+                        if verb=frame then
+                            GetPicRect(lastPicObj);
+                    end else
+                        GetPicObj;
+                end else
+                    GetPicObj;
+                (* set pen, fill *)
+                SetPInf(verb,lastPicObj);
+                (* finish object *)
+                GetBBox(lastPicObj);
+                lastPicObj^.oDat.kind := kind;
+                lastPicKind := kind;
+            end;
+    end; (* GetGERect *)
+
+(* ********************************************************************* *)
+
+(* Std Scrap Interface/LisaGraf BottleNeck capture procs *)
+
+(* ********************************************************************* *)
+
+    procedure GEText(count: Integer; textAddr: QDPtr; numer,denom: Point);
+    type
+        PtrRun= ^Run;
+        Run = record
+            lpFst:     integer;         (* starting lp of run            *)
+            font:      integer;         (* font number, from FontMgr     *)
+            face:      Style;           (* formatting characteristics    *)
+        end;
+    var
+        thisObj: TObjPtr;
+        thisRun,lastRun: PtrRun;
+        oldTLen,oldFLen: Integer;
+        dst:     QdPtr;
+        needFmt: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    GEText(',count:1,')');
+
+        startPic := FALSE;
+        (* get txt obj *)
+        if gePicFlag and geTxtFlag then begin
+            thisObj := textPicObj;
+            with thisObj^.oDat do
+            if inf.tLen=0 then begin
+                tLoc.x := thePort^.pnLoc.h-cTxtPad+1;
+                tLoc.y := thePort^.pnLoc.v;
+            end;
+        end else begin
+            (* get new obj *)
+            thisObj    := NewObj(iObjText);
+            with thisObj^.oDat do begin
+                (* set text params *)
+                inf.tLen   := 0;
+                inf.fLen   := 0;
+                inf.tDat   := 1;
+                inf.tPat   := iFillClear;
+                tLoc.x     := thePort^.pnLoc.h-cTxtPad+1;
+                tLoc.y     := thePort^.pnLoc.v;
+                (* get storage for data *)
+                tHnd       := NewText(inf.tlen);
+                fHnd       := NewFmts(inf.fLen);
+            end;
+        end;
+        with thisObj^.oDat do begin
+            (* data size is zero *)
+            oldTLen := inf.tLen;
+            oldFLen := inf.fLen;
+        end;
+        (* set text inf *)
+        with thisObj^.oDat do begin
+            (* size txt to accommodate current data *)
+            inf.tLen := oldTLen+count;
+            ChangeSizeH(curDoc.hHz,tHnd,inf.tLen);
+            (* copy the text *)
+            dst := Pointer(Ord(tHnd^)+oldTLen);
+            MoveLeft(textAddr^,dst^,count);
+
+            (* see if format changes *)
+            needFmt := TRUE;
+            if oldFLen>0 then begin
+                lastRun := Pointer(Ord(fHnd^)+(oldFLen-1)*runSize);
+                with lastRun^,thePort^ do
+                    if font=txFont then
+                        if face=txFace then
+                            needFmt := FALSE;
+            end;
+            if needFmt then begin
+                (* size fmt to accommodate current data *)
+                inf.fLen := oldFLen+1;
+                ChangeSizeH(curDoc.hHz,fHnd,inf.fLen*runSize);
+                thisRun := Pointer(Ord(fHnd^)+oldFLen*runSize);
+                thisRun^.lpFst := oldTLen;
+                thisRun^.font  := thePort^.txFont;
+                thisRun^.face  := thePort^.txFace;
+            end;
+        end;
+        if NOT (gePicFlag and geTxtFlag) then begin
+            GetBBox(thisObj);
+            FinishObj(thisObj);
+        end;
+    end; (* GEText *)
+
+(* ********************************************************************* *)
+
+    procedure ApLDLine(newPt: Point);  {GELine duplicated something}
+    var r: Rect;
+        ph,pv: Integer;
+        thisObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    ApLDLine(',newPt.h:2,',',newPt.v:2,')');
+
+        startPic := FALSE;
+        if NOT geTxtFlag then begin
+            (* get new obj *)
+            thisObj := NewObj(iObjSLin);
+            (* set pen, fill *)
+            SetPInf(frame,thisObj);
+            (* lines are never filled *)
+            thisObj^.oDat.inf.flPat := iFillClear;
+            (* do we have arrows? *)
+            thisObj^.oDat.inf.dat := 0;
+            (* center line geometry on line thickness *)
+            with thisObj^.oDat,thePort^ do begin
+                ph := pnSize.h DIV 2;
+                pv := pnSize.v DIV 2;
+                p1.x := pnLoc.h + ph;
+                p1.y := pnLoc.v + pv;
+                p2.x := newPt.h + ph;
+                p2.y := newPt.v + pv;
+            end;
+            (* update port penLoc *)
+            thePort^.pnLoc := newPt;
+            (* get bbox *)
+            GetBBox(thisObj);
+            (* finish object *)
+            FinishObj(thisObj);
+        end;
+    end; (* ApLDLine *)
+
+(* ********************************************************************* *)
+
+    procedure GERect(verb: GrafVerb; r: Rect);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            Writeln('    GERect(',Ord(verb):2,')');
+        If gePicFlag AND geTxtFlag then
+           If verb=paint then
+               textPicObj^.oDat.inf.tPat := GetFill(thePort^.pnPat)
+           else if verb=erase then
+               textPicObj^.oDat.inf.tPat := GetFill(thePort^.bkPat);
+        IF NOT geTxtFlag THEN BEGIN
+            if GetGERect(iObjRect,verb,r) then
+                (* do nothing *);
+        END;
+    end; (* GERect *)
+
+(* ********************************************************************* *)
+
+    procedure GERRect(verb: GrafVerb; r: Rect; ovWd,ovHt: Integer);
+    var i,indx: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    GERndR(',Ord(verb):2,', ',ovWd:2,',',ovHt:2,')');
+        IF NOT geTxtFlag THEN BEGIN
+            if GetGERect(iObjRndR,verb,r) then
+                with lastPicObj^,oDat do begin
+                    (* get nearest corner radius *)
+                    for i := 1 to 5 do begin
+                        indx := i;
+                        if ovWd<=rndSizes[iUnitInch,i].h then
+                            i := 5;
+                    end;
+                    inf.dat := indx;
+                end;
+        END;
+    end; (* GERRect *)
+
+(* ********************************************************************* *)
+
+    procedure GEOval(verb: GrafVerb; r: Rect);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    GEOval(',Ord(verb):2,')');
+        If NOT geTxtFlag then
+            if GetGERect(iObjOval,verb,r) then
+                (* do nothing *);
+    end; (* GEOval *)
+
+(* ********************************************************************* *)
+
+    procedure GEArc(verb: GrafVerb; r: Rect; startAngle,arcAngle: Integer);
+    var thisArc: TArcHnd;
+        thisObj: TObjPtr;
+        thisR:   Rect;
+        objOK:   Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    GEArc (',Ord(verb):2,')');
+
+        startPic := FALSE;
+        if NOT geTxtFlag then
+            if verb<>invert then begin
+                (* if the arc has same geometry as last arc, then just change
+                   the fill or pen, otherwise create a new obj *)
+                objOK := FALSE;
+                if iObjArc=lastPicKind then
+                    if EqualRect(r,lastPicRect) then with lastPicObj^.oDat.arc^^ do
+                        if (startAngle=aStart) and (arcAngle=aAngle) then begin
+                            objOK := TRUE;
+                            if verb=frame then begin
+                                (* center rect geometry on line thickness *)
+                                thisR := r;
+                                CenterRect(r);
+                                (* set obj geometry *)
+                                RectToR2D(thisR,lastPicObj^.oDat.arc^^.ar2D);
+                            end;
+                        end;
+
+                if not objOK then begin
+                    (* remember rect *)
+                    lastPicRect := r;
+                    (* get new obj *)
+                    thisObj := NewObj(iObjArc);
+                    (* set arc *)
+                    thisArc := NewArc;
+                    thisObj^.oDat.arc := thisArc;
+
+                    (* set the geometry *)
+                    (* center rect geometry on line thickness *)
+                    thisR := r;
+                    CenterRect(r);
+                    (* set obj geometry *)
+                    with thisArc^^ do begin
+                        RectToR2D(thisR,ar2D);
+                        aStart := startAngle;
+                        aAngle := arcAngle;
+                    end;
+                    FinishObj(thisObj);
+                end;
+
+                (* set pen, fill *)
+                SetPInf(verb,lastPicObj);
+                (* finish object *)
+                GetBBox(lastPicObj);
+            end;
+    end; (* GEArc *)
+
+(* ********************************************************************* *)
+
+    procedure GEPoly(verb: GrafVerb; poly: PolyHandle);
+    var thisObj: TObjPtr;
+        index,size: Integer;
+        thisClst: TCLstHnd;
+       { dummyFlag: Boolean;}
+        this2D,last2D: Point2D;
+        crdPt: Point;
+        crdPt2D: Point2D;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    GEPoly(',Ord(verb):2,')');
+        startPic := FALSE;
+        if NOT geTxtFlag then
+            if verb<>invert then begin
+                If sPolyFlag then begin
+                    thisObj := scpSPObj;
+                end else begin
+                    OpenCLst(curDoc.hHz,thisCLst,1000,iObjPoly);
+                    ScrnToWld(poly^^.polyPoints[0],this2D);
+                    thisCLst^^.beg2D := this2D;
+                    thisCLst^^.c2DLst[0] := this2D;
+                    index := 1;
+                    size := (poly^^.polySize - 10) DIV 4;
+                    while index<size do begin
+                        SetPt(crdPt,0,0);
+                        {dummyFlag := PolyNext(poly,index,crdPt);}
+                        (*$R-*)
+                        crdPt := poly^^.polyPoints[index];
+
+                        (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+                        ScrnToWld(crdPt,crdPt2D);
+                        PutPNode(thisCLst,crdPt2D);
+                        index := index + 1
+                    end;
+                    CloseCLst(thisCLst);
+                    (* get new obj *)
+                    thisObj := NewObj(iObjPoly);
+                    thisObj^.oDat.cLst := thisCLst;
+                    GetBBox(thisObj);
+                    (* see if we need new obj *)
+                    if lastPicKind=iObjPoly then
+                        if EqualRect(thisObj^.bBox,lastPicObj^.bBox) then
+                            if size=lastPolySize then begin
+                                last2D := lastPicObj^.oDat.cLst^^.beg2D;
+                                if this2D.x=last2D.x then
+                                    if this2D.y=last2D.y then begin
+                                        FreeObj(thisObj);
+                                        thisObj := lastpicObj;
+                                    end;
+                            end;
+                    (* set pen, fill *)
+                    SetPInf(verb,thisObj);
+                    (* finish object *)
+                    GetBBox(thisObj);
+                    lastPolySize := size;
+                end;
+                FinishObj(thisObj);
+            end;
+    end; (* GEPoly *)
+
+(* ********************************************************************* *)
+
+    procedure GERgn(verb: GrafVerb; rgn: rgnHandle);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        startPic := FALSE;
+        (* do nothing...GE doesn't know how to handle regions yet *)
+    end; (* GERgn *)
+
+(* ********************************************************************* *)
+
+    procedure GEBits(VAR srcBits: BitMap; Var srcRect,dstRect: Rect;
+                     mode: Integer; maskRgn: RgnHandle);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        startPic := FALSE;
+        (* do nothing...GE doesn't know how to handle bitMaps yet *)
+    end; (* GEBits *)
+
+(* ********************************************************************* *)
+
+    procedure GEComment(kind,size: Integer; data: Handle);
+    Type TPtrLongInt = ^LongInt;
+        THndLongInt = ^TPtrLongInt;
+    var thisObj: TObjPtr;
+        fldWidth,thisAlign: Integer;
+        picComHnd:  THndLongInt;
+        objHandle: ^TObjPtr;
+        cLstHandle: TCLstHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+
+        picComHnd := Pointer(Ord(data));
+        Case kind of
+             cPicFgClr: scpFgClr := picComHnd^^;
+             cPicBgClr: scpBgClr := picComHnd^^;
+             cPicCSPoly: begin
+                             sPolyFlag := TRUE;
+                             cLstHandle := Pointer(Ord(data));
+                             DupCLst(cLstHandle,scpCLst);
+                         end;
+             cPicBSPoly: begin
+                             objHandle := Pointer(Ord(data));
+                             objHandle^^.oDat.cLst := scpCLst;
+                             DupObj(objHandle^,scpSPObj);
+                         end;
+             cPicESPoly: sPolyFlag := FALSE;
+             cPictHnd: begin
+                           scpTHnd := HAllocate(curDoc.hHz,size);
+                           MoveLeft(data^^,scpTHnd^^,size);
+                       end;
+             cPicfHnd: begin
+                           scpFHnd := HAllocate(curDoc.hHz,size);
+                           MoveLeft(data^^,scpFHnd^^,size);
+                       end;
+             cPicRTxt: begin
+                           thisObj := Pointer(Ord(PAllocate(curDoc.pHz, size)));
+                           MoveLeft(data^^,thisObj^,size);
+                           With thisObj^.oDat do begin
+                               tHnd := scpTHnd;
+                               fHnd := scpFHnd;
+                           end;
+                           FinishObj(thisObj);
+                       end;
+              {cPicTxtBeg: geTxtFlag := TRUE;}
+              {cPicTxtEnd: geTxtFlag := FALSE;}
+        end;{Case}
+        If TraceCmd then begin
+            WriteLn('scpFgClr,scpBgClr ',scpFgClr:8,scpBgClr:8);
+            WriteLn('Compare to ');
+            Write('blackColor ',blackColor,' whiteColor ',whiteColor);
+            WriteLn(' redColor ',redColor,' greenColor ',greenColor);
+        end;
+        If startPic or gePicFlag then begin
+
+            case kind of
+
+
+                cPicGEDwg:  if startPic then gePicFlag := TRUE;
+                cPicTxtBeg:
+                    begin
+                        geTxtFlag := TRUE;
+                        (* get new obj *)
+                        textPicObj := NewObj(iObjText);
+                        with textPicObj^.oDat do begin
+                            (* data size is zero *)
+                            inf.tLen   := 0;
+                            inf.fLen   := 0;
+                            (* get storage for data *)
+                            tHnd       := NewText(inf.tlen);
+                            fHnd       := NewFmts(inf.flen);
+                            (* set text params *)
+                            inf.tDat := data^^;
+                            inf.tPat   := iFillClear;
+                        end;
+                    end;
+                cPicTxtEnd:
+                    begin
+                        geTxtFlag := FALSE;
+                        with textPicObj^,oDat,inf do
+                        if tLen>0 then begin
+                            GetBBox(textPicObj);
+                            FinishObj(textPicObj);
+                            (* offset tLoc for align *)
+                            with bBox do
+                            fldWidth := right-left-2*cTxtPad;
+                            thisAlign := tDat MOD 16;
+                            if thisAlign=cAlnRgt then
+                                tLoc.x := tLoc.x+fldWidth
+                            else if thisAlign=cAlnCtr then
+                                tLoc.x := tLoc.x+fldWidth/2;
+                        end;
+                    end;
+                cPicGrpBeg:
+                    begin
+                        geGrpFlag := TRUE;
+                        InitODB(grpDB);
+                    end;
+                cPicGrpEnd:
+                    begin
+                        geGrpFlag := FALSE;
+                        if grpDB.lst.lBeg<>NIL then begin
+                            thisObj := NewObj(iObjGroup);
+                            thisObj^.oDat.grp := grpDB.lst;
+                            GetBBox(thisObj);
+                            FinishObj(thisObj);
+                        end;
+                    end;
+            end; (* case *)
+        end;
+    end; (* GEComment *)
+
+(* ********************************************************************* *)
+
+    procedure PicToOLst(thisPic: PicHandle);
+    var thisFrame: Rect;
+        thisObj:   TObjPtr;
+        geProcs: QDProcs;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            WlnPic('PicToOLst=',thisPic);
+
+        (* set LisaGraf pointers to capture procs *)
+        SetStdProcs(geProcs);
+        geProcs.textProc    := @GEText;
+        geProcs.lineProc    := @ApLDLine;
+        geProcs.rectProc    := @GERect;
+        geProcs.rRectProc   := @GERRect;
+        geProcs.ovalProc    := @GEOval;
+        geProcs.arcProc     := @GEArc;
+        geProcs.polyProc    := @GEPoly;
+        geProcs.rgnProc     := @GERgn;
+        geProcs.bitsProc    := @GEBits;
+        geProcs.commentProc := @GEComment;
+        thePort^.grafProcs  := @geProcs;
+
+        thisFrame := thisPic^^.picFrame;
+        with thisFrame do begin
+            OffsetRect(thisFrame,-left,-top);
+            thisFrame.right  := CMin(right,cHDwgMax);
+            thisFrame.bottom := CMin(bottom,cVDwgMax);
+            {XXX should we do this?}
+            (* check to see if picture needs to be scaled *)
+        end;
+
+        (* play picture back, capture into ODB *)
+        startPic    := TRUE;
+        gePicFlag   := FALSE;
+        geTxtFlag   := FALSE;
+        geGrpFlag   := FALSE;
+        lastPicKind := iObjNil;
+        lastPicObj  := NIL;
+        lastPicRect := nilRect;
+        ResetSLst(curDoc.sLst);
+        DrawPicture(thisPic,thisFrame);
+
+        (* set LisaGraf pointers back to standard procs *)
+        thePort^.grafProcs := NIL;
+
+    end; (* PicToOLst *)
+
+
+(* ********************************************************************* *)
+
+(* Standard Scrap Interface private setup routines *)
+
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure GEGrowDSeg(VAR errNum: Integer; deltaSize: LongInt);
+    var dSeg: Integer;
+        newMemSize,newDiskSize: LongInt;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* procCBMore for scrap *)
+        dSeg  := DSegOfScrap;
+        (* grow by 1024 multiple *)
+        Size_DataSeg(errNum,dSeg,
+                     deltaSize,newMemSize,
+                     deltaSize,newDiskSize);
+        if traceOn then begin
+            if errNum=0 then
+                writeln('scrap dataSeg expanded to ',newMemSize:10,
+                        ', on request of ',deltaSize:10)
+            else
+                writeln('OS Error(',errNum:1,') on expanding scrap heap');
+        end;
+    end; (* GEGrowDSeg *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    function  GEGrowScrapHz(hz: THz; cbNeed: TC): TC;
+    var errNum: Integer;
+        deltaSize: LongInt;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if hz=scrapPHz then
+            errNum := 1
+        else begin
+            deltaSize := ((cbNeed Div 1024)+1)*1024;
+            GEGrowDSeg(errNum,deltaSize);
+        end;
+        (* check for errors *)
+        if errNum>0 then
+            Error('Can''t expand scrapHz',cbNeed,FATAL)
+        else
+            GEGrowScrapHz := deltaSize;
+    end; (* GEGrowScrapHz *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    function  InitGEScrap(pSiz,hSiz,numHnd: LongInt;
+                          hzProc: TProc;
+                          VAR pHz,hHz: THz): Boolean;
+    var sizeNeeded,sAddr: LongInt;
+        errNum,dSeg: Integer;
+        dSegInfo: DsInfoRec;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* This routine is called by PutGEScrap instead of the sequence:
+                        EraseScrapData;
+                        scrapHz := HzOfScrap;
+           It initializes two heaps in the scrap dataSeg:
+           a non-Relocatable heap of size SIZPHZ,
+           and a relocatable heap with numHnd handles in it.
+           Returns them in pHz,hHz respectively.
+           Note that hHz is created after pHz so that it can be grown.
+           It is initially sized to (scrap Info_DataSeg.mem_Size) - pSiz. *)
+
+        if traceFio then
+            writeln('InitGEScrap(',pSiz:2,',',numHnd:2,',',Ord(hzProc):2,')');
+
+        (* init the heaps *)
+        dSeg  := DSegOfScrap;
+        Info_DataSeg (errNum, dSeg, dSegInfo);
+
+        (*$IFC rangeOn *)
+        IF errNum > 0 THEN
+            Error ('InitGEScrap failed on Info_DataSeg.', ErrNum,FATAL);
+        (*$ENDC *)
+
+        {XXX NOTE: take into account the size of scrapPic!}
+        (* make sure scrap dataSeg is big enough *)
+        sizeNeeded := pSiz+hSiz+numHnd*8+1024-dSegInfo.mem_Size;
+
+        if traceFio then
+            writeln('    dSegSize=',dSegInfo.mem_size:2,
+                    ' sizeNeeded=',sizeNeeded:2,
+                    ' dSeg=',dSeg:4);
+
+        GEGrowDSeg(errNum,sizeNeeded);
+        if errNum>0 then
+            InitGEScrap := FALSE
+        else begin
+            InitGEScrap := TRUE;
+            Info_DataSeg (errNum, dSeg, dSegInfo);
+
+            sAddr := AddrOfScrapDSeg;
+            if traceFio then
+                writeln('    pHzInit(',sAddr:8,',',(sAddr+pSiz):8,',',
+                                       Ord(NIL):1,',',10:3,',',0:1,',',
+                                       Ord(hzProc):8,',',Ord(NIL):1,',',
+                                       Ord(NIL):1,',',Ord(NIL):1,')');
+
+            pHz := HzInit (Pointer (sAddr),
+                           Pointer (sAddr+pSiz),
+                           NIL,
+                           10,
+                           0,
+                           hzProc,
+                           NIL, NIL, NIL);
+
+            if traceFio then
+                writeln('    hHzInit(',(sAddr+pSiz):8,',',
+                                       (sAddr+dSegInfo.mem_Size):8,',',
+                                       Ord(NIL):1,',',numHnd:3,',',0:1,',',
+                                       Ord(hzProc):8,',',Ord(NIL):1,',',
+                                       Ord(NIL):1,',',Ord(NIL):1,')');
+
+            hHz := HzInit (Pointer (sAddr+pSiz),
+                           Pointer (sAddr+dSegInfo.mem_Size),
+                           NIL,
+                           numHnd,
+                           0,
+                           hzProc,
+                           NIL, NIL, NIL);
+
+            (* make GrScrap pic NIL *)
+            PutGrScrap(NIL,errNum);
+        end;
+    end; (* InitGEScrap *)
+
+(* ********************************************************************* *)
+
+(* Standard Scrap interface public routines *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure DoGetGEScrap(fCopyData: Boolean; VAR kind: Integer;
+                           VAR bBox: Rect; VAR hSiz,pSiz: LongInt);
+    var scrapHnd:   TH;
+        scrapKind:  ScrapType;
+        picHnd:     PicHandle;
+        thisGEScp:  TGEScpHnd;
+        thisOLst:   TODBLst;
+        errNum:     Integer;
+        thisStat:   TStatRec;
+
+    (* ***************************************************************** *)
+
+        procedure CopyNewOSLst;
+        var thisObj,scrapObj: TObjPtr;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* copy thisOLst from scrap dataSeg to curDoc dataSeg *)
+            InitSLst(curDoc.sLst);
+            thisObj := thisOLst.lst.lBeg;
+            while thisObj<>NIL do begin
+                DupObj(thisObj,scrapObj);
+                scrapObj^.cSel := iSelNml;
+
+                {Insert in oLst or add to out of place list}
+                If (txtTTpFl AND (scrapObj^.oDat.kind=iObjText)) OR
+                    ((NOT txtTTpFl) AND (scrapObj^.oDat.kind<>iObjText)) then
+                    AddToSEnd(outPlLst,scrapObj)
+                else begin
+                    InsertFt(scrapObj,pstLcObj);
+                    pstLcObj := scrapObj;
+                end;
+
+                thisObj := thisObj^.fLink;
+            end;
+        end; (* CopyNewOSLst *)
+
+    (* ***************************************************************** *)
+
+    begin (* DoGetGEScrap *)
+        {$IFC sampcalls} ALogCall; {$ENDC} (* DoGetGEScrap *)
+        (* folded code for Peek and Get GEScrap *)
+        sPolyFlag := FALSE;   {initialize sPolyFlag}
+        scpFgClr := blackColor;    {initialize colors}
+        scpBgClr := whiteColor;
+        GetScrap(scrapKind,scrapHnd);
+        kind := scrapKind;
+        bBox := nilRect;
+        hSiz := 0;
+        pSiz := 0;
+        if kind=scrapDwg then begin
+            if scrapHnd<>NIL then begin
+                (* get access to scrap data seg *)
+                StartGetScrap(errNum);
+                if rangeOn then
+                    if errNum<>0 then
+                        Error('StartGetScrap',errNum,NONFATAL);
+
+                (* get scrap oLst and bBox *)
+                thisGEScp := Pointer(Ord(scrapHnd));
+                thisOLst  := thisGEScp^^.oLst;
+                bBox      := thisGEScp^^.bBox;
+                (* get scrap size requirements *)
+                GetOLstStats(thisOLst.lst.lBeg,thisStat);
+                GetStatSiz(thisStat,hSiz,pSiz);
+                (* copy the scrap to oLst and set cSel *)
+                if fCopyData then
+                    CopyNewOSLst;
+
+                (* unbind scrap data seg access *)
+                EndGetScrap(errNum);
+                if rangeOn then
+                    if errNum<>0 then
+                        Error('EndGetScrap',errNum,NONFATAL);
+            end;
+        end else if (scrapUG in currScrapSet) then begin
+            (* see if we have a scrap picture *)
+            GetGrScrap(picHnd);
+            if picHnd<>NIL then begin
+                kind := scrapDwg;
+
+                (* get access to scrap data seg *)
+                StartGetScrap(errNum);
+                if rangeOn then
+                    if errNum<>0 then
+                        Error('StartGetScrap',errNum,NONFATAL);
+
+                (* get scrap bBox *)
+                bBox := picHnd^^.picFrame;
+                (* estimate the size of the picture:
+                   figure 10 bytes minimum per object,
+                   75% of bytes are pSize, 25% are hSize *)
+                hSiz := picHnd^^.picSize;
+                hSiz := hSiz Div 4;
+                pSiz := 12*hSiz;
+                (* create TObjLst from picture *)
+                (* copy the scrap to oLst and sLst *)
+                if fCopyData then begin
+                    PicToOLst(picHnd);
+                    bBox := curDoc.sLst^^.sBBox;
+                end;
+
+                (* unbind scrap data seg access *)
+                EndGetScrap(errNum);
+                if rangeOn then
+                    if errNum<>0 then
+                        Error('EndGetScrap',errNum,NONFATAL);
+            end;
+        end else if (scrapCS in currScrapSet) then begin
+            kind := scrapFE;
+            (* get scrap size requirements *)
+            pSiz := 40;
+            hSiz := 255;
+        end;
+        if traceFio then begin
+            Write('DoGetGEScrap, kind=',kind:2);
+            WlnRect(', bBox=',bBox);
+        end;
+    end; (* DoGetGEScrap *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    function  PeekGEScrap(* VAR bBox: Rect; VAR hSiz,pSiz: LongInt): Integer *);
+    var kind:  Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (*
+        called from PasteCmd:
+            get scrap kind and its bBox.
+        *)
+        DoGetGEScrap(FALSE,kind,bBox,hSiz,pSiz);
+        PeekGEScrap := kind;
+    end; (* PeekGEScrap *)
+
+(* ********************************************************************* *)
+
+    function  GetGEScrap(* VAR bBox: Rect): Integer *);
+    var kind:  Integer;
+        hSiz,pSiz: LongInt;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (*
+        called from PasteCmd:
+            Read scrap into nObjOLst if it is recognizable.
+            If scrapType=scrapPic then convert to oLst.
+        *)
+        DoGetGEScrap(TRUE,kind,bBox,hSiz,pSiz);
+        GetGEScrap := kind;
+    end; (* GetGEScrap *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    function  PutGEScrap(* : Boolean *);
+    var thisGEScp: TGEScpHnd;
+        thisOLst: TODBLst;
+        thisObj,scrapObj: TObjPtr;
+        scrapHHz: THz;
+        thisStat: TStatRec;
+        numHnd,hSiz,pSiz: LongInt;
+        errNum: Integer;
+        thisPic: PicHandle;
+        thisRect: Rect;
+        sel2D: Point2D;
+        i: Integer;
+        savePort: GrafPtr;
+        saveZoomOn: Integer;
+
+    (* ***************************************************************** *)
+
+        procedure ShowTOLst;
+        var obj: TObjPtr;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            obj := thisOLst.lst.lBeg;
+            while obj<>NIL do begin
+                ShowObj(obj);
+                obj := obj^.fLink;
+            end;
+        end; (* ShowTOLst *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (*
+        Called from CutCmd, CopyCmd:
+            Inherit scrap, write curDoc.sLst to scrapHz.
+        *)
+
+        if traceFio then
+            writeln('PutGEScrap');
+
+        (* claim ownership of the scrap *)
+        InheritScrap(TRUE);
+
+        (* bind scrap data seg for writing to its dataSeg *)
+        putScpFlag := TRUE;
+        StartPutScrap(errNum);
+        if rangeOn then
+            if errNum<>0 then
+                Error('StartPutScrap',errNum,NONFATAL);
+
+        (* find out byte size of non-relocatable blocks *)
+        (* and number of relocatable blocks we will write *)
+        GetSLstStats(curDoc.sLst,thisStat);
+        GetStatSiz(thisStat,hSiz,pSiz);
+        pSiz := pSiz+512;               (* add slop *)
+        hSiz := hSiz+512;
+        with thisStat do begin          (* total num handles *)
+            numHnd := numArc+   (* number of arcs *)
+                      numCrd+   (* number of freeHand curves *)
+                      numC2D+   (* number of polygons *)
+                      numTxt+   (* number of text fields *)
+                      numFmt+   (* number of formats in all text fields *)
+                      10;       (* slop *)
+        end;
+
+        (* init scrap heap zones: instead of calling EraseScrapData, *)
+        (* set up the heaps ourself to get both relocatable and      *)
+        (* non-relocatable heaps *)
+
+        if NOT InitGEScrap(pSiz,hSiz,numHnd,@GEGrowScrapHz,
+                           scrapPHz,scrapHHz) then begin
+            PutGEScrap := FALSE;
+            PutScrap(scrapDwg,NIL,errNum);
+        end else begin
+            PutGEScrap := TRUE;
+            (* set ge heap zones to scrap heap zones *)
+            saveHHz    := curDoc.hHz;
+            savePHz    := curDoc.pHz;
+            curDoc.hHz := scrapHHz;
+            curDoc.pHz := scrapPHz;
+
+            (* copy curDoc.sLst to scrpHz, offset each obj so that it will
+               be visible in scrap fldr *)
+            GetSelRect(curDoc.sLst,thisRect);
+            ScrnToWld(thisRect.topLeft,sel2D);
+            InitODB(thisOLst);
+            for i := 1 to curDoc.sLst^^.sCnt do begin
+                thisObj := CurSelObj(i);
+                DupObj(thisObj,scrapObj);
+                { allow locked objects to be copied }
+                scrapObj^.oDat.locked := 0;
+                OffsetObj(scrapObj,-sel2D.x,-sel2D.y);
+                AddToOEnd(thisOLst,scrapObj);
+            end;
+            (* get scrap BBox *)
+            thisRect := curDoc.sLst^^.sBBox;
+            OffsetRect(thisRect,-Round(sel2D.x),-Round(sel2D.y));
+            With thisRect do
+                SetRect(thisRect,left,top,right+1,bottom+1);{To fix clip problem
+                        with rotated freehand and polygons.}
+            (* get handle to list of objects and set scrap.what to it *)
+            thisGEScp := Pointer(Ord(HAllocate(scrapHHz,SizeOf(TGEScrap))));
+            thisGEScp^^.oLst := thisOLst;
+            thisGEScp^^.bBox := thisRect;
+            PutScrap(scrapDwg,Pointer(Ord(thisGEScp)),errNum);
+            if rangeOn then
+                if errNum<>0 then
+                    Error('PutScrap',errNum,NONFATAL);
+
+            GetPort(savePort);
+            SetPort(scrapFolder);
+            ClipRect(thisRect);
+
+            (* create scrap picture *)
+            theHeap := scrapHHz;
+
+            saveZoomOn := curDoc.atr.zoomOn;    {Turn zoom off}
+            curDoc.atr.zoomOn := 0;
+
+            thisPic := OpenPicture(thisRect);
+            makingScpPic := TRUE;
+            PicComment(cPicGEDwg,0,NIL);
+            ShowTOLst;
+            makingScpPic := FALSE;
+            ClosePicture;
+            PutGrScrap(thisPic,errNum);
+            if rangeOn then
+                if errNum<>0 then
+                    Error('PutGrScrap',errNum,NONFATAL);
+            theHeap := geHHz;
+
+            (* create WM picture *)
+            WMOpenPicture(scrapFolder);
+            ShowTOLst;
+            WMClosePicture;
+
+            curDoc.atr.zoomOn := saveZoomOn;    {Turn zoom back on}
+
+            SetPort(savePort);
+
+            (* restore ge heap zones *)
+            curDoc.hHz   := saveHHz;
+            curDoc.pHz   := savePHz;
+        end;
+
+        (* unbind scrap dataseg *)
+        EndPutScrap(errNum);
+        putScpFlag := FALSE;
+    end; (* PutGEScrap *)
+
+(* ********************************************************************* *)
+(*$S Undo*)
+    procedure UndoGEScrap;
+    var errNum,tScrap: Integer;
+        savePort: GrafPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        UndoInheritScrap(errNum);
+        GetPort(savePort);
+        SetPort(scrapFolder);
+        InvalRect(scrapFolder^.portRect);
+        SetPort(savePort);
+    end; (* UndoGEScrap *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure ShowScrap(* r: Rect *);
+    var scrapHnd:  TH;
+        scrapPic:  PicHandle;
+        scrapKind: ScrapType;
+        errNum: Integer;
+        thisGEScp: TGEScpHnd;
+        obj: TObjPtr;
+        tRect: Rect;
+        saveZoomOn: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+
+        saveZoomOn := curDoc.atr.zoomOn;    {Turn zoom off}
+        curDoc.atr.zoomOn := 0;
+
+        GetScrap(scrapKind,scrapHnd);
+        if traceFio then begin
+            WlnRect('ShowScrap:',r);
+            Writeln('    scrapKind=',scrapKind:1);
+        end;
+
+        SetPort(scrapFolder);
+        ClipRect(r);
+        FillRect(r,white);
+        if scrapKind=scrapFE then
+            TxtDrwScrap
+        else if scrapKind=scrapDwg then begin
+            if scrapHnd<>NIL then begin
+                StartGetScrap(errNum);
+                thisGEScp := Pointer(Ord(scrapHnd));
+                scpClrFl := TRUE;              {Tells ShowObj to use scpShPat}
+                obj := thisGEScp^^.olst.lst.lBeg;
+                while obj <> NIL do begin
+                    if SectRect(obj^.bBox,r,tRect) then
+                        ShowObj(obj);
+                    obj := obj^.fLink;
+                end;
+                scpClrFl := FALSE;
+                EndGetScrap(errNum);
+            end;
+        end else if (scrapUG in currScrapSet) then begin
+            StartGetScrap(errNum);
+            GetGrScrap(scrapPic);
+            if scrapPic<>NIL then begin
+                if traceFio then with scrapFolder^ do begin
+                    WlnPic ('    scrapPic=',scrapPic);
+                    WLnRgn ('        vis= ',visRgn);
+                    WLnRgn ('        clip=',clipRgn);
+                    WLnRect('        port=',portRect);
+                end;
+                DrawPicture(scrapPic,scrapPic^^.picFrame);
+            end;
+            EndGetScrap(errNum);
+        end else if (scrapCS in currScrapSet) then
+            TxtDrwScrap;
+        curDoc.atr.zoomOn := saveZoomOn;    {Turn zoom back on}
+    end; (* ShowScrap *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure MkScrapPic;
+    var scrapKind: ScrapType;
+        scrapHnd:  TH;
+        thisR: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetScrap(scrapKind,scrapHnd);
+        if (scrapKind=scrapFE)
+        or (scrapKind=scrapDwg) then begin
+            SetRect(thisR,0,0,cHDwgMax,cVDwgMax);
+            WmOpenPicture(scrapFolder);
+            ShowScrap(thisR);
+            WmClosePicture;
+        end;
+    end; (* MkScrapPic *)
+
+end. (* UNIT *)
+ÿ

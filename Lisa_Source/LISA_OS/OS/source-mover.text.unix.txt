@@ -1,0 +1,856 @@
+;       MOVER.TEXT
+
+;       By Dave Offen.
+;       Copyright 1983, 1984, Apple Computer Inc.
+
+        .INCLUDE        SOURCE/PASCALDEFS.TEXT
+
+PARALEL_B .EQU  IOMMU+$0D801     ;LOCATION OF DISK DIAG BIT
+
+        ;PARALLEL PORT DEFS
+
+VIA2BAS .EQU    IOMMU+$0D801
+IER     .EQU    $70
+
+        ;twiggy 6505 defs
+
+TWIGBAS .EQU    IOMMU+$0C000
+TWIGHDR .EQU    TWIGBAS+$3E8
+TWIGDATA .EQU   TWIGBAS+$400
+TWIGCMD .EQU    1               ;$81=RWTS COMD, $83=SEEK,$85=CLR INT STAT,
+                                ;  86=ENABLE, 87=DISABLE
+TWIGPARM .EQU   3               ;0=READ, 1=WRITE, 2=UNCLAMP, 3=FORMAT, 4=VERIFY
+TWIGDRIV .EQU   5               ;0=TOP, 80=BOTTOM
+TWIGHEAD .EQU   7               ;0-1
+TWIGSEC  .EQU   9               ;0-22, FORMATTED 2:1 INTERLEAVE
+TWIGTRAK .EQU   $B              ;0-45, 0 IS OUTSIDE.
+TWIGCNFM .EQU   $F              ;FORMAT CONFIRMATION BYTE
+TWIGERR  .EQU   $11             ;NON-ZERO MEANS ERROR ON INTERRUPT
+TWIGD0IN .EQU   $4B             ;NON-ZERO MEANS DISK 0 IS IN DRIVE
+TWIGD1IN .EQU   $4F             ;NON-ZERO MEANS DISK 1 IS IN DRIVE
+TWIGSTAT .EQU   $5F             ;INTERRUPT SOURCE
+TWIGPRC .EQU    $61             ;PREVIOUS COMMAND CODE
+TWIGPRP .EQU    $63             ;PREVIOUS PARAM, DRIVE, HEAD, SECTOR
+TWIGPRT .EQU    $6B             ;PREVIOUS TRACK
+TWIGB2  .EQU    $B9             ;ENDING DATA BITSLIP ERROR COUNT
+TWIGCS  .EQU    $BB             ;CHECKSUM ERROR COUNT
+TWIGSKING .EQU  $13F            ;=$11 WHEN BUSY SEEKING OR PARKING
+;(LISA FORMAT FLAG = 1 AT $13)
+
+        ;PARAMETER MEMORY DEFS
+
+PMEMAD  .EQU    TWIGBAS+$180    ;ADDRESS OF PARAMETER MEMORY'S 64 BYTES
+
+        ;RS-232 defs
+
+RSBASE  .EQU    IOMMU+$0D201
+PORTB   .EQU    0
+CTRL    .EQU    0
+
+        .PROC   MOVER
+;-------------------------------------------------------------------------
+;       procedure MOVER (source: absptr, dest: absptr, length: int4);
+;
+;       Move block of bytes to anywhere in memory.  Move 0-63 blocks of 4 bytes;
+;       0-32767 blocks of 256 bytes; 0-3 bytes one byte
+;       at a time.  This routine is optimized for speed of long moves.
+;       The move is perfromed without propagation of bytes at start or end.
+;
+;       MOVELEFT is faster for <32 bytes, but can cause propagation if source
+;       and destination overlap.
+;
+;       During execution, stack holds: return-addr, orig D4-D7,A3-A6, 1-byte count,
+;       256-byte count (on top of stack)
+;
+;       D0 = scratch
+;       D1-D3 clobbered
+;       D4 = total length
+;       D5 = 1 if dest and source are both odd
+;       D6 = 4-byte count
+;       A0 = destination address
+;       A1 = source address
+;       A2 clobbered
+;       D4-D7,A3-A6 preserved
+;       A7 = SP
+;------------------------------------------------------------------------
+
+        MOVEM.L D4-D7/A3-A6,-(SP)
+        MOVEM.L 36(SP),D4/A0-A1         ;FROM STACK:  D4=LENG, A0=DEST, A1=SOURCE
+        TST.L   D4
+        BLE     DUN                     ;LENGTH <= 0 MEANS EXIT
+        CMPA.L  A1,A0
+        BCS.S   @1                      ;FORWARD MOVE IF DEST < SOURCE
+        ADDA.L  D4,A0                   ;FOR BACKWARD MOVE, POSITION TO END OF
+        ADDA.L  D4,A1                   ;  DATA IN SOURCE AND DEST
+@1      MOVEQ   #1,D5                   ;FIND OUT IF SOURCE OR DEST ADDR ARE ODD
+        MOVE    A0,D1
+        AND     D5,D1                   ;D1 =1 IFF DEST IS ODD
+        MOVE    A1,D2
+        AND     D5,D2                   ;D2 =1 IFF SOURCE IS ODD
+        MOVE    D2,D5
+        AND     D1,D5                   ;D5 = 1 IFF BOTH SOURCE & DEST ARE ODD
+        BNE.S   @2                      ;SKIP IF BOTH ODD
+        OR      D1,D2
+        BEQ.S   @3                      ;SKIP IF BOTH EVEN
+        MOVE.L  D4,-(SP)                ;ONE ODD, ONE EVEN. MOVE ALL 1 BYTE @ TIME
+        MOVEQ   #0,D6                   ;4-BYTE MOVE COUNT = 0
+        MOVE    D6,-(SP)                ;256-BYTE MOVE COUNT = 0
+        BRA.S   @5
+
+@2      SUBQ.L  #1,D4                   ;BOTH ODD, TAKE 1 OFF TOTAL LENGTH
+@3      MOVE.L  D4,D0                   ;SOURCE & DEST BOTH EVEN OR BOTH ODD
+        MOVEQ   #3,D1
+        AND.L   D4,D1                   ;SET UP COUNTERS FOR VARIOUS LENGS
+        MOVE.L  D1,-(SP)                ;1-BYTE-COUNT ONTO STACK
+        LSR.L   #2,D0
+        MOVEQ   #$3F,D6
+        AND     D0,D6                   ;4-BYTE COUNT INTO D6
+        LSR.L   #6,D0
+        MOVE    D0,-(SP)                ;256-BYTE MOVE COUNT ONTO TOP OF STACK
+
+@5      CMPA.L  A1,A0
+        BCS.S   FWD                     ;FORWARD IF DEST < SOURCE
+
+        ;BACKWARD MOVE
+
+        TST     D5
+        BEQ.S   @7                      ;SKIP IF NOT ODD-TO-ODD TRANSFER
+        MOVE.B  -(A1),-(A0)             ;ODD-T0-ODD.  XFER 1 BYTE FIRST
+
+        ; 4-BYTE MOVES
+
+@7      SUBQ    #1,D6
+        BMI.S   BKW1P                   ;NO 4-BYTE MOVES
+@8      MOVE.L  -(A1),-(A0)
+        DBF     D6,@8
+
+        ;256 BYTE MOVES (BACKWARDS)
+
+BKW1P   SUBQ    #1,(SP)
+        BMI     BKW1                    ;NO 256-BYTE MOVES
+@1      MOVE.L  -(A1),-(A0)             ;INSTEAD OF MOVEM, WHICH CAUSES BUS ERROR
+                                        ; AT END OF SEGMENT
+        LEA     -252(A1),A1             ;SUBTRACT 252 FROM SOURCE ADDRESS
+        MOVEM.L 208(A1),D0-D7/A2-A4
+        MOVEM.L D0-D7/A2-A4,-(A0)
+        MOVEM.L 156(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L 104(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L 52(A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        MOVEM.L (A1),D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,-(A0)
+        SUBQ    #1,(SP)
+        BPL.S   @1
+
+        ;1-BYTE MOVE (BACKWARD)
+
+BKW1    ADDQ    #2,SP
+        MOVE.L  (SP)+,D7                ;LENGTH
+        BEQ.S   DUN                     ;NO SINGLE BYTES TO MOVE
+@1      MOVE.B  -(A1),-(A0)
+        SUBQ.L  #1,D7
+        BNE.S   @1
+        BRA.S   DUN                     ;DONE
+
+        ;FORWARD MOVE
+
+FWD     TST     D5
+        BEQ.S   @0                      ;SKIP IF NOT ODD-TO-ODD TRANSFER
+        MOVE.B  (A1)+,(A0)+             ;ODD-T0-ODD.  XFER 1 BYTE FIRST
+
+        ; 4-BYTE MOVES
+
+@0      SUBQ    #1,D6
+        BMI.S   MOV1P                   ;NO 4-BYTE MOVES
+@1      MOVE.L  (A1)+,(A0)+
+        DBF     D6,@1
+
+        ;256-BYTE MOVES (FORWARD)
+
+MOV1P   SUBQ    #1,(SP)
+        BMI.S   FWD1                    ;NO 256-BYTE MOVES
+@1      MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,52(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,104(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A6
+        MOVEM.L D0-D7/A2-A6,156(A0)
+        MOVEM.L (A1)+,D0-D7/A2-A4
+        MOVEM.L D0-D7/A2-A4,208(A0)
+        LEA     252(A0),A0              ;ADD 252 TO DEST BASE ADDRESS.
+        MOVE.L  (A1)+,(A0)+             ;INSTEAD OF MOVEM, WHICH CAUSES BUS ERROR
+                                        ; AT END OF SEGMENT
+        SUBQ    #1,(SP)
+        BPL.S   @1
+
+        ;1-BYTE MOVES (FORWARD)
+
+FWD1    ADDQ    #2,SP
+        MOVE.L  (SP)+,D7                ;LENGTH
+        BEQ.S   DUN                     ;NO SINGLE BYTES TO MOVE
+@1      MOVE.B  (A1)+,(A0)+
+        SUBQ.L  #1,D7
+        BNE.S   @1
+
+        ;TIME TO RETURN
+
+DUN     MOVEM.L (SP)+,D4-D7/A3-A6       ;RESTORE REGS
+        MOVE.L  (SP)+,A0                ;RETURN ADDR
+        LEA     12(SP),SP               ;POP OFF PARAMS
+        JMP     (A0)
+
+
+        .PROC   INTSOFF
+;-----------------------------------------------------------------
+;       procedure INTSOFF ( level: clokints..allints, var status: integer);
+;
+;       Set interrupt priority to level, and return previous status.
+;       Values for level are: clokints, twigints, slotints, winints
+;       rsints, allints.
+;
+;       Uses only D0-D1, A0, A1
+;-----------------------------------------------------------------
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        MOVE.L  (SP)+,A1        ;ADDR OF RETURN PARAMETER "STATUS"
+        MOVE    SR,D0
+        MOVE    D0,D1           ;RETAIN COPY OF SR
+        AND     #$700,D0        ;CURRENT PRIO LEVEL
+        MOVE    D0,(A1)         ;RETURN THE OLD STATUS
+        EOR     D1,D0           ;CLR CURRENT INT PRIO
+        OR      (SP)+,D0        ;SET SUPERV. BIT(among others)IN DESIRED PRIO
+        CMP     D1,D0
+        BLE.S   @2              ;RETURN IF DESIRED <= CURRENT PRIO
+        TRAP    #7              ;SET SR TO VALUE IN D0, RETURN TO ADDR IN A0
+
+@2      JMP     (A0)            ;RETURN
+
+
+        .PROC   TRAP7
+;----------------------------------------------------------------
+;       CALL WITH DESIRED SR IN D0, AND RETURN ADDR IN A0.
+;       WORKS ONLY IF CALLED FROM DOMAIN 0.
+
+        ADDQ    #6,SP           ;REMOVE TRAP PARAMETERS FROM STACK
+        MOVE    D0,SR           ;UPDATE SR
+        JMP     (A0)            ;RETURN VIA A0
+
+
+        .PROC   INTSON
+;------------------------------------------------------------------
+;       procedure INTSON (status: integer);
+;
+;       Restore interrupt priority to "status" returned from prev call
+;       to intsoff.
+;------------------------------------------------------------------
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDRESS
+        MOVE    SR,D0
+        AND     #$2000,D0
+        BNE.S   @9              ;NO TRAP NEEDED IF IN SUPERVISOR MODE ALREADY
+        OR      (SP)+,D0        ;SET SUPERVISOR BIT IN RESTORED STATUS
+        TRAP    #7              ;SET SR TO VALUE IN D0; RETURN TO ADDR IN A0
+
+@9      OR      (SP)+,D0        ;SET SUPERVISOR BIT IN RESTORED STATUS
+        MOVE    D0,SR           ;UPDATE SR
+        JMP     (A0)            ;RETURN VIA A0
+
+
+
+        .PROC   A5SET
+        .DEF    A5SETUP
+;---------------------------------------------------------------------------
+;       PROCEDURE A5SET;
+;
+;       SET UP SYSA5.  MUST BE CALLED FROM SAME SEGMENT!
+;
+;----------------------------------------------------------------------------
+
+A5SETUP MOVE.L  B_SYSGLOBAL,A5
+        MOVE.L  SYSA5(A5),A5
+        RTS
+
+
+        .PROC   START_RWTS
+;---------------------------------------------------------------------
+;
+;       procedure START_RWTS (rwts: interrupt_data);
+;
+;       This routine is called from the TWIGGY driver for doing read, seek
+;       verify and reset disk interrupts.
+;       It is also called from START_WRITE and FINISH_READ for doing read
+;       or write.  Err is returned when previous command didn't cause interrupt.
+;
+;---------------------------------------------------------------------
+
+        MOVEA.L (SP)+,A0             ;RETURN ADDRESS
+        MOVEA.L  (SP)+,A1               ;BASE OF INTERRUPT DATA
+        MOVEA.L #TWIGBAS,A2             ;BASE ADDRESS OF TWIGGY PARAMS
+@0      TST.B   TWIGCMD(A2)
+        BEQ.S   @3                      ;BRANCH IF PREV COMMAND TAKEN
+@1      BTST    #6,PARALEL_B
+        BEQ     @1                      ;WAIT FOR DISK DIAG TO GO HI
+        BRA     @0
+
+@3      MOVE.B  TWIGERR(A2),ERR(A1)     ;RETURN ERROR CODE FROM PREV COMMAND
+        MOVE.B  CMD(A1),D1              ;HOLD NEXT CMD IN D1
+        CMPI.B  #$81,D1
+        BNE.S   @7                      ; NOT RWTS COMMAND
+
+        ;INTERRUPT-GENERATING COMMAND
+
+        MOVE.L  RWTS_CMD(A1),D0         ;GET COMMAND, DRIVE, SIDE, SECTOR
+        SWAP    D0
+        ROR.B   #1,D0                   ;DRIVE 0=0; 1=$80
+        SWAP    D0
+        MOVEP.L D0,TWIGPARM(A2)         ;WRITE COMMAND, DRIVE, SIDE, SECTOR
+        MOVE.B  CYL(A1),TWIGTRAK(A2)    ;COPY TRACK
+        CMPI.B  #3,RWTS_CMD(A1)         ;FORMAT COMMAND?
+        BNE.S   @6
+        MOVE.B  #-1,TWIGCNFM(A2)        ;YES, SET UP "CONFIRMATION BYTE"
+@6      MOVE.B  D1,TWIGCMD(A2)          ;START UP THE DISK WITH $81
+        JMP     (A0)                    ;RETURN
+
+        ;NON-INTERRUPTING COMMAND
+
+@7      CMPI.B  #$83,D1                 ;SEEK?
+        BNE.S   @8
+        CMPI.B  #$11,TWIGSKING(A2)      ;YES
+        BEQ.S   @9                      ;DON'T SEEK WHILE PARKING OR STILL SEEKING
+        ;CAN REMOVE NEXT 2 LINES AFTER TWIGGY ROM 46 UPGRADE
+        CMPI.B  #$83,TWIGPRC(A2)
+        BEQ.S   @9                      ;DON'T ISSUE ANOTHER SEEK WHILE SEEKING
+        MOVE.B  DRIVE(A1),D0            ;SEEK, LOAD PARAMS
+        ROR.B   #1,D0
+        MOVE.B  D0,TWIGDRIV(A2)
+        MOVE.B  HEAD(A1),TWIGHEAD(A2)
+        MOVE.B  CYL(A1),TWIGTRAK(A2)
+@8      MOVE.B  RWTS_CMD(A1),TWIGPARM(A2) ;COPY PARAMETER FOR THIS COMMAND
+        MOVE.B  D1,TWIGCMD(A2)            ;DO A 80, 83, 85, 86 OR 89 COMMAND
+@9      JMP     (A0)
+
+
+        .IF     TWIGGYBUILD
+
+        .PROC   FINISH_READ
+        .REF    START_RWTS
+;----------------------------------------------------------------------
+;
+;       procedure FINISH_READ (buffer: absptr; var hdr: pagelabel;
+;                              rwts: interrupt_data);
+;
+;       Start seek  if drive >=0. Then copy
+;       data from disk buffer to data and header buffers.
+;
+;----------------------------------------------------------------------
+
+        MOVEM.L D4-D7,-(SP)             ;DON'T CLOBBER PASCAL REGS
+        MOVEA.L  20(SP),A0              ;GET RWTS DATA ADDRESS
+        TST.B   DRIVE(A0)
+        BLT.S   @1                      ;DON'T SEEK IF DRIVE # < 0
+        MOVE.L  A0,-(SP)                ;PUSH RWTS DATA ADDRESS ONTO STACK
+        JSR     START_RWTS              ;AND DO THE SEEK
+
+        ;UNPACK THE 12 BYTE HEADER INTO 24 BYTES
+
+@1      MOVEA.L #TWIGHDR,A1             ;12 BYTE HEADER AREA
+        MOVEP.L 01(A1),D0               ;VERSION & VOLUME
+        MOVEP.W 09(A1),D1
+        SWAP    D1                      ;FILEID IN LEFT WORD
+                                        ;DON'T KNOW ABSPAGE YET (IGNORE D2)
+        MOVEP.W 13(A1),D3
+        EXT.L   D3                      ;RELPAGE
+        MOVEP.W 17(A1),D4               ;FWDLINK W/DATAUSED
+        MOVEP.W 21(A1),D5               ;BKWDLINK W/ DATAUSED
+        MOVE    D5,D1                   ;ASSEMBLE DATAUSED INTO LOW WORD OF D1
+        LSR     #5,D1
+        MOVE    D4,D6
+        AND     #$F800,D6
+        ADD     D6,D1
+        LSR     #6,D1
+        MOVE    #$07FF,D6               ;UNPACK BKWDLINK & FWDLINK
+        AND     D6,D4
+        CMP     D6,D4
+        BNE.S   @2
+        EXT.W   D4                      ;7FF => FFFFFFFF
+@2      EXT.L   D4
+        AND     D6,D5
+        CMP     D6,D5
+        BNE.S   @3
+        EXT.W   D5                      ;7FF => FFFFFFFF
+@3      EXT.L   D5
+        MOVEA.L 24(SP),A2               ;HEADER ADDRESS
+        MOVEM.L D0-D5,(A2)              ;COPY THE 24 HEADER BYTES
+
+        MOVEA.L 28(SP),A0               ;WITH DATA BUFFER POINTER IN A0
+        MOVE    #512,D0                 ;SET UP FOR 512 BYTE DATA XFER
+
+        ;WITH DESTINATION ADDRESS IN A0, LENGTH (EVEN MULTIPLE OF 32) IN D0
+        ;AND SOURCE IN LAST (D0) BYTES OF DISK BUFFER
+
+        EXT.L   D0
+        ADDA.L  D0,A0                   ;POINT TO END OF DESTINATION
+        MOVEA.L #TWIGDATA+1024,A1       ;AND END OF SOURCE
+        LSR     #5,D0
+        MOVE    D0,A2                   ;NUMBER OF 32-BYTE TRANSFERS
+        MOVE    A0,D0                   ;CKECK FOR ODD ADDRESS
+        AND     #1,D0
+        BEQ.S   @5                      ;SKIP IF EVEN
+
+        ;TRANSFER TO ODD ADDRESS (WHAT A PAIN!)
+
+        SUBQ    #2,A1
+        MOVE.B  1(A1),-(A0)             ;MOVE 1 BYTE TO GET ON EVEN BOUNDARY
+        SUBQ    #1,A2                   ;LOOP THROUGH 32 BYTES 1 TIME FEWER
+@4      LEA     -64(A1),A1
+        MOVEP.L 1(A1),D0                ;MOVE FROM SOURCE TO REGS
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D0-D7,-(A0)             ;MOVE FROM REGISTERS TO DESTINATION
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE     @4                      ;MOVE 32 MORE?
+        LEA     -64(A1),A1              ;31 REMAIN TO XFER
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D1-D7,-(A0)             ;MOVE 28 BYTES FROM REGISTERS TO DEST
+        MOVEP.W 5(A1),D0                ;MOVE LAST 3 BYTES
+        MOVE.W  D0,-(A0)
+        MOVE.B  3(A1),-(A0)
+        BRA.S   @6                      ;DONE
+
+        ;TRANSFER TO EVEN ADDRESS
+
+@5      LEA     -64(A1),A1
+        MOVEP.L 1(A1),D0                ;MOVE FROM SOURCE TO REGS
+        MOVEP.L 09(A1),D1
+        MOVEP.L 17(A1),D2
+        MOVEP.L 25(A1),D3
+        MOVEP.L 33(A1),D4
+        MOVEP.L 41(A1),D5
+        MOVEP.L 49(A1),D6
+        MOVEP.L 57(A1),D7
+        MOVEM.L D0-D7,-(A0)             ;MOVE FROM REGISTERS TO DESTINATION
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE     @5                      ;MOVE 32 MORE?
+
+@6      MOVEM.L (SP)+,D4-D7/A0          ;RESTORE PASCAL REGS & GET RETURN ADDR
+        LEA     12(SP),SP
+        JMP     (A0)                    ;RETURN
+
+
+        .PROC   START_WRITE
+        .REF    START_RWTS
+;-----------------------------------------------------------------------
+;
+;       procedure START_WRITE (buffer: absptr; hdr:pagelabel;
+;                              rwts: interrupt_data);
+;
+;       Copy header and data and into twiggy buffer and
+;       initiate write.
+;
+;-----------------------------------------------------------------------
+
+        MOVEM.L D4-D7,-(SP)             ;DON'T CLOBBER PASCAL REGS
+
+        ;PACK HEADER OF 24 BYTES INTO 12 IN HEADER BUFFER
+
+        MOVEA.L #TWIGHDR,A1             ;ADDRESS OF 12 BYTE BUFFER
+        MOVEA.L 24(SP),A2               ;PICK UP ADDRESS OF HEADER
+        MOVEM.L (A2),D0-D5
+        MOVEP.L D0,01(A1)               ;VERSION, VOLUME
+        LSL.W   #6,D1                   ;SHIFT DATAUSED LEFT 6
+        MOVE    D1,D0
+        AND     #$F800,D0               ;MSB OF DATAUSED
+        AND     #$07FF,D4
+        ADD     D0,D4                   ;PACKED WITH FWDLINK
+        MOVEP.W D4,17(A1)
+        LSL.W   #5,D1
+        AND     #$07FF,D5
+        ADD     D1,D5                   ;PACK LSB OF DATAUSED WITH BKWDLINK
+        MOVEP.W D5,21(A1)
+        SWAP    D1
+        MOVEP.W D1,09(A1)               ;FILEID
+        MOVEP.W D3,13(A1)               ;RELPAGE
+
+        MOVEA.L 28(SP),A0               ;MEMORY ADDRESS
+        LEA     24(A1),A1               ;ADDRESS OF TWIGGY DATA BUFFER
+        MOVEA   #15,A2                  ;15*32 = 512-32 BYTES TO MOVE IN 1ST LOOP
+
+        ;COPY 512 BYTES FROM MEMORY TO DISK BUFFER.  A0=MEMORY ADDRESS,
+        ;A1=DISK BUFFER ADDRESS, A2 = NUMBER OF 32-BYTE BLOCKS TO TRANSFER - 1.
+
+        MOVE    A0,D0                   ;CHECK FOR ODD ADDRESS
+        LSR     #1,D0                   ;PUT "ODD-FLAG" IN X AND C
+        BCC.S   @7                      ;SKIP IF EVEN
+
+        ;TRANSFER FROM ODD ADDRESS
+
+        MOVE.B  (A0)+,1(A1)             ;COPY 1ST BYTE TO GET ON  EVEN ADDRESS
+        ADDQ    #2,A1
+
+        ;EVEN OR ODD ADDRESS -- FIRST XFER 480 BYTES USING MOVEM LOOP
+
+@7      MOVEM.L (A0)+,D0-D7             ;CAN'T USE MOVEM AT END OF XFER BECAUSE
+                                        ; CAUSES BUS ERROR IF AT END OF SEGMENT
+        MOVEP.L D0,01(A1)
+        MOVEP.L D1,09(A1)
+        MOVEP.L D2,17(A1)
+        MOVEP.L D3,25(A1)
+        MOVEP.L D4,33(A1)
+        MOVEP.L D5,41(A1)
+        MOVEP.L D6,49(A1)
+        MOVEP.L D7,57(A1)
+        LEA     64(A1),A1
+        SUBQ    #1,A2
+        MOVE    A2,D0                   ;SETS CONDITION CODES
+        BNE.S   @7
+        MOVEM.L (A0)+,D0-D6             ;COPY REMAINING 31 OR 32 BYTES TO FINISH XFER
+        MOVEP.L D0,01(A1)
+        MOVEP.L D1,09(A1)
+        MOVEP.L D2,17(A1)
+        MOVEP.L D3,25(A1)
+        MOVEP.L D4,33(A1)
+        MOVEP.L D5,41(A1)
+        MOVEP.L D6,49(A1)
+        SUBX    D0,D0                   ;TEST "ODD-FLAG" STILL IN X
+        BPL.S   @8                      ;SKIP IF ORIGINALLY STARTED ON EVEN ADDRESS
+        MOVE.W  (A0)+,D0                ;ODD ADDRESS -- ONLY 3 MORE TO GO
+        MOVEP.W D0,57(A1)
+        MOVE.B  (A0)+,61(A1)
+        BRA.S   @9                      ;DONE
+
+        ;WAS TRANSFER FROM EVEN ADDRESS --  XFER LAST 4 BYTES
+
+@8      MOVE.L  (A0)+,D0                ;MOVEM WOULD CAUSE BUS ERROR @ SEGMENT END
+        MOVEP.L D0,57(A1)
+
+        ;NOW DO THE WRITE
+
+@9      MOVE.L  20(SP),-(SP)            ;COPY RWTS-DATA ADDRESS ONTO STACK
+        JSR     START_RWTS
+        MOVEM.L (SP)+,D4-D7/A0          ;RESTORE PASCAL REGS & GET RETURN ADDR
+        LEA     12(SP),SP
+        JMP     (A0)
+
+
+        .PROC   ISTWIGIN
+;-----------------------------------------------------------------------
+;
+;       function ISTWIGIN (drive: 0..1): boolean;
+;
+;       See if twiggy is inserted.
+;       Call only during initialization when both disks are idle
+;-------------------------------------------------------------------------
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        TST.B   (SP)+           ;WHICH DRIVE?
+        BNE.S   @1
+        TST.B   TWIGBAS+TWIGD0IN;CHECK DRIVE 0 (TOP)
+        BRA.S   @2
+
+@1      TST.B   TWIGBAS+TWIGD1IN;CHECK DRIVE 1 (BOTTOM)
+@2      SNE     D0
+        NEG.B   D0
+        MOVE.B  D0,(SP)         ;RETURN T OR F
+        JMP     (A0)            ;RETURN
+
+
+        .PROC   DINT
+        .REF    TWIG_INT
+;------------------------------------------------------------------------
+;
+;       DISK INTERRUPT HANDLER
+;
+;------------------------------------------------------------------------
+
+        MOVEM.L D0-D3/A1-A2/A5,-(SP)    ;SAVE REGISTERS (A0 ALREADY SAVED)
+        MOVEA.L B_SYSGLOBAL,A5  ;UPDATE A5 FOR REFERENCING SYSGLOBALS
+        MOVEA.L PORT_CB_PTRS+FLOPPY(A5),A1      ;ADDRESS OF DATA PASSED TO PASCAL
+        MOVEA.L SYSA5(A5),A5                    ;SET UP PASCAL'S A5
+        MOVEA.L #TWIGBAS,A0
+        MOVE.B  TWIGSTAT(A0),INT_STAT(A1)       ;SET VARIABLES IN RECORD PASSED
+        MOVE.B  TWIGERR(A0),ERR(A1)             ;ERROR CODE
+        MOVE.B  TWIGCS(A0),D0
+        ADD.B   TWIGB2(A0),D0                   ;SUM SOFT WRITE ERRS
+        SCS     D1
+        OR.B    D0,D1
+        BPL.S   @1
+        MOVEQ   #$7F,D0                         ;IF CARRY OR NEG, SET TO $7F
+@1      MOVE.B  D0,CS_ER_CNT(A1)                ;& MOVE INTO CHECKSUM ERR COUNT
+        MOVE.B  TWIGPRC(A0),CMD(A1)             ;PREVIOUS COMMAND
+        MOVEP.L TWIGPRP(A0),D0
+        SWAP    D0
+        ROL.B   #1,D0                           ;DRIVE 0=0; 1=$80
+        SWAP    D0
+        MOVE.L  D0,RWTS_CMD(A1)                 ;PREV PARAM, DRIVE, HEAD, SECT
+        MOVE.B  TWIGPRT(A0),CYL(A1)             ;PREVIOUS TRACK
+        MOVE.L  A1,-(SP)                ;PUSH ADDRESS OF RECORD ONTO STACK
+        JSR     TWIG_INT                ;CALL PASCAL
+        MOVEM.L (SP)+,D0-D3/A1-A2/A5    ;RESTORE ACCUMS
+        RTS
+
+        .ELSE
+
+        .PROC   DINT            ;DUMMY TWIGGY INTERRUPT ROUTINE
+        RTS
+
+        .ENDC
+
+
+
+        .PROC   W_PARAM_MEM
+;-----------------------------------------------------------------------
+;
+;       procedure W_PARAM_MEM (data: longint);
+;
+;       Update parameter memory.  Twiggy interrupts must be off.
+;-------------------------------------------------------------------------
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        MOVE.L  (SP)+,A1        ;ADDR OF PARAM MEM RECORD
+        MOVE.L  #PMEMAD,A2      ;SHARED MEMORY ADDR OF PARAM MEM
+        MOVEQ   #15,D1          ;REPEAT 4 BYTES, 16 TIMES
+@1      MOVE.L  (A1)+,D0        ;GET NEXT 4 BYTES
+        MOVEP.L D0,1(A2)        ;WRITE THEM OUT
+        ADDQ    #8,A2           ;ADD 8 TO SHARED MEMORY ADDR
+        DBF     D1,@1           ;REPEAT
+        JMP     (A0)            ;RETURN WHEN DONE
+
+
+        .PROC   CALL_HDISK
+        .DEF    CALLDRIVER
+;-------------------------------------------------------------------------
+;
+;    procedure CALLDRIVER (var errnum: integer; config_ptr: ptrdevrec;
+;                                               parameters: param_ptr);
+;       Call driver-procedure at configptr^.entry_pt, with definition:
+;               function <call-addr> (parameters: param_ptr): integer;
+;-------------------------------------------------------------------------
+
+;-------------------------------------------------------------------------
+;   procedure CALL_HDISK(* var errnum: int2; configptr: ptrdevrec;
+;                                         parameters: param_ptr *);
+;-------------------------------------------------------------------------
+        MOVE.L  8(SP),D0        ;CONFIG_PTR
+        BEQ.S   CD3             ;NIL CONFIG_PTR
+        MOVE.L  D0,A1
+        MOVE.L  4(SP),A2        ;PARAMETERS PTR
+        MOVE.L  A1,(A2)         ;SAVE CONFIG_PTR IN PARAMETER RECORD
+        MOVE.L  EXT_ADDR(A1),A0 ;CONFIGINFO EXTENSION
+        MOVE.L  ENT_PT(A0),D2
+        BNE.S   CD1             ;CONTINUE BELOW
+        BEQ.S   CD3             ;BRANCH WHEN ENTRY POINT IS NIL
+
+CALLDRIVER
+        MOVE.L  8(SP),D0        ;CONFIG_PTR
+        BEQ.S   CD3             ;NIL CONFIG_PTR
+        MOVE.L  D0,A1
+        MOVE.L  4(SP),A2        ;PARAMETERS ADDRESS
+        MOVE.L  A1,(A2)         ;COPY CONFIG_PTR INTO 1ST CELL OF PARAMETERS RECORD
+        MOVE.L  ENT_PT(A1),D2
+        BEQ.S   CD3             ;BRANCH WHEN ENTRY POINT IS NIL
+CD1     MOVEQ   #0,D1
+        MOVE    D1,-(SP)        ;FOR FUNCTION RESULT
+        MOVE    INTPAR(A2),D0   ;INTPAR IN D0 FOR ASSEMBLY LANGUAGE DRIVERS
+        MOVE    FNCTN_CODE(A2),D1 ;FUNCTION CODE IN D1 FOR ASSEMB LANG DRIVERS
+        MOVE.L  A2,-(SP)        ;PARAMETERS PASSED ON STACK
+        MOVE.L  D2,A0
+        JSR     (A0)            ;CALL DRIVER ENTRY POINT
+                                ;D0=INTPAR, D1=FNCTN_CODE, A1=CONFIGPTR
+        MOVE.W  (SP)+,D0        ;POP FUNCTION RESULT
+CD2     MOVE.L  (SP)+,A1        ;RETURN ADDRESS
+        ADDQ    #8,SP
+        MOVE.L  (SP)+,A0        ;ERRNUM ADDRESS
+        MOVE.W  D0,(A0)         ;SAVE ERRNUM
+        JMP     (A1)            ;RETURN
+
+CD3     MOVE.W  #605,D0         ;ERRNUM WHEN ENTRY POINT = NIL
+        BRA.S   CD2
+
+        .PROC   ALLSET
+;---------------------------------------------------------------------------
+;       function ALLSET (source, target: int1): boolean;
+;
+;       Returns "true" iff all of the bits in the source byte are set to
+;       one in the target byte.
+;
+;----------------------------------------------------------------------------
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        MOVE.B  (SP)+,D1        ;TARGET
+        MOVE.B  (SP)+,D0        ;SOURCE
+        AND.B   D0,D1
+        CMP.B   D0,D1
+        SEQ     D0              ;SET TO ONES IF ALL BITS OF TARGET ARE SET
+        NEG.B   D0              ;MAKE IT EQUAL 0(FALSE) OR 1(TRUE)
+        MOVE.B  D0,(SP)         ;RETURN THE RESULT
+        JMP     (A0)            ;RETURN
+
+
+        .PROC   ALRM
+        .REF    ALARM_FIRES
+;-------------------------------------------------------------
+;       Called when alarm fires.  Calls pascal ALARM_FIRES with alarm # on stack
+
+        MOVE.L  (SP)+,A0        ;RETURN ADDR
+        MOVE.L  B_SYSGLOBAL,A5  ;SET UP SYSTEM A5 REGISTER
+        MOVE.L  SYSA5(A5),A5
+        MOVE    D0,-(SP)        ;COPY ALARM # FROM D0 TO TOP OF STACK
+        MOVE.L  A0,-(SP)        ;SO ALARM_FIRES RETURNS TO CALLER
+        JMP     ALARM_FIRES     ;CALL PASCAL TO DISPATCH TO "DALARMS" IN DRIVER
+
+
+        .PROC   INTHNDLRS       ;INTERRUPT HANDLERS
+        .DEF    PARALLEL,LVL3INT,LVL4INT,LVL5INT,RSINT,SONYINT
+        .REF    DRIVERCALL,SYSTEM_ERROR
+;---------------------------------------------------------------------------
+;        INTERNAL SONY INTERRUPT
+
+SONYINT MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS NOT SAVED BY PASCAL
+        MOVE.L  B_SYSGLOBAL,A0          ;SYSGLOBAL POINTER
+        MOVE.L  PORT_CB_PTRS+FLOPPY(A0),A1;POINTER TO CONFIGINFO ENTRY
+        BSR.S   CALL_DRIVER
+        BNE.S   @9
+
+        ;RESET INTERRUPTS IF NO DRIVER (FOR WHEN IT'S CONFIGURABLE)
+
+        MOVEA.L #TWIGBAS,A2             ;BASE ADDRESS OF TWIGGY PARAMS
+@0      TST.B   TWIGCMD(A2)
+        BNE.S   @0                      ;WAIT FOR PREV COMMAND TAKEN
+
+        MOVE.B  #$88,TWIGPARM(A2)       ;DISABLE MASK
+        MOVE.B  #$87,TWIGCMD(A2)        ;DISABLE INTS
+@4      TST.B   TWIGCMD(A2)
+        BNE.S   @4                      ;WAIT FOR PREV COMMAND TAKEN
+
+@9      MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTS
+
+;---------------------------------------------------------------------------
+;        ;PARALLEL PORT INTERRUPT
+
+PARALLEL MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS NOT SAVED BY PASCAL
+        MOVE.L  B_SYSGLOBAL,A0          ;SYSGLOBAL POINTER
+        MOVE.L  PORT_CB_PTRS+VIA1(A0),A1;POINTER TO CONFIGINFO ENTRY
+        BSR.S   CALL_DRIVER
+        BNE.S   @1                      ;SKIP IF DRIVER INITIALIZED
+        MOVE.B  #$3B,VIA2BAS+IER        ;CLEAR PARAPORT INTS (EXCEPT TIMER 1 & SR)
+@1      MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTS
+
+;-------------------------------------------------------------------
+;
+;  CONFIGURABLE DRIVER INTERRUPT HANDLER CALLER
+;
+;  CALL CALL-DRIVER WITH ORIGINAL D0-D3,A0-A2,A5 SAVED ON STACK, AND WITH
+;    B_SYSGLOBAL IN A0, CONFIGINFO ADDR IN A1.
+;    RETURNS WITH "Z" FLAG SET WHENEVER THERE IS NO DRIVER INITIALIZED (W/D0,D1 PRESERVED)
+;
+
+CALL_DRIVER
+        MOVE.L  A1,D2
+        BEQ.S   @9                      ;SEE IF CONFIGINFO ENTRY IS NIL
+        MOVE.L  ENT_PT(A1),D2           ;GET DRIVER ENTRY PT IN D2 & SET COND CODES
+        BEQ.S   @9                      ;SKIP IF DRIVER UNINITIALIZED
+        MOVEQ   #0,D0                   ;INTPAR=0 IN D0 AND ON STACK
+        MOVEQ   #DINTERRUPT,D1          ;FUNCTION CODE IN D1 AND ON STACK
+        MOVE.L  D1,-(SP)                ;PASS INTPAR(=0 IN MSW) & FUNCTION CODE(LSW)
+        MOVE.L  A1,-(SP)                ;PASS ADDRESS OF CONFIGINFO ENTRY
+        SUBQ    #2,SP                   ;ROOM FOR FUNCTION RESULT (WILL BE IGNORED)
+        PEA     2(SP)                   ;PUSH PARAMETER RECORD'S ADDRESS
+        MOVE.L  SYSA5(A0),A5            ;PREPARE TO CALL PASCAL
+        MOVE.L  D2,A0                   ;COPY DRIVER ENTRY PT TO ADDRESS REGISTER
+        JSR     (A0)                    ;CALL DRIVER TO HANDLE INTERRUPT
+                                        ;D0=INTPAR, D1=FNCTN_CODE, A1=CONFIGPTR
+        LEA     10(SP),SP               ;POP PARAM RECORD AND FUNCT RETURN
+        MOVE.L  A5,D2                   ;CLEAR "Z" IN CONDITION CODES
+@9      RTS
+
+
+;----------------------------------------------------------------------
+;
+;      LEVEL 3, 4 AND 5 INTERRUPT HANDLERS
+;
+
+LVL3INT MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS NOT SAVED BY PASCAL
+        MOVE.L  B_SYSGLOBAL,A0          ;SYSGLOBAL POINTER
+        MOVE.L  PORT_CB_PTRS+SLOT2(A0),A1;POINTER TO CONFIGINFO ENTRY
+        BSR.S   CALL_DRIVER
+        BEQ.S   NOTHERE
+        MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTE
+
+LVL4INT MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS NOT SAVED BY PASCAL
+        MOVE.L  B_SYSGLOBAL,A0          ;SYSGLOBAL POINTER
+        MOVE.L  PORT_CB_PTRS+SLOT1(A0),A1;POINTER TO CONFIGINFO ENTRY
+        BSR.S   CALL_DRIVER
+        BEQ.S   NOTHERE
+        MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTE
+
+LVL5INT MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS NOT SAVED BY PASCAL
+        MOVE.L  B_SYSGLOBAL,A0          ;SYSGLOBAL POINTER
+        MOVE.L  PORT_CB_PTRS+SLOT0(A0),A1;POINTER TO CONFIGINFO ENTRY
+        BSR.S   CALL_DRIVER
+        BEQ.S   NOTHERE
+        MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTE
+
+        ;NO DRIVER PRESENT
+
+NOTHERE MOVE    #10605,-(SP)
+        JSR     SYSTEM_ERROR
+        BRA.S   NOTHERE
+
+;-------------------------------------------------------------------------
+;
+;       RS-232 INTERRUPT HANDLER AT LEVEL 6.
+;
+;--------------------------------------------------------------------------
+
+RSINT   MOVEM.L D0-D3/A0-A2/A5,-(SP)    ;SAVE REGS PASCAL WON'T SAVE
+        MOVE.L  #RSBASE+PORTB+CTRL,A0   ;SET UP HW CONTROL REG ADDR FOR PORT B
+        MOVE.B  #2,(A0)                 ;SELECT REG 2, THEN WAIT BEFORE ACCESSING
+        MOVE.L  B_SYSGLOBAL,A1          ;SYSGLOBAL POINTER
+        MOVE.L  SYSA5(A1),A5            ;PREPARE PASCAL A5
+        MOVEQ   #$0E,D0                 ;LOAD MASK FOR INTERRUPT VECTOR
+        AND.B   (A0),D0                 ;READ INTERRUPT VECTOR FROM REG 2
+        LSR     #1,D0                   ;SHIFT RIGHT ONE
+        MOVEQ   #4,D1
+        AND     D0,D1                   ;0 FOR PORT B; 4 FOR PORT A INTERRUPTING
+        SUB     D1,D0                   ;MASK D0 TO 0..3
+        ADD.L   D1,A1                   ;ADD 0 OR 4 TO B_SYSGLOBAL OFFSET
+        MOVE.L  PORT_CB_PTRS+RS_232B(A1),A1 ;CONTROL BLOCK ADDRESS FOR PORT A OR B
+        MOVE.L  (A1),A0                 ;GET DRIVER ENTRY PT
+        MOVE.L  D0,-(SP)                ;PASS FUNCTN_CODE (=0 IN MSW) & INTPAR(LSW)
+        CLR     D1                      ;FUNCTN_CODE ALSO IN D1
+        MOVE.L  A1,-(SP)                ;PASS ADDRESS OF CONFIGINFO ENTRY
+        MOVE.L  SP,D2                   ;REMEMBER CURRENT SP ADDR
+        SUBQ    #2,SP                   ;ROOM FOR FUNCTION RESULT (WILL BE IGNORED)
+        MOVE.L  D2,-(SP)                ;ADDRESS OF PARAMETERS ON STACK
+        JSR     (A0)                    ;CALL DRIVER TO HANDLE INTERRUPT
+                                        ;D0=INTPAR, D1=FNCTN_CODE, A1=CONFIGPTR
+        LEA     10(SP),SP               ;POP PARAM RECORD AND FUNCT RETURN
+        MOVEM.L (SP)+,D0-D3/A0-A2/A5
+        RTE
+
+
+        .END
+
+ÿ

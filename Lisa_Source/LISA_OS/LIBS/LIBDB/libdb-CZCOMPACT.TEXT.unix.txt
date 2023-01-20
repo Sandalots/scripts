@@ -1,0 +1,529 @@
+{ Copyright 1983,Apple Computer Inc. }
+{$R-}
+{$U-}
+{$SETC OSBuilt := TRUE }
+unit czCompact ;
+       intrinsic;
+
+interface
+
+uses
+{$IFC OSBuilt }
+        {$U libsm/unitstd.obj} unitstd,
+        {$U libdb/dbenv.obj } dbenv,
+        {$U libdb/dbdecl1.obj } dbdecl1,
+        {$U libos/syscall.obj } syscall,
+        {$U libos/psyscall.obj } psyscall,
+        {$U libdb/lowlevel.obj } lowlevel,
+        {$U libdb/pooler.obj } pooler,
+        {$U libdb/heap.obj } heap;
+{$ELSEC }
+        {$U obj:dbenv.obj } dbenv,
+        {$U obj:dbdecl1.obj } dbdecl1,
+        {$U obj:syscall.obj } syscall,
+        {$U obj:lowlevel.obj } lowlevel,
+        {$U obj:pooler.obj } pooler,
+        {$U obj:heap.obj } heap;
+{$ENDC }
+
+{$SETC debug := false }
+
+Type
+        states_de_compact = (no_try,first_try);
+
+Var
+        pheap_segment : longint;               {  heap address }
+        heap_segment : integer;                { refno of heap segment }
+        heapsize : longint;                    { size of heap segment }
+        czone : zonedesc;
+        compact_state : states_de_compact;
+{$IFC PRERELEASE }
+        debug_compact : boolean;
+{$ENDC }
+
+
+{***************************************************************************
+
+                             heap_compact
+
+        compacts heap and relocates all pointers.  the only allocated
+        blocks that should be in the heap now are the following:
+
+        1) the table of buffer descriptors, pointed to by buffpool
+        2) the table of file descriptors, pointed to by pfiletable
+        3) the table of scan descriptors, pointed to by pscantable
+        4) the filedescriptors pointed to by the entries in pfiletable
+        5) the scandescriptors pointed to by the entries in pscantable
+        6) the record descriptors pointed to by the pedesc and pkdesc
+           fields of the file descriptors
+        7) the cos records pointed to by the scan descriptors
+        8) the pagestack for btree code, pointed to by pstack
+
+        nothing else should be in the heap except free blocks!!!!!!
+
+
+*****************************************************************************}
+
+procedure heap_compact;
+
+{*******************************************************************************
+
+                                init_compact_state
+
+        returns the proper local_state variable, depending on whether the
+        global state variable indicates some parent routine is taking care
+        of the compaction or not.
+
+********************************************************************************}
+
+function init_compact_state : states_de_compact;
+
+{*******************************************************************************
+
+                                retry_compact
+
+        returns true iff the caller should retry the command.  checks the
+        local state and the error result to determine if compaction should
+        be done.  if so, compacts and returns true else returns false.
+
+        compaction is only done if the local state is first_try and the
+        error_code is nomem.
+
+        resets the global and local state as necessary.
+
+        error_code - return results
+            noerr
+            nomem
+
+
+********************************************************************************}
+
+function retry_compact(var error_code : integer;
+                       var local_state : states_de_compact) : boolean;
+
+Implementation
+
+Type
+        relloc_rec =
+            record
+                newloc : heapptr;
+                size : integer;
+            end;
+        ptrrelloc_rec = ^ relloc_rec;
+{$IFC DOLLARD }
+{$D- }
+{$ENDC}
+
+{$IFC PRERELEASE }
+{$S debug }
+procedure dump_heap;
+var
+        psize,p : heapptr;
+        prelrec : ptrrelloc_rec;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with czone do
+            begin
+            writeln('avail');
+            p := avail;
+            while p <> nil do
+                with p^ do begin
+                    psize := @blk[abs(size)-lhead];
+                    writeln('p,sl,su:',ord(p):14,size:7,psize^.size:7);
+                    p := next;
+                end;
+            writeln('heap');
+            p := @heapmin^;
+            while comp44(ord(p),ord(heapmax)) = lt do
+                with p^ do begin
+                    psize := @blk[abs(size)-lhead];
+                    prelrec := @blk[abs(size)-sizeof(relloc_rec)];
+                    writeln('sl,su:',size:7,psize^.size:7);
+                    if size > 0 then writeln('newloc:',ord(prelrec^.newloc));
+                    p := @blk[abs(size)];
+                end;
+            writeln('endheap');
+            end;
+end;
+
+procedure dumpallptrs;
+var
+        pfd : ^ptrfiledesc;
+        psd : ^ptrscandesc;
+        i : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pfd := @pfiletable^;
+        for i := 0 to nfiles-1 do
+            begin
+            if pfd^ <> nil then
+                begin
+                writeln('file #',i:4,ord(pfd^):15);
+                writeln(ord(pfd^^.pedesc));
+                if pfd^^.pkdesc <> nil then
+                    begin
+                    writeln(ord(pfd^^.pkdesc):16,
+                            ord(pfd^^.pfldset):16);
+                    end;
+                end;
+            pfd := pointer(ord(pfd)+sizeof(ptrfiledesc));
+            end;
+
+        psd := @pscantable^;
+        for i := 0 to nscans-1 do
+            begin
+            if psd^ <> nil then
+                begin
+                writeln('scan #',i:4,ord(psd^):15);
+                if psd^^.ptrcos <> nil then
+                    writeln(ord(psd^^.ptrcos));
+                end;
+            psd := pointer(ord(psd)+sizeof(ptrscandesc));
+            end;
+
+        writeln(ord(pfiletable));
+        writeln(ord(pscantable));
+        writeln(ord(buffpool));
+        writeln(ord(pstack));
+
+end;
+{$ENDC }
+{$S swapaccs }
+{****************************************************************************
+
+                                fixup
+
+        takes a pointer to a heap block and rellocates it, using the
+        newloc
+
+****************************************************************************}
+
+{$S swapaccs }
+procedure fixup(pp : ptrptr);
+var
+        p : heapptr;
+        prelrec : ptrrelloc_rec;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        p := pointer(ord(pp^)-lhead);
+        prelrec := pointer(ord(p)+p^.size-sizeof(relloc_rec));
+        pp^ := pointer(ord(prelrec^.newloc)+lhead);
+end; { fixup }
+
+{***************************************************************************
+
+                             heap_compact
+
+        compacts heap and relocates all pointers.  the only allocated
+        blocks that should be in the heap now are the following:
+
+        1) the table of buffer descriptors, pointed to by buffpool
+        2) the table of file descriptors, pointed to by pfiletable
+        3) the table of scan descriptors, pointed to by pscantable
+        4) the filedescriptors pointed to by the entries in pfiletable
+        5) the scandescriptors pointed to by the entries in pscantable
+        6) the record descriptors pointed to by the pedesc and pkdesc
+           fields of the file descriptors
+        7) the cos records pointed to by the scan descriptors
+        8) the pagestack for btree code, pointed to by pstack
+
+        nothing else should be in the heap except free blocks!!!!!!
+
+        the compaction has three phases:
+
+        1) compute where the allocated blocks will be after compaction
+        2) reset all pointers
+        3) perform compaction
+
+
+*****************************************************************************}
+
+{$S swapaccs }
+procedure heap_compact;
+var
+        freesize,
+        i : integer;
+        np,
+        p,
+        pnext  : heapptr;
+        prelrec : ptrrelloc_rec;
+        pfd : ^ptrfiledesc;
+        pdd : ^ptrdiffdesc;
+        psd : ^ptrscandesc;
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if debug_compact then
+            begin
+            writeln('before assigning ptrs');
+            dump_heap;
+            end;
+{$ENDC }
+
+        with czone do
+            begin
+            if avail <> nil then
+                begin
+
+            {   phase one - where we put it all ? }
+
+                p := @heapmin^;
+                pnext := @p^;
+                freesize := 0;
+                while comp44(ord(p),ord(heapmax)) = lt do
+                    with p^ do begin
+                        if size < 0 then
+                            begin
+                            freesize := freesize - size;
+                            end
+                        else
+                            begin
+                            prelrec := @blk[abs(size)-sizeof(relloc_rec)];
+                            prelrec^.newloc := pnext;
+                            pnext := pointer(ord(pnext) + size);
+                            end;
+                        p := @blk[abs(size)];
+                    end;
+
+{$IFC debug }
+                if debug_compact then
+                    begin
+                    writeln('after assigning ptrs ',freesize);
+                    dump_heap;
+                    end;
+{$ENDC }
+
+
+                {   phase two - fix up all the nasty pointers }
+
+                pfd := @pfiletable^;
+                for i := 0 to nfiles-1 do
+                    begin
+
+{$IFC debug }
+                if debug_compact then
+                    writeln('pfd,pfd^:',ord(pfd):16,ord(pfd^));
+{$ENDC }
+
+                    if pfd^ <> nil then
+                        begin
+                        fixup(@pfd^^.pedesc);
+                        if pfd^^.pkdesc <> nil then
+                            begin
+                            fixup(@pfd^^.pkdesc);
+                            pfd^^.pfldset := pointer(ord(pfd^^.pkdesc)+
+                                             pfd^^.nfields*sizeof(flddesc));
+                            end;
+                        fixup(@pfd^);
+                        end;
+                    pfd := pointer(ord(pfd)+sizeof(ptrfiledesc));
+                    end;
+
+
+{$IFC debug }
+                if debug_compact then writeln('files done');
+{$ENDC }
+
+                psd := @pscantable^;
+                for i := 0 to nscans-1 do
+                    begin
+                    if psd^ <> nil then
+                        begin
+                        if psd^^.ptrcos <> nil then fixup(@psd^^.ptrcos);
+                        fixup(@psd^);
+                        end;
+                    psd := pointer(ord(psd)+sizeof(ptrscandesc));
+                    end;
+
+
+{$IFC debug }
+                if debug_compact then writeln('scans done');
+{$ENDC }
+
+
+                pdd := @pdifftable^;
+                for i := 0 to ndiffs-1 do
+                    begin
+                    if pdd^ <> nil then
+                        begin
+                        if pdd^^.pkfilter <> nil then fixup(@pdd^^.pkfilter);
+                        if pdd^^.pdfilter <> nil then fixup(@pdd^^.pdfilter);
+                        if pdd^^.phigh <> nil then fixup(@pdd^^.phigh);
+                        if pdd^^.plow <> nil then fixup(@pdd^^.plow);
+                        fixup(@pdd^);
+                        end;
+                    pdd := pointer(ord(pdd)+sizeof(ptrdiffdesc));
+                    end;
+
+                fixup(@pfiletable);
+                fixup(@pscantable);
+                fixup(@pdifftable);
+                fixup(@buffpool);
+                fixup(@pstack);
+
+                {   phase three - do the compaction }
+
+                p := @heapmin^;
+                while comp44(ord(p),ord(heapmax)) = lt do
+                    with p^ do
+                        begin
+                        np := @blk[abs(size)];
+                        if size > 0 then
+                            begin
+                            prelrec := @blk[size-sizeof(relloc_rec)];
+                            if ord(p) <> ord(prelrec^.newloc) then
+                                movelf(@p^,@prelrec^.newloc^,size);
+                            end;
+                        p := np;
+                        end;
+                avail := @pnext^;
+                with avail^ do
+                    begin
+                    size := -freesize;
+                    prep := nil;
+                    next := nil;
+                    end;
+                p := @heapmax^;
+                p^.size := -freesize;
+
+
+{$IFC debug }
+                if debug_compact then
+                    begin
+                    writeln('after compaction');
+                    dumpallptrs;
+                    dump_heap;
+                    end;
+{$ENDC }
+
+                end; { if }
+            end; { with }
+end; { heap_compact }
+{$S access }
+{*******************************************************************************
+
+                                init_compact_state
+
+        returns the proper local_state variable, depending on whether the
+        global state variable indicates some parent routine is taking care
+        of the compaction or not.
+
+********************************************************************************}
+
+{$S access }
+function init_compact_state {: states_de_compact};
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if debug_compact then writeln('i_c_s:',ord(compact_state));
+{$ENDC }
+
+        if compact_state = no_try then
+            begin
+            compact_state := first_try;
+            init_compact_state := first_try;
+            end
+        else init_compact_state := no_try;
+end; { init_compact_state }
+
+
+{*******************************************************************************
+
+                                retry_compact
+
+        returns true iff the caller should retry the command.  checks the
+        local state and the error result to determine if compaction should
+        be done.  if so, compacts and returns true else returns false.
+
+        compaction is only done if the local state is first_try and the
+        error_code is nomem.
+
+        resets the global and local state as necessary.
+
+********************************************************************************}
+
+{$S access }
+function retry_compact{(var error_code : integer;
+                        var local_state : states_de_compact) : boolean};
+var
+{!8-16-83} delta,
+        newsize : longint;
+        SHeapSize : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if debug_compact then
+            writeln('retry:',error_code:7,ord(local_state):7,czone.lastdiff:7);
+{$ENDC }
+
+        if (local_state = first_try) and (error_code = nomem) then
+            begin
+            heap_compact;
+            retry_compact := true;
+            if czone.lastdiff > 0 then
+                begin
+{!8-16-83}      SHeapSize := ord(czone.heapmax)-ord(czone.heapmin)+lhead;
+{!8-16-83}      if czone.lastdiff > ($7ffe-SHeapSize) then error_code := nomem
+                else
+                    begin
+
+                {   We may have to do something here to avoid lockup }
+
+                    size_dataseg(error_code,heap_segment,czone.lastdiff,
+                                 newsize,czone.lastdiff,newsize);
+                    end;
+                if error_code <> noerr then
+                    begin
+
+{$IFC debug }
+                    if debug_compact then writeln('size error:',error_code);
+{$ENDC }
+
+                    error_code := nomem;
+                    retry_compact := false;
+                    compact_state := no_try;
+                    end
+                else
+                    begin
+
+                    {  since it's a grow, no error can occur }
+
+{!8-16-83}          delta := newsize-heapsize;
+{!8-16-83}          if SHeapSize > ($7ffe-delta) then delta := $7ffe-SHeapSize;
+{!8-16-83}          error_code := grow_heap(@czone,delta);
+                    heapsize := newsize;
+
+{$IFC debug }
+                    if debug_compact then
+                        begin
+                        writeln('newsize:',heapsize);
+                        dump_heap;
+                        end;
+{$ENDC }
+
+                    end;
+                end
+            else error_code := noerr;
+            end
+        else
+            begin
+            retry_compact := false;
+            if local_state <> no_try then compact_state := no_try;
+            end;
+
+{$IFC debug }
+        if debug_compact then writeln('retry:',ord(compact_state));
+{$ENDC }
+
+end; { retry_compact }
+
+
+end.
+
+
+
+ÿ

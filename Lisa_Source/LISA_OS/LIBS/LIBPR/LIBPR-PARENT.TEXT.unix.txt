@@ -1,0 +1,1317 @@
+(* link exec
+$EXEC
+L?
++W
+-#Boot-intrinsic.lib
+
+LibPr/Parent
+LibPr/ParDlg
+-#Boot-PrLib
+-#Boot-sys1lib
+-#Boot-iospaslib
+
+
+LibPr/Parent
+F{iler}C{opy}LibPr/Parent.obj,-#Boot-System.Print
+Y{es}
+Q{uit}
+$ENDEXEC
+*)
+
+{                   NOTE: The above links this program.                        }
+{------------------------------------------------------------------------------}
+{                Copyright 1983, 1984, Apple Computer Inc.                     }
+{------------------------------------------------------------------------------}
+{$S Parent}
+PROGRAM Parent;
+{  This is the background Father process that controls other background printing processes.}
+
+{<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>}
+
+USES
+    {$U LibSM/UnitStd     } UnitStd,
+    {$U LibSM/UnitHz      } UnitHz,
+    {$U LibOS/SysCall     } SysCall,
+    {$U LibPM/PMDecl      } PMDecl,
+    {$U LibPM/PMM         } PMM,
+    {$U LibOS/PSysCall    } PSysCall,
+    {$U LibPL/PPasLibC    } PPasLibC,
+    {$U LibQD/Storage     } Storage,
+    {$U LibQD/QuickDraw   } QuickDraw,
+    {$U LibFM/FontMgr     } FontMgr,
+    {$U LibFM/FmgrUtil    } FmgrUtil,
+    {$U LibWM/Events      } Events,
+    {$U LibWM/Menus       } Menus,
+    {$U LibWM/Windows     } Windows,
+    {$U LibWM/Folders     } Folders,
+    {$U libSB/WmlStd      } WmlStd,
+    {$U libSB/WmlCrs      } WmlCrs,
+    {$U LibAM/AlertMgr    } AlertMgr,
+    {$U LibHW/HwInt       } HwInt,
+
+    {$U LibPr/PrStdInfo   } PrStdInfo,
+    {$U LibPr/PrStdProcs  } PrStdProcs,
+    {$U LibPr/Queues      } Queues,
+    {$U LibPr/PrEvents    } PrEvents,
+    {$U LibPr/PrDlgMgr    } PrDlgMgr,
+    {$U LibPr/PrMgr       } PrMgr,
+    {$U-}
+    {$U Libpr/ParDlg      } ParDlg;  {!DC 2/22/84}
+
+{$SETC PrDebug = FALSE}
+{$SETC MeFiler = FALSE}
+
+{===============================================================================}
+
+{$IFC PrDebug}
+  {$R+}
+{$ELSEC}
+  {$R-}
+{$ENDC}
+
+{$IFC PrSymbols}
+  {$D+}
+{$ELSEC}
+  {$D-}
+{$ENDC}
+
+{$S Parent}
+
+{===============================================================================}
+CONST
+  cDSMasterPool = 50;             {Size of master pointer pool for shared data segment}
+  cJHMasterPool = 100;            {Size of job queue master pointer pool}
+  cJobHeapSize  = 3000;           {Size of job queue heap}
+  cIDDotMatrix  = 32;             {ID number for Dot Matrix Printer}
+  NumOutstandingDocs = 12;        {Number of documents that can be printed at one time}
+
+  sParentException  = 'PrBackDialog';
+  sProcessPrefix    = 'System.PR_';
+  sPrDirectory      = 'System.PRD';
+  sPrAlerts         = 'System.Parent.';
+  sHeap             = 'ParentHeap';
+  strinit           = '                                                                                ';
+
+  PaCSize       = 5;
+  PaCBytes      = 1800;
+  cAxDeath      = 5;              {No System.PRD}
+  cAxNoDefault  = 6;              {No printers in PRD or PM and no drivers}
+  cAxNoDrivers  = 7;              {PM entry but no PRD entry}
+  cAxNoProcess  = 8;              {All entries okay but process doesn't start up}
+  cAxNoBtnFile  = 9;              {Button file missing}
+
+  heapSize      = 4000;
+  heapldsn      = 8;
+
+{$IFC PrDebug}
+  sEStrg00   = 'Parent: Unable to DECLARE_EXCEP_HDL in Genesis';
+  sEStrg01   = '';
+  sEStrg02   = 'Parent: Unable to handle Graph Error';
+  sEStrg03   = 'Parent: Unable to create data segment in Genesis';
+  sEStrg04   = 'Parent: Problem in initializing alerts';
+  sEStrg05   = 'Parent: Unable to make heap data segment';
+{$ELSEC}
+  sEStrg00   = '';
+  sEStrg01   = '';
+  sEStrg02   = '';
+  sEStrg03   = '';
+  sEStrg04   = '';
+  sEStrg05   = '';
+{$ENDC}
+
+  lDSmemsize  = 2048;                     {Initial DS memory size}
+  lDSdsksize  = 2048;                     {Initial DS disk size}
+
+  iJobID    = 1;
+  icopies   = 2;
+  iPtrID    = 3;
+  iPortID   = 4;
+
+{===============================================================================}
+TYPE
+
+  TCombo    = RECORD
+    PrntrID   : TC;
+    PortID    : TC;
+  END;
+
+{===============================================================================}
+VAR
+  cError          : TC;
+  MainRxChan      : Channel;
+  MainCallChan    : Channel;
+  SonDiedChan     : Channel;
+  PDSRefNum       : TC;     {--Parent Data Segment for printer list}
+  HDSREfNum       : TC;     {--QuickDraw heap segment}
+  pDataSeg        : TpPrDSHead;
+  HeapSpace       : ARRAY [0..cJobHeapSize] OF TC;
+  sDirName        : PathName;
+  FreeJobQueue,FreeSubQueue : hQueue;
+  hParentAlerts   : TAlertFile;
+  JobHeap         : THz;
+  TotalJobs       : TC;
+  DocTitle        : STR255;
+  WhoActive       : TL;
+
+{============================= PROCEDURE DIRECTORY =============================}
+FUNCTION  AddEntry(sdevname:E_Name;PtrID,PtrPort:TC):ThPrPrinter;       FORWARD;
+PROCEDURE BuildList;                                                    FORWARD;
+PROCEDURE BuildQ;                                                       FORWARD;
+PROCEDURE CallService(environPtr:p_env_blk;excepDataPtr:p_ex_data);     FORWARD;
+PROCEDURE CancelAllPrinting;                                            FORWARD;
+PROCEDURE CleanUpPrinter(hPrinter:ThPrPrinter);                         FORWARD;
+PROCEDURE CleanUpJob(SenderID,leftover:TL);                             FORWARD;
+PROCEDURE CountJobs;                                                    FORWARD;
+PROCEDURE DispatchJob(lfile,ncopies,prntrID,portID:TL);                 FORWARD;
+FUNCTION  DoAlert(af:TAlertFile;an:TC;at:TAlertKind):TC;                FORWARD;
+FUNCTION  FindJobID(JobQ:hQueue;JobID:TC):ThPrintJob;                   FORWARD;
+FUNCTION  FindNthPrinter(n:TC):ThPrPrinter;                             FORWARD;
+PROCEDURE Genesis;                                                      FORWARD;
+PROCEDURE GraphError(errNum:INTEGER);                                   FORWARD;
+PROCEDURE Main;                                                         FORWARD;
+PROCEDURE Nemesis(Cause:TL);                                            FORWARD;
+PROCEDURE ParentAlerts;                                                 FORWARD;
+FUNCTION  ParcessID(proID:TC):ThPrPrinter;                              FORWARD;
+FUNCTION  ParsePort(ptrID:TC;port:TC):ThPrPrinter;                      FORWARD;
+FUNCTION  ParsePrntrID(nID:TC):ThPrPrinter;                             FORWARD;
+PROCEDURE PostDocName(VAR PrEvent:PrEventBlock);                        FORWARD;
+PROCEDURE PrgXtraEntries;                                               FORWARD;
+PROCEDURE PrintCleanup;                                                 FORWARD;
+PROCEDURE PrReadPM;                                                     FORWARD;
+PROCEDURE PrSysTerm(environPtr:p_env_blk;excepDataPtr:p_ex_data);       FORWARD;
+PROCEDURE QueueInvalidate;                                              FORWARD;
+PROCEDURE QueueValidate;                                                FORWARD;
+PROCEDURE RemoveFile(lFileID:TL);                                       FORWARD;
+PROCEDURE RemoveJob(JobIns:ThSubJob);                                   FORWARD;
+PROCEDURE StartUp(handprint:ThPrPrinter);                               FORWARD;
+PROCEDURE StopPrinter(hPrinter:ThPrPrinter;lfile:TL);                   FORWARD;
+PROCEDURE Suicide(st:STR255);                                           FORWARD;
+
+{===============================================================================}
+{$S Parent}
+FUNCTION  AddEntry{(sdevname:E_Name;PtrID,PtrPort:TC):ThPrPrinter};
+VAR
+  hPrinter    : ThPrPrinter;
+  htemp       : hQueue;
+BEGIN
+WITH pDataSeg^ DO BEGIN
+  hPrinter:=POINTER(HAllocate(hzDS,SIZEOF(TPrPrinter)));
+  WITH hPrinter^^, PrRec.PrInfo DO BEGIN
+    CurSubJob:=NIL;
+    SonID:=PrNilProcess;
+    DevName:=sdevname;
+    PrinterID:=PtrID;         {--These should be set by the process started up...}
+    port:=PtrPort;            {--but we'll set it here in case he doesn't make it.}
+    Xmetrics:=TRUE;           {--Need to set the metrics}
+  END;
+  htemp:=POINTER(HAllocate(hzDS,SIZEOF(Queue)));
+  QueueInit(htemp);
+  hPrinter^^.JobQueue:=htemp;
+  StartUp(hPrinter);
+  WITH hPrinter^^ DO IF (SonID = lParentID) THEN SonID:=PrNilProcess;
+  Enqueue(QueueDS,POINTER(hPrinter));
+END;
+AddEntry:=hPrinter;
+END;
+
+{===============================================================================}
+{$S ParDlg}
+  FUNCTION  uBuildList(hQItem,pNum:hQueue):TF;
+  CONST
+    {strinit = '                                                                                ';}
+    {string    '++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|'}
+    {          'Daisy Wheel Printer     serial port B  (default printer)                        '}
+    prtrstart = 1;
+    prtrend   = 22;
+    portstart = 25;
+    portend   = 43;
+  VAR
+    sList   : STRING[80];
+    hPrinter: ThPrPrinter;
+    NumCount: ^TC;
+    shack   : TP;
+  BEGIN
+    uBuildList:=TRUE;
+    hPrinter:=POINTER(hQItem);
+    NumCount:=POINTER(pNum);
+    shack:=@sList;
+    PsPortName(hPrinter^^.PrRec.PrInfo.Port,@shack);
+    sList:=CONCAT('                        ',sList);    {--spaces with port name attached}
+    PsCopy(ORD4(@hPrinter^^.DevName)+1,ORD4(@sList)+prtrstart,
+      cMin(prtrend-prtrstart+1,LENGTH(hPrinter^^.DevName)));
+    IF (hPrinter = pDataSeg^.DefaultPr) THEN sList:=CONCAT(sList,ParDefTsp);
+    MakeListBtn(NumCount^,SList);
+    WITH pDataSeg^, DlgArgs DO BEGIN
+      IF (hPrinter = PrChosen) OR ((PrChosen = NIL) AND (DefaultPr = hPrinter)) THEN PushListBtn(NumCount^);
+    END;
+    NumCount^:=NumCount^+1;
+  END;
+
+PROCEDURE BuildList;
+VAR
+  hDummy      : hQueue;
+  NumPrinters : TC;
+BEGIN
+maxCBtnList:=CMIN(QueueLength(pDataSeg^.QueueDS),cMaxList);
+NewList;
+NumPrinters:=0;
+hDummy:=EnumerateQueue(pDataSeg^.QueueDS,uBuildList,@NumPrinters);
+END;
+
+{===============================================================================}
+{$S ParDlg}
+  FUNCTION uBuildQ(hQItem,pNum:hQueue):TF;
+  CONST
+    {strinit = '                                                                                ';}
+    {string    '++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|++++|'}
+    {          'Daisy Wheel Printer     serial port B        Exceptionally long file name goÉ  1'}
+    prtrstart = 1;
+    prtrend   = 22;
+    portstart = 25;
+    portend   = 43;
+    filestart = 46;
+    fileend   = 77;
+    jobstart  = 79;
+    singular  = 80;
+  VAR
+    sList   : STRING[singular];
+    sport   : STRING[singular];
+    shack   : TP;
+    hPrinter: ThPrPrinter;
+    NumCount: ^TC;
+    PrintJob: ThPrintJob;
+    tempport: TC;
+  BEGIN
+    uBuildQ:=TRUE;
+    hPrinter:=POINTER(hQItem);
+    NumCount:=POINTER(pNum);
+    shack:=@sport;
+    sList:=strinit;
+    PsPortName(hprinter^^.PrRec.PrInfo.Port,@shack);
+    PsCopy(ORD4(@hPrinter^^.DevName)+1,ORD4(@sList)+1,cMin(prtrend,LENGTH(hPrinter^^.DevName)));
+    tempport:=hPrinter^^.PrRec.PrInfo.Port;
+    IF (tempport = PrNilPort) THEN BEGIN
+      PsCopy(ORD4(@sport)+1,ORD4(@sList)+portstart,LENGTH(sport));
+    END
+    ELSE BEGIN
+      PsCopy(ORD4(@sport)+1,ORD4(@sList)+portstart,cMin(portend-portstart+1,LENGTH(sport)));
+      PrintJob:=POINTER(QueuePeek(hPrinter^^.JobQueue));
+      IF (PrintJob = NIL) THEN BEGIN
+        {sport:='(not printing)';
+        PsCopy(ORD4(@sport)+1,ORD4(@sList)+filestart,cMin(fileend-filestart+1,LENGTH(sport)));}
+      END
+      ELSE BEGIN
+        PsCopy(ORD4(@PrintJob^^.DocName)+1,ORD4(@sList)+filestart,
+          cMin(fileend-filestart+1,LENGTH(PrintJob^^.DocName)));
+        tempport:=QueueLength(hPrinter^^.JobQueue)-1;
+        IF tempport > 0 THEN BEGIN
+          IF tempport > 9 THEN BEGIN
+            sList[jobstart]:=CHR((tempport DIV 10)+ORD('0'));
+            tempport:=tempport MOD 10;
+          END;
+          sList[jobstart+1]:=CHR(tempport+ORD('0'));
+        END;
+        {IF tempport > 0 THEN sList[jobstart+1]:=CHR(tempport+ORD('0'));}
+      END;
+    END;
+    MakeQBtn(NumCount^,SList);
+    NumCount^:=NumCount^+1;
+  END;
+
+PROCEDURE BuildQ;
+VAR
+  hDummy      : hQueue;
+  NumPrinters : TC;
+BEGIN
+maxCBtnQ:=CMIN(QueueLength(pDataSeg^.QueueDS),cMaxList);
+NewQ;
+NumPrinters:=0;
+hDummy:=EnumerateQueue(pDataSeg^.QueueDS,uBuildQ,@NumPrinters);
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE CallService{(environPtr:p_env_blk;excepDataPtr:p_ex_data)};
+VAR
+  pevData   : ^PrEventBlk;
+  Message   : ^PrMessage;
+  excepName : t_ex_name;
+  select    : TC;        {!DC 2/22/84}
+  hPrinter  : ThPrPrinter;
+  cErr      : TC;
+BEGIN
+  pevData:=POINTER(excepDataPtr);
+  Message:=@pevData^.eventBytes[0];
+  WhoActive:=pevData^.event_header.send_pid;
+  CASE Message^ OF
+    EPrListDialog: WITH pevData^, pDataSeg^, DlgArgs DO BEGIN
+      BIND_DATASEG(cErr,DDSRefNum);
+      BuildList;
+      ReturnOpt := FListDlg (select); {!DC 2/22/84}
+      UNBIND_DATASEG(cErr,DDSRefNum);
+      IF ReturnOpt = eDlgOk THEN BEGIN
+        hPrinter:=FindNthPrinter(select);
+        ThePrRec:=hPrinter^^.PrRec;
+        PrChosen:=hPrinter;
+      END;
+      fBackGround:=FALSE;
+      ACTIVATE_PROCESS(cError,WhoActive,FALSE);
+    END;
+
+    EMonitorDialog: WITH pevData^, pDataSeg^, DlgArgs DO BEGIN
+      BIND_DATASEG(cErr,DDSRefNum);
+      BuildQ;
+      ReturnOpt := FQDlg; {!DC 2/22/84}
+      UNBIND_DATASEG(cErr,DDSRefNum);
+      IF ReturnOpt = eDlgCancel THEN CancelAllPrinting;
+      fBackGround:=FALSE;
+      ACTIVATE_PROCESS(cError,WhoActive,FALSE);
+    END;
+
+    EDone: WITH pevData^ DO CleanupJob(event_header.send_pid,event_text[icopies]);
+
+    {--Terminate given print job for the given printer}
+    EPrintTerminate: WITH pevData^ DO StopPrinter(ParsePort(eventLongs[iptrID],eventLongs[iportID]),
+      eventLongs[ijobID]);
+
+    {--Update the metrics for all devices}
+    EMetrics:  QueueValidate;
+  END;
+  excepName:=COPY(MainCallChan.ChName,1,ECNameSize);
+  ENABLE_EXCEP(cError,excepName);
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION uCancelAllPrinting(hQItem,xnil:hQueue):TF;
+  BEGIN
+    uCancelAllPrinting:=TRUE;
+    CleanUpPrinter(POINTER(hQItem));
+  END;
+
+PROCEDURE CancelAllPrinting;
+VAR
+  dummyQ    : hQueue;
+BEGIN
+  dummyQ:=EnumerateQueue(pDataSeg^.QueueDS,uCancelAllPrinting,nil);
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE CleanUpJob{(SenderID,leftover:TL)};
+VAR
+  hPrinter    : ThPrPrinter;
+  PrSubJob    : ThSubJob;
+  SubSub      : ThSubJob;
+  PrDocJob    : ThPrintJob;
+BEGIN
+  hPrinter:=ParcessID(SenderID);
+  IF (hPrinter <> NIL) THEN BEGIN
+    PrDocJob:=POINTER(QueuePeek(hPrinter^^.JobQueue));
+{WRITELN('Cleanup printer ',SenderID:1,', subjob is ',ORD4(hPrinter^^.CurSubJob):1);}
+    PrSubJob:=hPrinter^^.CurSubJob;
+    IF (PrDocJob = NIL) THEN BEGIN
+      LeftOver:=0;
+    END
+    ELSE IF (PrSubJob <> NIL) THEN BEGIN
+      IF (PrDocJob^^.FileID <> PrSubJob^^.DocID.FileID) THEN BEGIN
+        LeftOver:=0;
+        PrDocJob:=NIL;
+      END;
+    END;
+    IF (PrSubJob <> NIL) THEN BEGIN
+      IF (LeftOver = 0) THEN BEGIN  {--Last copy was printed, we're done}
+        IF (PrSubJob^^.DocID.BlockID = LastBlock) AND (PrDocJob <> NIL) THEN BEGIN
+          REPEAT  {--Remove all extra jobs that might have been requeued for a second printing}
+            SubSub:=POINTER(Dequeue(PrDocJob^^.DocQueue));
+            IF (SubSub <> NIL) THEN RemoveJob(SubSub);
+          UNTIL (SubSub = NIL);
+          Enqueue(FreeJobQueue,POINTER(DeQueue(hPrinter^^.JobQueue)));
+        END;
+        RemoveJob(PrSubJob);
+        PrSubJob:=NIL;  {--So current job will be set properly if there are no more jobs pending}
+      END
+      ELSE BEGIN  {--not the last copy}
+        IF (PrSubJob^^.DocID.BlockID = LastBlock) THEN BEGIN
+          PrDocJob^^.CopiesLeft:=leftover;
+        END;
+        {--Requeue this job}
+        Enqueue(PrDocJob^^.DocQueue,POINTER(PrSubJob));
+      END;
+    END;
+    PrDocJob:=POINTER(QueuePeek(hPrinter^^.JobQueue));
+    IF (PrDocJob <> NIL) THEN BEGIN
+      PrSubJob:=POINTER(DeQueue(PrDocJob^^.DocQueue));
+      IF (PrSubJob <> NIL) THEN BEGIN
+        WITH PrSubJob^^ DO PrPrintRequest(SenderID,DocID.JobID,PrDocJob^^.CopiesLeft,0,0);
+      END;
+    END;
+    hPrinter^^.CurSubJob:=PrSubJob;
+  END;
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE CleanUpPrinter{(hPrinter:ThPrPrinter)};
+BEGIN
+  WHILE (QueuePeek(hPrinter^^.JobQueue) <> NIL) DO BEGIN
+    StopPrinter(hPrinter,0);  {--Take the current one off the top of the stack}
+  END;
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE CountJobs;
+BEGIN
+  PrNotify(MainRxChan.EvBlock.event_header.send_pid,EReply,TotalJobs-QueueLength(FreeSubQueue),0,0,0);
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE DispatchJob{(lfile,ncopies,prntrID,portID:TL)};
+VAR
+  hPrinter    : ThPrPrinter;
+  PrSubJob    : ThSubJob;
+  PrDocJob    : ThPrintJob;
+BEGIN
+  hPrinter:=ParsePort(prntrID,portID);
+  IF (hPrinter <> NIL) THEN BEGIN
+    REPEAT
+      PrSubJob:=POINTER(DeQueue(FreeSubQueue));
+      IF (PrSubJob = NIL) THEN PsYieldCPU;  {--This loop may lockup under certain conditions, }
+    UNTIL (PrSubJob <> NIL);                {--i.e., if there is only one document, it has all}
+                                            {--the subjobs and more than one copy is requested}
+    PrSubJob^^.DocID.JobID:=lfile;
+    PrDocJob:=FindJobID(hPrinter^^.JobQueue,PrSubJob^^.DocID.FileID);
+    IF (PrDocJob = NIL) THEN BEGIN  {--Maybe a new job}
+      IF (PrSubJob^^.DocID.BlockID <> 0) THEN BEGIN
+        {--If its not zero, its an aborted job.  Throw it away.}
+        RemoveJob(PrSubJob);
+      END
+      ELSE BEGIN {--Add a new job}
+        REPEAT
+          PrDocJob:=POINTER(DeQueue(FreeJobQueue));
+          IF (PrDocJob = NIL) THEN PsYieldCPU;
+        UNTIL (PrDocJob <> NIL);
+{WRITELN('Document started, ',DocTitle);}
+        PsCopy(ORD4(@DocTitle),ORD4(@PrDocJob^^.DocName),LENGTH(DocTitle)+1);
+        WITH PrDocJob^^ DO BEGIN
+          CopiesLeft:=ncopies;
+          FileID:=PrSubJob^^.DocID.FileID;
+        END;
+        Enqueue(hPrinter^^.JobQueue,POINTER(PrDocJob));
+        IF (hPrinter^^.CurSubJob = NIL) THEN BEGIN  {--Not currently printing, fire it up}
+          hPrinter^^.CurSubJob:=PrSubJob;
+          IF (hPrinter^^.SonID = PrNilProcess) THEN BEGIN
+            Startup(hPrinter);
+            WITH hPrinter^^ DO IF (SonID = lParentID) THEN SonID:=PrNilProcess;
+          END;
+          PrPrintRequest(hPrinter^^.SonID,lfile,ncopies,0,0);
+        END
+        ELSE BEGIN
+          Enqueue(PrDocJob^^.DocQueue,POINTER(PrSubJob));
+        END;
+      END;
+    END
+    ELSE BEGIN {--Add to existing job}
+      IF (ncopies < PrDocJob^^.CopiesLeft) THEN BEGIN
+        {--Implies not enough disk space to spool entire document}
+        {--Maybe should alert here}
+        PrDocJob^^.CopiesLeft:=1;
+      END;
+      IF (hPrinter^^.CurSubJob <> NIL) THEN BEGIN
+        Enqueue(PrDocJob^^.DocQueue,POINTER(PrSubJob));
+      END
+      ELSE BEGIN
+        hPrinter^^.CurSubJob:=PrSubJob;
+        PrPrintRequest(hPrinter^^.SonID,lfile,ncopies,0,0);
+      END;
+    END;
+{WRITELN('SubJob Request (file,copies,printer,port) ',lfile:1,' ',ncopies:1,' ',prntrID:1,' ',portID:1);}
+  END ELSE RemoveFile(lfile);
+END;
+
+{===============================================================================}
+{$S Parent}
+FUNCTION  DoAlert{(af:TAlertFile;an:TC;at:TAlertKind):TC};
+BEGIN
+{PsNonPreemptive;}
+DoAlert:=PrOtherAlert(af,an,at,TRUE{Background});
+{PsPreemptive;}
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION  uFindJobID(hpr,pJobID:hQueue):TF;
+  VAR
+    hPrJob    : ThPrintJob;
+    pID       : ^TC;
+  BEGIN
+    hPrJob:=POINTER(hpr);
+    pID:=POINTER(pJobID);
+    uFindJobID:=(hPrJob^^.FileID <> pID^);
+  END;
+
+{-------------------------------------------------------------------------------}
+
+FUNCTION  FindJobID{(JobQ:hQueue;JobID:TC):ThPrintJob};
+BEGIN
+FindJobID:=POINTER(EnumerateQueue(JobQ,uFindJobID,@JobID));
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION  uFindNthPrinter(hQItem,pNum:hQueue):TF;
+  VAR
+    pn        : ^TC;
+  BEGIN
+    pn:=POINTER(pNum);
+    uFindNthPrinter:=(pn^ > 0);
+    pn^:=pn^-1;
+  END;
+FUNCTION  FindNthPrinter{(n:TC):ThPrPrinter};
+BEGIN
+  FindNthPrinter:=POINTER(EnumerateQueue(pDataSeg^.QueueDS,uFindNthPrinter,@n));
+END;
+
+{===============================================================================}
+{$S     }
+PROCEDURE Genesis;
+VAR
+  excepName       : t_ex_name;
+  sSegname        : PathName;
+  sDelName        : PathName;
+  sJobName        : E_Name;
+  sPrefix         : E_Name;
+  lSegPtr         : TL;
+  pStart,pLimit   : TP;
+  hProcess        : ThPrPrinter;
+  sNull           : NameString;
+  fNewSegment     : TF;
+  PrPrintJob      : ThPrintJob;
+  PrSubJob        : ThSubJob;
+  DSInfo          : DsInfoRec;
+  tempref         : TC;
+  knil            : TProc;
+  J               : TC;
+  cVariant        : T32;
+  htemp           : hQueue;
+
+BEGIN
+pDataSeg:=NIL;
+cPrError:=0;
+lParentID:=MY_ID;
+fBackGround:=FALSE;
+fInitialized:=FALSE;
+WhoActive:=ActiveProcess;   {-- Window manager global}
+knil:=POINTER(procNil);{.StdUnit}
+
+{--What to do if I die  ..(The first thing)}
+excepName:='SYS_TERMINATE';
+DECLARE_EXCEP_HDL(cError,excepName,@PrSysTerm);
+IF (cError <> 0) THEN Suicide(sEStrg00);
+
+{--Wait to be awakened before proceeding}
+{$IFC NOT MeFiler}
+(*SUSPEND_PROCESS(cError,lParentID,FALSE{suspend only me});*) (*--Don't do it at all for now.*)
+{$ENDC}
+
+{--Open QuickDraw and the Window Manager}
+InitGraf(@thePort);
+{--OpenWM must be called before any other creation of any other datasegment due to the concurrency}
+{--problem. }
+{$IFC MeFiler}
+InitWM;
+InitMenus;
+PMInit(cError);
+{$ELSEC}
+OpenWM;
+{$ENDC}
+
+PsNonPreemptive;
+sSegName:=sHeap;
+MAKE_DATASEG(cError,sSegName,heapSize,heapSize,HDSRefNum,lSegPtr,heapldsn,ds_private);
+IF cError <> 0 THEN Suicide(sEStrg05);
+INFO_DATASEG(cError,HDSRefNum,DSInfo);
+InitHeap(POINTER(lSegPtr),POINTER(lSegPtr+DSInfo.mem_size),knil);
+
+
+{--Initialize the Print Manager; events and Alerts should be inited now.}
+PrBgdInit;
+ParentAlerts;
+PsPreemptive;
+
+{--Create and initialize a data segment, a heap and the queue}
+sSegName := sParentSeg;
+fNewSegment:=FALSE;
+OPEN_DATASEG(cError,sSegName,PDSRefNum,lSegPtr,ldsnshared);
+IF (cError > 0) THEN BEGIN
+  fNewSegment:=TRUE;
+  MAKE_DATASEG(cError,sSegName,lDSmemsize,lDSdsksize,PDSRefNum,lSegPtr,ldsnshared,DS_Shared);
+  IF (cError > 0) THEN Suicide(sEStrg03);
+END
+ELSE BEGIN
+  IF (cerror < 0) THEN fNewSegment:=TRUE;
+  SETACCESS_DATASEG(cError,PDSRefNum,FALSE{make me readwrite});
+END;
+INFO_DATASEG(cError,PDSRefNum,DSInfo);
+pDataSeg:=POINTER(lSegPtr);
+pStart  :=POINTER(lSegPtr+SIZEOF(TPrDSHead));
+pLimit  :=POINTER(lSegPtr+DSInfo.mem_size);
+IF (DSInfo.mem_size < lDSmemsize) OR (DSInfo.mem_size <> DSInfo.disc_size) THEN BEGIN
+  SIZE_DATASEG(cError,PDSRefNum,lDSmemsize-DSInfo.mem_size,DSInfo.mem_size,
+    lDSdsksize-DSInfo.disc_size,DSInfo.disc_size);
+  pLimit:=POINTER(lSegPtr+DSInfo.mem_size);
+  fNewSegment:=TRUE;
+END;
+
+WITH pDataSeg^ DO BEGIN
+  IF (hzCrash <> DSCrashPassword) THEN fNewSegment:=TRUE;
+  hzCrash:=0;    {If we crash before dying this will not be set to DSCrashPassword}
+  IF (fNewSegment = FALSE) THEN BEGIN
+    cVariant.l:=ORD4(QueueDS^^.Head);
+    {--If the queue is marked "in use" then it must be trashed.  Reinitialize.}
+    IF (cVariant.i1.b15 = 0) THEN BEGIN
+      fNewSegment:=TRUE;  {--Boy is this ever a kludge, but it works well enough}
+    END
+    ELSE BEGIN
+      INFO_ADDRESS(cError,ORD4(hzDS),tempref);
+      IF (tempref <> PDSRefNum) OR (cError > 0) THEN BEGIN
+        fNewSegment:=TRUE;
+      END;
+    END;
+  END;
+  ParentID:=lparentID;
+  IF fNewSegment THEN BEGIN
+    hzDS:=HzInit(pStart,pLimit,pStart,cDSMasterPool,0,
+      knil,knil,knil,knil{Default all the Proc params});
+    DefaultPr:=NIL;
+    QueueDS  :=POINTER(HAllocate(hzDS,SIZEOF(Queue)));
+    QueueInit(QueueDS);
+  END;
+END;
+
+
+{--Make a heap for the Job Queues}
+JobHeap:=HzInit(@HeapSpace,@HeapSpace[cJobHeapSize],@HeapSpace,cJHMasterPool,0,
+  knil,knil,knil,knil{default the Proc params});
+{--Initialize the Job Queue}
+FreeSubQueue:=POINTER(HAllocate(JobHeap,SIZEOF(Queue)));
+QueueInit(FreeSubQueue);
+FreeJobQueue:=POINTER(HAllocate(JobHeap,SIZEOF(Queue)));
+QueueInit(FreeJobQueue);
+FOR J:=0 TO NumOutstandingDocs DO BEGIN
+  PrPrintJob:=POINTER(HAllocate(JobHeap,SIZEOF(TPrintJob)));
+  htemp:=POINTER(HAllocate(JobHeap,SIZEOF(Queue)));
+  WITH PrPrintJob^^ DO BEGIN
+    CopiesLeft:=0;
+    FileID:=0;
+    QueueInit(htemp);
+    DocQueue:=htemp;
+  END;
+  EnQueue(FreeJobQueue,POINTER(PrPrintJob));
+END;
+TotalJobs:=0;
+REPEAT
+  PrSubJob:=POINTER(HAllocate(JobHeap,SIZEOF(TSubJob)));
+  IF (PrSubJob <> POINTER(hNIL)) THEN BEGIN
+    EnQueue(FreeSubQueue,POINTER(PrSubJob));
+    TotalJobs:=TotalJobs+1;
+  END;
+UNTIL (PrSubJob = POINTER(hNIL));
+
+{--Make the event channel (and refnum) that we will have to use for MAKE_PROCESS calls}
+WITH SonDiedChan DO BEGIN
+  ChName:='';   {blank name means its for the OS and my son process activity}
+  Exname:='';
+  MAKE_EVENT_CHN(cError,ChName);
+  OPEN_EVENT_CHN(cError,ChName,refnum,Exname,TRUE{Receiver});
+END;
+
+{--Invalidate the printer process entries in the shared queue;
+   all process IDs nil and job queues empty.}
+QueueInvalidate;
+
+{--Establish the Default Printer}
+WITH pDataSeg^ DO BEGIN
+  IF (DefaultPr = NIL) THEN BEGIN
+    {--Read PM, PRD file and add printer for each entry.}
+    QueueValidate;
+    {--Then default to Dot Matrix}
+    IF (DefaultPr = NIL) THEN BEGIN {Still?  We are getting desperate.}
+      DefaultPr:=ParsePrntrID(cIDDotMatrix);
+    END;
+    {--Then default to first one in Queue}
+    IF (DefaultPr = NIL) THEN BEGIN {Still?  Anything will do.}
+      DefaultPr:=POINTER(QueuePeek(QueueDS));
+    END;
+    {--Then alert}
+    IF (DefaultPr = NIL) THEN BEGIN {Still?  We're in trouble.}
+      ArgAlert(1,'3056'{NoPMDrivers});
+      cError:=DoAlert(hParentAlerts,cAxNoDefault,stopProc);
+    END;
+  END;
+END;
+
+{$IFC NOT MeFiler}
+{--Remove any latent unused print files}
+GET_WORKING_DIR(cError,sDirName);  {Hopefully the boot volume}
+RESET_CATALOG(cError,sDirName);
+sPrefix:='[P';
+REPEAT
+  PsYieldCPU;
+  GET_NEXT_ENTRY(cError,sPrefix,sJobName);
+  sDelName:=sJobName;
+  IF cError <= 0 THEN KILL_OBJECT(cError,sDelName);
+UNTIL cError > 0;
+{$ENDC}
+
+DocTitle:='';
+
+{--Does its own sched_class calls to be non-preemptive}
+IF (ParDlgInit <> TRUE) THEN BEGIN
+  ArgAlert(1,'3059'{NoBtnFile});
+  cError:=DoAlert(hParentAlerts,cAxNoBtnFile,stopProc);
+END
+ELSE BEGIN
+  {--Open the Global Event Channels on which we receive commands from the world.}
+  {--This is only safe after the dialog has been initialized.}
+  PrOpenChan(MainRxChan,TRUE{Receiver});
+  PrOpenCall(MainCallChan,@CallService);
+END;
+
+fInitialized:=TRUE;
+
+END;
+
+{===============================================================================}
+{$S Finish}
+PROCEDURE GraphError{(errNum:INTEGER)};
+BEGIN
+{$IFC PrDebug}
+Writeln('Parent: QuickDraw error ',errNum);
+Suicide(sEStrg02);
+{$ENDC}
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE Main;
+VAR
+  lCommand  : PrMessage;
+
+BEGIN
+REPEAT
+  {--Get a command and do something}
+  CASE PrAccept(MainRxChan) OF
+    {--Dequeue Print Job}
+    EDone: WITH MainRxChan.EvBlock DO CleanupJob(event_header.send_pid,event_text[icopies]);
+
+    {--Queue up Print Job}
+    EPrintRequest: WITH MainRxChan.EvBlock DO DispatchJob(event_text[iJobID],event_text[icopies],
+      event_text[iptrID],event_text[iportID]);
+
+    {--Wake up the specified process}
+    EWake: StartUp(POINTER(MainRxChan.EvBlock.event_text[1]));
+
+    {--Count the number of waiting print jobs and reply to the guy who sent it.}
+    EJobCount:  CountJobs;
+
+    {--Get Document name for next file to be printed}
+    EStuffed:  PostDocName(MainRxChan.EvBlock);
+
+    OTHERWISE {We're not equipped to handle anything else}
+      {$IFC PrDebug}
+      BEGIN
+        WRITELN('Event received from: ',ORD(MainRxChan.event_header.send_pid):1,
+          ' event = ',ORD(MainRxChan.EvBlock.eventBytes[0]):1);
+      END
+      {$ENDC};
+  END;
+UNTIL FALSE;
+END;
+
+{===============================================================================}
+{$S Finish}
+PROCEDURE Nemesis{(Cause:TL)};
+VAR
+  sSegName    : PathName;
+BEGIN
+{Make sure any suspended foreground task is awake.}
+lParentID:=PrNilProcess;
+  {--Make sure any dialog is down}
+PsNonPreemptive;
+DialogHeight(0,FALSE);
+  {--Make sure anyone suspended in dialog is activated}
+fBackGround:=FALSE;
+ACTIVATE_PROCESS(cError,WhoActive,FALSE);
+
+IF fInitialized THEN ParDlgQuit;                {--Make sure dialogs are closed cleanly}
+fInitialized:=FALSE;
+PsPreemptive;
+
+{--In case the last sender is waiting for a reply, send him one.}
+PrNotify(MainRxChan.EvBlock.event_header.send_pid,EReply,0,0,0,0);
+
+WITH MainRxChan DO BEGIN
+  CLOSE_EVENT_CHN(cError,refnum);
+  KILL_EVENT_CHN(cError,ChName);
+END;
+WITH MainCallChan DO BEGIN
+  CLOSE_EVENT_CHN(cError,refnum);
+  KILL_EVENT_CHN(cError,ChName);
+END;
+
+IF (pDataSeg <> NIL) THEN WITH pDataSeg^ DO BEGIN
+  ParentID:=PrNilProcess;
+  IF (Cause = killed) OR (Cause = fthr_term) THEN
+    hzCrash:=DSCrashPassword;      {If hzCrash is not set to DSCrashPassword then it's assumed
+                                    we crashed heavily and need to rebuild Hz and dataseg}
+END;
+
+CLOSE_DATASEG(cError,HDSRefNum);                {--Get rid of the heap data seg}
+
+CLOSE_DATASEG(cError,PDSRefNum);
+END;
+
+{===============================================================================}
+{$     }
+PROCEDURE ParentAlerts;
+VAR
+  cAlerts   : TC;
+BEGIN
+  InitAlerts(PaCSize,PaCBytes,theHeap,nil,nil);
+  OpenPhraseFile(cAlerts,sPrAlerts);
+  IF (AlertError <= 0) THEN BEGIN
+    hParentAlerts:=ReadAlerts(cAlerts,cAxVersion);
+  END;
+  IF (AlertError > 0) THEN Suicide(sEStrg04);
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION  uParcessID(hQItem,pproID:hQueue):TF;
+  VAR
+    hQPrRec   : ThPrPrinter;
+    pptr      : ^TC;
+  BEGIN
+    hQPrRec:=POINTER(hQItem);
+    pptr:=POINTER(pproID);
+    uParcessID:=TRUE;
+    WITH hQPrRec^^ DO IF (SonID = pptr^) THEN uParcessID:=FALSE;
+  END;
+
+{-------------------------------------------------------------------------------}
+{$S Parent}
+FUNCTION  ParcessID{(proID:TC):ThPrPrinter};
+BEGIN
+ParcessID:=POINTER(EnumerateQueue(pDataSeg^.QueueDS,uParcessID,@proID));
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION  uParsePort(hQItem,pportID:hQueue):TF;
+  VAR
+    hQPrRec   : ThPrPrinter;
+    pptr      : ^TCombo;
+  BEGIN
+    hQPrRec:=POINTER(hQItem);
+    pptr:=POINTER(pportID);
+    uParsePort:=TRUE;
+    WITH hQPrRec^^.PrRec.PrInfo DO IF ((PrinterID = pptr^.PrntrID) AND
+        (Port = pptr^.portID)) THEN uParsePort:=FALSE;
+  END;
+
+{-------------------------------------------------------------------------------}
+{$S Parent}
+FUNCTION  ParsePort{(ptrID:TC;port:TC):ThPrPrinter};
+VAR
+  IDandPort : TCombo;
+BEGIN
+WITH IDandPort DO BEGIN
+  PrntrID:=ptrID;
+  portID:=port;
+END;
+ParsePort:=POINTER(EnumerateQueue(pDataSeg^.QueueDS,uParsePort,@IDandPort));
+END;
+
+{===============================================================================}
+{$S Parent}
+  FUNCTION  uParsePrntrID(hQItem,theID:hQueue):BOOLEAN;
+  VAR
+    hQPrRec   : ThPrPrinter;
+  BEGIN
+    hQPrRec:=POINTER(hQItem);
+    uParsePrntrID:=TRUE;
+    WITH hQPrRec^^.PrRec.PrInfo DO IF (PrinterID = ORD(theID)) THEN uParsePrntrID:=FALSE;
+  END;
+
+{-------------------------------------------------------------------------------}
+{$S Parent}
+FUNCTION  ParsePrntrID{(nID:TC):ThPrPrinter};
+BEGIN
+ParsePrntrID:=POINTER(EnumerateQueue(pDataSeg^.QueueDS,uParsePrntrID,POINTER(nID)));
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE PostDocName{(VAR PrEvent:PrEventBlock)};
+VAR
+  strptr  : TP;
+BEGIN
+WITH PrEvent DO BEGIN
+  strptr:=POINTER(ORD4(@DocTitle)+(eventBytes[1]*maxstuff));
+  MoveLeft(eventBytes[2],strptr^,maxstuff);
+END;
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE PrgXtraEntries;
+VAR
+  hPrinter    : ThPrPrinter;
+  htemp       : ThPrPrinter;
+  redsize     : TC;
+  lnewmem,lnewdisk  : TL;
+  dsinfo      : DSInfoRec;
+  xpevent     : PrMessages;
+  tempID      : TL;
+BEGIN
+WITH pDataSeg^ DO BEGIN
+  QueueInUse(QueueDS);
+  hPrinter:=POINTER(QueueDS);
+  WHILE (hPrinter^^.Link <> NIL) DO BEGIN
+    IF (hPrinter^^.Link^^.Valid = FALSE) THEN BEGIN
+      {--UnQueue this entry}
+      WITH QueueDS^^ DO IF (ORD4(Tail) = ORD4(hPrinter^^.Link)) THEN Tail:=POINTER(hPrinter);
+      htemp:=hPrinter^^.Link;
+      hPrinter^^.Link:=htemp^^.Link;
+
+      StopPrinter(htemp,0);
+      RemoveJob(htemp^^.CurSubJob);
+      htemp^^.CurSubJob:=NIL;
+
+      tempID:=htemp^^.SonID;
+      IF (tempID <> PrNilProcess) THEN BEGIN
+        {--Terminate the process}
+        KILL_PROCESS(cError,tempID);
+        {--Wait for termination event from the son we just terminated}
+        IF (cError = 0) THEN REPEAT
+          xpevent:=PrAccept(SonDiedChan);
+        UNTIL (SonDiedChan.EvBlock.event_header.send_pid = tempID);
+      END;
+
+      {--Free Job Queue, we don't wait for any jobs to complete?}
+      FreeH(hzDS,POINTER(htemp^^.JobQueue));
+
+      {--Free htemp}
+      FreeH(hzDS,POINTER(htemp));
+
+      {ReSize the data segment}
+{
+      redsize:=CbShrinkHz(hzDS,redsize);
+      INFO_DATASEG(cError,PDSRefNum,dsinfo);
+      redsize:=dsinfo.Mem_Size-CbOfHz(hzDS);
+      IF (redsize > 0) THEN SIZE_DATASEG(cError,PDSRefNum,-((redsize DIV 512)*512),lnewmem,0,lnewdisk);
+}
+    END ELSE hPrinter:=hPrinter^^.Link;
+  END;
+  QueueFree(QueueDS);
+END;
+END;
+
+{===============================================================================}
+{$S Finish}
+PROCEDURE PrintCleanup;
+BEGIN
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE PrReadPM;
+VAR
+  NextEntry       : TL;
+  PrConfig        : ConfigDev;
+  hPrinter        : ThPrPrinter;
+  subword         : TPrExtWord;
+  IDPrinter       : T16;
+BEGIN
+  NextEntry:=0;
+  REPEAT
+    PMReadConfig(cError,NextEntry,PrConfig);
+    IF (cError = 0) THEN WITH PrConfig DO BEGIN
+      IF (nExtWords > 0) THEN BEGIN
+        subword.ExtWord:=ExtWords[1];
+        IF (subword.printer_flag) THEN BEGIN
+          IDPrinter.i:=0;
+          IDPrinter.n2:=pos.slot;
+          IDPrinter.n1:=pos.chan;
+          IDPrinter.n0:=pos.dev;
+          hPrinter:=ParsePort(subword.PrDeviceID,IDPrinter.i);
+          IF (hPrinter = NIL) THEN BEGIN  {--Try once more}
+            hPrinter:=ParsePrntrID(subword.PrDeviceID);
+            IF (hPrinter = NIL) THEN BEGIN  {--We're pretty desperate at this point}
+              {--Something is wrong, we should have one of these entries in there somewhere.}
+              ArgAlert(1,'3057'{PMbutNoPRD});
+              cError:=DoAlert(hParentAlerts,cAxNoDrivers,stopProc);
+            END
+            ELSE BEGIN
+              IF (hPrinter^^.PrRec.PrInfo.port <> PrNilPort) THEN BEGIN
+                hPrinter:=AddEntry(hPrinter^^.DevName,hPrinter^^.PrRec.PrInfo.PrinterID,IDPrinter.i);
+              END;
+              WITH hPrinter^^ DO BEGIN
+                valid:=TRUE;
+                PrRec.PrInfo.port:=IDPrinter.i;
+                {--Tell the son that he's being reconfigured, if he needs to know.}
+                IF (SonID <> PrNilProcess) THEN PrNotify(SonID,EConfigure,0,0,0,0);
+              END;
+            END;
+          END;
+          IF (subword.default_flag) THEN BEGIN
+            pDataSeg^.DefaultPr:=hPrinter;
+          END;
+        END;
+      END;
+    END;
+  UNTIL (cError > 0);
+END;
+
+{===============================================================================}
+{$S Finish}
+PROCEDURE PrSysTerm{(environPtr:p_env_blk;excepDataPtr:p_ex_data)};
+BEGIN
+PsNonPreemptive;
+ImDying;
+PsPreemptive;
+Nemesis(excepDataPtr^[0]);
+END;
+
+{===============================================================================}
+{$S     }
+FUNCTION  uQueueInvalidate(SQ,hpr:hQueue):TF;
+VAR
+  hPrinter    : ThPrPrinter;
+BEGIN
+  uQueueInvalidate:=TRUE;
+  hPrinter:=POINTER(ORD4(SQ));
+  WITH hPrinter^^ DO BEGIN
+    {Valid:=FALSE;}
+    SonID:=PrNilProcess;
+    CurSubJob:=NIL;
+    QueueInit(JobQueue);
+  END;
+END;
+
+PROCEDURE QueueInvalidate;
+VAR
+  hpnil     : hQueue;
+BEGIN
+hpnil:=EnumerateQueue(pDataSeg^.QueueDS,uQueueInvalidate,NIL);
+END;
+
+{===============================================================================}
+{$S Parent}
+FUNCTION  uQueueMark(SQ,hpr:hQueue):TF;
+VAR
+  hPrinter    : ThPrPrinter;
+BEGIN
+  uQueueMark:=TRUE;
+  hPrinter:=POINTER(ORD4(SQ));
+  hPrinter^^.Valid:=FALSE;
+END;
+
+PROCEDURE QueueMark;
+VAR
+  hpnil     : hQueue;
+BEGIN
+hpnil:=EnumerateQueue(pDataSeg^.QueueDS,uQueueMark,NIL);
+END;
+
+PROCEDURE QueueValidate;
+VAR
+  PRDRec    : PRD_Info;
+  sPath     : PathName;
+  localRef  : TC;
+  lactual   : TL;
+  hPrinter  : ThPrPrinter;
+  J,K       : TC;
+  DrChoice  : DriverChoice;
+BEGIN
+QueueMark;   {--Mark each queue entry for potential removal}
+WITH pDataSeg^ DO BEGIN
+  {--Match every entry in System.PRD file with entry in Queue}
+  sPath:=sPrDirectory;
+  OPEN(cError,sPath,localRef,[Dread{,DWrite}]);
+  IF (cError > 0) THEN BEGIN
+    ArgAlert(1,'3055'{NoPRD});
+    cError:=DoAlert(hParentAlerts,cAxDeath,stopProc);
+  END
+  ELSE BEGIN
+    READ_DATA(cError,localRef,ORD4(@PRDRec),SIZEOF(prdHeader),lactual,sequential,0);
+    IF (PRDRec.descr.version = prdversion) THEN BEGIN
+      FOR J:=0 TO PRDRec.descr.prdcount-1 DO BEGIN
+        READ_DATA(cError,localRef,ORD4(@PRDRec.info),SIZEOF(prdEntry),lactual,sequential,0);
+        FOR K:=0 TO PRDRec.info[0].info.numDrivers-1 DO BEGIN
+          READ_DATA(cError,localRef,ORD4(@DrChoice),SIZEOF(DrChoice),lactual,sequential,0);
+        END;
+        hPrinter:=ParsePrntrID(PRDRec.info[0].info.printer_id);
+        IF (hPrinter = NIL) THEN BEGIN
+          WITH PRDRec.info[0] DO BEGIN
+            hPrinter:=AddEntry(drvr_name,info.printer_id,PrNilPort);
+          END;
+        END;
+        {--Mark this entry so it wont be purged}
+        hPrinter^^.valid:=TRUE;
+        {--But set its port nil so reading PM will put in the right port without adding an extra entry}
+        hPrinter^^.PrRec.PrInfo.Port:=PrNilPort;
+      END;
+    END;
+    CLOSE_OBJECT(cError,localRef);
+  END;
+  {--Read Parameter Memory and match each entry also}
+  PrReadPM;
+  PrgXtraEntries;
+END;
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE RemoveFile{(lFileID:TL)};
+VAR
+  Conversion  : TPrFileID;
+  aPath       : PathName;
+BEGIN
+  Conversion.LongID:=lFileID;
+  GetFileName(Conversion);
+  aPath:=Conversion.sFileName;
+{WRITELN('Killing ',aPath);}
+{$IFC NOT MeFiler}
+  KILL_OBJECT(cError,aPath);
+{$ENDC}
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE RemoveJob{(JobIns:ThSubJob)};
+BEGIN
+  IF (JobIns <> NIL) THEN BEGIN
+    {--Delete file}
+    RemoveFile(JobIns^^.DocID.JobID);
+    Enqueue(FreeSubQueue,POINTER(JobIns));
+  END;
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE StartUp{(handprint:ThPrPrinter)};
+VAR
+  sPath       : PathName;
+  sNull       : NameString;
+  cErr        : TC;
+  ProcessID   : TL;
+  Chan        : Channel;{--temporary until the background takes hold of it.}
+  PrcssInfo   : ProcInfoRec;
+  PrinterName : STR255;
+  PtrID,PrPort: TC;
+BEGIN
+  {--Save ID and Port}
+  WITH handprint^^.PrRec.PrInfo DO BEGIN
+    PtrID:=PrinterID;
+    PrPort:=Port;
+  END;
+  {--Start up the background process specified by hPrinter.}
+  sPath:=CONCAT(sProcessPrefix,handprint^^.DevName);
+  sNull:='';
+  MAKE_PROCESS(cErr,ProcessID,sPath,sNull,SonDiedChan.refnum);
+  IF (cErr <= 0) THEN BEGIN
+    WITH Chan DO BEGIN
+      ExName:='';
+      PrIDtoPath(ProcessID,ChName);
+      OPEN_EVENT_CHN(cError,ChName,refnum,exname,FALSE);
+      EvBlock.event_text[1]:=ORD4(handprint);
+      PrOffer(Chan,ETalkToMe);
+      REPEAT
+        PsYieldCPU;
+        INFO_PROCESS(cErr,ProcessID,PrcssInfo);
+      UNTIL (handprint^^.SonID <> PrNilProcess) OR (cErr > 0);
+      CLOSE_EVENT_CHN(cError,refnum);
+    END;
+  END;
+  WITH handprint^^ DO IF (cErr > 0) THEN BEGIN
+    {--This tells the PrMgr (in the application) that the process is not going to make it out alive}
+    SonID:=lParentID;
+    PrRec.PrInfo.Port:=PrNilPort;
+    PrinterName:=DevName;
+    ArgAlert(1,PrinterName);
+    ArgAlert(2,'3058'{NoProcess});
+    cErr:=DoAlert(hParentAlerts,cAxNoProcess,stopProc);
+  END
+  ELSE BEGIN
+    IF XMetrics THEN BEGIN
+      XMetrics:=FALSE;
+      PrNotify(SonID,EMetrics,ORD4(handprint),PtrID,PrPort,0);
+    END;
+  END;
+  {--Clear out job queue for this printer}
+  CleanUpPrinter(handprint);
+  RemoveJob(handprint^^.CurSubJob);
+  handprint^^.CurSubJob:=NIL;  {--CleanUpPrinter only empties the job queue}
+END;
+
+{===============================================================================}
+{$S Parent}
+PROCEDURE StopPrinter{(hPrinter:ThPrPrinter;lfile:TL)};
+{--Cancel the given print job for the given printer.
+   If lfile is zero, cancel the job at the top of the Queue.}
+VAR
+  PrQueJob    : ThPrintJob;
+  PrSubJob    : ThSubJob;
+  localID     : TDocID;
+BEGIN
+  IF (hPrinter <> NIL) THEN BEGIN
+    localID.JobID:=lfile;
+    IF (lfile <> 0) THEN BEGIN
+      PrQueJob:=FindJobID(hPrinter^^.JobQueue,localID.FileID);
+    END
+    ELSE BEGIN
+      PrQueJob:=POINTER(QueuePeek(hPrinter^^.JobQueue));
+    END;
+    IF (PrQueJob <> NIL) THEN BEGIN
+      localID.FileID:=PrQueJob^^.FileID;
+      REPEAT
+        PrSubJob:=POINTER(DeQueue(PrQueJob^^.DocQueue));
+        RemoveJob(PrSubJob);
+      UNTIL (PrSubJob = NIL);
+      IF UnQueue(hPrinter^^.JobQueue,POINTER(PrQueJob)) THEN BEGIN
+        Enqueue(FreeJobQueue,POINTER(PrQueJob));
+      END;
+      WITH hPrinter^^ DO IF (CurSubJob <> NIL) THEN IF (CurSubJob^^.DocID.FileID = PrQueJob^^.FileID) THEN BEGIN
+        IF (SonID <> MainRxChan.EvBlock.event_header.send_pid) THEN BEGIN
+          PrCall(cError,SonID,EPrintTerminate,0,0,0,0);
+        END;
+      END;
+    END;
+  END;
+END;
+
+{===============================================================================}
+{$S Finish}
+PROCEDURE Suicide{(st:STR255)};
+BEGIN
+{$IFC PrDebug}
+  WRITELN(st);
+{$ENDC}
+  EXIT(Parent);
+END;
+
+{===============================================================================}
+{$S     }
+BEGIN
+Genesis;
+Main;
+Nemesis(self_killed);
+END.
+{===============================================================================}
+
+
+ÿ

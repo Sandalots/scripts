@@ -1,0 +1,644 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+UNIT exceprim;      (* Exception management primitive routines - resident  *)
+                    (* to be used by eventchn, excepmgr, and other units *)
+INTERFACE
+
+  USES
+    (*$U object/driverdefs.obj*)         driverdefs,
+    (*$U object/hwint.obj*)              hwint,
+    (*$U object/sysglobal.obj*)          globalda,
+    (*$U object/procprims.obj *)         proc_prims,
+    (*$U object/mmprim.obj*)             mmprimitives,
+    (*$U object/asynctr.obj*)            asynctr,
+    (*$U object/genio.obj*)              genio,
+    (*$U object/twiggy.obj*)             twiggy,
+    (*$U object/vmstuff.obj *)           vmstuff,
+    (*$U object/sfileio.obj *)           sfileio,
+    (*$U object/fsprim.obj *)            fs_primitives;
+
+  CONST
+    len_exname = 16;
+    size_exdata = 11;           (* 48 bytes, exception data block should have the same
+                                   size as r_event_blk, received event block *)
+
+    sys_terminate = 'SYS_TERMINATE';
+    sys_zero_div  = 'SYS_ZERO_DIV';
+    sys_value_oob = 'SYS_VALUE_OOB';
+    sys_overflow  = 'SYS_OVERFLOW';
+    sys_nmi_key   = 'SYS_NMI_KEY';
+
+                                (* exception kind definitions, these are duplicated
+                                   in excepasm module  *)
+                                (* Note that these numbers should be in the same order
+                                   as the hardware exception kind values *)
+    def_div_zero   = 11;        (* default handler for div zero exception was called *)
+    def_value_oob  = 12;        (* " for value oob exception due to CHK instruction*)
+    def_ovfw       = 13;        (* " for overflow exception *)
+    def_nmi_key    = 14;        (* " for nmi key pressed *)
+    def_range      = 15;        (* " for 'SYS_VALUE_OOB' excep due to value range err *)
+    def_str_index  = 16;        (* " for 'SYS_VALUE_OOB' excep due to string index err*)
+
+    bus_error      = 21;        (* bus error occurred *)
+    addr_error     = 22;        (* address error occurred *)
+    illg_inst      = 23;        (* illegal instruction trap occurred *)
+    priv_violation = 24;        (* privilege violation trap occurred *)
+    line_1010      = 26;        (* line 1010 emulator trap occurred *)
+    line_1111      = 27;        (* line 1111 emulator trap occurred *)
+    spur_intr      = 28;        (* spurrious interrupt occurred *)
+    unexpected_ex  = 29;        (* unexpected exception occurred *)
+
+    div_zero    = 31;           (* exception kind definitions for hardware exception *)
+    value_oob   = 32;           (* for CHK instruction *)
+    ovfw        = 33;
+    nmi_key     = 34;
+    value_range = 35;           (* excep kind for value range and string index error *)
+    str_index   = 36;           (* Note that these two cause 'SYS_VALUE_OOB' excep *)
+
+    no_error        = 0;
+    e_ex_base       = 200;      (* exception functions error base *)
+    no_exname       = 201;      (* no such exception name declared before *)
+    no_space        = 202;      (* no system data space for ecb in declare_excep_hdl *)
+    e_ilname        = 203;      (* illegal name - like null name *)
+
+    e_hard_excep    = 10200;    (* system errors in exception starts from this value *)
+                                (* no space left in system data area in hard_excep *)
+    e_hardsyscode   = 10201;    (* hardware exception occurs while in system code *)
+    e_hard_sigl     = 10202;    (* no space left from sigl_excep call in hard_excep *)
+    e_nmi_excep     = 10203;    (* no space left from sigl_excep call in nmi_excep *)
+
+    e_flinesyscode  = 10204;    (* f-line trap occurred in system code - ref is asm *)
+    e_ex_prolog     = 10205;    (* error from wait_event_chn called in excep_prolog *)
+    e_excep_setup   = 10207;    (* no system data space in excep_setup *)
+    e_rangeerror    = 10208;    (* no space left from sigl_excep call in rangeerror *)
+
+    e_term_def      = 10212;    (* error in term_def_hdl from enable_excep *)
+    e_force_term    = 10213;    (* error in force_term_excep, no space in enq_ex_data *)
+
+    prim_level = 20;            (* trace level, primitive routines, fence is 100 *)
+    hard_prolog_level = 50;     (* hardware exception and prolog level *)
+    ui_level = 90;              (* user interface level *)
+    em_over_fence_level = 101;  (* over the fence level *)
+
+
+  TYPE
+    t_ex_state = (enabled, queued, ignored);        (* exception state *)
+    t_ex_name  = string [len_exname];               (* exception name  *)
+
+    p_ex_data = ^t_ex_data;
+    t_ex_data = array [0..size_exdata] of longint;  (* excep data block type *)
+
+    p_term_ex_data = ^term_ex_data;
+    term_ex_data = record                        (* terminate exception data block *)
+                    case excep_kind : longint of
+                      illg_inst,
+                      priv_violation,        (* due to illegal instruction,
+                                                           privilege violation *)
+                      line_1010,
+                      line_1111,
+                      def_div_zero,
+                      def_value_oob,
+                      def_ovfw,
+                      def_nmi_key               (* terminate due to default handler for
+                                                hardware exception *)
+                        : (sr : integer;
+                           pc : longint);       (* at the time of occurrence *)
+                      def_range,
+                      def_str_index             (* terminate due to default handler for
+                                                   'SYS_VALUE_OOB' excep for value
+                                                   range or string index error *)
+                        : (value_check : integer;
+                           upper_bound : integer;
+                           lower_bound : integer;
+                           return_pc   : longint;
+                           caller_a6   : longint);
+                       bus_error,
+                       addr_error              (* due to bus error or address error *)
+                         : (fun_field : packed record            (* one integer *)
+                                          filler   : 0..$7ff;  (* 11 bits - junk *)
+                                          r_w_flag : boolean;  (* read = true, write = false *)
+                                          i_n_flag : boolean;
+                                                 (* instruction = false, not = true *)
+                                          fun_code : 0..7;
+                                                (* 3 bits - MSB = 0 if user state
+                                                   MSB = 1 if supervisor state *)
+                                        end;
+                            access_adr    : longint;
+                            inst_register : integer;
+                            sr_error      : integer;
+                            pc_error      : longint);
+                   end;
+
+     p_hard_ex_data = ^hard_ex_data;
+     hard_ex_data = record                (* hardware exception data block *)
+                     case excep_kind : longint of
+                      div_zero, value_oob, ovfw
+                        : (sr : integer;
+                           pc : longint);
+                      value_range, str_index
+                        : (value_check : integer;
+                           upper_bound : integer;
+                           lower_bound : integer;
+                           return_pc   : longint;
+                           caller_a6   : longint);
+                   end;
+
+
+    longadr = ^longint;
+    t_ex_sts = record                               (* excep status *)
+                ex_occurred_f : boolean;
+                ex_state : t_ex_state;
+                num_excep : integer;
+                hdl_adr : longadr;
+              end;
+
+    exctrb_ptr = ^exctrblk;
+    exctrblk = record                             (* excep control block *)
+                 ecb_link : linkage;              (* linkage to other ecb *)
+                 ex_name : t_ex_name;
+                 hdl_adr : longadr;               (* handler address      *)
+                 insysmode : boolean;             (* handler execution mode *)
+                 num_excep : integer;             (* number of excep in queue *)
+                 exq_head : relptr;               (* excep queue head pointer *)
+                 exq_tail : relptr;               (* excep queue tail pointer *)
+                 ex_occurred_f : boolean;         (* excep occurred flag *)
+                 ex_state : t_ex_state;
+                 ec_refnum : integer;             (* event channel refnum    *)
+               end;
+
+
+    exdata_ptr = ^exdatablk;
+    exdatablk = record                            (* excep data block  *)
+                  nextdata_ptr : relptr;              (* next blk pointer  *)
+                  datablk : t_ex_data;
+                end;
+
+    p_env_blk = ^env_blk;
+    env_blk = env_area;        (* environment block - should be the same as
+                                  env_area *)
+
+
+
+  procedure raise_ex_pending (ecb_ptr : exctrb_ptr);
+
+  procedure signal_excep (var errnum : integer;
+                          var excep_name : t_ex_name;
+                          excep_data : t_ex_data);
+
+  procedure sigl_excep (var errnum : integer;
+                        ecb_ptr : exctrb_ptr;
+                        excep_data : t_ex_data);
+
+  procedure srch_ecb (var errnum : integer;
+                      var excep_name : t_ex_name;
+                      var found_ecb : exctrb_ptr);
+
+  procedure deq_ex_data (ecb_ptr : exctrb_ptr;
+                         var data_ptr : exdata_ptr);
+
+  procedure set_ec_refnum (var errnum : integer;
+                           var excep_name : t_ex_name;
+                           refnum : integer;
+                           var ecb_ptr : exctrb_ptr);
+
+
+  function exprmversion : integer;
+
+
+
+IMPLEMENTATION
+
+
+  CONST
+    curversion = 5;             (* alpha 5.2 version *)
+
+
+
+(*$S kr_prims*)
+
+
+  function exprmversion (* : integer *);
+    begin
+      exprmversion := curversion;
+    end;  (* funtion exprmversion *)
+
+
+
+
+  procedure raise_ex_pending (* ecb_ptr : exctrb_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Increment exception pending count for the current process.        *)
+    (*   Also set the last_ecb_ptr to point to the ecb of the last occurred*)
+    (*   exception.                                                        *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ecb_ptr : pointer to ecb of the last occurred exception.          *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by sigl_excep, setup_state, force_term_excep,              *)
+    (*   open_event_chn only.                                              *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      pre_state : intson_type;
+      b_sloc_ptr : ^syslocal;
+      pcb_ptr : ptr_pcb;
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then            (* trace level for primitive routines
+                                                   is 20, fence is 100 *)
+        writeln ('e raise_ex_pending : ecb =', ord (ecb_ptr));
+      (*$ENDC*)
+      pcb_ptr := pointer (c_pcb_ptr);
+      {
+      intsoff (allints, pre_state);     (* needed if interrupt routine wants to
+                                           signal exception too. *)
+      }
+      with pcb_ptr^ do
+          excep_pending := excep_pending + 1;
+      {
+      intson (pre_state);
+      }
+
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      b_sloc_ptr^.last_ecb_ptr := ord (ecb_ptr);
+
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then
+        writeln ('l raise_ex_pending : excep_pending =', pcb_ptr^.excep_pending,
+                 '  last_ecb_ptr =', b_sloc_ptr^.last_ecb_ptr);
+      (*$ENDC*)
+
+    end;  (* procedure raise_ex_pending *)
+
+
+
+
+
+
+
+  procedure sigl_excep (* var errnum : integer;
+                          ecb_ptr : exctrb_ptr;
+                          excep_data : t_ex_data *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   enqueues an exception infomation block into exception queue and   *)
+    (*   raise exception pending if state is enabled.                      *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ecb_ptr : pointer to the exception control block.                 *)
+    (*   excep_data : exception infomation block.                          *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : no_error if no error, no_space if no space in system area*)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   Syslocal variable last_ecb_ptr is set to the ecb_ptr if state is  *)
+    (*   enabled for exception in current process.                         *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by signal_excep, hard_excep, force_term_excep only.        *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label
+      9;
+
+    var
+      tail_ptr : ^exdatablk;
+      data_ptr : ^exdatablk;
+      a_data_ptr : absptr;
+
+    begin                               (* procedure sigl_excep *)
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then
+        writeln ('e sigl_excep : ecb =', ord (ecb_ptr));
+      (*$ENDC*)
+      errnum := no_error;
+      with ecb_ptr^ do
+        begin
+          if ex_state <> ignored then
+            begin
+              if not getspace (sizeof (exdatablk), b_syslocal_ptr, a_data_ptr) then
+                begin
+                  errnum := no_space;
+                  goto 9;
+                end
+              else
+                with ecb_ptr^ do
+                  begin
+                    data_ptr := pointer (a_data_ptr);
+                    data_ptr^.datablk := excep_data;
+
+                    tail_ptr := pointer (exq_tail + b_syslocal_ptr);
+                    data_ptr^.nextdata_ptr := tail_ptr^.nextdata_ptr;
+                    tail_ptr^.nextdata_ptr := ord (data_ptr) - b_syslocal_ptr;
+                    exq_tail := tail_ptr^.nextdata_ptr;
+                    num_excep := num_excep + 1;
+                    if num_excep = 1 then
+                        exq_head := exq_tail;
+                    (*$IFC DEBUG2*)
+                    if trace (em, prim_level) then
+                      writeln ('  a enq ex data : num_excep =', num_excep,
+                               ' data_ptr =', ord (data_ptr));
+                    (*$ENDC*)
+                  end;
+            end;
+          ex_occurred_f := true;                (* only do this if no error *)
+          if ex_state = enabled then
+              raise_ex_pending (ecb_ptr);
+         9 :
+          (*$IFC DEBUG2*)
+          if trace (em, prim_level) then
+            writeln ('l sigl_excep : errnum =', errnum);
+          (*$ENDC*)
+        end;  (* with *)
+
+    end;  (*  procedure sigl_excep *)
+
+
+
+  procedure srch_ecb (* var errnum : integer;
+                        var excep_name : t_ex_name;
+                        var found_ecb : exctrb_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   searches the exception control block of the specified name.       *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   excep_name : exception name.                                      *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : no_error - function completed successfully.              *)
+    (*            no_exname - no exception control block of the specified. *)
+    (*            e_ilname - exception name is null or longer than allowed.*)
+    (*   found_ecb : pointer of the exception control block found.         *)
+    (*                                                                     *)
+    (* Side effects :                                                      *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use :                                         *)
+    (*   called by all user interface level routines.                      *)
+    (*                                                                     *)
+    (* Error Conditions :                                                  *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      head_ptr : exctrb_ptr;
+      b_sloc_ptr : ^syslocal;
+      c_ecb_ptr : exctrb_ptr;
+      up_excep_name : e_name;
+
+    begin                               (* begin procedure srch_ecb *)
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then
+        writeln ('e srch_ecb : excep_name = ', excep_name);
+      (*$ENDC*)
+                                  (* to search local exception  *)
+      b_sloc_ptr := pointer (b_syslocal_ptr);
+      head_ptr := @b_sloc_ptr^.head_ecb;
+      found_ecb := nil;
+
+      errnum := no_error;
+      if (length (excep_name) <= 0)
+        or (length (excep_name) >= sizeof (t_ex_name)-1)
+      then errnum := e_ilname
+      else
+        begin
+          errnum := no_exname;                   (* assuming not found first *)
+          up_excep_name := copy (excep_name, 1, length (excep_name));
+          upshift (@up_excep_name);
+          c_ecb_ptr := pointer (head_ptr^.ecb_link.fwd_link + b_syslocal_ptr);
+          while (c_ecb_ptr <> head_ptr) do
+            begin
+              if c_ecb_ptr^.ex_name <> up_excep_name then       (* names are stored
+                                                                   in upper case*)
+                c_ecb_ptr := pointer (c_ecb_ptr^.ecb_link.fwd_link
+                                        + b_syslocal_ptr)
+              else
+                begin           (* found it *)
+                  found_ecb := c_ecb_ptr;
+                  c_ecb_ptr := head_ptr;        (* to end the loop *)
+                  errnum := no_error;
+                end;
+            end;
+
+        end;
+
+      (*$IFC DEBUG2*)
+      if trace (em, prim_level) then
+        writeln ('l srch_ecb : errnum =', errnum, ' found_ecb =', ord (found_ecb));
+      (*$ENDC*)
+    end;  (* procedure srch_ecb  *)
+
+
+
+(* File : exceprm2  *)
+(* Exception management primitive routines - part 2 - resident *)
+
+
+
+  procedure signal_excep (* var errnum : integer;
+                            var excep_name : t_ex_name;
+                            excep_data : t_ex_data *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   signals the occurrence of the specified exception and force the   *)
+    (*   exception handler to be entered.                                  *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   excep_name : exception name                                       *)
+    (*   excep_data : infomation to be passed to the handler               *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : no_error - function completed successfully               *)
+    (*            no_exname - tried to signal a non-existent exception     *)
+    (*            e_ilname - exception name is null or longer than allowed.*)
+    (*            no_space - no space in system data area                  *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    label 9;
+    var
+      c_ecb_ptr : exctrb_ptr;
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 2;
+          parms [1].addr := ord (@excep_name);
+          parms [1].readwrite := false;
+          parms [2].addr := ord (@excep_data);
+          parms [2].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      if trace (em, ui_level) then                 (* user interface level is 90 *)
+        writeln ('e signal_excep : excep_name = ', excep_name);
+      (*$ENDC*)
+      srch_ecb (errnum, excep_name, c_ecb_ptr);
+                                         (* search the ecb of this name *)
+      if errnum = no_error then                 (* exists an ecb of this name *)
+          sigl_excep (errnum, c_ecb_ptr, excep_data);
+                                  (* enq data blk and raise excep pending *)
+     9:
+      (*$IFC DEBUG2*)
+      if trace (em, ui_level) then
+        writeln ('l signal_excep : errnum =', errnum);
+      (*$ENDC*)
+
+    end;   (* procedure signal_excep   *)
+
+
+
+
+
+  procedure deq_ex_data (* ecb_ptr : exctrb_ptr;
+                           var data_ptr : exdata_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   dequeues an exception information block from head of queue. The   *)
+    (*   queue is singly linked.                                           *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ecb_ptr : pointer to the ecb.                                     *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   data_ptr : pointer to the data block dequeued.                    *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by excep_prolog, flush_excep only.                     The *)
+    (*   queue must be non-empty before called. The caller is responsible  *)
+    (*   for releasing the space, since excep_prolog needs to get data out *)
+    (*   before space is released.                                         *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+
+    begin
+      (*$IFC DEBUG2*)
+      if trace (em, hard_prolog_level) then
+        writeln ('e deq_ex_data : ecb =', ord (ecb_ptr));
+      (*$ENDC*)
+      with ecb_ptr^ do
+        begin
+          data_ptr := pointer (exq_head + b_syslocal_ptr);
+          exq_head := data_ptr^.nextdata_ptr;
+          num_excep := num_excep - 1;
+          if num_excep = 0 then
+              exq_tail := exq_head;
+
+          (*$IFC DEBUG2*)
+          if trace (em, hard_prolog_level) then
+            writeln ('l deq_ex_data : num_excep =', num_excep, ' data_ptr =',
+                      ord (data_ptr));
+          (*$ENDC*)
+        end;
+
+    end;   (* procedure deq_ex_data  *)
+
+
+
+
+
+
+  procedure set_ec_refnum (* var errnum : integer;
+                             var excep_name : t_ex_name;
+                             refnum : integer;
+                             var ecb_ptr : exctrb_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   set call event channel's refnum in the corresponding exception    *)
+    (*   control block of the specified exception name. This is called     *)
+    (*   by open_event_chn when open a call channel to receive.            *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   excep_name : exception name                                       *)
+    (*   refnum : the call event channel's refnum.                         *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : no_space - if no space left in system data area          *)
+    (*            e_ilname - exception name is null or longer than allowed.*)
+    (*   ecb_ptr : pointer to the ecb of the specified exception name.     *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   Called by open_event_chn and close_event_chn only.                *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      b_sysarea : absptr;
+
+    begin
+      srch_ecb (errnum, excep_name, ecb_ptr);
+                                        (* search for the local ecb only of this name *)
+      if errnum = no_error then
+        ecb_ptr^.ec_refnum := refnum;
+    end;  (* procedure set_ec_refnum *)
+
+
+
+ (* end of file exceprm2 *)
+
+
+
+end.
+
+ÿ

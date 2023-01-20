@@ -1,0 +1,596 @@
+{$S openclose  }
+{***************************************************************************
+
+                                findlabel
+
+        the label equivalent of findkeyed.
+
+        Input Parameters
+                pscan - the scan descriptor
+                which - positioning parameter,i.e. exact, first, etc.
+                nsearch - (for which = aprrox) number of fields to search
+                    on
+                plabrec - for exact and approx, the search key
+
+        Output Parameters
+                sresult - return result
+                buffer - buffer contains cos page
+                index - index of cos record
+
+        Return Results
+                noerr
+                ioerr
+                notfound
+                eos
+                fileempty
+
+****************************************************************************}
+
+{$S openclose  }
+procedure findlabel(var ddresult : integer;
+                        which : integer;
+                        nsearch : integer;
+                        pscan : ptrscandesc;
+                        plabrec : ptrdata;
+                    var buffer,
+                        index : integer);
+label
+        10;
+var
+        lresult,
+        scratch : integer;
+        fileid : integer;
+        pd : ptrpagedesc;
+        page : fileptr;
+        nflds,
+        descoff : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'findlabel');
+{$ENDC }
+
+     {  we start the search at the cos page if we can, else we start from
+        the head of the list }
+
+        with pscan^ do
+            begin
+            fileid := onfile;
+            if (touched = touch_by_vltree) then
+                page := pfiletable^[fileid]^.labellist
+            else page := keypage;
+            index := 0;
+            end;
+
+        if page = nilptr then lresult := fileempty
+        else
+            begin
+            getpage(lresult,buffer,fileid,page,true);
+            if (which = approx) or (which = exact) then
+                begin
+                if lresult = noerr then
+                    begin
+                    index := 0;
+                    if (which = approx) and (nsearch < labelkeys)
+                    then nflds := nsearch
+                    else nflds := labelkeys;
+                    findduplicate(lresult,fileid,@lab_desc,@lab_desc,nflds,
+                          false,which=exact,plabrec,buffer,index,scratch);
+                    end;
+                end
+            else if which = last then
+                begin
+                while lresult = noerr do
+                    begin
+                    descoff := pfiletable^[fileid]^.pagesize-sizeof(pagedesc);
+                    pd := pointer(ord(buffpool^[buffer].pbuff)+descoff);
+                    page := pd^.next;
+                    index := pd^.nkeys;
+                    if page = nilptr then goto 10; { bingo }
+                    relbuff(lresult,buffer,0);
+                    if lresult = noerr then
+                        getpage(lresult,buffer,fileid,page,true);
+                    end;
+                10 :
+                end;
+            end;
+        ddresult := lresult;
+
+
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'fndl:',ddresult:5,buffer:7,index:5);
+{$ENDC }
+
+end; { findlabel }
+{*****************************************************************************
+
+                                 labcosval
+
+        if scan's cos page has been touched, labcosval refinds the
+        proper page and index.  the cos page can be untouched (a state of
+        grace), touched_by_vltree (disturbed by some update operation of
+        unknown character and so our page and index are unreliable) or
+        touched_by_delete (the cos record was deleted, but we still have
+        an exact page and index for the record immediately following)
+
+        Input Parameters
+                pscan - the scan descriptor
+
+        Output Parameters
+                sresult - return result
+                buffer - buffer contains cos page
+                index - index of cos record
+                pos - the position that trying to find the cos record
+                    found us in
+
+        Return Results
+                noerr
+                ioerr
+                notfound
+                eos
+                fileempty
+
+*****************************************************************************}
+{$S openclose  }
+procedure labcosval(var ddresult : integer;
+                        pscan : ptrscandesc;
+                    var buffer,
+                        index,
+                        pos : integer);
+var
+        lresult : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if labdebug then
+            begin
+            writeln(dumpfile,'labcosval');
+            printcos(pscan);
+            end;
+{$ENDC }
+
+        with pscan^ do
+            begin
+            pos := position;
+            if (touched = touch_by_vltree) then
+                begin
+                if (pos = first) or (pos = last) then
+                    findlabel(lresult,pos,0,pscan,ptrcos,buffer,index)
+                else
+                    begin
+                    findlabel(lresult,exact,0,pscan,ptrcos,buffer,index);
+                    if lresult = notfound then
+                        begin
+                        nextprior(lresult,onfile,buffer,index,next);
+                        if lresult = noerr then
+                            begin
+                            lresult := notfound;
+                            pos := prior;
+                            end
+                        else if lresult = eos then pos := last;
+                        end; { then }
+                    end; { else }
+                end { then }
+            else if touched = touch_delete then
+                begin
+                getpage(lresult,buffer,onfile,keypage,true);
+                if lresult = noerr then
+                    begin
+                    index := keyindex;
+                    nextprior(lresult,onfile,buffer,index,next);
+                    if lresult = noerr then pos := prior
+                    else if lresult = eos then pos := last;
+                    end;
+                end
+            else { keyindex and keypage are still valid }
+                begin
+                getpage(lresult,buffer,onfile,keypage,true);
+                index := keyindex;
+                pos := position;
+                end; { else }
+            end; { with }
+{$IFC debug }
+        if labdebug then printcos(pscan);
+{$ENDC}
+        ddresult := lresult;
+end; { labcosval }
+{**************************************************************************
+
+                                lfetch
+
+        fetches a label record and makes it cos.  pretty much like efetch.
+
+
+**************************************************************************}
+
+{$S openclose  }
+procedure lfetch{(var ddresult : integer;
+                      scanid : integer;
+                      which : integer;
+                      nsearch : integer;
+                      plabrec : ptrlabelentry)};
+label
+        1,2,100;
+var
+        loc_compact_state : states_de_compact;
+        pb : ptrdata;
+        po : ptroffsets;
+        pnew,
+        prec : ptrdata;
+        pos,
+        index,
+        entsize,
+        i,
+        buffer,
+        lresult,
+        tresult : integer;
+        pscan : ptrscandesc;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'lfet:',which:6,scanid:6);
+{$ENDC }
+
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+        lresult := SParmsBad(scanid,which,nsearch,@plabrec^);
+        if lresult <> noerr then goto 1;
+
+        pscan := pscantable^[scanid];
+        with pscan^ do
+            begin
+
+        {   position the scan  }
+
+            if (which = approx) or (which = exact) then
+                begin
+                with pfiletable^[onfile]^ do
+                    begin
+                    findlabel(lresult,which,nsearch,pscan,
+                              @plabrec^,buffer,index);
+                    if lresult = notfound then
+                        begin
+                        nextprior(lresult,onfile,buffer,index,next);
+                        if lresult = noerr then
+                            begin
+                            lresult := notfound;
+                            pos := prior;
+                            end
+                        else
+                            if lresult = eos then pos := last;
+                        end
+                    else
+                        if lresult = noerr then pos := exact;
+                    end; { with }
+                end
+            else if (which = next) or (which = prior) then
+                begin
+                labcosval(lresult,pscan,buffer,index,pos);
+                if lresult <= eos then
+                    begin
+                    if which = prior then index := index-1
+                    else if pos = exact then index := index+1;
+                    nextprior(lresult,onfile,buffer,index,which);
+                    if lresult = noerr then pos := exact
+                    else if lresult = eos then pos := last;
+                    end;
+                end
+            else if (which = current) then
+                begin
+                labcosval(lresult,pscan,buffer,index,pos);
+                end
+            else { first or last }
+                begin
+                pos := which;
+                findlabel(lresult,which,0,pscan,nil,buffer,index);
+                end;
+
+            if lresult > eos then
+                begin
+                if lresult = fileempty then
+                    begin
+                    lresult := eos;
+                    if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+                    ptrcos := nil;
+                    position := first;
+                    touched := touch_by_vltree;
+                    end;
+                goto 1;
+                end;
+
+            if (pos = first) or (pos = last) then
+                begin
+                if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+                ptrcos := nil;
+                end
+            else with pfiletable^[onfile]^ do
+                begin
+                pb := buffpool^[buffer].pbuff;
+                po := pointer(ord(pb)+pagesize-
+                              (sizeof(pagedesc)+sizeof(integer)));
+                prec := pointer(ord(pb)+po^[-index]);
+                entsize := po^[-index-1] - po^[-index];
+
+                lresult := nnew(@czone,entsize,@pnew);
+                if lresult <> noerr then goto 2;
+
+                movelf(prec,pnew,entsize);
+                if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+                cossize := entsize;
+                ptrcos := pnew;
+                if pos <> exact then lresult := notfound
+                end;
+            keypage := buffpool^[buffer].page;
+            keyindex := index;
+            position := pos;
+            touched := untouched;
+
+        {   release buffers }
+
+2 :         relbuff(tresult,buffer,isleaf);
+            if tresult <> noerr then lresult := tresult;
+            end; { with }
+
+1 :     ddresult := lresult;
+
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'lfet:',ddresult:6);
+{$ENDC }
+
+        if retry_compact(ddresult,loc_compact_state) then goto 100;
+end; { lfetch }
+{************************************************************************
+
+                                 ldelete
+
+        deletes the cos label record (after optional repositioning).
+        pretty much like edelete, with deletekeyed mixed in.
+
+
+************************************************************************}
+
+{$S openclose  }
+procedure ldelete{(var ddresult : integer;
+                      scanid : integer;
+                      which : integer;
+                      nsearch : integer;
+                      plabrec : ptrlabelentry)};
+label
+        1,2,100;
+var
+        loc_compact_state : states_de_compact;
+        size,
+        event,
+        leftbuff,
+        rightbuff,
+        buffer,
+        descoff,
+        pagesize,
+        lresult,
+        tresult : integer;
+        pnextrec : ptrdata;
+        pb : ptrdata;
+        po : ptroffsets;
+        pd : ptrpagedesc;
+        dindex : integer;
+        dpage,
+        sibling : fileptr;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'ldel:',scanid);
+{$ENDC }
+
+
+    {   fetch record to delete }
+
+        lfetch(lresult,scanid,which,nsearch,plabrec);
+        if lresult <> noerr then goto 1;
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+        with pscantable^[scanid]^ do
+            begin
+
+        {   1) choose a sibling page for possible merge or rotate as
+               result of page underflow
+            2) call pagedelete to delete the record and do the merge or rotate
+               if necessary
+            3) if all went ok, update cos }
+
+
+            getpage(lresult,buffer,onfile,keypage,true);
+            if lresult <> noerr then goto 2;
+            descoff := pfiletable^[onfile]^.pagesize-sizeof(pagedesc);
+            pd := pointer(ord(buffpool^[buffer].pbuff)+descoff);
+            sibling := pd^.next;
+            if sibling = nilptr then sibling := pd^.prior;
+
+            event := pagedelete(lresult,
+                                onfile,
+                                labeltype,
+                                buffer,
+                                keyindex,
+                                sibling,
+                                rightbuff,
+                                dpage,
+                                dindex);
+            if lresult <> noerr then goto 2;
+
+            if event = rotate then
+                begin
+                relbuff(lresult,rightbuff,isleaf);
+                if lresult <> noerr then goto 2;
+                end;
+
+            if event = treeempty then { nothing left in tree }
+                begin
+                ndispose(@czone,@ptrcos^);
+                ptrcos := nil;
+                touched := touch_by_vltree;
+                position := first;
+                end
+            else { set scan to be prior to next record }
+                begin
+                touched := touch_delete;
+                keypage := dpage;
+                keyindex := dindex;
+                position := prior;
+                end;
+            end; { with }
+2 :     if retry_compact(lresult,loc_compact_state) then goto 100;
+
+1 :     ddresult := lresult;
+
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'ldel:',ddresult:6);
+{$ENDC }
+
+end; { ldelete }
+
+{**************************************************************************
+
+                                linsert
+
+        inserts a label record and makes it cos.  pretty much like einsert,
+        with insertkeyed.
+
+***************************************************************************}
+
+{$S openclose  }
+procedure linsert{(var ddresult : integer;
+                      scanid : integer;
+                      plabrec : ptrlabelentry;
+                      size : integer;
+                      newticket : boolean)};
+label
+        1,2,100;
+var
+        loc_compact_state : states_de_compact;
+        insresult : integer;
+        pd : ptrpagedesc;
+        ptick : ^ fileptr;
+        pscan : ptrscandesc;
+        sibpage : fileptr;
+        buff2,
+        buffer,
+        index,
+        lresult,
+        tresult : integer;
+        pnewrec : ptrdata;
+        iindex : integer;
+        ipage : fileptr;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'lins,size:',scanid:7,size:7);
+{$ENDC }
+
+
+        dont_use_freelist := false;
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+        lresult := SParmsBad(scanid,exact,0,@plabrec^);
+        if odd(size) then lresult := oddrecsize;
+        if lresult <> noerr then goto 1;
+
+   {    1) if newticket is true, compute the next ticket and check for overflow
+        2) allocate space for new cos, and copy record in
+        3) call findlabel to figure out where to stick it
+        4) check for duplicate key
+        5) call either firstpage or pageinsert to stick in record, depending
+           on whether the labellist is nil or not
+        6) if all goes well, update cos }
+
+        pscan := pscantable^[scanid];
+        with pscan^ do
+            begin
+            if newticket then
+                begin
+                ptick := @pfiletable^[onfile]^.labeltickets;
+                if ptick^ = -1 then
+                    begin
+                    lresult := ticketoverflow;
+                    goto 1;
+                    end;
+                plabrec^.enum := ptick^;
+                end;
+
+            lresult := nnew(@czone,size,@pnewrec);
+            if lresult <> noerr then goto 1;
+
+            movelf(@plabrec^,pnewrec,size);
+
+            findlabel(lresult,exact,0,pscan,pnewrec,buffer,index);
+            if lresult = noerr then
+                begin
+                lresult := duplkey;
+                relbuff(tresult,buffer,isleaf);
+                if tresult <> noerr then lresult := tresult;
+                end
+            else if lresult = fileempty then
+                firstleaf(lresult,onfile,labeltype,pnewrec,size,ipage,
+                          iindex)
+            else if lresult = notfound then
+                begin
+                if quickinsert(onfile,labeltype,pnewrec,
+                               size,nil,true,
+                               index,buffer,ipage,iindex) then
+                    begin { have to split or rotate }
+                    pd := pointer(ord(buffpool^[buffer].pbuff)+
+                                  pfiletable^[onfile]^.pagesize-sizeof(pagedesc));
+                    insresult := splitORrotate(lresult,onfile,labeltype,
+                                          pnewrec,size,nil,true,
+                                          index,buffer,
+                                          pd^.prior,pd^.next,
+                                          buff2,ipage,iindex,
+                                          nil,
+                                          sibpage);
+                    if lresult = noerr then
+                        begin
+                        if insresult = isplit then
+                            relbuff(lresult,buffer,isleaf);
+                        relbuff(tresult,buff2,isleaf);
+                        if tresult <> noerr then lresult := tresult;
+                        end;
+                    end
+                else relbuff(lresult,buffer,isleaf);
+                end;
+            if lresult <> noerr then goto 2;
+
+            if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+            cossize := size;
+            ptrcos := pnewrec;
+
+            if newticket then ptick^ := ptick^ + 1;
+            position := exact;
+            touched := untouched;
+            keypage := ipage;
+            keyindex := iindex;
+            goto 1;
+            end; { with }
+
+2 :     ndispose(@czone,@pnewrec^);
+1 :
+{$IFC debug }
+        if labdebug then writeln(dumpfile,'lins:',lresult:6);
+{$ENDC }
+
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+        ddresult := lresult;
+end; { linsert }
+
+
+ÿ

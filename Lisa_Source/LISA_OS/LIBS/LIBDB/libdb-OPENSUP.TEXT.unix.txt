@@ -1,0 +1,860 @@
+{#f     libdb/opensup.text   }
+{$S swapaccs }
+{***************************************************************************
+
+                                moveheap
+
+        moves heap to make room for buffer pool, if necessary.
+
+ ***************************************************************************}
+{$S swapaccs }
+procedure moveheap(delta : fileptr;
+                   hsize : integer);
+var
+        i : integer;
+        pfd : ^ptrfiledesc;
+        pdd : ^ptrdiffdesc;
+        psd : ^ptrscandesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if delta <> 0 then
+            begin
+            pfd := @pfiletable^;
+            for i := 0 to nfiles-1 do
+                begin
+
+{$IFC debug }
+            if debug_compact then
+                writeln('pfd,pfd^:',ord(pfd):16,ord(pfd^));
+{$ENDC }
+
+                if pfd^ <> nil then
+                    begin
+                    pfd^^.pedesc := pointer(ord(pfd^^.pedesc) + delta);
+                    if pfd^^.pkdesc <> nil then
+                        begin
+                        pfd^^.pkdesc := pointer(ord(pfd^^.pkdesc) + delta);
+                        pfd^^.pfldset := pointer(ord(pfd^^.pfldset) + delta);
+                        end;
+                    pfd^ := pointer(ord(pfd^) + delta);
+                    end;
+                pfd := pointer(ord(pfd)+sizeof(ptrfiledesc));
+                end;
+
+
+{$IFC debug }
+            if debug_compact then writeln('files done');
+{$ENDC }
+
+            psd := @pscantable^;
+            for i := 0 to nscans-1 do
+                begin
+                if psd^ <> nil then
+                    begin
+                    if psd^^.ptrcos <> nil then
+                        psd^^.ptrcos := pointer(ord(psd^^.ptrcos) + delta);
+                    psd^ := pointer(ord(psd^) + delta);
+                    end;
+                psd := pointer(ord(psd)+sizeof(ptrscandesc));
+                end;
+
+
+{$IFC debug }
+            if debug_compact then writeln('scans done');
+{$ENDC }
+
+
+            pdd := @pdifftable^;
+            for i := 0 to ndiffs-1 do
+                begin
+                if pdd^ <> nil then
+                    begin
+                    if pdd^^.pkfilter <> nil then
+                        pdd^^.pkfilter := pointer(ord(pdd^^.pkfilter) + delta);
+                    if pdd^^.pdfilter <> nil then
+                        pdd^^.pdfilter := pointer(ord(pdd^^.pdfilter) + delta);
+                    if pdd^^.phigh <> nil then
+                        pdd^^.phigh := pointer(ord(pdd^^.phigh) + delta);
+                    if pdd^^.plow <> nil then
+                        pdd^^.plow := pointer(ord(pdd^^.plow) + delta);
+                    pdd^ := pointer(ord(pdd^) + delta);
+                    end;
+                pdd := pointer(ord(pdd)+sizeof(ptrdiffdesc));
+                end;
+
+            pfiletable := pointer(ord(pfiletable) + delta);
+            pscantable := pointer(ord(pscantable) + delta);
+            pdifftable := pointer(ord(pdifftable) + delta);
+            buffpool := pointer(ord(buffpool) + delta);
+            pstack := pointer(ord(pstack) + delta);
+
+            if delta < 0 then { move the heap up, start from top }
+                begin
+                movelf(pointer(pheap_segment),
+                       pointer(pheap_segment+delta),
+                       hsize);
+                end
+            else { move the heap down, start at bottom }
+                begin
+                moverf(pointer(pheap_segment),
+                       pointer(pheap_segment+delta),
+                       hsize);
+                end;
+
+            pheap_segment := pheap_segment + delta;
+            czone.avail := pointer(ord(czone.avail)+delta);
+            czone.heapmin := pointer(ord(czone.heapmin)+delta);
+            czone.heapmax := pointer(ord(czone.heapmax)+delta);
+            end;
+end; { moveheap }
+{***************************************************************************
+
+                                initpool
+
+                sets up data structures to use database intrinsics
+
+ ***************************************************************************}
+
+
+{$S openclos }
+procedure initpool{(var ddresult : integer;
+                        first_time : boolean;
+                        heap_ldsn : integer;
+                        nbuff : integer;
+                        dheapsize : integer;
+                        pheapname : ptrpathname;
+                        dstype : Tdstype;
+                        pagesize : integer)};
+label
+        1,
+        2;
+const
+        NotInCat = 313;
+        SizeBad  = -320;
+        DSCrashed = -321;
+var
+        copyright : string[35];
+        NeedSeg : boolean;
+        segName : pathname;
+
+        newheapsize,
+        minsize,
+        actual,
+        newsize1,
+        newsize,
+        oldbsize,
+        newbsize : fileptr;
+
+        xsfer,
+        newhsize,
+        oldhsize,
+        lresult,
+        tempresult,
+        i : integer;
+        pbuffpool,
+        pt : ptrdata;
+        dsinfo : DsInfoRec;
+
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        newheapsize := dheapsize;
+
+        {  if it's the first call, we have to create heap and buffer pool
+           segments  }
+
+        if first_time then
+            begin
+
+            copyright := 'Copyright 1983,Apple Computer Inc.';
+            psize := pagesize;
+
+{$IFC PRERELEASE }
+            REWRITE(DUMPFILE,'CONSOLE:');
+            PDEBUG := FALSE;
+            BDEBUG := FALSE;
+            SCANDEBUG := FALSE;
+            DEBUG_COMPACT := FALSE;
+            LABDEBUG := FALSE;
+            DBDEBUG := FALSE;
+{$ENDC }
+
+            segName := 'segName';
+            if pheapname <> nil then
+                movelf(@pheapname^,@segname,length(pheapname^)+1);
+
+            isleaf := 0;
+            isnonleaf := 0;
+            isroot := 10;
+
+{$IFC debugpool }
+            labwrites := 0;
+            datareads := 0;
+            datawrites := 0;
+{$ENDC}
+
+            prefix_length := 0;
+            prefix := '';
+{af}        passwd_length := 0;
+            password := '';
+
+        {   guarantee heap is large enough for the descriptors we will
+            allocate immediately }
+
+            minsize := nbuff * sizeof(buffdesc) + 3 * sizeof(ptrlongint) +
+                       5*sizeof(stackrec) + 5 * allocover;
+            if newheapsize < minsize then newheapsize := minsize;
+            newbsize := mult424(nbuff,psize);
+            newheapsize := newheapsize + newbsize;
+
+            NeedSeg := true;
+            if dstype = ds_shared then
+                begin
+                open_dataseg(lresult,segName,heap_segment,
+                             pbuff_segment,heap_ldsn);
+                if (lresult = SizeBad) or (lresult = DSCrashed) then
+                    lresult := noerr;
+                if lresult = noerr then
+                    begin
+                    setaccess_dataseg(lresult,heap_segment,false);
+                    if lresult <> noerr then goto 2;
+                    end;
+                if lresult <> NotInCat then
+                    begin
+                    NeedSeg := false;
+                    if lresult <> noerr then goto 1;
+                    end;
+                end;
+
+            if NeedSeg then
+                begin
+                make_dataseg(lresult,segName,newheapsize,
+{$IFC NOSWAP }               0,
+{$ELSEC      }               newheapsize,
+{$ENDC       }
+                             heap_segment,
+                             pbuff_segment,
+                             heap_ldsn,
+                             dstype);
+                if lresult <> noerr then goto 1;
+                end;
+
+            pheap_segment := pbuff_segment + newbsize;
+
+{$IFC debug }
+            if dbdebug then
+                begin
+                writeln(dumpfile,'lresult,pheap_segment:',lresult:7,
+                        pheap_segment:14,'pbuff_segment:',lresult:7,
+                        pbuff_segment:14);
+                end;
+{$ENDC }
+
+            info_dataseg(lresult,heap_segment,dsinfo);
+            if lresult <> noerr then goto 2;
+            heapsize := dsinfo.mem_size;
+
+            if heapsize < newheapsize then
+                begin
+                size_dataseg(lresult,heap_segment,newheapsize-heapsize,newsize,
+{$IFC NOSWAP   }             0,
+{$ELSEC        }             newheapsize-heapsize,
+{$ENDC         }
+                             newsize1);
+                if lresult <> noerr then goto 2;
+                heapsize := newsize;
+                end;
+
+            init_heap(@czone,heapsize-newbsize,pointer(pheap_segment));
+            compact_state := no_try;
+
+            lresult := nnew(@czone,sizeof(ptrfiledesc),@pfiletable);
+            nfiles := 1;
+            pfiletable^[0] := nil;
+
+            lresult := nnew(@czone,sizeof(ptrscandesc),@pscantable);
+            nscans := 1;
+            pscantable^[0] := nil;
+
+            lresult := nnew(@czone,sizeof(ptrdiffdesc),@pdifftable);
+            ndiffs := 1;
+            pdifftable^[0] := nil;
+
+            popenobj := nilval;
+
+        {   set up descriptor for label records }
+
+            with lab_desc[0] do
+                begin
+                ftype := ftypint2;
+                size := sizeof(integer);
+                direction := ascending;
+                offset := 0;
+                end;
+            with lab_desc[1] do
+                begin
+                ftype := ftypfptr;
+                size := sizeof(fileptr);
+                direction := ascending;
+                offset := 2;
+                end;
+            with lab_desc[2] do
+                begin
+                ftype := ftypint2;
+                size := sizeof(integer);
+                direction := ascending;
+                offset := 6;
+                end;
+            with lab_desc[3] do
+                begin
+                ftype := ftypvnull;
+                size := sizeof(vfld);
+                direction := ascending;
+                offset := 8;
+                end;
+
+        {   set up descriptor for uniqueid's }
+
+            uiddesc.ftype := ftypnull;
+            uiddesc.offset := 0;
+            uiddesc.size := sizeof(uid);
+            uiddesc.direction := ascending;
+
+            maxdepth := 4;
+            curdepth := 4;
+            lresult := nnew(@czone,(maxdepth+1)*sizeof(stackrec),@pstack);
+
+            ticks := 0;
+            lastbuff := nbuff;
+            lresult := nnew(@czone,lastbuff * sizeof(buffdesc),@buffpool);
+            lastbuff := lastbuff - 1;
+
+            pt := pointer(pbuff_segment);
+            for i := 0 to lastbuff do
+               with buffpool^[i] do
+                   begin
+                   state := empty;
+                   locks := 0;
+                   pfile := nilval;
+                   page := nilptr;
+                   priority := -1;
+                   pbuff := pt;
+                   pt := pointer(ord(pt) + psize);
+                   end;
+            goto 1; { successfull exit }
+
+        2:  close_dataseg(tempresult,heap_segment);
+            end
+        else { already up and going, wants to shrink or grow something }
+            begin
+
+        {   compute the size of the new heap segment and whether the heap
+            and buffer pool change size }
+
+            newbsize := mult424(nbuff,psize);
+            oldbsize := mult424(lastbuff+1,psize);
+            newhsize := newheapsize;
+            oldhsize := heapsize-oldbsize;
+            newheapsize := newheapsize + newbsize;
+
+        {   if the number of buffers is changed, we must resize buffpool.  if
+            the number of buffers shrinks, we must page out any buffers with
+            dirty data in them  }
+
+            if lastbuff <> (nbuff-1) then
+                begin
+                for i := nbuff to lastbuff do
+                    with buffpool^[i] do
+                        begin
+                        if state = dirty then
+                            begin
+                            with pfiletable^[pfile]^ do
+                                begin
+                                dowritenon(lresult,pfile);
+                                write_data(tempresult,frefno,ord(pbuff),
+                                           pagesize,actual,absolute,page);
+                                if tempresult <> noerr then
+                                    begin
+                                    if no_room(tempresult) then
+                                        begin
+                                        lresult := noroom;
+                                        fstatus := noroom;
+                                        end
+                                    else
+                                        begin
+                                        lresult := ioerr;
+                                        fstatus := inconsistent;
+                                        end;
+                                    goto 1;
+                                    end;
+                                end;
+                            state := clean;
+                            end;
+                        end;
+                end;
+
+        {   compact the heap and shrink it if necessary }
+
+            heap_compact;
+{!8-16-83}  lresult := nnew(@czone,nbuff*sizeof(buffdesc),@pbuffpool);
+{!8-16-83}  if lresult <> noerr then goto 1;
+            if newhsize < oldhsize then { shrink the heap }
+                begin
+                lresult := grow_heap(@czone,newhsize-oldhsize);
+{!8-16-83}      if lresult <> noerr then
+{!8-16-83}          begin
+{!8-16-83}          ndispose(@czone,@pbuffpool^);
+{!8-16-83}          goto 1;
+{!8-16-83}          end;
+                oldhsize := newhsize;
+                end;
+
+        {   if necessary, grow the heap datasegment }
+
+            if newheapsize > heapsize then
+                begin
+                size_dataseg(lresult,heap_segment,newheapsize-heapsize,
+                             newsize,
+{$IFC NOSWAP  }              0,
+{$ELSEC       }              newheapsize-heapsize,
+{$ENDC        }
+                             newsize1);
+{!8-16-83}      if lresult <> noerr then
+{!8-16-83}          begin
+{!8-16-83}          ndispose(@czone,@pbuffpool^);
+{!8-16-83}          goto 1;
+{!8-16-83}          end;
+                heapsize := newsize;
+                end;
+
+        {   now move the start of the heap, if necessary }
+
+            moveheap(newbsize - oldbsize,oldhsize);
+{!8-16-83}  pbuffpool := pointer(ord(pbuffpool)+(newbsize-oldbsize));
+
+        {   grow heap, if necessary }
+
+            if newhsize > oldhsize then
+                begin
+                lresult := grow_heap(@czone,newhsize-oldhsize);
+{!8-16-83}      { grow_heap can return no error on grow }
+                end;
+
+
+        {   repeg buffpool pointers and resize buffpool^, if necessary }
+
+            if lastbuff <> (nbuff-1) then
+                begin
+{!8-16-83}      {2 lines deleted }
+                xsfer := lastbuff + 1;
+                if xsfer > nbuff then xsfer := nbuff;
+                movelf(@buffpool^,pbuffpool,xsfer*sizeof(buffdesc));
+                ndispose(@czone,@buffpool^);
+                buffpool := @pbuffpool^;
+                pt := pointer(pbuff_segment + oldbsize);
+                for i := lastbuff+1 to nbuff-1 do
+                    with buffpool^[i] do
+                        begin
+                        state := empty;
+                        locks := 0;
+                        pfile := nilval;
+                        page := nilptr;
+                        priority := -1;
+                        pbuff := pt;
+                        pt := pointer(ord(pt) + psize);
+                        end;
+                lastbuff := nbuff - 1;
+                end;
+
+        {   now shrink heap dataseg, if necessary }
+
+            if newheapsize < heapsize then
+                begin
+                size_dataseg(lresult,heap_segment,newheapsize-heapsize,newsize,
+{$IFC NOSWAP  }              0,
+{$ELSEC       }              newheapsize-heapsize,
+{$ENDC        }
+                             newsize1);
+                if lresult <> noerr then goto 1;
+                heapsize := newsize;
+                end;
+
+{$IFC debug }
+            if dbdebug then
+                begin
+                writeln('new heap size:',newsize);
+                dumpheap(@czone);
+                end;
+{$ENDC }
+            end;
+
+1 :     ddresult := lresult;
+end;
+{$S openclose }
+{*************************************************************************
+
+                              freekeys
+
+        frees all the keyfiles linked off of a data file (via pkeyfiles).
+
+**************************************************************************}
+
+{$S openclose }
+procedure freekeys(var ddresult : integer;
+                       fileid : integer);
+        forward;
+{^T 20}
+{***************************************************************************
+
+                                freefile
+
+            releases a reference to a file descriptor and decrements
+            either readers or writers, depending on intent.
+
+            if writers becomes 0 then
+                - if the file has indexes then a freefile is done on each
+                  open index file descriptor
+            if readers and writers are both 0 then
+                - the file is closed
+                - the descriptor is released
+
+            Input Parameters
+                fileid - file to release reference on
+                intent - scan intent under which this reference was taken
+
+            Output Parameters
+                ddresult - return result
+
+            Return Results
+                noerr
+                ioerr
+                noroom
+                inconsistent
+                OS(Close_object)
+
+****************************************************************************}
+{$S openclose }
+procedure freefile(var ddresult : integer;
+                       fileid : integer;
+                       intent : integer);
+label
+        2;
+var
+        pfile : ptrfiledesc;
+        pf,
+        tresult : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if dbdebug then
+            begin
+            writeln(dumpfile,'freef:',fileid);
+            dumpheap(@czone);
+            end;
+{$ENDC }
+
+        ddresult := noerr;
+        with pfiletable^[fileid]^ do
+            begin
+            if inpset(@flags,fdata) and (intent = update) and (writers = 1)
+            then freekeys(ddresult,fileid);
+            if (intent = update) or (intent = labelupdate) then
+                writers := writers - 1
+            else
+                readers := readers - 1;
+            if (readers = 0) and (writers = 0) then
+                begin
+                pfile := pfiletable^[fileid];
+                doclose(tresult,fileid);
+
+
+{$IFC debug }
+                if dbdebug then writeln(dumpfile,tresult:6);
+{$ENDC }
+
+
+                if tresult <> noerr then ddresult := tresult;
+                if pedesc <> nil then ndispose(@czone,@pedesc^);
+                if pkdesc <> nil then ndispose(@czone,@pkdesc^);
+                if fileid = popenobj then popenobj := pnext
+                else
+                    begin
+                    pf := popenobj;
+                    repeat
+                        with pfiletable^[pf]^ do
+                            begin
+                            if pnext = fileid then
+                                begin
+                                pnext := pfile^.pnext;
+                                goto 2; { break }
+                                end;
+                            pf := pnext;
+                            end;
+                    until false;
+                 2 : { break }
+                    end;
+                ndispose(@czone,@pfile^);
+                end;
+            end; { with }
+
+{$IFC debug }
+        if dbdebug then
+            begin
+            writeln(dumpfile,'freef(result):',ddresult);
+            dumpheap(@czone);
+            end;
+{$ENDC }
+
+end; { freefile }
+{*************************************************************************
+
+                              freekeys
+
+        frees all the keyfiles linked off of a data file (via pkeyfiles).
+        these references are all update intent.
+
+
+        Input Parameters
+                fileid - data file
+
+        Output Parameters
+                ddresult - return result
+
+        Return Results
+                noerr
+                ioerr
+                noroom
+                inconsistent
+                OS(close_object)
+
+**************************************************************************}
+
+{$S openclose }
+procedure freekeys{(var ddresult : integer;
+                       fileid : integer)};
+var
+        tresult,
+        pnextf,pf : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+            pf := pkeyfiles;
+            pkeyfiles := nilval;
+            end;
+        while pf <> nilval do
+            with pfiletable^[pf]^ do
+                begin
+                pnextf := pkeyfiles;
+                freefile(tresult,pf,update);
+                if tresult <> noerr then ddresult := tresult;
+                pf := pnextf;
+                end;
+end;
+{***************************************************************************
+
+                                toss_scan
+
+        releases a scan, preparatory to either deleting the scan (closescan)
+        or establishing another scan on top of it (openscan's label scan)
+
+            - does a freefile on viafile if it exists and is different
+              from onfile
+            - does a freefile on onfile if it exists
+            - release ptrcos if necessary
+            - unlinks scan from viafile list of scans
+
+        Input Parameters
+                scanid - scan index
+
+        Output Parameters
+                ddresult - return result
+
+        Return Results
+                noerr
+                ioerr
+                noroom
+                inconsistent
+                OS(close_object)
+
+****************************************************************************}
+
+{$S openclose }
+procedure toss_scan(var ddresult : integer;
+                        scanid : integer);
+var
+        pscan : ptrscandesc;
+        tresult : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pscantable^[scanid]^ do
+            begin
+            ddresult := noerr;
+            with pfiletable^[viafile]^ do
+                begin
+                if scanid = scans then scans := fnext
+                else
+                    begin
+                    pscan := pscantable^[scans];
+                    while pscan^.fnext <> scanid do
+                        pscan := pscantable^[pscan^.fnext];
+                    pscan^.fnext := fnext;
+                    end;
+                if (viafile <> onfile) then
+                    freefile(ddresult,viafile,intent);
+                end; { with }
+            freefile(tresult,onfile,intent);
+            if tresult <> noerr then ddresult := tresult;
+            if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+            end; { with }
+{$IFC debug }
+            if dbdebug then dumpheap(@czone);
+{$ENDC}
+end; { toss_scan }
+{^T 20}
+{***************************************************************************
+
+                                closescan
+
+        see interface.
+
+****************************************************************************}
+
+{$S openclose }
+procedure closescan{(var ddresult : integer;
+                         scanid : integer)};
+var
+        pscan : ptrscandesc;
+        tresult : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if dbdebug then
+            begin
+            writeln(dumpfile,'cls:',scanid);
+            dumpheap(@czone);
+            end;
+{$ENDC }
+
+        if scanidbad(scanid) then ddresult := badscanid
+        else
+            begin
+            toss_scan(ddresult,scanid);
+            pscan := pscantable^[scanid];
+            with pscan^ do
+                begin
+                ndispose(@czone,@pscan^);
+                pscantable^[scanid] := nil;
+                end; { with }
+
+{$IFC debug }
+            if dbdebug then
+                begin
+                writeln(dumpfile,'cls:',ddresult);
+                dumpheap(@czone);
+                end;
+{$ENDC }
+
+            end; { else }
+end; { closescan }
+{^T 20}
+{***************************************************************************
+
+                                flushscan
+
+        see interface
+
+****************************************************************************}
+
+{$S access }
+procedure flushscan{(var ddresult : integer;
+                        scanid : integer)};
+var
+        isnotdata : boolean;
+        tresult,
+        pf : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if scanidbad(scanid) then ddresult := badscanid
+        else
+            begin
+            ddresult := noerr;
+            pf := pscantable^[scanid]^.onfile;
+            isnotdata := not inpset(@pfiletable^[pf]^.flags,fdata);
+            repeat
+                with pfiletable^[pf]^ do
+                    begin
+                    checkpt(tresult,pf,clean);
+                    pf := pkeyfiles;
+                    if tresult <> noerr then ddresult := tresult;
+                    end;
+            until isnotdata or (pf = fnilval);
+            end;
+
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'flushscan>:',ddresult);
+{$ENDC }
+
+end; { flushscan }
+{^T 20}
+{************************************************************************
+
+                                filldesc
+
+        initializes the bare minimum fields of the file descriptor
+        beyond the filelabel.
+
+        fstatus
+        pkeyfiles
+        scans
+        lastvfld,firstvfld,lastvsfld
+        openid
+
+        Input Parameters
+                pfile - file descriptor to fill in
+
+************************************************************************}
+
+{$S openclose }
+procedure filldesc{(var ddresult : integer;
+                        pfile : ptrfiledesc)};
+var
+        F_info : Fs_info;
+        i : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfile^ do
+            begin
+            info(ddresult,frefno,F_info);
+            openid := F_info.fuid;
+            fstatus := noerr;
+            scans := nilval;
+            pkeyfiles := nilval;
+
+        {   compute first and last var. len. field (optimization)
+            for whole record and just nonleaf fields  }
+
+            firstvfld := -1;
+            lastvsfld := -1;
+            for i := 0 to nfields-1 do with pedesc^[i] do
+                if ftype >= ftypvstr then
+                    begin
+                    if firstvfld = -1 then
+                        begin
+                        firstvfld := i;
+                        lastvfld := i;
+                        if i < nsort then lastvsfld := i;
+                        end
+                    else
+                        begin
+                        lastvfld := i;
+                        if i < nsort then lastvsfld := i;
+                        end;
+                    end;
+
+            end;
+end;
+
+ÿ

@@ -1,0 +1,494 @@
+
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+
+
+  (*
+   *  Def_Mount
+   *       check range of unit number.
+   *       verify that unit is not already mounted.
+   *       io_init to UP the device.
+   *       allocate DCB.
+   *       allocate MDDF for disk.
+   *       default initialize MDDF.
+   *       initialize DCB.
+   *       update mount table to indicate DCB.
+   *)
+  {$S fs3 }
+  procedure def_mount (* var ecode   : error;
+                             unitnum : integer *);
+
+  label 1;
+
+  var
+       temp_addr : absptr;
+       ptrDCB    : DCBptr;
+       ptrConfig : ptrdevrec;
+       ptrExt    : ^ext_diskconfig;
+
+  begin
+
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln ('DEF_MOUNT  device = ',unitnum);
+  {$ENDC}
+
+      ecode := 0;
+
+      (* Check range of device number *)
+      if (unitnum < firstdev) or (unitnum > maxdev) then
+      begin
+        ecode := E1_DEV_RANGE;
+        goto 1;
+      end{if};
+
+      if mounttable[unitnum] <> pointer(BADPTR1) then
+      begin
+        ecode := E1_DEV_MOUNTED;       (* device already mounted *)
+        goto 1;
+      end{if};
+
+      io_init(ecode, unitnum);   (* initialize to perform I/O on this device *)
+      if ecode > 0 then goto 1;
+
+      (* Allocate a Device Control Block from the SysGlobal pool *)
+      if not SuperGetspace(sizeof(DCB), temp_addr) then
+      begin
+        ecode := E_DCB_NOSPACE;
+        goto 1;
+      end{if};
+
+      ptrDCB := pointer(temp_addr);
+      ptrConfig := configinfo[unitnum];
+
+      with ptrDCB^ do
+      begin
+        if ptrConfig^.blockstructured then
+        begin
+          (****************************)
+          (*  Block-structured Device *)
+          (****************************)
+          if not SuperGetspace(sizeof(MDDFdb), temp_addr) then
+          begin
+            (* No space for the MDDF; release the allocated DCB *)
+            relspace(ord(ptrDCB), b_sysglobal_ptr);
+            ecode := E_DCB_NOSPACE;
+            goto 1;
+          end
+          else
+          begin
+            (* Establish temporary defaults to bring up the MDDF *)
+            MDDFdata := pointer(temp_addr);
+            with MDDFdata^ do
+            begin
+              ptrExt := pointer(ptrConfig^.ext_addr);
+              fsversion := -1;    (* unknown file system version *)
+              blockcount := ptrExt^.num_bloks;
+              blocksize := defblocksize;
+              datasize := defpgdatasize;
+              geography.firstblock := ptrExt^.fs_strt_blok;
+              geography.lastblock := ptrExt^.num_bloks - 1;
+              geography.lastfspage := geography.lastblock - geography.firstblock;
+              MDDFaddr := 0;      (* standard place to find MDDF *)
+              MDDFsize := sizeof(MDDFdb);
+              overmount_stamp.a := 0;   (* allow def_mount of ANY volume *)
+              overmount_stamp.b := 0;
+            end{with};
+            MDDFdirty := false;
+          end{if};
+        end
+        else
+          (***********************)
+          (*  Sequential Device  *)
+          (***********************)
+          MDDFdata := pointer(badptr1);
+
+
+        (* Initialize the Device Control Block  *)
+        name := ptrConfig^.devname;
+        dnum := unitnum;
+        dtype := ptrConfig^.devt;
+        sfcbchain.fwd_link := ord(@sfcbchain) - b_sysglobal_ptr;
+        sfcbchain.bkwd_link := sfcbchain.fwd_link;
+        status := defmounted;
+        access := 0;         (* future access control *)
+        private := false;    (* assume shared device  *)
+        remotedev := false;  (* no network access yet *)
+        locked := false;
+        opencount := 0;
+        mount_pending := false;
+        unmount_pending := false;
+        init_sem(semMDDF, 1);      (* init the semaphore *)
+        init_sem(semmap, 1);
+        init_sem(slSem, 1);
+        init_sem(volSem, 1);
+        init_sem(semio, 1);
+        topol := 0;
+        openchain.fwd_link := ord(@openchain) - b_sysglobal_ptr;
+        openchain.bkwd_link := openchain.fwd_link;
+        left_mounted := FALSE;
+      end{with};
+
+      (* Plug the DCB into the mount table *)
+      mounttable[unitnum] := ptrDCB;
+
+  1:  (* exit *)
+
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln ('DEF_MOUNT  exit ecode = ',ecode);
+  {$ENDC}
+
+  end{proc Def_Mount};
+
+
+
+
+
+
+
+  (*
+   *  Def_Unmount
+   *       check range of unit number.
+   *       verify that a device is mounted.
+   *       io_disinit to DOWN the device.
+   *       release MDDF for disk.
+   *       release DCB.
+   *       update mount table.
+   *)
+  {$S fs3 }
+  procedure def_unmount (* var ecode   : error;
+                               unitnum : integer *);
+
+  label 1;
+
+  var
+       ptrDCB : DCBptr;
+
+  begin
+
+  {$IFC DEBUG2}
+    if trace (FS, 11) then
+      writeln('DEF_UNMOUNT  device = ',unitnum);
+  {$ENDC}
+
+      ecode := 0;
+
+      (* Check range of device number *)
+      if (unitnum < firstdev) or (unitnum > maxdev) then
+      begin
+        ecode := E1_DEV_RANGE;
+        goto 1;
+      end;
+
+      ptrDCB := mounttable[unitnum];
+
+      if ptrDCB = pointer(badptr1) then
+      begin
+        ecode := E1_DEV_MOUNTED;       (* no device mounted on this unit *)
+        goto 1;
+      end;
+
+      with ptrDCB^ do
+      begin
+        status := unmounted;
+        io_disinit(ecode, unitnum);  (* close down I/O resources for this device *)
+
+        (* Release the MDDF *)
+        if configinfo[unitnum]^.blockstructured then
+          relspace(ord(MDDFdata), b_sysglobal_ptr);
+      end{with};
+
+      (* Release the Device Control Block *)
+      relspace(ord(ptrDCB), b_sysglobal_ptr);
+
+      (* Update the mount table *)
+      mounttable[unitnum] := pointer (badptr1);
+
+  1:  (* exit *)
+
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln('DEF_UNMOUNT  exit ecode = ',ecode);
+  {$ENDC}
+
+  end{proc Def_Unmount};
+
+
+
+
+
+
+
+{$IFC DEBUG1}
+  {$S fs3 }
+  procedure  Muzak;
+    procedure  Pause ( n : integer );
+    var l : longint;
+    begin
+        l := timer;
+        repeat until timer >= l+n;  (* wait n msecs *)
+    end;
+  begin
+      {
+      Beep(8000, 200);  Pause(160);
+      Beep(7000, 200);  Pause(160);
+      Beep(6000, 200);  Pause(160);
+      Beep(7000, 200);  Pause(160);
+      Beep(8000, 200);  Pause(160);
+      Beep(7000, 200);
+      }
+      Beep(1700, 100);
+      {
+      Beep(3500, 500);  Pause(190);
+      Beep(6000, 270);  Pause(160);
+      Beep(3500, 400);
+      }
+  end{proc Muzak};
+{$ENDC}
+
+
+
+  (*
+   *  Real_Mount
+   *       def_mount the device.
+   *       Disk:
+   *            read the MDDF.
+   *            verify the MDDF.
+   *            check bad block tables.
+   *            write the MDDF (check for write-protect).
+   *            allocate bitmap.
+   *            read bitmap.
+   *)
+  {$S fs3 }
+  procedure real_mount (* var ecode  : error;
+                              device : integer *);
+
+  label 1;
+
+  const
+        SPARE_TABLES_OK = 0;
+        SPARES_THRESHOLD = 2;
+        SPARES_INTACT = 4;
+
+  var
+       temp_addr  : absptr;
+       page       : longint;
+       actual     : longint;
+       dparm      : params;
+       cparm      : dc_rec;
+       wcode      : error;
+       locl_ecode : error;
+       must_unmnt : boolean;
+
+  begin
+
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln('REAL_MOUNT  device = ', device);
+  {$ENDC}
+
+      wcode := 0;
+      must_unmnt := FALSE;
+
+      (* default mount checks the device number *)
+      def_mount(ecode, device);    (* default mount the device *)
+      if ecode > 0 then goto 1;
+      must_unmnt := TRUE;
+
+      with mounttable[device]^ do
+      begin
+        if configinfo[device]^.blockstructured then
+        begin
+          (****************************)
+          (*  Block-structured Device *)
+          (****************************)
+          (* read the MDDF *)
+          MDDF_io(ecode, device, ord(MDDFdata), readop);
+          if ecode > 0  then goto 1;
+
+          (* verify the MDDF *)
+          MDDFdirty := FALSE;
+          with MDDFdata^ do
+          begin
+            if ((fsversion <> REL1_VERSION)  and
+                (fsversion <> PEPSI_VERSION) and
+                (fsversion <> CUR_VERSION))
+               or (MDDFaddr <> 0) { **********need another test here!**********
+               or (MDDFsize <> sizeof(MDDFdb)) ****}
+               or (length(volname) > max_ename) then
+            begin             (* wrong version, don't bring up *)
+              ecode := E_FS_VERSION;
+              goto 1;
+            end{if};
+  {$IFC DEBUG1}
+            if fsversion = REL1_VERSION then Beep(8100, 175);  (* yucko old volume! *)
+            if fsversion = CUR_VERSION then Muzak;  (* speedy new volume *)
+  {$ENDC}
+            left_mounted := vol_mounted;  (* record state in DCB *)
+            vol_mounted := TRUE;
+          end{with};
+
+          (*
+           *  That was the first access to the volume; so check-in with the
+           *  driver to see how sturdy the volume looks.
+           *)
+          with dparm do
+          begin
+            fnctn_code := dcontrol;
+            parptr := ord(@cparm);
+          end{with};
+          with cparm do
+          begin
+            dversion := 2;
+            dcode := 20;
+          end{with};
+          drivercall(ecode, device, @dparm);
+          if ecode > 0 then goto 1;
+
+          with cparm do
+          begin
+            (*
+             *  return a warning if one bad block directory cannot be read or
+             *  only two more entries are available for bad block remapping.
+             *)
+            if (ar10[3] <> SPARE_TABLES_OK) or
+               (ar10[2] <= SPARES_THRESHOLD) then  wcode := -1059;
+
+            (*
+             *  return an error if the bad block track looks unformatted or
+             *  if neither of the bad block directories can be found.
+             *)
+            if ar10[0] <> SPARES_INTACT then
+            begin
+               ecode := E_SPARES_DAMAGED;
+               goto 1;
+             end{if};
+          end{with};
+
+          Make_MRData(ecode, MDDFdata^.bitmap_bytes, temp_addr);
+          if ecode > 0 then
+          begin
+            ecode := E_BITMAP_NOSPACE;
+            goto 1;
+          end
+          else
+          begin
+            (* read allocation bit map into memory *)
+            bitmap_io(ecode, device, readop, temp_addr);
+            if ecode > 0 then
+            begin             (* I/O error reading in bit map *)
+              Rel_MRData(locl_ecode, temp_addr);
+              goto 1;
+            end;
+            mapdirty := false;
+            allocmap := pointer(temp_addr);
+          end{if};
+
+          name := MDDFdata^.volname;      (* get volume name *)
+
+          (*  write the MDDF to check for write-protect tab  *)
+          MDDF_io(ecode, device, ord(MDDFdata), writeop);
+          if ecode > 0 then goto 1;  (* hard error;  don't mount *)
+        end
+        else
+          (***********************)
+          (*  Sequential Device  *)
+          (***********************)
+          allocmap := pointer (badptr1);
+
+        status := realmounted;  (* means we have MDDF and bitmap for volume *)
+      end;
+
+    1:  (* exit *)
+        (* return warnings related to bad block handling as the highest priority *)
+        (* warning code below all positive error codes                           *)
+
+      if ecode <= 0 then
+        ecode := wcode
+      else  (* error *)
+        if must_unmnt then def_unmount(locl_ecode, device);
+
+
+  {$IFC DEBUG2}
+    if trace (FS, 11) then
+      writeln ('REAL_MOUNT  exit ecode = ',ecode);
+  {$ENDC}
+
+  end{proc real_mount};
+
+
+
+
+
+
+
+
+  (*
+   *  Real_Unmount
+   *       check range of device number.
+   *       flush file system.
+   *       check for open files on device.
+   *       flush directory nodes.
+   *       release bitmap for disk.
+   *       def_unmount the device.
+   *)
+  {$S fs3 }
+  procedure real_unmount (* var ecode  : error;
+                                device : integer *);
+
+  label 1;
+
+  var
+       ptrDCB : DCBptr;
+
+  begin
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln('REAL_UNMOUNT  device = ',device);
+  {$ENDC}
+
+      ecode := 0;
+      if (device < firstdev) or (device > maxdev) then
+      begin
+        ecode := E2_DEV_RANGE;
+        goto 1;
+      end;
+
+      ptrDCB := mounttable[device];
+      if ptrDCB <> pointer(badptr1) then with ptrDCB^ do
+      begin
+        if opencount > 0 then
+        begin
+          ecode := E_DEV_IN_USE;
+          goto 1;
+        end;
+
+        if configinfo[device]^.blockstructured then
+        begin
+          MDDFdata^.vol_mounted := left_mounted;
+          MDDFdirty := TRUE;
+          (* flush buffered information *)
+          flushfs(ecode);
+          FlushNodes(device, TRUE {clear}, ecode);
+          (* release bitmap data area *)
+          Rel_MRData(ecode, ord(allocmap));
+        end{if};
+
+        status := defmounted;    (* only have MDDF now *)
+        def_unmount(ecode, device); (* releases MDDF on blocked devices, and DCB *)
+      end{with};
+
+  1:  (* exit *)
+
+  {$IFC DEBUG2}
+    if trace(FS, 11) then
+      writeln('REAL_UNMOUNT  exit ecode = ',ecode);
+  {$ENDC}
+
+  end{proc real_unmount};
+ÿ

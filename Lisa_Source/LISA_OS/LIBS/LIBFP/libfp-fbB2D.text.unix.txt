@@ -1,0 +1,487 @@
+;-----------------------------------------------------------
+; 06AUG82: WRITTEN BY JEROME COONEN
+; 12AUG82: TIDIED (JTC)
+; 04SEP82: PASCAL ENUM TYPES KEPT IN HI BYTE OF WORD, SO
+;       CHANGES REQUIRED TO DECFORM.STYLE AND DECIMAL.SGN
+; 30DEC82: ADD TEST FOR SCALED RESULT AGAINST 10^N-1 JTC.
+; 18JAN83: PRINT ALL HEX DIGITS OF NANS.
+; 09JUN83: CHANGE REG CONVENTIONS TO PRESERVE A5,A6 (JTC).
+;
+; BINARY->DECIMAL CONVERSION.  BASED ON ALGORITHM B OF
+; J. COONEN'S PAPER "ACCURATE, YET ECONOMICAL BINARY-
+; DECIMAL CONVERSIONS".
+;
+; INPUT: POINTERS TO
+;       DESTINATION: DECIMAL STRUCTURE WITH SGN, EXP, DIGS
+;       SOURCE: BINARY FLOATING-POINT NUMBER IN FORMAT
+;               ENCODED IN INSTRUCTION
+;       FORMAT: STRUCTURE WITH TYPE KEY AND COUNT DIGITS
+;               KEY: 0 - FLOAT, 1 - FIXED, 2 - NICE
+;
+; ASSUME ODDBALL REGISTER MASK AT START:
+;       OPWORD    -- D6.LO
+;       STATE PTR -- A0
+;       DST PTR   -- A1
+;       SRC PTR   -- A2
+;
+; DELIVERS ONE-CHARACTER DIGIT STRING IN CASE OF
+; ZERO (0), INF (I), NAN (N), OR FIXED-PT OFLOW (?).
+;
+; DEPENDS ON RETURN CODES FROM UNPACK ROUTINE.
+;-----------------------------------------------------------
+B2D:
+
+;-----------------------------------------------------------
+; UNPACK INPUT VALUE TO D6.B, A4.W, D4, D5 IN ORDER TO
+; CATCH SPECIAL CASES
+;-----------------------------------------------------------
+        MOVE.W  D6,D0           ; OPWORD
+        ROL.W   #6,D0           ; ALIGN INPUT FORMAT FIELD
+        CLR.L   D2              ; IF-NAN FLAG
+        MOVE.L  D2,D3           ; NUMBER-CASE FLAG
+        MOVE.L  D2,D6           ; SIGN AND ERROR FIELD
+        MOVE.L  D2,D7           ; ROUNDING INFO
+        MOVEA.L A2,A3           ; SET UP SRC ADRS
+        BSR     UNPACK
+
+;-----------------------------------------------------------
+; NOW GET FORMAT OPERAND AND SET UP 30-BYTE (3 EXTENDEDS)
+; STACK FRAME.
+;-----------------------------------------------------------
+        MOVE.W  A4,D0           ; EXPONENT
+        MOVEA.L LKADR3(A6),A4   ; FORMAT POINTER
+        SUBA.W  #30,SP
+        MOVEA.L SP,A3           ; FRAME POINTER
+
+;-----------------------------------------------------------
+; CAN PLACE SIGN REGARDLESS OF NUMERICAL VALUE.
+; THEN PLACE COUNT OF 1 IN STRING LENGTH FIELD -- DEFAULT.
+;-----------------------------------------------------------
+        ROL.B   #1,D6           ; LEAVE SIGN IN BIT #0
+;-----------------------------------------------------------
+; ENUM TYPE: DELIVER DECIMAL.SGN TO HI BYTE.  SET DEFAULT
+; STRING LENGTH TO 1, USEFUL JUST BELOW AND LATER WHEN
+; SCALED FIXED-PT RESULT OVERFLOWS TO '?'.
+;-----------------------------------------------------------
+        MOVE.B  D6,(A1)         ; DELIVER SIGN
+        MOVE.B  #1,4(A1)        ; LENGTH TO 1
+
+;-----------------------------------------------------------
+; NOW PICK OUT NAN, INF, ZERO CASES...
+;-----------------------------------------------------------
+        TST.W   D2              ; IF-NAN
+        BEQ.S   @10
+
+;-----------------------------------------------------------
+; PUT NXXXX... FOR 16 HEXITS OF A NAN, REGARDLESS OF FORMAT
+; SINCE TRAILING ZEROS WILL BE STRIPPED LATER.  NOTE THAT
+; NAN STRUCT IS 22 BYTES LONG: 2 WORDS FOR SIGN AND EXP,
+; AND 18 BYTES FOR LENGTH, N, AND 16 HEXITS.
+;-----------------------------------------------------------
+        ADDQ.L  #4,A1           ; POINT TO RESULT STRING
+        MOVE.B  #17,(A1)+       ; LENGTH = N PLUS 2 SETS OF 8
+        MOVE.B  #'N',(A1)+      ; FIRST CHAR
+
+        BSR.S   @31             ; FIRST 8 HEXITS FROM D4
+        MOVE.L  D5,D4           ; MOVE LOW 8 HEXITS
+        BSR.S   @31             ; AND CONVERT
+
+        SUBA.W  #22,A1          ; POINT TO HEAD OF STRUCT
+        BRA     BDFIN
+
+;-----------------------------------------------------------
+; ROUTINE TO DISPLAY D4 IN 0-9, A-F.
+;-----------------------------------------------------------
+@31:
+        MOVEQ   #8,D0           ; LOOP COUNT
+@33:
+        ROL.L   #4,D4           ; PRINT FROM HI TO LO
+        MOVEQ   #$0F,D1         ; NIBBLE MASK
+        AND.B   D4,D1           ; STRIP NIBBLE
+        OR.B    #'0',D1         ; '0' IS $30
+        CMPI.B  #'9',D1         ; HEX LETTER?
+        BLE.S   @35
+
+        ADDQ.B  #7,D1           ; TRANSLATE TO A-F
+@35:
+        MOVE.B  D1,(A1)+        ; STUFF CHARACTER
+        SUBQ.W  #1,D0
+        BNE.S   @33
+        RTS
+
+;-----------------------------------------------------------
+; CHECK FOR 0, INF, OR (GASP) AN HONEST NUMBER.
+;-----------------------------------------------------------
+@10:
+        TST.W   D3              ; IF-SPECIAL-NUMBER
+        BEQ.S   BD1             ; 0 --> FINITE, NONZERO
+
+        MOVEQ   #'0',D0         ; ASSUME IT'S ZERO
+        CMPI.W  #2,D3           ; 2 --> ZERO
+        BEQ.S   @16
+
+        MOVEQ   #'I',D0
+@16:
+        MOVE.B  D0,5(A1)        ; SAVE 1-CHAR FIELD
+        BRA     BDFIN           ; GO TO END OF CONVERSION
+
+;-----------------------------------------------------------
+; NEED NORMALIZED FORM OF NUMBER (EVEN WHEN VALUE IS
+; EXTENDED DENORMALIZED) IN ORDER TO COMPUTE
+;       FLOOR( LOG10 ( | X | ) ).
+; AS EXPLAINED IN THE B-D PAPER, WE CAN APPROXIMATE
+; LOG2 ( | X | )   BY   EXP.FRAC .
+; SO WE PUT THIS INFORMATION TOGETHER BEFORE STORING THE
+; SIGNED EXTENDED VALUE AT THE TOP OF THE STACK FRAME (A3).
+; FOR CONVENIENCE, THIS INFORMATION IS KEPT EVEN IN THE
+; CASE OF FIXED CONVERSIONS, IN WHICH IT IS IRRELEVENT.
+;-----------------------------------------------------------
+BD1:
+        MOVE.L  D4,D1           ; INTEGER-BIT.FRAC
+        MOVE.W  D0,D1           ; EXP IN LOW WORD
+        SUBI.W  #$3FFF,D1       ; UNBIAS EXP
+        SWAP    D1              ; ALIGN EXP AND INT.FRAC
+        ADD.W   D1,D1           ; FINALLY HAVE EXP.FRAC
+
+;-----------------------------------------------------------
+; DENORMALIZE IF NECESSARY TO RETURN TO EXTENDED FORMAT
+; AND STORE IN FRAME.
+;-----------------------------------------------------------
+        TST.W   D0              ; NEGATIVE EXP?
+        BPL.S   @7
+@3:
+        LSR.L   #1,D4           ; SHIFT DIGITS RIGHT 1 BIT
+        ROXR.L  #1,D5
+        ADDQ.W  #1,D0           ; INCREMENT EXP, TOWARD 0
+        BMI.S   @3
+@7:
+        ROR.W   #1,D6           ; PUT SIGN INTO HI BIT
+        OR.W    D6,D0           ; PLACE ABOVE EXP
+
+;-----------------------------------------------------------
+; USE UTILITY TO PLACE NUMBER IN FRAME
+;-----------------------------------------------------------
+        BSR     TOA3
+
+;-----------------------------------------------------------
+; CLEAR OUT D4 FOR LOGX AND BYPASS MULTIPLY IF FIXED CVT.
+;-----------------------------------------------------------
+        CLR.L   D4
+;-----------------------------------------------------------
+; DECFORM.STYLE ENUM TYPE TEST
+;-----------------------------------------------------------
+        TST.B   (A4)            ; NONZERO --> FIXED
+        BNE.S   BD3
+
+        MOVE.L  #$4D104D42,D0   ; FLOOR( LOG10 (2) )
+        TST.L   D1              ; EXP NEGATIVE?
+        BPL.S   @1
+
+        ADDQ.W  #1,D0           ; BUMP LOG TO ASSURE FLOOR
+@1:
+
+;-----------------------------------------------------------
+; COMPUTE  LOG10(2) * LOG2(X)  INTO D4.W.  THIS IS A 32*32
+; SIGNED MULTIPLY SO CANNOT USE CORE ROUTINE OF THE MULT
+; OPERATION.  SINCE ONLY THE LEADING 16 BITS ARE OF
+; INTEREST, IT IS NOT NECESSARY TO CARRY OUT THE LOW ORDER
+; 16*16 PARTIAL PRODUCT.  THE SCHEME IS:
+;
+;               A  B    = D0 = FLOOR( LOG10 (2) ) > 0
+;             * X  Y    = D1 = FLOOR( LOG2  |X| )
+;            -------
+;            A--Y
+;            B--X
+;        + A--X
+;       ------------
+;          ????????     = D4.W, KEEPING ONLY 16 BITS
+;-----------------------------------------------------------
+        MOVE.L  D0,D4
+        SWAP    D4              ; D4.W = A
+        MULU    D1,D4           ; D4.L = A--Y
+        CLR.W   D4
+        SWAP    D4              ; D4.W = A--Y.HI
+
+        SWAP    D1              ; D1.W = X
+        MOVE.W  D1,D5
+        MULS    D0,D5           ; D5.L = B--X
+        SWAP    D5
+        EXT.L   D5              ; D5.W = B--X.HI WITH SIGN
+        ADD.L   D5,D4           ; CANNOT CARRY OR BORROW
+
+        SWAP    D0              ; D0.W = A
+        MULS    D1,D0           ; D0.L = A--X
+        ADD.L   D0,D4
+        SWAP    D4              ; D4.W = FLOOR(LOG10(X))
+
+;-----------------------------------------------------------
+; ADD 1 TO D4.W YIELDING THE NUMBER OF DIGITS LEFT OF THE
+; DECIMAL POINT WHEN X IS WRITTEN OUT, A HANDY VALUE.
+;-----------------------------------------------------------
+        ADDQ.W  #1,D4
+
+;-----------------------------------------------------------
+; COMPUTE THE VALUE SCALE WHICH HAS BEEN COOKED SO THE
+; COMPUTATION IS INDEPENDENT OF WHETHER FIXED OR FLOAT.
+; ITS NEGATIVE IS THE TENTATIVE DECIMAL EXP.
+; NOTE MUST LOAD OPERAND ADDRESS SINCE MAY LOOP BACK TO BD3.
+; THAT IS DONE ABOVE BDGETCNT BELOW.
+;-----------------------------------------------------------
+BD3:
+        BSR     BDGETCNT
+        SUB.W   D4,D3           ; D4 = 0 OR LOG10(X)
+        MOVEA.L LKADR1(A6),A1   ; RESULT ADDRESS
+        MOVE.W  D3,2(A1)        ; DELIVER EXPONENT...
+        NEG.W   2(A1)           ; ...WITH CORRECT SIGN
+
+;-----------------------------------------------------------
+; SAVE X IN CASE ROUNDING ERROR IN LOG10(X) FORCES
+; RECOMPUTATION (JUST FALLS THROUGH FOR FIXED CONVERSIONS).
+;-----------------------------------------------------------
+        MOVE.W  (A3),20(A3)
+        MOVE.L  2(A3),22(A3)
+        MOVE.L  6(A3),26(A3)
+
+;-----------------------------------------------------------
+; COMPUTE SCALED VALUE (STEPS B4-B7) USING COMMON CORE.
+;-----------------------------------------------------------
+        BSR     DBCORE
+
+;-----------------------------------------------------------
+; ROUND RESULT TO INTEGER ACCORDING TO INPUT MODE.
+;-----------------------------------------------------------
+        PEA     (A3)            ; ADRS OF NUM BUFFER
+        MOVE.W  #OPRINT,-(SP)   ; ROUND TO INTEGER OPCODE
+        BSR     REFP68K
+
+;-----------------------------------------------------------
+; COMPUTE 10^N TO CHECK WHETHER FIXED OVERFLOW (RESULT = ?)
+; OR ROUND ERROR IN   FLOOR( LOG10 (X) ) .
+; NOTE THAT POW10 PRESERVES A1 ACROSS CALL, SO A1 MAY BE
+; USED IN SUBSEQUENT ACCESSES.
+;-----------------------------------------------------------
+        LEA     10(A3),A1       ; PUT 10^N ABOVE SCALED VAL
+
+;-----------------------------------------------------------
+; ENUM TYPE DECFORM.STYLE IN HI BYTE OF WORD.
+; IF FLOAT, CHECK AGAINST REQUESTED NUMBER OF SIG DIGITS.
+; IF FIXED, CHECK AGAINST MAX OF 19.
+;-----------------------------------------------------------
+        TST.B   (A4)            ; FLOAT OR FIXED?
+        BNE.S   @3
+
+        BSR.S   BDGETCNT
+        BRA.S   @5
+@3:
+        MOVEQ   #19,D3
+@5:
+        BSR     POW10
+
+;-----------------------------------------------------------
+; NOW PERFORM COMPARISON RIGHT ON MEMORY OPERANDS, WHICH
+; MAKES SENSE SINCE BOTH VALUES ARE NORMALIZED.  NOTE THAT
+; THE SCALED VALUE IS SIGNED.
+;-----------------------------------------------------------
+        MOVE.W  (A3),D0         ; SIGN, EXP OF SCALED VAL
+        BCLR    #15,D0          ; ABSOLUTE VALUE
+        CMP.W   (A1),D0         ; (SCALED) - (10^N)
+        BNE.S   @13
+
+        MOVE.L  2(A3),D0        ; HIGH ORDER DIGITS
+        CMP.L   2(A1),D0
+        BNE.S   @13
+
+        MOVE.L  6(A3),D0
+        CMP.L   6(A1),D0
+@13:
+        BCS.S   BD85            ; LESS THAN --> OK
+
+;-----------------------------------------------------------
+; IF SCALED VALUE OUT OF RANGE DISTINGUISH CASES:
+; FLOAT: JUST FIX LOG10 AND RECOMPUTE (EVEN IF EXACTLY 10^N)
+; FIXED: STORE '?' AND GIVE UP.
+;-----------------------------------------------------------
+;-----------------------------------------------------------
+; ENUM TYPE DECFORM.STYLE IS IN HI BYTE
+;-----------------------------------------------------------
+        TST.B   (A4)            ; FLOAT OR FIXED
+        BNE.S   @15
+
+        ADDQ.W  #1,D4           ; FIX LOG10(X)
+        MOVE.W  20(A3),(A3)     ; RESTORE SAVED VALUE
+        MOVE.L  22(A3),2(A3)
+        MOVE.L  26(A3),6(A3)
+        BRA.S   BD3
+
+@15:
+        MOVEA.L LKADR1(A6),A1
+        MOVE.B  #'?',5(A1)      ; STORE  1-CHAR STRING
+        BRA     BDFIN
+
+
+;-----------------------------------------------------------
+; IF TYPE OF CONVERSION IS FLOAT, THEN DELIVER DIGIT COUNT,
+; FORCED TO BE BETWEEN 1 AND 19.
+; IF TYPE IS FIXED, THEN DELIVER STATED COUNT.
+;-----------------------------------------------------------
+BDGETCNT:
+        MOVE.W  2(A4),D3        ; COUNT VALUE FROM FORMAT
+        TST.B   (A4)            ; NONZERO --> FIXED
+        BNE.S   @3
+        TST.W   D3              ; COUNT <= 0 --> FORCE 1
+        BLE.S   @1
+
+        CMPI.W  #19,D3          ; BIGGER THAN 19?
+        BLE.S   @3
+        MOVEQ   #19,D3
+        BRA.S   @3
+@1:
+        MOVEQ   #1,D3           ; FORCE AT LEAST 1 DIGIT
+@3:
+        RTS
+
+
+
+;-----------------------------------------------------------
+; NOW CHECK FLOAT RESULT AGAINST LOWER BOUND 10^N-1.
+;-----------------------------------------------------------
+BD85:
+        TST.B   (A4)            ; NONZERO --> FIXED
+        BNE.S   BD9
+
+        BSR.S   BDGETCNT        ; GET NUMBER OF DIGITS N
+        SUBQ.W  #1,D3           ; WANT N-1
+        BSR     POW10           ; 10^N-1 IN (A1)
+
+;-----------------------------------------------------------
+; AGAIN, PERFORM COMPARISON RIGHT ON MEMORY OPERANDS.
+;-----------------------------------------------------------
+        MOVE.W  (A3),D0         ; SIGN, EXP OF SCALED VAL
+        BCLR    #15,D0          ; ABSOLUTE VALUE
+        CMP.W   (A1),D0         ; (SCALED) - (10^N)
+        BNE.S   @13
+
+        MOVE.L  2(A3),D0        ; HIGH ORDER DIGITS
+        CMP.L   2(A1),D0
+        BNE.S   @13
+
+        MOVE.L  6(A3),D0
+        CMP.L   6(A1),D0
+@13:
+        BCC.S   BD9             ; UNSIGNED >=  --> OK
+
+;-----------------------------------------------------------
+; IF SCALED VALUE IS TOO SMALL, JUST FORCE 10^N-1,
+; CONVENIENTLY KEPT IN (A1).
+;-----------------------------------------------------------
+        MOVE.W  (A1),(A3)
+        MOVE.L  2(A1),2(A3)
+        MOVE.L  6(A1),6(A3)
+        BRA.S   BD9
+
+
+
+;-----------------------------------------------------------
+; COMPUTE THE DIGIT STRING.
+;-----------------------------------------------------------
+BD9:
+;-----------------------------------------------------------
+; TO CONVERT THE BINARY INTEGER FIELD TO A DECIMAL STRING,
+; DIVIDE BY 10^19 (TO GET A FRACTION), THEN REPEATEDLY
+; MULTIPLY BY 10 AND STRIP THE DIGIT THAT FALLS OFF THE
+; LEFT.  DIVIDE, WHICH USES THE CODE FROM FLOATING DIV,
+; IS COOKED SO THAT THE BINARY POINT AFTER DIVISION IS TO
+; THE LEFT OF THE QUOTIENT IN D4/5.  TO PREPARE FOR THE
+; DIVISION, MUST RIGHT-ALIGN THE INTEGER FIELD.
+;
+; THE SCALED VALUE MAY BE ZERO IN FIXED CONVERSION, IN WHICH
+; CASE STORE '0' AND EXIT.
+;-----------------------------------------------------------
+        MOVEA.L LKADR1(A6),A1   ; DST ADRS
+        MOVE.W  (A3),D3         ; SIGN AND EXP OF SCALED VAL
+        MOVE.L  2(A3),D1        ; HIGH DIGITS
+        BNE.S   @3
+
+        MOVE.B  #'0',5(A1)
+        BRA     BDFIN
+@3:
+        MOVE.L  6(A3),D2        ; LOW DIGITS
+        BCLR    #15,D3          ; CLEAR SIGN
+        SUBI.W  #$403E,D3       ; UNBIAS EXPONENT
+        BEQ.S   @7              ; ZERO IF HUGE INT
+
+@5:
+        LSR.L   #1,D1           ; SHIFT RIGHT A BIT
+        ROXR.L  #1,D2
+        ADDQ.W  #1,D3
+        BMI.S   @5
+@7:
+
+;-----------------------------------------------------------
+; PREPARE FOR CALL TO RESTORE ROUTINE:
+;       DIVIDEND: D1,D2      DIVISOR: D3,A2    QUO: D4,D5
+;
+; TO AVOID THE  XXXXX.99999 CASE WHICH CHOPS TO WRONG INT,
+; ADD 1 IN LAST PLACE AND PROPAGATE.
+; NOTE THAT 'RESTORE' RETURNS WITH D0 SET TO 0.
+;-----------------------------------------------------------
+        MOVE.L  #$8AC72304,D3   ; 10^19 HIGH
+        MOVE.L  #$89E80000,A2
+        MOVEQ   #65,D0          ; GET FULL WIDTH QUOTIENT
+        BSR     RESTORE
+
+        ADDQ.L  #1,D5
+        ADDX.L  D0,D4
+
+;-----------------------------------------------------------
+; NOW WRITE THE DIGIT STRING, GUARANTEED NONZERO, SKIPPING
+; LEADING ZEROS.
+;-----------------------------------------------------------
+        ADDQ.L  #4,A1           ; POINT TO STRING
+        MOVEA.L A1,A2           ; COPY PTR TO OUTPUT STRING
+        CLR.B   (A2)+           ; ZERO OUT LENGTH BYTE
+        MOVEQ   #19,D6          ; DIGIT COUNTER
+@11:
+        ADD.L   D5,D5           ; DOUBLE FRACTION
+        ADDX.L  D4,D4
+        ADDX.W  D0,D0
+
+        MOVE.L  D5,D3           ; SAVE 2 * DIG
+        MOVE.L  D4,D2
+        MOVE.W  D0,D1
+
+        ADD.L   D5,D5           ;  4 * DIG
+        ADDX.L  D4,D4
+        ADDX.W  D0,D0
+        ADD.L   D5,D5           ; 8 * DIG
+        ADDX.L  D4,D4
+        ADDX.W  D0,D0
+
+        ADD.L   D3,D5           ; 10 * DIG
+        ADDX.L  D2,D4
+        ADDX.W  D1,D0
+
+;-----------------------------------------------------------
+; D0 IS GUARANTEED NONZERO IF ANY NONZERO DIGITS HAVE BEEN
+; SEEN.  THE HIGH BYTE OF D0 CONTAINS EXTRANEOUS INFO TO
+; MARK "FIRST DIGIT SEEN".
+;-----------------------------------------------------------
+        TST.W   D0              ; ADDX.W WON'T SET THE Z BIT
+        BEQ.S   @12             ; 0 --> LEAD 0
+
+        ORI.L   #$0130,D0       ; ASCII-FY THE DIG
+        MOVE.B  D0,(A2)+        ; STUFF IT
+        CLR.B   D0              ; LEAVE HI BYTE MARK
+        ADDQ.B  #1,(A1)         ; INCREMENT LENGTH
+@12:
+        SUBQ.B  #1,D6
+        BNE.S   @11
+
+;-----------------------------------------------------------
+; THE EXIT POINT FOR ALL THE TRIVIAL CASES.
+;-----------------------------------------------------------
+BDFIN:
+        ADDA.W  #30,SP          ; KILL STACK FRAME
+        BRA     POP3
+
+ÿ

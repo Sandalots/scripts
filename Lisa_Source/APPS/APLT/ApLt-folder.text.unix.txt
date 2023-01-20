@@ -1,0 +1,723 @@
+{ Copyright 1983, Apple Computer, Inc. }
+
+{$S SegTEDoc }
+
+function GetDoc (HTerm: THTerm; FileName: Str30; SetupOnly: Boolean): Boolean;
+  {GetDoc reads HTerm^^.Setup from FileName.  It returns True if the read
+   was successful. If SetUpOnly is True then only the setup information is
+   read into HTerm.}
+  const
+    WrongPsWd = 1294;
+  var
+    eCode: Integer;
+    FilePath: PathName;
+    FileNum: Integer;
+    NrRead: LongInt;
+    Document: TDocument;
+    TheCache: THCache;
+    HRow: THLine;
+    RowNr: Integer;
+
+
+  function GetCache (var TheCache: THCache): Boolean;
+    {GetCache reads a cache saved in the file open to FileNum, and returns}
+    {true if it succeeded.}
+
+    var
+      eCode: Integer;
+      GotCache: Boolean;
+      NrRead: LongInt;
+      HPage: THPage;
+      NextPage: THPage;
+      ReadSize: Integer;
+
+    {$S SegTEDoc }
+    begin {GetCache}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      GotCache:=True;                                  {Hope for the best.}
+
+      NewHCache (TheCache);
+
+      Read_Data (eCode,
+                 FileNum,
+                 Ord (TheCache^),
+                 SizeOf (TCache),
+                 NrRead,
+                 Sequential, 0);
+
+      if (eCode>0) or (NrRead<>SizeOf (TCache)) then
+        GotCache:=False;
+
+      if HeapState<>HeapNormal then begin
+        GotCache:=False;
+        TheCache^^.LastPage:=NIL;
+      end;
+
+      NextPage:=Pointer (Ord (TheCache));
+      ReadSize:=Ord (TheCache^^.LastPage);
+      while GotCache and (ReadSize>0) do begin
+        NewHPage (HPage);
+
+        if HeapState=HeapNormal then
+          SizeHPage (HPage, ReadSize-SizeOfTPage);
+
+        NextPage^^.Prev:=HPage;
+        if HeapState=HeapNormal then begin
+          Read_Data (eCode,
+                     FileNum,
+                     Ord (HPage^),
+                     ReadSize,
+                     NrRead,
+                     Sequential, 0);
+
+          if (eCode>0) or (NrRead<>ReadSize) then
+            GotCache:=False;
+
+          ReadSize:=Ord (HPage^^.Prev);
+          NextPage:=HPage;
+
+        end else begin
+          GotCache:=False;
+          HPage^^.Prev:=NIL;
+        end;
+      end;
+
+      if not GotCache then
+        KillCache (TheCache);
+
+      GetCache:=GotCache;
+    end; {GetCache}
+
+  {$S SegTEDoc }
+  begin {GetDoc}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    GetDoc:=False;                           {Expect the worst.}
+
+    FilePath:=FileName;
+    Open_Secure (eCode, FilePath, FileNum, [DRead],HTerm^^.Password);  {PW}
+    if eCode>0 then
+      Exit (GetDoc);
+
+    Read_Data (eCode,                        {Get the setup info}
+               FileNum,
+               Ord (@Document),
+               SizeOf (TDocument),
+               NrRead,
+               Sequential, 0);
+
+    if (eCode>0) or (NrRead<>SizeOf (TDocument)) then begin
+      Close_Object (eCode, FileNum);
+      Exit (GetDoc);
+    end;
+
+    if Document.dVersion <> 'S' then begin     {can't read it if not Spring version}
+      Close_Object (eCode, FileNum);
+      HTerm^^.OldVersion := TRUE;
+      GiveAlert (HTerm, AlrtStop, ALDocRead,HTerm^^.TheTitle, '', '');
+      Exit (GetDoc);
+    end else HTerm^^.OldVersion := FALSE;
+
+    HTerm^^.Setup:=Document.dSetup;         {Install the setup info}
+
+    if not SetupOnly then begin               {Should we read the rest?}
+      with HTerm^^, Display [RightNow], MoveArray, Document do begin                        {[JS]}
+        Cursor:=dCursor;                      {Get the other values}
+        TabStops:=dTabStops;
+        CharGroup:=dCharGroup;
+        CharSet[GroupG0]:=dCharSet[GroupG0];
+        CharSet[GroupG1]:=dCharSet[GroupG1];
+        ColumnStops := dColumnStops;                                                        {[JS]}
+
+
+        if not dSaved then begin                  {Keep suspended values.}
+          Select:=dSelect;
+          Lights:=dLights;
+          FirstRow:=dFirstRow;
+          FirstCol:=dFirstCol;
+        end;
+      end;
+
+      TheCache:=HTerm^^.HCache;                   {Kill the old cache.}
+      KillCache (TheCache);
+
+      if Document.dCacheExists then               {Is there a cache to read?}
+        if not GetCache (TheCache) then           {Read the Lines Off Top}
+          GiveAlert (HTerm, AlrtNote, ALNoCache, HeapDisk, '', '');
+
+      with HTerm^^ do begin
+        HCache:=TheCache;                         {Install the Lines Off Top}
+
+        if TheCache=NIL then
+          Display [RightNow].MoveArray.StartScreen:=MinRow                                      {[JS]}
+        else
+          Display [RightNow].MoveArray.StartScreen:=TheCache^^.LinesInCache + MinRow;           {[JS]}
+      end;
+
+      if GetCache (TheCache) then begin           {Read the terminal screen area.}
+        for RowNr:=MinRow to MaxRow do begin
+          ExpandRow (TheCache, RowNr, HRow, FALSE);      {Install the terminal screen area}
+          HTerm^^.Display [RightNow].Screen [RowNr]^^:=HRow^^;
+          FreeRow (HRow);
+
+          with HTerm^^.Display [RightNow].Screen [RowNr]^^ do begin
+            Changed:=True;
+            Cached:=False;
+          end;
+        end;
+
+        KillCache (TheCache);
+
+      end else
+        GiveAlert (HTerm, AlrtNote, ALNoBody, HeapDisk, '', '');
+    end;
+
+    Close_Object (eCode, FileNum);
+    GetDoc:=True;
+  end; {GetDoc}
+
+
+function PutDoc (HTerm: THTerm;
+                 FileName: Str30;
+                 WasSaved: Boolean;
+                 var Why: FReason): Boolean;
+  {PutDoc writes HTerm^^.Setup to FileName.  It returns True if the
+   write was successful. WasSaved should be True if this is a save, False if
+   this is a suspend.  Why returns a filer reason of why the write failed if
+   PutDoc returns False.}
+
+  const
+     FileExists=890;
+     WrongPsWd= 1294;
+
+  var
+    eCode: Integer;
+    FilePath: PathName;
+    FileNum: Integer;
+    NrWritten: LongInt;
+    Document: TDocument;
+    HPage: THPage;                      {Also used as THCache.}
+    PrevPage: THPage;
+    WriteSize: Integer;
+    PotDoc: Boolean;
+    TheCache: THCache;
+    RowNr: Integer;
+
+
+  procedure PutCache (TheCache: THCache);
+    {PutCache writes TheCache out to the file opened to FileNum.}
+
+    {$S SegTEDoc }
+    begin {PutCache}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      if not HTerm^^.OldVersion then begin
+
+        ClipCache (TheCache);                       {Trim unused space.}
+
+        if TheCache<>NIL then begin
+          WriteSize:=SizeOf (TCache);               {Fake first TCache write.}
+          HPage:=Pointer (Ord (TheCache));
+
+        end else
+          HPage:=NIL;
+
+        while PotDoc and (HPage<>NIL) do begin
+          {THPage field used as previous (NEXT in file/list) page size for both TCache and TPage.}
+          PrevPage:=HPage^^.Prev;
+          if PrevPage<>NIL then
+            HPage^^.Prev:=Pointer (SizeOfTPage + PrevPage^^.PageSize)
+          else
+            HPage^^.Prev:=Pointer (0);
+
+          Write_Data (eCode,
+                      FileNum,
+                      Ord (HPage^),
+                      WriteSize,
+                      NrWritten,
+                      Sequential, 0);
+
+          if NrWritten<>WriteSize then begin
+            PotDoc:=False;
+            Why:=noDiskSpace;
+          end else if eCode>0 then begin
+            PotDoc:=False;
+            Why:=cantWrite;
+          end;
+
+          WriteSize:=Ord (HPage^^.Prev);
+          HPage^^.Prev:=PrevPage;
+          HPage:=PrevPage;
+        end;
+      end;
+    end; {PutCache}
+
+  {$S SegTEDoc }
+  begin {PutDoc}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    PotDoc:=True;
+    Why:=allOK;
+
+    if not HTerm^^.OldVersion then begin
+
+      FilePath:=FileName;
+      Make_Secure (eCode, FilePath, HTerm^^.Password);
+      if (eCode>0) and (eCode<>FileExists) then begin
+        PotDoc:=False;
+        Why:=cantWrite;
+
+      end else begin
+        Open_Secure (eCode, FilePath, FileNum, [DWrite],HTerm^^.Password);  {PW}
+        if eCode>0 then begin
+          Why :=cantWrite;
+          if eCode= WrongPsWd then why := wrongPassword;
+          PotDoc:=False;
+
+        end else begin
+          with Document, HTerm^^, Display [RightNow], MoveArray do begin                      {[JS]}
+            dVersion:= 'S';  {Spring Version}
+            dSaved:=WasSaved;
+            dSetup:=Setup;
+            dCursor:=Cursor;
+            dSelect:=Select;
+            dLights:=Lights;
+            dTabStops:=TabStops;
+            dFirstRow:=FirstRow;
+            dFirstCol:=FirstCol;
+            dCacheExists:= (HCache<>NIL);
+            dCharGroup:=CharGroup;
+            dCharSet[GroupG0]:=CharSet[GroupG0];
+            dCharSet[GroupG1]:=CharSet[GroupG1];
+            dColumnStops := ColumnStops;                                                      {[JS]}
+          end;
+
+          Write_Data (eCode,
+                      FileNum,
+                      Ord (@Document),
+                      SizeOf (TDocument),
+                      NrWritten,
+                      Sequential, 0);
+
+          if NrWritten<>SizeOf (TDocument) then begin
+            PotDoc:=False;
+            Why:=noDiskSpace;
+          end else if eCode>0 then begin
+            PotDoc:=False;
+            Why:=cantWrite;
+          end;
+
+          PutCache (HTerm^^.HCache);                {Write the cache.}
+
+          TheCache:=NIL;                            {Write the screen.}
+          for RowNr:=MinRow to MaxRow do
+            PutRow (TheCache, HTerm^^.Display [RightNow].Screen [RowNr]);
+          PutCache (TheCache);
+          KillCache (TheCache);
+
+          Compact (eCode, FileNum);
+          if eCode>0 then begin
+            PotDoc:=False;
+            Why:=cantWrite;
+          end;
+
+          Close_Object (eCode, FileNum);
+          if eCode>0 then begin
+            PotDoc:=False;
+            Why:=cantWrite;
+          end;
+        end;
+      end;
+    end;
+
+    PutDoc:=PotDoc;
+    If PotDoc then HTerm^^.ComeFromBlank := False;
+  end; {PutDoc}
+
+
+procedure SetDefaultCharSet(HTerm: THTerm);            {*}
+     {SetDefaultCharSet uses the name of the default charset gotten from the
+      phrase file in TEINIT and initializes the CharSet}
+
+    {$S SegTEDoc }
+    begin
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      with HTerm^^ do begin
+
+             CharSet[GroupG0]:= IntCharGroup;
+             CharSet[GroupG1]:= IntCharGroup;
+        end;
+   end; {SetDefaultCharSet}
+
+
+
+procedure Revert1Folder (HTerm: THTerm; SetupOnly: Boolean; NewDoc: Boolean);
+  {Revert1Folder reads the file associated with HTerm, installs the information}
+  {in HTerm, and updates the screen to match the new information.  If SetupOnly}
+  {is true then only HTerm^^.Setup is read and updated.  If NewDoc is true then}
+  {the current contents of HTerm is ignored for incremental update.}
+
+  var
+    ChangePort: Boolean;
+    ChangeModem: Boolean;
+    WasModem: TDBModem;
+    ChangeCols: Boolean;
+    CanTalk: array [Boolean] of Boolean;
+    SavePort: GrafPtr;
+    Why: FReason;
+
+  {$S SegTEDoc }
+  begin {Revert1Folder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    if not NewDoc then
+      with HTerm^^.Setup do begin
+        ChangePort:=PortA;
+        WasModem:=Modem;
+        ChangeCols:=Cols80;
+      end;
+
+    CanTalk [True ]:= (CanTalkTo (SerialA) = TalkOK);
+    CanTalk [False]:= (CanTalkTo (SerialB) = TalkOK);
+
+    with HTerm^^ do begin                    {Set up in case of a read failure.}
+      with Setup do begin                    {Or in case of blank stationery.}
+        Modem:=DBOther;
+        ADNumber:='';
+        AutoDial:=False;
+        AnswrBk:='';
+
+        AutoRepeat:=True;
+        MarginBell:=False;
+        Cols80:=True;
+        Wraparound:=True;
+        AutoLF:=False;
+        WhiteScreen:=True;
+        BlockCursor:=False;
+        SeeLights:=False;
+        SeeTabs:=False;
+        SeeColumns := FALSE;                                                                {[JS]}
+        Runoff:=True;
+
+        Terminal:=DBvt100;
+        PortA:=CanTalk [True];
+        BaudRate:=DB1200;
+        Parity:=DBNoParity;
+        XOnXOff:=False;
+        FullDuplex:=True;
+        OnLine:=CanTalk [PortA];
+        CantRemember:=False;
+        PhoneVis:=TRUE;
+
+        WordWrap := TRUE;                                                                   {[JS]}
+        WrapPoint := 60;                                                                    {[JS]}
+      end;
+
+      CharGroup:=GroupG0;
+      SetDefaultCharSet(HTerm);  {set default international character set}
+
+      if not SetupOnly then begin
+        CacheTooBig:=False;
+        CacheMuchTooBig:=False;
+        with Cursor do begin
+          Ln:=MinRow;
+          Ch:=MinCol;
+        end;
+
+        with Select do begin
+          Left :=Cursor;
+          Right:=Cursor;
+        end;
+
+        with Display [RightNow], MoveArray do begin                                         {[JS]}
+          FirstRow:=MinRow;
+          FirstCol:=MinCol;
+        end;
+      end;
+    end;
+    if not GetDoc (HTerm, HTerm^^.FileName, SetupOnly) then begin  {Read failed}
+      if NewDoc then begin                                         {Blank stationery}
+        if PutDoc (HTerm,HTerm^^.FileName, True, Why) then ;{Do nothing.}
+        HTerm^^.ComeFromBlank := True;
+      end else
+        GiveAlert (HTerm, AlrtStop, ALDocRead,HTerm^^.TheTitle, '', '');
+      end;
+    if NewDoc then begin
+      ChangePort :=False;
+      ChangeModem:=False;
+      ChangeCols :=False;
+
+    end else
+      with HTerm^^.Setup do begin
+        ChangePort := (ChangePort<>PortA);
+        ChangeModem:= (WasModem<>Modem);
+        ChangeCols := (ChangeCols<>Cols80);
+      end;
+
+    InstallSetup (HTerm, ChangePort, ChangeModem);  {Install the info}
+    InstallCmfort (HTerm, ChangeCols);              {Repaints the terminal}
+
+    GetPort (SavePort);                             {Doesn't need repaint}
+    SetPort (HTerm^^.Folder);
+    ValidRgn (HTerm^^.Folder^.VisRgn);
+    SetPort (SavePort);
+
+  end;  {Revert1Folder}
+
+
+procedure RevertFolder (HTerm: THTerm);
+  {RevertFolder does a "Revert to Previous Version" for HTerm.}
+
+  {$S SegTEDoc }
+  begin {RevertFolder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    Revert1Folder (HTerm, False, False);
+  end;  {RevertFolder}
+
+
+procedure State1Folder (HTerm: THTerm; SetupOnly: Boolean; NewDoc: Boolean);
+  {State1Folder resets all of the terminal state information for HTerm, reads}
+  {the file associated with HTerm, installs the information in HTerm, and}
+  {updates the screen to match the new information.  If SetupOnly is true}
+  {then only HTerm^^.Setup is read and updated.  If NewDoc is true then}
+  {the current contents of HTerm is ignored for incremental update.}
+
+  var
+    RowNr: Integer;
+    TheSeqNr: LongInt;
+    ColNr: Integer;
+    I: Integer;
+
+  {$S SegTEDoc }
+  begin {State1Folder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    with HTerm^^ do begin                    {set the "Power on" defaults}
+      with Cursor do begin
+        Ln:=Display [RightNow].MoveArray.StartScreen + MinRow;                                      {[JS]}
+        Ch:= MinCol;
+      end;
+
+      TermProc:=NIL;
+      KeyPad:=False;
+      CursorSave:=Cursor;
+      BaseSave:=BlankChar;
+      StyleSave:=M80Style;
+      BaseChar:=BlankChar;
+      TMargin:=0;
+      BMargin:=MaxRow-MinRow;
+      TOrigin:=0;
+      BOrigin:=MaxRow-MinRow;
+      TBOrigin:=False;
+      TellSetup:=False;
+      CursorKey:=False;
+      STP.Value:=0;
+      NextNewLine:=False;
+
+      with Display [RightNow], MoveArray do begin                                               {[JS]}
+        for RowNr:=MinRow to MaxRow do begin
+          with Screen [RowNr]^^ do begin
+            TheSeqNr:=SeqNr;
+            Screen [RowNr]^^:=BlankLine;
+
+            SeqNr:=TheSeqNr;
+            Changed:=True;
+            Repaint:=True;
+          end;
+        end;
+
+        TabStops [MinCol]:=False;
+        for ColNr:=MinCol+1 to MaxCol do
+          TabStops [ColNr]:= (ColNr mod 8 = 1);
+
+        FOR ColNr := MinCol TO MaxCol DO                                                    {[JS]}
+            ColumnStops[ColNr] := FALSE;                                                    {[JS]}
+
+        ShowGrayLine := FALSE;                                                              {[JS]}
+
+        Position := MinCol;         {The position marker allways starts in MinCol}          {[JS]}
+
+        for I:=1 to 4 do
+          Lights [I]:=False;
+      end;
+    end;
+
+    Revert1Folder (HTerm, SetupOnly, NewDoc); {get the setup info}
+  end;  {State1Folder}
+
+
+procedure StateFolder (HTerm: THTerm);
+  {StateFolder does a "Revert to Initial State" for HTerm.}
+
+  {$S SegTEDoc }
+  begin {StateFolder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    State1Folder (HTerm, True, False);
+  end;  {StateFolder}
+
+
+procedure MakeFolder (HTerm: THTerm);
+  {MakeFolder allocates all of the storage for HTerm, and then reads and}
+  {initializes it.}
+
+  var
+    When: Moment;
+    RowNr: Integer;
+    HLine: THLine;
+    TheBlink: THBlinkItem;
+    Pt: Point;
+    TheSBList: TSBList;
+    TheVSBar: THSB;
+    TheHSBar: THSB;
+    SavePort: GrafPtr;
+
+  {$S SegTEDoc }
+  begin {MakeFolder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+
+    with HTerm^^ do begin    {default all non-state, non-revert variables}
+      HCache:=NIL;
+
+      UartOpen:=False;
+      OffHook:=False;
+
+      RecUartLen:=0;
+      KbdReady:=False;
+      ReplyLen:=0;
+      ComeFromBlank := False;
+
+      Changed:=False;
+      Repaint:=False;
+      LastUpdate:=Time;
+      NrChanges:=0;
+    end;
+
+    GetFldrTitle (HTerm^^.Folder, HTerm^^.TheTitle);  {get the title}
+
+
+    for When:=AtPaint to RightNow do begin            {default the screen state}
+      for RowNr:=MinRow to MaxRow do begin
+        NewHLine (HLine);
+        HTerm^^.Display [When].Screen [RowNr]:=HLine;
+        HLine^^:=BlankLine;
+
+        if When=AtPaint then begin
+          HLine^^.SeqNr:=NextSeqNr;
+          NextSeqNr:=NextSeqNr+1;
+
+        end else
+          HLine^^.SeqNr:=HTerm^^.Display [AtPaint].Screen [RowNr]^^.SeqNr;
+      end;
+
+      with HTerm^^.Display [When], MoveArray do begin                                               {[JS]}
+        FirstRow:=MinRow;
+        FirstCol:=MinCol;
+        StartScreen:=MinRow;
+        HThumbPos:=0;
+        VThumbPos:=0;
+      end;
+    end;
+
+    MakeBlink (TheBlink, HTerm^^.Folder);     {make the inversion areas}
+    HTerm^^.BlinkRgn:=TheBlink;
+
+    MakeBlink (TheBlink, HTerm^^.Folder);
+    HTerm^^.InvertRgn:=TheBlink;
+    SetSolid (HTerm^^.InvertRgn, True);
+
+    MakeBlink (TheBlink, HTerm^^.Folder);
+    HTerm^^.CursorRect:=TheBlink;
+
+    MakeBlink (TheBlink, HTerm^^.Folder);
+    HTerm^^.CaretRect:=TheBlink;
+    SetSolid (HTerm^^.CaretRect, True);
+
+    InitSBList (TheSBList, TheHeap);       {make the scroll bars}
+
+    SetPt (Pt, 0, 0);
+    TheVSBar:=SBCreate (TheSBList, HSBNIL, TyVHV, Pt, 0);
+    TheHSBar:=SBCreate (TheSBList, HSBNIL, TyVHH, Pt, 0);
+
+    SetSBIcons (TheVSBar, [IconArwA, IconPagA, IconPagB, IconArwB, IconThumb]);
+    SetSBIcons (TheHSBar, [IconArwA, IconPagA, IconPagB, IconArwB, IconThumb]);
+
+    SetThumb (TheVSBar, 0);
+    SetThumb (TheHSBar, 0);
+
+    with HTerm^^ do begin
+      SBList:=TheSBList;
+      VSBar:=TheVSBar;
+      HSBar:=TheHSBar;
+    end;
+
+    State1Folder (HTerm, False, True);   {initialize the rest}
+
+  end;  {MakeFolder}
+
+
+procedure KillFolder (HTerm: THTerm);
+  {KillFolder saves HTerm's setup info and kills its folder and all}
+  {related storage.}
+
+  var
+    ThePrev: THTerm;
+    TheNext: THTerm;
+    HPage: THPage;
+    DeadPage: THPage;
+    When: Moment;
+    RowNr: Integer;
+    eCode: Integer;
+
+  {$S SegTEDoc }
+  begin {KillFolder}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    ThePrev:=HTerm^^.Prev;                        {Remove it from TermList.}
+    TheNext:=HTerm^^.Next;
+    if TheNext<>NIL then
+      TheNext^^.Prev:=ThePrev;
+    if ThePrev<>NIL then
+      ThePrev^^.Next:=TheNext
+    else
+      TermList:=TheNext;
+
+    if HTerm^^.OffHook then                       {Hang it up.}
+      HangUp (HTerm);
+
+    if HTerm^^.UartOpen then begin                {Close the UART.}
+      Close_Object (eCode, HTerm^^.RefNum);
+      Unmount (eCode, UartPath [HTerm^^.Setup.PortA]);
+    end;
+
+    if HTerm^^.HCache<>NIL then begin
+      HPage:=HTerm^^.HCache^^.LastPage;           {Kill the cache.}
+      while HPage<>NIL do begin
+        DeadPage:=HPage;
+        HPage:=HPage^^.Prev;
+        DspHPage (DeadPage);
+      end;
+      DspHCache (HTerm^^.HCache);
+    end;
+
+    KillSB (HTerm^^.SBList, HTerm^^.VSBar);       {Kill the scroll bars.}
+    KillSB (HTerm^^.SBList, HTerm^^.HSBar);
+    (*** Need to kill HTerm^^.SBList?? ***)
+
+    for When:=AtPaint to RightNow do              {Kill the screen storage.}
+      for RowNr:=MinRow to MaxRow do
+        DspHLine (HTerm^^.Display [When].Screen [RowNr]);
+
+    KillBlink (HTerm^^.CursorRect);               {Kill the blinkers.}
+    KillBlink (HTerm^^.CaretRect);
+    KillBlink (HTerm^^.BlinkRgn);
+    KillBlink (HTerm^^.InvertRgn);
+
+    if HTerm=TheTerm then                         {Deactivate it.}
+      TheTerm:=NIL;
+
+    KillAlerts (HTerm);                           {Dequeue all pending alerts.}
+
+    DspHTerm (HTerm);                             {Kill the terminal.}
+
+    ShrinkSegMemory (TheHeap);                    {Shrink the heap back down.}
+
+    NrTerms:=NrTerms-1;
+  end; {KillFolder}
+
+{$S SegTE }
+
+ÿ

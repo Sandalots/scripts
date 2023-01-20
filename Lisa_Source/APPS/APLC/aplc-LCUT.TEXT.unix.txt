@@ -1,0 +1,783 @@
+{ Saving Universal Text version of LC cells-type scrap }
+
+{  15 April 1983 : metric space conversion done from 96-pixel space to 100-pixel space }
+
+UNIT LCUT;   INTRINSIC;                 {'Copyright 1983, Apple Computer Inc.'}
+
+INTERFACE
+
+uses (*$U obj:UnitStd.obj *)            UnitStd,
+     (*$U obj:UnitHz.obj *)             UnitHz,
+     (*$U obj:Storage.obj *)            Storage,
+     (*$U obj:Fontmgr.obj *)            FontMgr,
+     (*$U obj:QuickDraw.obj *)          QuickDraw,
+     (*$U obj:dbenv.obj *)              dbenv,
+     (*$U obj:FEdec.obj *)              FEdec,
+     (*$U obj:fld.obj *)                fieldedit,
+     (*$U obj:teenv.obj *)              teenv,
+
+     (*$U obj:SysCall.obj *)            Syscall,
+     (*$U obj:PMDecl *)                 PMDecl,
+     (*$U obj:PrStd.obj *)              PrStd,
+
+     (*$U obj:wm.events.obj *)          events,
+
+     (*$U obj:scrap.obj *)              scrap,
+     (*$U obj:unitFile.obj  *)          unitFile,
+     (*$U obj:unitFmt.obj   *)          unitFmt,
+     (*$U obj:unitCs.obj    *)          UnitCs,
+     (*$U obj:unitFF.obj *)             unitFF;
+
+
+
+CONST
+
+
+      { "status" codes to return to doDeActEvent : }
+
+    LCUTAllOk = 0 ;    { successful creation}
+    LCUTNoData= 1 ;    { No non-empty cells in range }
+    LCUTTabProb=2 ;    { Too many tab-stops needed }
+    LCUTWidProb=3 ;    { Scrap matrix too wide to fit on 17" paper }
+    LCUTNoHeap =4 ;    { Insufficient space in the Scrap Heap }
+
+procedure WriteLCUT (tblCharWid : integer; Tblfntid : TLfntid; var status : integer );
+procedure InitLCutProcs
+  (
+   CellBlank    { parameters} : ProcPtr;
+   CellInfo     { parameters} : ProcPtr;
+   CellValue    { parameters} : ProcPtr;
+   FinalDataSnip{ parameters} : ProcPtr;
+   GetSnipId    { parameters} : ProcPtr;
+   RgInScrap    { parameters} : ProcPtr;
+   SnipWidth    { parameters} : ProcPtr;
+   SwitchTable  { parameters} : ProcPtr
+  );
+
+
+
+IMPLEMENTATION
+
+    {$setc fDebug := not teProduction }
+
+(*$R- *)
+
+(*$IFC teSym *)
+(*$D+ *)
+(*$ELSEC *)
+(*$D- *)
+(*$ENDC *)
+
+
+CONST    { these are approximations and will change... }
+  MaxCols = 58 ;     { max number of tabs WP will allow, less one  } {=}
+  MaxChrs = 299;     { max number of chars in a row (very generous) }
+  MaxPixs = 1400;    { max width of 17" paper, in pixels }    {=}
+  LeftMarg = 100;     { left margin }
+  chReturn = 13;
+  NormalRt = 750 ;   { 'normal' right margin for use unless rows get too long }  {+}
+
+TYPE
+  LCM  = record  { all unit-global information  }
+
+  {A:  Data of use to SeqLpdMtx }
+
+    ScrapRows:    integer ;    { how many rows there are in the Scrap }
+    NumTabs :     integer ;    { number of elements in the Tabs[] array (they run from
+                                 0 to NumTabs-1); this is also the cardinal number of
+                                  columns in the Scrap }
+    LCFont:       TFam ;
+    Chars:        array [ 0 .. MaxChrs ] of byte ;
+    Tabs:         array [ 0 .. MaxCols ] of TTbd ;
+    ThisRow:      integer ;    { most recent row already built ; ranges from
+                                 zero to ScrapRows - 1;  initialized to -1,
+                                   indicating that no row has yet been built}
+
+  {B: Data for communication between WriteLCUT and GetLCUTRow}
+
+    ColWidth:       Array[1..MaxCols ] of integer;  {width in chars of each snip}
+    BasePixel:      Array[0..MaxCols] of integer ;  { separator pixel between two
+                                                   adjacent columns }
+    ScrapRg:        range;
+  end { record };
+
+  PLCM = ^ LCM ;
+  HLCM = ^ PLCM ;
+
+VAR
+   LH: HLCM ;  {handle off which the "LCM" variables are accessed}
+   CharCount: integer;
+   HalfDxMin: integer ;  {    Half of lotus's 'dxMinTab', rounded up if necessary
+                          NB: twice this is used instead of dxMinTab everywhere, as bulletproofing
+                              against the chance that someday dxMinTab may turn out to be an odd number } {+}
+
+   rightMarg   : integer ; {+}
+
+   LCProcInfo  : record
+                    CellBlank     : ProcPtr;
+                    CellInfo      : ProcPtr;
+                    CellValue     : ProcPtr;
+                    FinalDataSnip : ProcPtr;
+                    GetSnipId     : ProcPtr;
+                    RgInScrap     : ProcPtr;
+                    SnipWidth     : ProcPtr;
+                    SwitchTable   : ProcPtr
+                 end;
+
+
+(*$IFC fDEbug *)
+procedure DeBugLcut ; forward ;
+(*$ENDC *)
+function GetLCUTRow (WhichRow: Integer) : boolean ; forward ;
+procedure PxHcsMtx ( index:  TB ); forward ;
+procedure SeqLpdMtx ( Lpd: Tlpd; var achad: Tachad ) ;  forward;
+
+function FFConvert ( oldPixel : INTEGER ) : INTEGER  ;  forward ;{ the screen-metric-space to-formatted-file
+                                                                  conversion routine }
+
+   function  LCellBlank
+     (rowId, colId : idType;
+      procParam    : ProcPtr
+     ) : boolean; external;
+
+   procedure LCellInfo
+     (parName      : cellParType;       {which parameter to read/write}
+      mode         : IOModeType;        {reading/writing mode flag}
+      rowId, colId : idType;            {location of cell}
+      var cellRec  : cellRecord;        {record to be read/written}
+      procParam    : ProcPtr
+     ); external;
+
+   procedure LCellValue
+     (mode         : IOModeType;        {reading/writing mode flag}
+      rowId, colId : idType;            {location of cell}
+      value        : ptrData;           {ptr to where chrs are to go}
+      wideFlg      : boolean;           {format for wide angle display? }
+      var numBytes,                     {max # of chrs /actual # chrs returned}
+          status   : integer;           {error status number}
+      procParam    : ProcPtr
+     ); external;
+
+   function  LFinalDataSnip
+     (aKind     : SnipKind;
+      procParam : ProcPtr
+     ) : idtype; external;
+
+   procedure LGetSnipId
+     (snip       : snipKind;            {type of information desired: row or column}
+      mode       : idModeType;          {mode of information desired: first/last...}
+      position   : fract;               {position in [0 .. 1000] for fraction oper}
+      refId      : idType;              {reference snip for next/prior oper}
+      var snipId : idType;              {resulting snip information}
+      procParam  : ProcPtr
+     ); external;
+
+   procedure LRginScrap
+     (var rg     : range;
+      procParam  : ProcPtr
+     ); external;
+
+   function  LSnipWidth
+     (snip      : snipKind;             {type of information desired}
+      snipId    : idType;               {snip for which the data is desired}
+      procParam : ProcPtr
+     ) : integer; external;             {width of the snip}
+
+   procedure LSwitchTable
+     (ScrapTable    : boolean;          {table to switch to}
+      var tableInfo : tableRecord;      {table information for that table}
+      procParam     : ProcPtr
+     ); external;
+
+
+{$S initial }
+procedure InitLCutProcs
+  (*
+   CellBlank    { parameters} : ProcPtr;
+   CellInfo     { parameters} : ProcPtr;
+   CellValue    { parameters} : ProcPtr;
+   FinalDataSnip{ parameters} : ProcPtr;
+   GetSnipId    { parameters} : ProcPtr;
+   RgInScrap    { parameters} : ProcPtr;
+   SnipWidth    { parameters} : ProcPtr;
+   SwitchTable  { parameters} : ProcPtr
+  *);
+begin
+   LCProcInfo.CellBlank     := CellBlank;
+   LCProcInfo.CellInfo      := CellInfo;
+   LCProcInfo.CellValue     := CellValue;
+   LCProcInfo.FinalDataSnip := FinalDataSnip;
+   LCProcInfo.GetSnipId     := GetSnipId;
+   LCProcInfo.RgInScrap     := RgInScrap;
+   LCProcInfo.SnipWidth     := SnipWidth;
+   LCProcInfo.SwitchTable   := SwitchTable
+end;
+
+
+{$S RWscrapCode}
+{ +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+  function MatCol ( aCol: integer )  : IDType ;
+    { Converts a column coordinate to matrix-relative terms }
+    begin
+      MatCol := LH^^.ScrapRg.LoCol + aCol - 1
+    end;
+{ +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+  function MatRow ( aRow: integer )  : IDType ;
+    { Converts a row coordinate to matrix-relative terms }
+    begin
+      MatRow := LH^^.ScrapRg.LoRow + aRow - 1
+    end;
+
+function ffConvert { (oldPixel: INTEGER) : INTEGER } ;  {+} { performs miracle conversion to Lotus's
+                                                              Metric space }
+   VAR L :  LONGINT ;
+   BEGIN
+       L := OldPixel ;
+       ffConvert :=  ( ( L * 100 ) + 95 ) DIV 96 ;
+   END ;
+
+
+procedure WriteLCUT {tblCharWid : integer; Tblfntid : TLfntid; var status: integer };
+
+{ Called from LC/BG folder exec at DeActivate time; writes cells-type scrap
+  contents to the true Scrap in Universal Text format
+
+   Assumptions on entry:
+     -- Current scrap type is Cells kind
+
+   After some initialization, this procedure, calls ScrapLib procedure
+   "PutCSScrap" to create a formatted file.  The SeqLpd which is called by
+   that procedure, "SeqLptMtx", calls, in turn, the getLcutRow procedure, which formats
+   the next row }
+
+
+VAR
+
+     CurCol:         integer;   { current-column temporary }
+
+     TotalChars:     integer;
+
+     cserr: integer;
+
+     j:              TB;
+     index:          TB;    { for use with ICSCreate }
+
+     TempHz:         THz;
+
+     BindStatus:     integer;   {+}
+
+  procedure Depart; {  exit formalities AFTER allocation of LH has taken place }
+     begin
+      { reset mm to operate off main matrix }
+        LSwitchTable(false,tblPars, LCProcInfo.SwitchTable);           { get current-table info in MM straight }
+        FreeH  ( TempHz, pointer(ord(LH)) ) ; { release all space used }
+        unBindUTDSeg ( BindStatus )           ;   { release the UT Data Segment }  {In A3 onward}
+        exit(WriteLCUT)
+     end;
+
+BEGIN
+(*$IFC fDebug *)
+ if TraceLCUT then writeln('WriteLCUT');
+(*$ENDC *)
+
+ halfDxMin := (dxMinTab + 1) div 2 ; { this is the number of pixels of 'horizontal leading' placed to the
+                                     left and right of each lc/bg column, in order not to violate Lotus's
+                                     restriction of the smallest distance allowed between 2 tabs }  {+}
+
+ { allocate space }
+ TempHz := TheHeap ;
+ LH := pointer(ord(HAllocate ( TempHz , sizeof(LCM) )));
+ if ( ord(LH) = ord(HNil) ) then
+    begin
+       status := LCUTNoHeap;
+       exit ( WriteLCUT )
+    end;
+
+ BindUTDSeg ( BindStatus ) ;             { make sure rghcs is in memory }
+
+ { determine how much data is present: }
+ LRginScrap ( LH^^.ScrapRg, LCProcInfo.RgInScrap ) ;      {++mm++}
+
+ { set up such that subsequent MM calls will refer to the Scrap }
+
+ LSwitchTable ( true, tblPars, LCProcInfo.SwitchTable );  {++mm++}
+
+{22Nov82 additions}
+ with LH^^.ScrapRg do begin
+ case RKind of
+    aNullRg,aRowGrid,aColGrid,aRowHedRg,aColHedRg,aTblHedRg:
+       begin  { nothing to do }
+          status := LCUTAllOk ;
+          depart
+       end;
+
+    aRowRg :  { a range of Rows is in the scrap }
+       begin  { find final column which has data }
+          RKind := aRectRg ;
+          loCol :=    1       ;
+          hiCol :=   LFinalDataSnip ( colKind, LCProcInfo.finalDataSnip )
+       end;
+
+    aColRg :
+       begin
+          RKind := aRectRg ;
+          loRow := 1          ;
+          hiRow := LFinalDataSnip ( rowKind, LCProcInfo.finalDataSnip )
+       end;
+
+    aWTBoxRg :
+       begin
+          RKind := aRectRg ;
+          loRow := 1          ;
+          loCol := 1          ;
+          hiRow := LFinalDataSnip ( rowKind, LCProcInfo.finalDataSnip ) ;
+          hiCol := LFinalDataSnip ( colKind, LCProcInfo.finalDataSnip )
+       end
+    end { case } ;
+
+    if ( hiRow < loRow ) or ( hiCol < loCol ) then
+       begin
+          status := lcutAllOK ;
+          depart
+       end
+ end ;{ with }
+
+ {$ifc fDebug }
+ if traceLCUT then with LH^^.ScrapRg do
+       writeln('LCUT: rectified range -- type is: ',ord(rKind),
+        '  loRow=',loRow:1,'  loCol=',loCol:1,'  HiRow=',hiRow:1,'  HiCol=',hiCol:1);
+ {$endc}
+
+ { compute the number of rows and columns }
+
+ with LH^^ do with ScrapRg do
+   begin
+     ScrapRows := hiRow - loRow + 1;
+     NumTabs  := HiCol - loCol + 1
+   end;
+
+{ Can we handle this situation?  }
+ if LH^^.NumTabs  > MaxCols then        { More tabs than WP can handle }
+   begin
+     status := LCUTTabProb;
+     Depart
+   end;
+
+ { Now fill the array of col widths (in chars), and compute total chars needed }
+ TotalChars := 0 ;
+ with LH^^ do
+   for CurCol := 1 to NumTabs  do begin
+     ColWidth[CurCol] := LSnipWidth( ColKind,  MatCol(CurCol), LCProcInfo.SnipWidth ) div tblCharWid; {++mm++}
+     TotalChars := TotalChars + ColWidth[CurCol]
+   end;
+ { If width of a row would be unpleasantly long, refuse the task }
+ if (TotalChars*TblCharWid+(LH^^.NumTabs * 2 * halfDxMin ) +   leftMargin         >   MaxPixs)     then
+ {    [pixels for text]      [pixels for inter-col gaps]    [pixels for l.margin]     }
+    begin
+       status := LCUTWidProb ;
+       Depart
+     end;
+
+ { Compute the BasePixel array }
+ with LH^^ do begin
+   BasePixel[0] := halfDxMin ;
+   for CurCol := 1 to NumTabs  do
+     BasePixel[CurCol] := BasePixel[CurCol - 1] + ffConvert(ColWidth[CurCol] * TblCharWid )+ 2*halfDxMin ; {+}
+   LCFont := TblFntID.fam ;  { set table's Font into info record }
+   thisRow := -1             { no row yet retrieved }
+ end ;     { with }
+
+
+ rightMarg := leftMarg + lh^^.basePixel[lh^^.numTabs] + 1 ;
+ IF      ( rightMarg <= normalRt )
+            THEN rightMarg := normalRt
+ ELSE IF ( rightMarg > maxPixs )
+            THEN rightMarg := maxPixs ;
+
+(*$IFC fDebug *)
+ if TraceLCUT then with LH^^ do begin    { print out results of global computations }
+    writeln('WriteLCUT comps: rows, cols, font, rightmarg:'); {+}
+    writeln( scrapRows,NumTabs ,ord(lcfont), rightmarg );     {+}
+    writeln('ColNum/ColWidths/BasePixel');
+     for CurCol:= 1 to NumTabs  do writeln (CurCol, ColWidth[CurCol] , BasePixel[CurCol])
+ end ;{ trace printout }
+(*$ENDC *)
+
+ { get new rghcs index... }
+
+ index := IcsCreate(tycsMtrx,SizeOf(Tcs),TempHz);
+(*$IFC fDebug *)
+ if traceLCUT then writeln('creating index ',index);
+(*$ENDC *)
+
+ { set up the array of procpointers ... }
+
+ with rghcs^[index]^^.cspd do
+    begin
+       ArgProc[iprocFreeICS] := pointer(ProcNil);
+       ArgProc[iprocPxHcs]   := @PxHcsMtx;
+       ArgProc[IprocSeqLpd]  := @SeqLpdMtx;
+       argproc[IProcFindLpFixed] := @FindLpFstPar;
+       argproc[IProcFSelLpBounds] := @TrueStdSelLpBounds;
+    end;
+
+ PutCSScrap(index, cserr);
+
+   FreeIcs ( index ) ;
+
+{$ifc fDebug}                              {+}
+   if traceLCUT then debugLCUT ;
+{$endc}
+
+   Status := LCUTAllOk;
+   depart  { will among other things unbind the UTDSeg }
+ end; { procedure }
+
+
+
+function GetLCUTRow { WhichRow: Integer) : boolean };
+
+{ For relative row "WhichRow" of the scrap matrix ( 0 ..ScrapRows-1 ), fills the
+  Tabs array and the Chars array of the LCM record with correct information,
+  and also updates LH^^.ThisRow.
+    The trailing carriage return is also sent, and hence Charcount can turn
+     out to be as small as one, but never zero.
+
+  Function value TRUE means that a proper row has been returned; FALSE
+  indicates that "WhichRow" was too small or too big  }
+
+VAR
+       TextBuffer:     array[0..127] of byte ; { MM "cellValue" text placed here }
+       CellRec:        CellRecord;  { MM "CellInfo" data placed here } {=}
+       CurCol:         integer;
+       NonNullFound:   boolean;
+       CurChar:        integer;
+       CurCharPos:     integer;
+       LastCol:        integer;
+       NumBytes:       integer;
+       CharPos:        integer;
+       ThisMatRow:     integer;
+       status:         integer;
+
+BEGIN
+(*$IFC fDebug *)
+  if traceLCUT then writeln('GetLCUTRow #',WhichRow);
+(*$ENDC *)
+
+  with LH^^ do BEGIN { big WITH spans entire procedure -- should be safe, as only Matrix Mgr calls here}
+
+    IF (( WhichRow > ScrapRows-1) OR (WhichRow < 0) ) THEN  BEGIN
+      GetLCUTRow := false;
+      exit (GetLCUTRow)
+    END;
+
+    IF ( WhichRow = ThisRow ) then           { requested row already here ? }
+       begin
+          GetLCUTRow := true;
+          exit(GetLCUTRow)
+       end;
+
+   ThisMatRow := MatRow(WhichRow+1);
+
+
+  { determine the highest column to have nonnull data in this row }
+
+   lastCol := ScrapRg.HiCol ;
+   nonNullFound := false;
+
+   while (lastCol >= ScrapRg.LoCol)  and ( not nonNullFound ) do
+     if (not LCellBlank( ThisMatRow , LastCol, LCProcInfo.CellBlank ) )
+       then nonNullFound := true
+     else LGetSnipId (colKind,mmPrior,0,LastCol,LastCol, LCProcInfo.getSnipID);
+
+   {convert LastCol to Scrap-local coordinates }
+
+   LastCol := LastCol - ScrapRg.LoCol + 1 ;
+
+   curCharPos := 0;
+   for curCol := 1 to NumTabs  do begin    { repeat for each matrix column in the Scrap }
+
+   if CurCol <= LastCol then
+      begin
+          chars[CurCharPos] := chTab;     {insert a tab character}
+          CurCharPos := CurCharPos + 1 ;
+
+          { get cell value into text buffer}
+          NumBytes := ColWidth[curCol];
+          LCellValue(mmRead,ThisMatRow,MatCol(curCol),@TextBuffer,false,
+            NumBytes , status , LCProcInfo.cellValue);
+          if status = cvnotenuff then NumBytes := ColWidth[curCol]
+      end
+   else
+      NumBytes := 0 ;   { if past final nonnull column, add nothing more until <cr> }
+
+   { determine alignment information }
+   LCellInfo( cRecord , mmRead , ThisMatRow , MatCol(curCol) , CellRec, LCProcInfo.CellInfo);  {++mm++}
+
+   { Adjust tab array as needs be... }
+
+   with Tabs[CurCol-1], CellRec do
+     begin
+     case align of
+        right:
+          begin
+            x := BasePixel[CurCol] - halfDxMin ;        {+}
+            quad := quadR
+          end;
+        center:
+          begin
+            x := (BasePixel[CurCol] + BasePixel[CurCol-1]) div 2 ;
+            quad := quadC
+          end;
+        otherwise
+          begin
+            x := BasePixel[curCol - 1] + halfDxMin ;    {+}
+            quad := QuadL
+          end
+      end; {case}
+      tyfill := tyfillnil;
+      x := x + leftmarg  ;      { Start tabs at 1" }   {+}
+      end; { with tabs }
+
+
+   For curChar := 1 to NumBytes do
+     chars[curCharPos + curChar - 1 ] := TextBuffer[curChar-1];
+
+   { Adjust curCharPos upward by desired amount, taking into account the
+     tab character...}
+     curCharPos := curCharPos + NumBytes;
+
+     end ;{ current column }
+
+    CharCount := CurCharPos + 1 ;
+    chars[CharCount-1] := chReturn;    { add ASCII carriage-return }
+    ThisRow := WhichRow;
+    GetLCUTRow := true ;
+
+  end { big WITH }
+ end { procedure GetLCUTRow };
+
+{ -------------------- >>>>>>>>>>>>>>> + <<<<<<<<<<<<<<< -------------------- }
+
+
+procedure SeqLpdMtx { Lpd: Tlpd; var achad: Tachad } ;
+
+{********************************************************************************
+Function: Starting at Lplim in the lpd return as large a run as possible, never
+more than allowed by the interval in achad. If achad.rgch is nil then set rgch
+to the row data array.
+
+errors : Stream is not of type matrix.
+*********************************************************************************}
+label 100, 50;
+
+var
+  kludge: record
+             case integer of
+                1:(a: integer;
+                   b: integer);
+                2:(c: longint);
+           end;
+
+  lp: Tlp;
+  i, cch: TC;
+  AchadSrc: TAchad;
+  LpRow: integer;
+  ichoflp: TC;
+  found: boolean;
+
+
+begin
+(*$IFC fDebug *)
+if traceLCut then writeln('entering seqencelpd');
+(*$ENDC *)
+
+  Lpd^.rce := @lpd^.arce;
+  movergch(pointer(ord(lpd^.rce)),@arcestd, arcestd.cb);
+{ The only part of the arce that is not standard is the font }
+
+   found := false;
+   i := 0;
+   while (i <= ifntlst) and not(found) do
+     begin
+     if argfam[i] = lh^^.lcfont then
+       begin
+       lpd^.rce^.ifnt := i;
+       found := true;
+       end;
+     i := i + 1;
+     end;
+   if not found then lpd^.rce^.ifnt := 0;
+
+  with kludge do
+     begin
+     c := lpd^.lplim;
+     ichoflp := b;
+     LpRow := a;
+     end;
+(*$IFC fDebug *)
+  if tracelcut then
+     writeln('seq from char ',ichoflp,' in row ',lprow);
+(*$ENDC *)
+
+  cch := achad.ichlim - achad.ichFst;
+
+{ Get the text }
+  if not GetLCUTRow(LpRow) then begin
+    lpd^.arce.fvan := true;
+(*$IFC fDebug *)
+    if tracelcut then
+     writeln('no row found, terminating.');
+(*$ENDC *)
+    achadsrc.ichfst := achadsrc.ichlim;
+    cch := 0;
+    goto 50;
+  end;
+
+{ check for vanished run }
+  if ichoflp >= CharCount then
+    with kludge do
+       begin
+(*$IFC fDebug *)
+       if tracelcut then
+          writeln('returning vanished run');
+(*$ENDC *)
+       lpd^.arce.fvan := true;
+       a := LpRow + 1;
+       b := 0;
+       lpd^.lplim := c;
+       goto 100
+       end
+  else
+    lpd^.arce.fvan := false;
+
+{ Set the starting position to the old ending position }
+  lpd^.lp := lpd^.lplim;
+  achadsrc.ichfst := ichoflp;
+
+{ return the minimum of the rest of the row or the size of the achad array }
+  cch := LpMinP(CharCount - ichoflp, cch);
+  achadsrc.ichlim := achadsrc.ichfst + cch;
+
+{ Set the paragraph descriptor }
+  lpd^.rpe := @lpd^.arpe;
+  moveRgch(@lpd^.arpe, @arpeStd, arpeStd.cb);
+  with kludge do
+     begin
+     a := lprow;
+     b := 0;
+     lpd^.lpfstpar := c;
+     b := cch;
+     lpd^.lplimpar := c;
+     end;
+
+  { stuff the tab array }
+  for i := 0 to lh^^.numtabs - 1 do
+     lpd^.rpe^.argtbd[i] := lh^^.tabs[i];
+  {should this be -1}
+  lpd^.rpe^.itblim := lh^^.numtabs;
+
+  with lpd^.rpe^ do
+     begin
+        xLftFst := leftmarg;   { first left marg }
+        xLftBody := leftmarg;       { left body margin }
+        xRt      := rightMarg;      { right margin -- computed by writeLCUT }  {+}
+     end;
+
+50:
+  achadsrc.rgch := @lh^^.chars;
+
+{Set the return achad}
+if achad.rgch = nil then
+   achad := achadsrc
+else begin
+   achad.ichlim := achad.ichfst + cch;
+   moveachad(achad,achadsrc);
+end;
+
+with kludge do
+  begin
+  a := lprow;
+  b := achadsrc.ichlim;
+  lpd^.lplim := c;
+  end;
+(*$IFC fDebug *)
+if tracelcut then
+   begin
+   writeln('achad.ichfst is ',achad.ichfst,' ichlim is ',achad.ichlim);
+   writeln('a is ',kludge.a,' b is ',kludge.b,' c is ',kludge.c);
+   end;
+(*$ENDC *)
+100:
+(*$IFC fDebug *)
+if tracelcut then
+   writeln('leaving seqlpdfld');
+(*$ENDC *)
+end;
+
+
+
+{ -------------------- >>>>>>>>>>>>>>> + <<<<<<<<<<<<<<< -------------------- }
+
+
+
+procedure PxHcsMtx { index:  TB } ;
+   begin
+(*$IFC fDebug *)
+     if rghcs^[index]^^.tycs = tycsMtrx then
+        writeln ( 'Type is indeed tycsMtrx' )
+      else
+        writeln ( 'Oshigosh, type is NOT tycsMtrx' )
+(*$Endc *)
+   end;
+
+{ -------------------- >>>>>>>>>>>>>>> + <<<<<<<<<<<<<<< -------------------- }
+
+
+(*$IFC fDebug *)
+(*$S LCdebug *)
+procedure DeBugLCUT ;
+ { gets row number on Soroc, calls GetNextRow ; give row number 0 or 999 to exit
+    -- only does it job if TraceLCUT is TRUE }
+
+ const HellFreezesOver = false ;
+
+ var reply: str255;
+     rowRequested,
+     i, factor             : integer;
+
+ begin
+  if traceLCUT then repeat
+
+   write( 'Row Number <999 to quit> ? ');
+   readln(RowRequested);
+
+   if rowRequested = 999 then exit(DeBugLCUT);
+
+   with LH^^ do
+   if GetLCUTRow ( rowRequested ) then
+      begin
+         WriteLn('GetLCUTRow: row: ',rowRequested:3,' Nchars:',CharCount:3);
+         for i := 0 to CharCount-1  do begin
+            if chars[i] = ChTab then write ('<tab>')
+            else if chars[i] = ChReturn then write('<ret>')
+            else write(chr(chars[i]));
+         end {for} ;
+         writeln;
+         readln( reply ) ; { wait for CR before continuing }
+         for i := 0 to NumTabs -1 do with tabs[i] do begin
+           write('tab#',i,' x:',x,' Quad:',ord(quad));
+           readln ( reply )   { wait for reply }
+         end { printout of tabs }
+      end
+   else
+      begin
+         WriteLn('GetLCUTRow:  False; row:',rowRequested:3, 'ThisRow:',ThisRow:3)
+      end
+
+ until HellFreezesOver
+ end {DeBugLCUT}  ;
+(*$ENDC *)
+
+end.  { of ball-game }
+ÿ

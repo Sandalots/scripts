@@ -1,0 +1,347 @@
+{ Copyright 1983, 1984, Apple Computer Inc. }
+
+(*$S ProcStart *)
+
+  procedure List_Versions (* var info : vers_info *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to list the version numbers of the various    *)
+        (*   functional ares of the OS in a record to be output in   *)
+        (*   whatever form the caller prefers.                       *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   info : a list of the version numbers from the various   *)
+        (*          functional areas of the OS.                      *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.  But note that this routine is in the privileged  *)
+        (*   system interface.                                       *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      with info do
+        begin
+          PPrim_V :=  PPrim_Version;
+          PM_V := PM_Version;
+
+          GDV := GDVersion;
+          MMPrimV := MMPrimVersion;
+          MMV := MMVersion;
+          DSV := DSVersion;
+
+          ExprmV := ExprmVersion;
+          ExmgrV := ExmgrVersion;
+          ECV := ECVersion;
+          TimeV := TimeVersion;
+
+          VMV := VMVersion;
+          SFV := SFVersion;
+          PrimV := PrimVersion;
+          UIV := UIVersion;
+          InitV := InitVersion;
+          CUR_V := CUR_Version;
+
+          OSVers := osVers_num
+        end
+    end { List_Versions };
+
+
+(*$S ProcComm *)
+
+  procedure Set_DebugMode (* var errnum : int2;  on_off : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure to turn the debug process flag    *)
+        (*   in sysglobal on or off.  While it is turned on, all     *)
+        (*   processes created will have a break point set at the    *)
+        (*   1st instruction of their main entry points.             *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   on_off : the boolean indicating whether the debug       *)
+        (*            process flag in sysglobal should be set on or  *)
+        (*            off.                                           *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this system     *)
+        (*            call procedure.  No errors are returned.       *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This routine is intended to be called only from the     *)
+        (*   privileged interface of the OS.                         *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    begin
+      if lb_enabled then
+        debugProcess := on_off;
+      errnum := 0
+    end { Set_DebugMode };
+
+
+(*$S debugRes *)
+
+  procedure OSQ;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                  { ptr to a PCB }
+      rootPcb_ptr : ptr_PCB;              { ptr to Root process's PCB }
+      mmrbPtr : mmrb_ptr;                 { ptr to the MMRB }
+      shut_event : s_eventblk;            { 'shutdown' event }
+      interval : timestmp_interval;       { for Send_Event_Chn }
+      clktime : time_rec;                 { ditto }
+      error : int2;                       { ditto }
+
+    begin
+      { 'clean up' based on state of operating system processes }
+      mmrbPtr := pointer(mmrb_addr);
+      rootPcb_ptr := pointer(root_pcb_ptr);
+      with rootPcb_ptr^, mmrbPtr^ do
+        if (blk_state <> [pipe_io]) or (sems_owned > 0) or memmgr_busyF then
+          begin  { the worst case }
+            c_pcb_ptr := root_pcb_ptr;   { for Blk/UnBlk_req calls }
+            Intson (0);
+            FS_Emergency
+          end
+        else
+          begin  { try to have Root take system down }
+            shut_event[0] := -2;
+            with interval do
+              begin
+                sec := 0;
+                msec := 0
+              end;
+            Send_Event_Chn (error, rootReq_chan, @shut_event, interval, clktime);
+
+            { make all processes non-preemptive so only Root will run }
+            pcb_ptr := pointer(fwd_ReadyQ);
+            while pcb_ptr^.priority > 0 do
+              begin
+                if ord(pcb_ptr) <> mm_pcb_ptr then
+                  pcb_ptr^.np_count := 1;
+                pcb_ptr := pcb_ptr^.next_schedPtr
+              end;
+            pcb_ptr := pointer(fwd_BlockQ);
+            while pcb_ptr <> @fwd_BlockQ do
+              begin
+                if ord(pcb_ptr) <> mm_pcb_ptr then
+                  pcb_ptr^.np_count := 1;
+                pcb_ptr := pcb_ptr^.next_schedPtr
+              end;
+
+            nonPreempt := root_pcb_ptr;
+
+            c_pcb_ptr := ord(nil);   { so no state saving is done }
+            Enter_Scheduler
+          end
+    end { OSQ };
+
+
+(*$S ProcComm *)
+
+  procedure Root;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Procedure to implement the root system process.  This   *)
+        (*   process will currently perform only the function of     *)
+        (*   creating the user Shell process and re-creating it if   *)
+        (*   it terminates.  Later, it will gather statistics and    *)
+        (*   bury 'dead' processes.  Also at a later date, the       *)
+        (*   process functions may be combined in with it.           *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   This procedure is intended only to be executed by the   *)
+        (*   root process.   It makes assumptions about its place    *)
+        (*   the process hierarchy and the fact that it executes in  *)
+        (*   system mode.                                            *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      shellPriority = 200;                   { priority of shell process }
+
+    var
+      errnum : int2;                         { error return }
+      shell_id : longint;                    { process id of Shell }
+      shellpcb_ptr : ptr_PCB;                { ptr to Shell's PCB }
+      restartShell : boolean;                { true if Shell should be restarted }
+      logRequest : boolean;                  { true if a Log operation is needed }
+      shutdown_mode : sm_type;               { mode for system shutdown }
+      waitlist : t_waitlist;                 { waitlist for Wait_Event_Chn }
+      ec_refnum : int2;                      { refnum returned by Wait_EC }
+      event_ptr : p_r_eventblk;              { ptr to term event }
+      term_event : r_eventblk;               { terminate event block }
+      shell_name : pathname;                 { name of Shell program }
+      null_entry : namestring;               { null entry point name }
+      ec_name : pathname;                    { event channel name - null }
+      null_excep : t_ex_name;                { null exception name }
+
+
+    procedure CreateShell;
+      { procedure to create the application Shell process from the root
+        process.  The root process will create a process from the program
+        file SYSTEM.SHELL.  If that file can't be found, the user is placed
+        in FTP to get a program file for SYSTEM.SHELL from the UCSD/Monitor
+        world. }
+
+      var
+        res_entry : namestring;              { entry name for resident process }
+        bootInfo : ^ext_diskconfig;          { extended info block for boot disk }
+
+      begin
+        repeat
+          Make_Process (errnum, shell_id, shell_name, null_entry, rootReq_chan);
+          if (errnum = 133) or (errnum = 134) then
+            begin  { couldn't get stack or syslocal }
+              { try resident Shell if boot disk is floppy }
+              bootInfo := pointer(configinfo[bootdev]^.ext_addr);
+              if bootInfo^.removable then
+                begin
+                  res_entry := 'resident';
+                  Make_Process (errnum, shell_id, shell_name, res_entry,
+                                rootReq_chan)
+                end
+            end;
+
+          if errnum <> 0 then System_Error (10102)
+        until errnum = 0;
+
+        SetPriority_Process (errnum, shell_Id, shellPriority)
+      end { CreateShell };
+
+
+    begin  { Root }
+      INIT_CDS;    {initialize configurable drivers}
+      { set up event channel for communication with Shell & Logging facility }
+      ec_name := '';   null_excep := '';   event_ptr := @term_event;
+      Open_Event_Chn (errnum, ec_name, rootReq_chan, null_excep, true { recv });
+      if errnum > 0 then
+        begin
+          (*$IFC debug2 *)
+          writeln ('   *** error in Root after Open_Event_Chn = ', errnum:1);
+          readln;
+          (*$ENDC *)
+          System_Error (10104)
+        end;
+      with waitlist do
+        begin
+          length := 1;
+          refnum[0] := rootReq_chan
+        end;
+
+      Log_Init (rootReq_chan);
+      shell_name := 'SYSTEM.SHELL';   null_entry := '';
+      logRequest := false;   restartShell := true;
+
+      repeat
+        if restartShell then CreateShell;
+
+        if logRequest then Log_Handler;
+
+        { wait for next event to be handled }
+        logRequest := false;   restartShell := false;
+        Wait_Event_Chn (errnum, waitlist, ec_refnum, event_ptr);
+        if errnum <> 0 then
+          begin  { a problem getting the event }
+            (*$IFC debug2 *)
+            writeln ('   *** error in Root after Wait_Event_Chn = ', errnum:1);
+            readln;
+            (*$ENDC *)
+          end
+        else
+          { got the event ok }
+          with event_ptr^ do
+            begin
+              if event_text[0] = -1 then
+                logRequest := true
+              else if event_text[0] = -2 then
+                { emergency shutdown signalled from OSQuit }
+                FS_Shutdown (errnum, reset_machine)
+              else
+                restartShell := (event_text[1] > 0) and (event_text[1] < 4)
+            end { with }
+      until not restartShell and not logRequest;
+
+      { now take the system down }
+      if event_ptr^.event_text[1] = 4 then shutdown_mode := kill_power
+        else shutdown_mode := reset_machine;
+
+      if Logging then
+        begin
+          Log_NewCmd (errnum, log_shutdown);
+          Log_Handler
+        end;
+
+      Close_Event_Chn (errnum, rootReq_chan);
+      (*$IFC debug2 *)
+      if errnum <> 0 then
+        begin
+          writeln ('   *** error in Root after Close_Event_Chn = ', errnum:1);
+          readln
+        end;
+      (*$ENDC *)
+
+      SetPriority_Process (errnum, My_Id, 1);
+      repeat
+        Enter_Scheduler;
+        Find_PCB (errnum, true, shell_id, shellpcb_ptr)
+      until (errnum <> 0);
+      { Shell and all user processes are now gone }
+
+      { free any programs left loaded }
+      Load_Cleanup;
+
+      { take the machine down }
+      FS_ShutDown (errnum, shutdown_mode)   { should never return }
+    end { Root };
+
+ÿ

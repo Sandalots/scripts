@@ -1,0 +1,651 @@
+{ Copyright 1983,Apple Computer Inc. }
+{#f     libdb/vltree.text }
+{$R-}
+{$L-}
+{$U-}
+{$S access }
+{$SETC OSBuilt := TRUE }
+unit vltree ;
+       intrinsic;
+Interface
+
+Uses
+
+{$IFC OSBUILT }
+{$U libsm/unitstd.obj} unitstd,
+{$U libdb/dbenv.obj } dbenv,
+{$U libin/INTRLIBp.obj } international,
+{$U libdb/dbdecl1.obj } dbdecl1,
+{$U libos/syscall.obj } syscall,
+{$U libos/psyscall.obj } psyscall,
+{$U libdb/lowlevel.obj } lowlevel,
+{$U libdb/pooler.obj } pooler,
+{$U libdb/heap.obj } heap;
+{$ELSEC}
+{$U OBJ:dbenv.obj } dbenv,
+{$U INTRLIB.obj } international,
+{$U OBJ:dbdecl1.obj } dbdecl1,
+{$U OBJ:syscall.obj } syscall,
+{$U OBJ:lowlevel.obj } lowlevel,
+{$U OBJ:pooler.obj } pooler,
+{$U OBJ:heap.obj } heap;
+{$ENDC}
+
+Const
+
+
+        {   delete return states }
+
+        noflow          = 0;
+        treeempty       = 1;
+        rotate          = 2;
+        coallesce       = 3;
+        pageempty       = 4;
+
+        {   added insert return states }
+
+        isplit           = 5;
+
+{************************************************************************
+
+                                entrysize
+
+        compute a record or key size.  does this by adding the lengths
+        of the var. len. fields between firstfld and lastfld, using
+        the record descriptor pedesc.
+
+*************************************************************************}
+
+function entrysize(firstfld,
+                    lastfld,
+                    doitfld,
+                    isize  : integer;
+                    pedesc : ptrrecptr;
+                    prec : ptrdata) : integer;
+
+{**************************************************************************
+
+                             quickinsert
+
+        inserts pnewrec into page, if it can be done without splitting or
+        rotating.
+
+        returns true iff it fails to insert.
+
+        Note that a record for a nonleaf page consists of a page ptr
+        followed by a key record.
+
+        Input Parameters:
+                fileid - file to do insert on
+                pagetype - type of page: nonleaftype,leaftype or labeltype
+                pnewrec - pts to record to insert
+                size - size of record to be inserted
+                pfptr - for nonleaf pages: the page ptr that goes w/ pnewrec
+                buff1 - buffer containing page
+                index - where to insert record
+
+        Output Parameters:
+                function result - returns true iff a split or rotate needed
+                kresult - result of operation - only can fail if split is
+                    required and buffer can't be obtained
+                ipage - page where inserted record went
+                iindex - index of inserted record
+
+         Return Results:
+                noerr
+                inconsistent
+                ioerr
+                noroom
+
+***************************************************************************}
+
+function quickinsert(    fileid : integer;
+                         pagetype : integer;
+                         pnewrec : ptrdata;
+                         size : integer;
+                         pfptr : ptrfileptr;
+                         canmove : boolean;
+                         index,
+                         buff1 : integer;
+                     var ipage : fileptr;
+                     var iindex : integer) : boolean;
+
+{**************************************************************************
+
+                             quickDelete
+
+        Attempts to delete the record at qpage,qindex if it can do so without
+        causing underflow - returns true if it was able to do so.
+
+        Input Parameters
+                onfile - file for operation
+                qpage - page in which record is
+                qindex - index of record
+
+        Output Parameters
+                return result - true iff did delete
+
+                kresult - return result
+
+                Output Results
+
+                    noerr
+                    nobuffs
+                    ioerr
+                    noroom
+                    ioerr
+                    inconsistent
+
+
+
+***************************************************************************}
+
+function quickDelete(var kresult : integer;
+                         onfile : integer;
+                         qpage : fileptr;
+                         qindex : integer) : boolean;
+
+{**************************************************************************
+
+                             quickUpdate
+
+        Attempts to update the record at qpage,qindex if it can do so
+        without causing underflow, overflow or possible relocation of the
+        record - returns true if it was able to do so.
+
+        Input Parameters
+                onfile - file for operation
+                qpage - page in which record is
+                qindex - index of record
+                pnewrec - pts to new value
+                size - size of new value
+
+        Output Parameters
+                return result - true iff did update
+
+                kresult - return result
+
+                Output Results
+
+                    noerr
+                    nobuffs
+                    ioerr
+                    noroom
+                    ioerr
+                    inconsistent
+
+
+
+
+***************************************************************************}
+
+function quickUpdate(var kresult : integer;
+                         onfile : integer;
+                         pnewrec : ptrdata;
+                         size : integer;
+                         qpage : fileptr;
+                         qindex : integer) : boolean;
+
+{**************************************************************************
+
+                             splitORrotate
+
+        inserts pnewrec into page. first attempt to rotate to leftsib or
+        rightsib.  if necessary,splits page into two pages.
+        except for split, always releases buff1 and only only returns a buff2
+        (locked) if all went well.  split releases all buffers on error
+        else returns both buffers.
+
+        Conceptual record: imagine record were inserted at index.
+        Note that si is in terms of this conceptual record.
+
+        r[0] r[1] ... r[si]  r[si+1] .. r[nkeys] r[nkeys+1]
+                           ^
+                       splitpoint
+
+        Case 0:
+
+        <----r[index]----->
+
+
+        Case 1:
+
+                             <-----r[index]---->
+
+
+            special case 0: (0 & 1 are not mutually exclusive)
+
+                             r[index]
+
+            special case 1:
+
+                                         r[index]
+
+        Note that a record for a nonleaf page consists of a page ptr
+        followed by a key record.
+
+        Input Parameters:
+                fileid - file to do insert on
+                pagetype - type of page: nonleaftype,leaftype or labeltype
+                pnewrec - pts to record to insert
+                size - size of record to be inserted
+                pfptr - for nonleaf pages: the page ptr that goes w/ pnewrec
+                buff1 - buffer containing page
+                index - where to insert record
+                leftsib,
+                rightsib - sibling pages, = nilptr if that sibling doesn't exist
+
+        Output Parameters:
+                function result - returns
+                    noflow - nothing was done (error)
+                    split - page split occured
+                    rotate - insert rotate occured
+                kresult - result of operation - only can fail if split is
+                    required and buffer can't be obtained
+                buff2 - if split, the # of new page's buffer
+                ipage - page where inserted record went
+                iindex - index of inserted record
+                ps - if not nil, this is a pagestack record into which we
+                    stuff information for recovery on noroom error
+                sibpage - on rotate, this was the sibling page used
+
+         Return Results:
+                noerr
+                inconsistent
+                ioerr
+                noroom
+
+***************************************************************************}
+
+function splitORrotate(var kresult : integer;
+                           fileid : integer;
+                           pagetype : integer;
+                           pnewrec : ptrdata;
+                           size : integer;
+                           pfptr : ptrfileptr;
+                           canmove : boolean;
+                           index,
+                           buff1 : integer;
+                           leftsib,
+                           rightsib : fileptr;
+                       var buff2 : integer;
+                       var ipage : fileptr;
+                       var iindex : integer;
+                           ps : ptrstackrec;
+                       var sibpage : fileptr) : integer;
+
+{**************************************************************************
+
+                             firstleaf
+
+        creates the first page of a btree or label with pnewrec.
+        returns the page & index of inserted record.
+
+        Input Parameters:
+                size - size of record to be inserted
+                pnewrec - pts to record to insert
+                fileid - file to do insert on
+                pagetype - type of page: leaftype or labeltype
+
+        Output Parameters:
+                kresult - result of operation - only can fail if split is
+                    required and buffer can't be obtained
+                ipage - page on which insert occured
+                iindex - index of inserted record
+
+         Return Results:
+                noerr
+                inconsistent
+                ioerr
+                noroom
+
+***************************************************************************}
+
+procedure firstleaf(var kresult : integer;
+                        fileid : integer;
+                        pagetype : integer;
+                        pnewrec : ptrdata;
+                        size : integer;
+                    var ipage : fileptr;
+                    var iindex : integer);
+
+{****************************************************************************
+
+                                pagedelete
+
+        deletes a record from a page.  does record rotate or coallesce
+        with closest sibling, if necessary.  returns page & index immediately
+        after the deleted record, suitable for finding next record. returns
+        how delete was carried out : coallesce,rotate,nounderflow,tree became
+        empty,page (w/out siblings and not root) became empty.
+
+        Input Parameters
+                fileid - file for insert
+                pagetype - labeltype or leaftype
+                buffer - buffer containing record to delete
+                index - index of record to delete
+                closestsib - address of closest sibling page
+
+        Output Parameters
+                kresult - status of call
+                rightbuff- # of right page's buffer, only returned for
+                        successful rotate
+                leftbuff - # of left page's buffer, only returned for
+                        successful coallesce
+                dpage - page on which search for next record after deleted
+                        record can begin, nilptr if couldn't give page.  only
+                        returns nilptr if returns pageempty or treeempty
+                dindex - index at which above search can begin
+
+        Return Results
+                noerr
+                inconsistent
+                ioerr
+
+        Function Results
+                rotate
+                coallesce
+                nounderflow
+                treeempty
+                pageempty
+
+****************************************************************************}
+
+function pagedelete(var kresult : integer;
+                        fileid : integer;
+                        pagetype : integer;
+                        buffer,
+                        index : integer;
+                        closestsib : fileptr;
+                    var rbuff : integer;
+                    var dpage : fileptr;
+                    var dindex : integer) : integer;
+
+{****************************************************************************
+
+                                findduplicate
+
+        given a starting point finds the lowest record that matches
+        pkey.  first we probe the starting point record (if it exists)
+        to tell us whether to look right or left.  if pkey falls to
+        the left of or falls on the starting point record then we
+        look to the left until we find the first record that compares
+        greater than pkey (or we find the first record period).
+        if pkey falls to the right of the starting point record then
+        we search to the right.  duplimpossible is a flag for optimizing
+        the search.  if duplimpossible and we are searching to the left
+        then we needn't continue if we find a matching record.
+
+        Input Parameters
+                fileid - file for search
+                pedesc - descriptor for records in pages
+                psdesc - descriptor for search key
+                nsearch - # of fields to do compare on
+                is_insert - true iff it is a find for insert - this
+                    means we never cross over to another page unless pkey
+                    belongs in the interior of that page.
+                duplimpossible - true iff duplicates are not possible
+                pkey - pts to search key
+                buffer - # of buffer to start search in
+                index - index of record to start search on
+
+        Output Parameters
+                kresult - return result
+                buffer - # of buffer at which search stopped
+                index - index at which search stopped
+                stackinvalid - indicates whether the search went left,
+                        right or stayed ok
+
+        Return Results
+                noerr
+                notfound
+                ioerr
+                inconsistent
+
+
+****************************************************************************}
+
+procedure findduplicate(var kresult : integer;
+                            fileid : integer;
+                            pedesc,
+                            psdesc : ptrrecptr;
+                            nsearch : integer;
+                            is_insert,
+                            duplimpossible : boolean;
+                            pkey : ptrdata;
+                        var buffer,
+                            index : integer;
+                        var stackinvalid : integer);
+
+{**************************************************************************
+
+                                nextprior
+
+        depending on the value of which, finds the next or prior record.
+        starts searching at record (buffer,index).  returns the # of
+        the buffer holding that record and the index of that record.
+
+        constraints on the initial value of index:
+
+        which                           constraint on index
+
+        next                            index >= 0
+        prior                           index <= pleaf^.nkeys
+
+        Input Parameters
+                fileid - file for search
+                buffer - # of buffer to start search in
+                index - index to start search on
+                which - next or prior
+
+        Output Parameters
+                kresult - return result
+                buffer - # of buffer in which search stopped
+                index - index where search stopped
+
+        Return Results
+                noerr
+                eos
+                ioerr
+                inconsistent
+
+**************************************************************************}
+
+procedure nextprior(var kresult : integer;
+                        fileid : integer;
+                    var buffer,
+                        index : integer;
+                        which : integer);
+
+{****************************************************************************
+
+                              find
+
+        searches the btree in three fashions:
+
+            which               fashion
+             first        finds first key in btree
+             last         finds last key in btree
+             approx,exact finds an initial search point for the key in
+                          pkey.  if duplicates are not allowed, and
+                          mode was not approx. this point is exact.  the
+                          standard btree search is used
+
+
+        Input Parameters
+            which - type of find desired
+            nsearch - for approx, # of fields that participate
+            fileid - descriptor for keyfile
+            psdesc - descriptor for key
+            pkey - ptr to desired entry to find
+
+        Output Parameters
+            kresult - result of findkeyed
+            buffer - returns buffer # which has page with the entry or where entry
+                 should be if not found
+            pstack is filled in
+
+        Return Results
+            noerr
+            notfound
+            ioerr
+            inconsistent
+
+
+****************************************************************************}
+
+procedure find(var kresult : integer;
+                   which : integer;
+                   nsearch : integer;
+                   fileid : integer;
+                   psdesc : ptrrecptr;
+                   pkey : ptrdata;
+               var buffer : integer);
+
+{**************************************************************************
+
+     findkeyed : depending on value of which, finds
+
+          which                      action
+            first     first key in btree
+            last      last key in btree
+            approx    first entry that approx. matches the key
+            exact     entry which matches key exactly
+            next      next entry after entry index of buffer
+            prior     entry prior to entry index of buffer
+
+
+       Input Parameters
+           which - type of find desired
+           nsearch - for approx, # of fields that participate
+           fileid - descriptor for keyfile
+           psdesc - descriptor for key
+           pkey - ptr to desired entry to find
+
+       Output Parameters
+           kresult - result of findkeyed
+           buffer - returns buffer # which has page with the entry or where
+                entry should be if not found
+           buffindex - index in buffer of entry or where entry should be if
+                not found
+
+       Return Results
+
+            noerr
+            notfound
+            ioerr
+            inconsistent
+
+******************************************************************************}
+
+procedure findkeyed(var kresult : integer;
+                        which : integer;
+                        nsearch : integer;
+                        fileid  : integer;
+                        psdesc : ptrrecptr;
+                        pkey     : ptrdata;
+                    var buffer,
+                        buffindex  : integer);
+
+
+{***************************************************************************
+
+     insertkeyed : inserts entry into keyed file
+
+
+     Input Parameters
+          fileid - as per findkeyed
+          psdesc - descriptor for pkey
+          pkey - ptr to entry record (only used for data files)
+          size - size of pkey
+
+     Output Parameters
+          kresult - as per findkeyed
+          ipage - page where record was inserted
+          iindex - index where record was inserted
+
+     Return Results
+       noerr
+       duplkey
+       ioerr
+       noroom
+       inconsistent
+       rectoobig
+
+**************************************************************************}
+
+
+procedure insertkeyed(var kresult : integer;
+                          fileid  : integer;
+                          pkey : ptrdata;
+                          size : integer;
+                      var ipage : fileptr;
+                      var iindex : integer);
+
+
+{***************************************************************************
+
+     deletekeyed : deletes entry from keyed file
+
+
+      Input Parameters
+        fileid,
+        pkey
+        psdesc  - as for insertkeyed
+
+      Output Parameters
+        kresult - return result
+        dpage - page where record after deleted record is
+        dindex - index of record after deleted record
+
+     Return Results
+       noerr
+       notfound
+       noroom
+       ioerr
+       inconsistent
+
+**************************************************************************}
+
+procedure deletekeyed(var kresult : integer;
+                          fileid : integer;
+                          pkey    : ptrdata;
+                      var dpage : fileptr;
+                      var dindex : integer);
+
+
+Implementation
+
+Const
+        { btree consts }
+
+        right = 0;            { stackinvalid codes }
+        left = 1;
+        ok = 2;
+
+{$IFC DOLLARD }
+{$D- }
+{$ENDC}
+
+{$IFC OSBuilt }
+{$I libdb/vlsup0.text }
+{$I libdb/vlsup1.text }
+{$I libdb/vlsup2.text }
+{$I libdb/vltree1.text }
+{$I libdb/vlrecover.text }
+{$I libdb/vlinsert.text }
+{$I libdb/vltree2.text }
+{$ELSEC }
+{$I l:vlsup0.text }
+{$I l:vlsup1.text }
+{$I l:vlsup2.text }
+{$I l:vltree1.text }
+{$I l:vlrecover.text }
+{$I l:vlinsert.text }
+{$I l:vltree2.text }
+{$ENDC }
+end.
+
+
+
+ÿ

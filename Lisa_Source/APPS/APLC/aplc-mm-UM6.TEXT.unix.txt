@@ -1,0 +1,1317 @@
+
+                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+
+(***************************************.*******.************************************
+   CloseMatrix - writes the matrix into file named by `fileName`.  The style which the
+                 matrix is being closed is passed through `closeInfo`.  Any status
+                 information will be returned through `status`.  The format of the
+                 file is as follows:
+
+      In General, the file structure is:
+         { 156 bytes - header information}
+         { n bytes of matrix manager data}
+           { table editor's band buffers}
+           { matrix manager data vectors}
+           { application specific information}
+
+      The 156 bytes of block header has the following format:
+           2 bytes      - LisaCalc/Business Graphics Password
+           2 bytes      - File version number
+          12 bytes      - Future extensions to version control
+          16 bytes      - Printer preference
+          96 bytes      - Future extensions to printer preference
+           4 bytes      - Size of heap when worksheet was saved
+           1 byte       - Type of application: LC or BG
+           1 byte       - record padding
+           2 bytes      - number of columns present in the model
+          20 bytes      - formatting information for cells
+
+      Starting at byte 157, the n bytes of matrix manager data has the format:
+             2 bytes    - # of columns present in the model with data
+             2 bytes    - last row in the model
+             2 bytes    - last column in the model
+          1024 bytes    - row heights and column widths for the 255 x 255 matrix
+          -----------
+          2 bytes       - row id number
+          2 bytes       - column id number
+                          if rowId = mInfSnip and colId = pInfSnip then a special
+                          condition is signalled which allows additional non-matrix data
+                          to be added to the file.  This data is any additional future enhancement
+                          information.  If a file is created that has this information and then
+                          brought to an earlier release, that information will be skipped over in
+                          the earlier release.  The format for this additional information is:
+
+                                2 bytes - type of data
+                                2 bytes - # of bytes for the data types information, if any
+                                n bytes - information for data type, if any
+
+          2 bytes       - attributes for the cell at (rowId, colId)
+          2 bytes       - type of data  10 = shared formula
+                                        11 = non-shared formula
+                                        12 = shared cell
+                                        13 = non-shared cell
+                                        14 = blank cell with attributes information
+
+          2 bytes       - # of bytes for the data types information, if any
+          n bytes       - information for data type, if any
+
+                          If the cell has a formula associated with it then the instance of the
+                          tcell will occur before its formula; given shared or non-shared cell.
+                          The cell will be followed by another "type of data" &
+                          "# of bytes" word to described the type of the formula (shared
+                          or non-shared) and the information for the formula.
+          -----------
+                          the information between the two dashed lines is repeated
+                          for as many items that are in the matrix.  A pInfSnip word
+                          will be written to signal the end of matrix manager data.
+
+          The table editor is responsible for packaging its band buffers and suppling
+          them to the matrix manager.  A band buffer will an id of nullSnip will be
+          written to signal the end of the band buffers.
+
+          The matrix manager data vectors which get written out are:
+              vecAttrs      - the attributes set for row & columns
+              vecBreaks     - the location of row & column page breaks
+              vecAttrTime   - a time stamp for when row & column attributes were set
+              vecTimer      - index into vecAttrTime
+              modeData      - state information
+              StrToFind     = string to use in the find dialog
+
+          Any application specific information is packaged by the application through
+          a call to "FxDataStuff".  The application is responsible for the format and
+          versioning of this information.
+
+     The status that can be returned is:
+        ok        - the file was written correctly
+        OpenErr   - the file under the name given could not be opened
+        MakeErr   - the directory entry for the file could not be made
+        FileErr   - an error occured while writing the data to the file
+        DSpaceErr - no disk space for the file
+        SizeErr   - data segment could not be sized downward
+        reSizeErr - data segment could not be re-sized upwarded
+****************************************.*******.***********************************)
+(*$S OpenClose *)
+procedure CloseMatrix
+  (* fileName    : PtrStrType;          {file where data is to be written}
+     closeinfo   : FIOKind;             {Type of file to open}
+     DTC         : longint;             {date/time created of previous file - if it existed}
+     checkAbort  : boolean;             {should user aborts be checked}
+     var status  : integer              {error status number}
+  *);
+label 1;
+const cacheSize  = 2250;
+type
+    cacheInfo   = packed record
+                     row, col : TidRng;
+                     oh       : integer
+                  end;
+
+var aTmBand     : tmBand;               {band to be saved}
+    rowId       : idType;               {location of cell to be saved}
+    colId       : idType;
+    tempRg      : range;                {temporary range}
+    dataShared  : boolean;
+    shoFormula  : boolean;
+    shoPreview  : boolean;
+    AttrDiff    : boolean;
+    cacheCnt    : integer;
+    cacheIndex  : integer;
+    constant    : integer;
+    errNum      : integer;              {OS error status}
+    dataLen     : integer;              {length of data to be saved}
+    dataOh      : integer;              {heap offset to data to be saved}
+    NewDiskSize : longint;              {temporary disk size for Size_DataSeg}
+    NewFileSize : longint;
+    ActFileSize : longint;
+    initSegSize : longint;
+    refInfo     : FS_info;              {file state information}
+    hContents   : THContents;           {handle to cell data to be saved}
+    forminfo    : THFmla;               {handle to formula data to be saved}
+    pCel        : TPCel;                {direct pointer to cell information}
+    ModeData    : ModeInfo;             {packed up mode information to be saved}
+    h           : fileHeader;           {packed up header information to be saved}
+    tStart      : longint;
+    pCelBlank,
+    attr,
+    pCelAttr    : record                {Kludge record for comparing attributes of cells}
+                     case alias of
+                        twdlDee : (a : Tattr);
+                        twdlDye : (i : integer)
+                     end;
+    cache       : packed array [0..cacheSize] of cacheInfo;
+
+
+(*$IFC DEBUGVERSION *)
+
+    (*$S debug2 *)
+    procedure dumpinfo(infonum : integer);
+    var forminfo : THFmla;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       write('writing: ',rowId:1,',',colid:1,'  attrs: ',wAttr(pCel^.attributes),':',pCelAttr.i = pCelBlank.i,
+             ' ', attrDiff,'  oh: ',pCel^.oh:1);
+       if infonum = 1 then
+          if hcontents <> nil then
+             with hContents^^ do
+                if vinfo.data.cellSeen then write('  cell seen')
+                else begin
+                        writeln;
+                        write('  cell saving: ',CbDataOfH(mxHz, @hContents^):1,' bytes')
+                     end;
+       if pCel^.attributes.pkHasRule then begin
+          forminfo := pointer(MakeHnd(hcontents^^.rule.ohfmla));
+          case forminfo^^.shared of
+             fAseen   : writeln('  faseen: ');
+             FSeen    : writeln('  fseen: ');
+             otherwise  writeln('  formula saving: ',CbDataOfH(mxHz, @forminfo^):1,' bytes')
+          end
+       end
+       else writeln
+    end;
+(*$ENDC *)
+
+
+    (*
+       loop - loops through the matrix doing certain operations depending upon PASSNUM.
+              The loop starts at the matrix coordinates passed through ROWSTART, COLSTART.
+              PASSNUM describes what is to be done during this loop through the matrix:
+                 1 : look for the first occurance of a cell than has the same heap
+                     offset as the one contained in DATAOH
+                 3 : look for the first occurance of a formula that has the same
+                     handle as FORMINFO
+                 4 : reset the cellSeen bits and formula shared information for all
+                     the cells that have been changed.  This must be done to leave the
+                     model in a usable state after a save and continue or a user abort
+                     or error while writing file.
+
+       NOTE: this routine does nothing if status <> 0 except if the passNum = 4 for resetting
+             the cellSeen bits and formula shared information.
+    *)
+    (*$S OpenClose *)
+    procedure loop(passNum, rowStart, colStart : integer);
+    var row, col   : idType;
+        tempCel    : TPCel;
+        nforminfo  : THFmla;
+        nhContents : THContents;
+        found      : boolean;
+        x          : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if (passNum = 4) or (status = 0) then begin
+          found   := false;
+
+          if passNum <> 4 then
+             for x := 0 to cacheCnt do
+                if cache[x].oh = dataOh then begin
+(*$IFC DEBUGVERSION *)
+                   if debug[17] then
+                      writeln('pass: ',passNum:1, '  found in cache(',x:1,'): ',cache[x].row:1,',',cache[x].col:1
+                              ,'  ',rowId:1,',',colId:1);
+(*$ENDC *)
+                   constant := cache[x].row;
+                   FBufStuff(fWord, @constant, dataLen, status);
+                   constant := cache[x].col;
+                   FBufStuff(fWord, @constant, dataLen, status);
+                   exit(loop)
+                end;
+          for row := rowStart to CT^.lastsnip[rowKInd] do if vecSnip[rowkind, row] <> absent then
+             for col := colStart to CT^.lastsnip[colKind] do if vecSnip[colKind, col] <> absent then begin
+                tempCel := FindPcel(row, col, false);
+                case passNum of
+                   1 : if tempCel^.oh = dataOh then found := true;
+                   3,
+                   4 : begin
+                          nhContents := GetHContents(tempCel);
+                          if nHcontents <> nil then nHcontents^^.vinfo.data.cellSeen := true;
+                          if tempCel^.attributes.pkHasRule then begin
+                             nhContents := GetHContents(tempCel);
+                             nforminfo  := pointer(MakeHnd(nhcontents^^.rule.ohfmla));
+                             with nforminfo^^ do
+                                if shared in [fASeen, fSeen] then
+                                   if (nforminfo = forminfo) and (passNum = 3) then found := true
+                                   else if passNum = 4 then
+                                           case shared of
+                                              fASeen : shared := fAbsolute;
+                                              fSeen  : shared := fShared
+                                           end
+                          end
+                       end
+                end;
+                if found then begin
+                   FBufStuff(fWord, @row, dataLen, status);
+                   FBufStuff(fWord, @col, dataLen, status);
+                   cacheIndex := (cacheIndex + 1) mod (cacheSize + 1);
+                   cache[cacheIndex].row := row;
+                   cache[cacheIndex].col := col;
+                   cache[cacheIndex].oh  := dataOh;
+(*$IFC DEBUGVERSION *)
+                   if traceMMgr then begin
+                      case passNum of
+                         1 : write('Cell Seen: ');
+                         3 : write('Formula Seen: ')
+                      end;
+                      writeln(row:1,',',col:1)
+                   end;
+(*$ENDC *)
+                   exit(loop)
+                end
+             end
+       end
+    end;
+
+
+(*$S OpenClose *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   DebugMess(5);
+   if debug[17] then
+      writeln('CloseMatrix:MxHz ok: ',FCheckHzOK(mxHz, errNum),'  # blocks: ',errNum:1,'/',numHandles:1
+              ,'  cStoredCOls: ',cStoredCols:1);
+(*$ENDC *)
+   tstart     := time;
+   UsingScrap := false;
+
+(*$IFC DEBUGVERSION *)
+   if debug[17] then begin
+      write('Before claimUndoBuffer:');
+      recalc(-1, -1, errNum, true);
+      writeln('.....')
+   end;
+(*$ENDC *)
+
+   claimUndoBuffer(true);               {remove any undo information}
+
+(*$IFC DEBUGVERSION *)
+   if debug[17] then begin
+      write('After claimUndoBuffer:');
+      if debug[17] then recalc(-1, -1, errNum, true);
+      writeln('.....')
+   end;
+(*$ENDC *)
+
+   shoFormula := tblPars.shoFormulas;
+   shoPreview := printState.preview;
+
+   Size_DataSeg(errNum, mmRefNum, 0, mmMemSize, -mmDiskSize, NewDiskSize);
+   if errNum <> 0 then begin
+      status := SizeErr;
+      goto 1
+   end;
+
+   cacheIndex := -1;
+   cacheCnt   := -1;
+   matState   := mmClose;              {signal that the matrix is closed}
+   if tableState <> tValues then mmSetWids(tValues);
+
+   if filename^ <> '' then begin
+      if doingMove then ClrFormErrors;
+      SetRgBits(tempRg, BCellSeen, false, 8);           {clear cellseen bits}
+      FBufInit(mmWrite, oDisk, @filename^, true, status);
+
+      NewFileSize := (mmMemSize - mxhz^.cbfree - scrapSize) div 512 + 1;
+      if app.BusGraph then initSegSize := BGhzLim
+      else initSegSize := LCHzLim;
+
+      with h do begin                                   {package file header information}
+         password       := LCpassWord + ord(appType);
+         version.stamp  := fileversion;
+         printer.config := curConfig;
+         segSize        := (1 + (mmMemSize - mxhz^.cbfree - scrapSize) div initSegSize) * initSegSize;
+         app            := appType;
+         nHandles       := numHandles + 20
+      end;
+
+      if status <> ok then goto 1;
+
+      {allocate the contiguous space needed for the file}
+      while (NewFileSize > 0) and (errNum <= 0) do begin
+         Allocate(errNum, FileRefNum, true, NewFileSize, ActFileSize);
+         if ActFileSize = 0 then begin
+            status := DSpaceErr;
+            goto 1
+         end
+         else NewFileSize := NewFileSize - ActFileSize
+      end;
+      if errNum <> 0 then begin
+         status := DSpaceErr;
+         goto 1
+      end;
+
+      dataLen := sizeOf(h);
+      FBufStuff(fRawData, @h, dataLen, status);
+      FBufStuff(fWord, @cStoredCols, dataLen, status);
+
+(*$IFC not RELone *)
+      dataLen := sizeOf(dataFormat);
+      FBufStuff(fRawData, @dataFormat, dataLen, status);
+(*$ENDC *)
+
+      with CT^ do begin
+         FBufStuff(fWord, @lastSnip[rowKind], dataLen, status);               {save the size of the matrix and row/col widths}
+         FBufStuff(fWord, @lastSnip[colKind], dataLen, status);
+         dataLen := sizeof(vecWid);
+         FBufStuff(fRawData, @vecWid, dataLen, status);
+         pCelBlank.a := attrBlank;
+         if status <> ok then goto 1;                   {trap out early if an error has occurred already}
+
+         {loop through the matrix and write out data for cells the either have attributes
+          different from a blank cell or have some cell information
+         }
+         for rowId := 1 to lastSnip[rowKind] do if vecSnip[rowKind, rowId] <> absent then begin
+(*$IFC DEBUGVERSION *)
+            if traceMMgr then writeln('Row: ',rowId:1,'  celBlank: ',wattr(attrblank));
+(*$ENDC *)
+            if checkAbort then
+               if abort then begin
+                  status := userStopped;             {if the user aborts, clear all cell seen info}
+                  loop(4, 1, 1);                     {and stop writing to the file}
+                  goto 1
+               end;
+
+            for colId := 1 to lastSnip[colKind] do if vecSnip[colKind, colId] <> absent then begin
+               pCel      := FindPcel(rowId, colId, false);
+
+               {Check the attributes of the cell.  Set attrDiff to true if the attributes are not
+                blank are are not contained in the row/col attribute information.  Use kludge record
+                to compare attributes as integers.
+               }
+               attrDiff   := false;
+               pCelAttr.a := pCel^.attributes;
+               if (pCel^.oh = 0) and (pCelAttr.i <> pCelBlank.i) then begin
+                  if vecAttrTime[colKind, colId] >= vecAttrTime[rowKind, rowId] then
+                     attr.a := vecAttrs[colKind, colId]
+                  else attr.a := vecAttrs[rowKind, rowId];
+                  attrDiff := (pCelAttr.i <> attr.i)
+               end;
+
+               if attrDiff or (pCel^.oh <> 0) then begin
+
+                  dataOh    := pCel^.oh;
+                  hContents := GetHContents(pCel);
+                  FBufStuff(fWord, @rowId, dataLen, status);                  {save coordinates of cell and attributes}
+                  FBufStuff(fWord, @colId, dataLen, status);
+                  FBufStuff(fWord, @pCelAttr.i, dataLen, status);
+(*$IFC DEBUGVERSION *)
+                  if traceMMgr then dumpinfo(1);
+(*$ENDC *)
+                  {if the cell is not blank, write out the cell data and possible formula data}
+                  if hContents <> nil then begin
+                     {if the cell has alreay been seen, enter a shared datatype into the file and
+                      find the cell that wrote out the cell info originally by looking for the first
+                      cell that has its cellseen bit on and points to the same cell as the
+                      current cell.  Once the cell is found, write out the location of that cell.
+                     }
+                     with hContents^^.vinfo.data do
+                        if cellseen then begin
+                           constant := 12;
+                           FBufStuff(fWord, @constant, dataLen, status);
+                           loop(1, 1, 1)
+                        end
+                        else begin
+                                constant := 13;
+                                FBufStuff(fWord, @constant, dataLen, status);
+
+                                {if this cell is shared, go and set all the cellSeen bits for those
+                                 cells it is shared with.
+                                }
+                                cellSeen := true;
+                                dataLen  := CbDataOfH(mxHz, @hContents^);
+                                FBufStuff(fSymbol, @hContents^^, dataLen, status);
+                                if refCnt > 1 then begin
+                                   cacheIndex := (cacheIndex + 1) mod (cacheSize + 1);
+                                   if cacheCnt < cacheSize then cacheCnt := cacheCnt + 1;
+                                   with cache[cacheIndex] do begin
+                                      row := rowId;
+                                      col := colId;
+                                      oh  := dataOh
+                                   end
+                                end
+                             end;
+                     if pCelAttr.a.pkHasRule then begin
+                        dataOh   := hcontents^^.rule.ohfmla;
+                        forminfo := pointer(MakeHnd(dataOh));
+                        with forminfo^^ do
+                           {if the formula has alreay been seen, enter a shared datatype into
+                            the file and find the formula that wrote out the formula info by
+                            looking for the first formula that has its shared bit changed and
+                            points to the same formula as the current formula.  Once the formula
+                            found, write out the location of that formula.
+                           }
+                           if shared in [fASeen, fSeen] then begin
+                              constant := 10;
+                              FBufStuff(fWord, @constant, dataLen, status);
+                              loop(3, 1, 1)
+                           end
+                           else begin
+                                   constant := 11;
+                                   FBufStuff(fWord, @constant, dataLen, status);
+                                   dataLen := CbDataOfH(mxHz, @forminfo^);
+                                   FBufStuff(fSymbol, @forminfo^^, dataLen, status);
+                                   {if the formula is shared, changed its sharing information to
+                                    reflect that the forumla has been seen.
+                                   }
+                                   dataShared := true;
+                                   case shared of
+                                      fShared   : shared     := fSeen;
+                                      fAbsolute : shared     := fASeen;
+                                      otherwise   dataShared := false
+                                   end;
+                                   if dataShared then begin
+                                      cacheIndex := (cacheIndex + 1) mod (cacheSize + 1);
+                                      if cacheCnt < cacheSize then cacheCnt := cacheCnt + 1;
+                                      with cache[cacheIndex] do begin
+                                         row := rowId;
+                                         col := colId;
+                                         oh  := dataOh
+                                      end
+                                   end
+                                end
+                     end
+                  end
+                  else begin
+                          constant := 14;
+                          FBufStuff(fWord, @constant, dataLen, status);             {write out blank cell datatype}
+(*$IFC DEBUGVERSION *)
+                          if traceMMgr then dumpinfo(2)
+(*$ENDC *)
+                       end;
+                  if status <> ok then begin            {if a problem arises, clear all cell seen info}
+                     loop(4, 1, 1);                     {and stop writing to the file}
+                     goto 1
+                  end
+               end
+            end
+         end
+      end;
+      constant := pInfSnip;
+      FBufStuff(fWord, @constant, dataLen, status);                           {put in end of matrix data marker}
+      loop(4, 1, 1);                                    {clear all cell seen info}
+
+      tmSaveBands;                                      {save table editor band buffers}
+      repeat
+         tmSaveNextBand(aTmBand);
+         FBufStuff(fTmBand, @aTmBand, dataLen, status)
+      until aTmBand.tmbLoId = nullsnip;
+
+      GetModeInfo(ModeData);
+      ModeData.formulaMode := shoFormula;
+
+      dataLen := sizeof(vecAttrs);                      {save matrix manager vectors}
+      FBufStuff(fRawData, @vecAttrs, dataLen, status);
+      dataLen := sizeof(vecBreaks);
+      FBufStuff(fRawData, @vecBreaks, dataLen, status);
+      dataLen := sizeof(vecAttrTime);
+      FBufStuff(fRawData, @vecAttrTime, dataLen, status);
+      dataLen := sizeof(vecTimer);
+      FBufStuff(fRawData, @vecTimer, dataLen, status);
+      dataLen := sizeof(ModeData);
+      FBufStuff(fRawData, @ModeData, dataLen, status);
+      dataLen := sizeof(StrToFind);
+      FBufStuff(fRawData, @StrToFind, dataLen, status);
+
+(*$IFC RELone *)
+      dataLen := 190 {sizeof(PRinfo)};
+      FBufStuff(fNull, nil, dataLen, status);
+(*$ENDC *)
+
+      if status = ok then FxDataStuff(closeInfo, fileversion > susVerNum, status);
+   1: Truncate(errNum, FileRefNum);                     {shrink the file down to size}
+      Compact(errNum, FileRefNum);
+      if DTC <> -1 then begin
+         Info(errNum, FileRefNum, refInfo);             {pass along the date/time created}
+         if errNum = 0 then begin
+            refInfo.DTC := DTC;
+            Set_File_Info(errNum, FileRefNum, refInfo)
+         end
+      end;
+      FBufClose(status)                                 {and close it}
+   end;
+
+   {resize the dataseg back to its original size}
+   Size_DataSeg(errNum, mmRefNum, 0, mmMemSize, mmDiskSize, NewDiskSize);
+   if (status = 0) and (errNum <> 0) then status := reSizeErr;
+   if shoFormula then mmSetWids(tFormulas);
+   if shoPreview then mmSetWids(tPreview);
+   closeTime := time - tStart;
+(*$IFC DEBUGVERSION *)
+   ;writeln('closematrix time: ',closeTime);
+    StatusMess(status);
+   if errnum <> 0 then OsError('CloseMatrix','closing', errNum);
+(*$ENDC *)
+end;
+
+
+(***************************************.*******.************************************
+   InitMatMgr - initializes the matrix manager and parsing tables.  Initialization
+                is distributed through out the units.  This routine serves to call
+                the appropriate routines for the initialization.  None of the code
+                in the initialization segment is needed after initialization is
+                completed.
+
+                Status returned:
+                   PtrErr    - block linkage ptr is odd
+                   OpenErr   - could not open "LisaCalcTables"
+                   FileErr   - error while reading "LisaCalcTables"
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure InitMatMgr
+  (* var status  : integer;             {initialization status}
+     application : AppKind              {type of application}
+  *);
+var x : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   FPsaveCnt   := 0;
+   traceMMgr   := false;
+   debugMx     := false;
+(*$ENDC *)
+   appType             := application;
+   app.LisaCalc        := false;
+   app.BusGraph        := false;
+   case appType of
+      aLisaCalc : app.LisaCalc := true;
+      aBusGraph : app.BusGraph := true
+   end;
+   matState             := mmClose;
+   MatrixInfo           := @TableArray[0];
+   ScrapInfo            := @TableArray[1];
+   mmUndoInfo.ptr       := @TableArray[2];
+   CT                   := MatrixInfo;
+   PRdataPtr            := @PRdataArea;
+   oppKind[rowKind]     := colKind;
+   oppKind[colKind]     := rowKind;
+   theAlFmt.alGrp       := gMisc;
+   theAlFmt.alMisc      := fStandard;
+   attrBlank.pkFormat   := theAlFmt.alFormat;
+   attrBlank.pkCircle   := false;
+   attrBlank.pkInvalid  := false;
+   attrBlank.pkHasRule  := false;
+   attrBlank.pkInCopy   := false;
+   attrBlank.moneybit   := false;
+   attrBlank.pkAlign    := aStandard;
+   attrBlank.pkProt     := protNone;
+   celBlank.attributes  := attrBlank;
+   StrToFind            := '';
+   FindInForms          := false;
+   FindInVals           := true;
+   formulaChanged       := true;
+   circularFlag         := false;
+   diskErr              := false;
+   printSelection       := false;
+   numHandles           := 1;
+   calcTime             := 0;
+   numPasses            := 0;
+   celBlank.oh          := 0;
+   absent               := 0;
+   dopeSize             := 0;
+   FirstLogCell.start   := nullSnip;                      {set the first logical cell to nil}
+   useDopeInfo          := false;
+   THmaxSize            := maxint - 16;
+   THdataSize           := THmaxSize - sizeof(TH) - 15;
+
+(*$IFC DEBUGVERSION *)
+   if skipFlag then minSwapSpace := 0
+   else minSwapSpace := ord4(175000) + ord4(35000) * ord(app.BusGraph);
+(*$ELSEC *)
+   minSwapSpace         := ord4(175000) + ord4(35000) * ord(app.BusGraph);
+(*$ENDC *)
+   circleRg.rKind       := aNullRg;
+   FixRange(circleRg);
+
+   initTable(TblPars);                          {Set up the table information}
+   with CT^ do begin
+      Tablefont.fam      := p10tile;
+      Tablefont.seteface := [];
+      Tablefont.dev      := devScreen;
+      SetCharInfo(Tablefont)
+   end;
+
+   printState.preview      := false;
+   printState.pGrids       := false;
+   printState.pPageHeader  := true;
+   printState.pColHeadings := false;
+
+   initparser(status)
+
+
+(*$IFC DEBUGVERSION *)
+   ;if odd(THdataSize) then status := PtrErr;
+   for x := 0 to 45 do begin
+      debug[x] := false;
+      if (x > 0) and (x <= 10) then timeclear(x)
+   end
+(*$ENDC *)
+end;
+
+
+(***************************************.*******.************************************
+   OpenMatrix - Reads the matrix from file FILENAME if the name isn't null; if it
+                is null, then the matrix is simply cleared.  Information about the
+                table is passed back in the TABLEINFO record parameter.  LOADFILE,
+                when true, signals that the entire file is to be loaded.  When
+                false, it signals that only the data should be loaded from the
+                file and the application specific data should not be changed.
+
+                The status that can be returned is:
+                   ok         - the file was read correctly
+                   OpenErr    - the file under the name given could not be opened
+                   FileErr    - an error occured while reading the data to the file
+                   NewerFile  - a file was opened which is a more recent file than
+                                the current software can handle
+                   BadFile    - a file was opened which is not a LisaCalc file
+                   DSpaceErr  - no disk space for the data segment
+                   OutOfMem   - the file could not be loaded because of memory problems
+                   OldFileErr - and old file was converted and read in
+****************************************.*******.***********************************)
+(*$S OpenClose *)
+procedure OpenMatrix
+  (* fileName      : PtrStrType;        {file to retrieve data from}
+     loadFile      : boolean;           {load File data: y/n}
+     checkAbort    : boolean;           {should user aborts be checked}
+     openInfo      : FIOKind;           {Type of file to open}
+     var tableInfo : tableRecord;       {table information about data}
+     var status    : integer            {error status number}
+  *);
+label 1,2;
+var colId        : idType;
+    rowId        : idType;
+    dataLen      : integer;
+    dataType     : integer;
+    maxrow       : integer;
+    maxcol       : integer;
+    numBytes     : integer;
+    errNum       : integer;
+    x            : integer;
+    bandCnt      : integer;
+    skipForm     : boolean;
+    formatsMatch : boolean;
+    done         : boolean;
+    aTmBand      : tmBand;
+    sizeKind     : FBufKind;
+    pCel         : TPCel;
+    tempPCel     : TPCel;
+    cell         : THContents;
+    hContents    : THContents;
+    pData        : ptrData;
+    pCelAttr     : wordptr;
+    VT           : variantType;
+    rg           : range;
+    snip         : snipKind;
+    ModeData     : ModeInfo;
+    defPrRec     : TPrRec;
+    h            : fileHeader;
+    tstart       : longint;
+    info_rec     : dsInfoRec;                 {segment info for data segment}
+    oldHeader    : packed record
+                      passWord : integer;
+                      version  : FileStamp;
+                      printer  : array [0..111] of byte;
+                      segSize  : longint;
+                      app      : appKind
+                   end;
+    Modes        : record
+                      case alias of
+                         twdlDee : (m1 : packed record
+                                            calcMode    : boolean;
+                                            circleMode  : boolean;
+                                            formulaMode : boolean
+                                         end
+                                    );
+                          twdlDye : (m2 : record
+                                             calcMode    : boolean;
+                                             circleMode  : CircleType;
+                                             Tfid        : TLfntId;
+                                             application : appKind
+                                          end
+                                    );
+                          twdlDoe : (m3 : record
+                                             calcMode    : boolean;
+                                             circleMode  : CircleType;
+                                             formulaMode : boolean;
+                                             Tfid        : TLfntId;
+                                             application : appKind
+                                          end
+                                    )
+                    end;
+
+    (*$S OpenClose *)
+    procedure ConvertFormats(var attr : Tattr);
+    var variant : variantType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       theALFmt.alFormat := attr.pkFormat;
+       if theALFmt.alGrp = gMoney then begin
+          variant.unByte   := theALFmt.alMoney;
+          variant.unMoney  := variant.unMoney - [mDollar];
+          theALFmt.alMoney := variant.unByte;
+          attr.pkFormat    := theALFmt.alFormat
+       end
+    end;
+
+
+    (*$S OpenClose *)
+    procedure SetModes;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       with ModeData do begin
+          CT^.TableFont := Tfid;
+          recalcflag    := calcMode and app.LisaCalc;
+          circleState   := circleMode;
+          curConfig     := h.printer.config;
+          FindInVals    := fInVals;
+          FindInForms   := fInForms;
+          printState    := pState;
+          if not FPrPrfValid(curConfig) then PrPrfDefault(curConfig);
+          if (openInfo = mmUnSuspend) and formulaMode then TableInfo.shoFormulas := true
+       end
+    end;
+
+
+(*$IFC DEBUGVERSION *)
+    (*$S debug2 *)
+    procedure dumpinfo(infonum : integer);
+    var y : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       case infonum of
+          1 : begin
+                 write('Version #',h.version.stamp:1,'  max row,col: ',maxrow:1,',',maxcol:1,
+                       '  cStoredCols: ',dopeSize:1,' loadFile:',loadfile,' application:');
+                 if appType = aLisaCalc then writeln('LisaCalc')
+                 else writeln('Business Graphics')
+              end;
+          2 : write(vecWid[rowKind, rowId]);
+          3 : write(vecWid[colKind, colId]);
+          5 : begin
+                 write(rowId:1,',',colId:1,'  attr: ',
+                       wAttr(pCel^.attributes),'  datatype: ',datatype:1);
+                 if datatype in [14,13,11] then writeln
+              end;
+          6 : writeln('  shared with ',rowId:1,',',colId:1);
+          7 : begin
+                 writeln('SnipWidth for rows (1-10)');
+                 for y := 1 to cmax(maxrow, 10) do write(VecWid[rowKind, y]:6);
+                 writeln;
+                 writeln('SnipWidth for cols (1-10)');
+                 for y := 1 to cmax(maxcol, 10) do write(VecWid[colKind, y]:6);
+              end;
+          8 : begin
+                 write('File type is: ');
+                 if h.app = aLisaCalc then write('aLisaCalc')
+                 else write('aBusGraphics');
+                 writeln('  SegSize: ',h.segSize:1,'  version: ',h.version.stamp:1,',',h.password:1)
+              end
+       end
+    end;
+(*$ENDC *)
+
+
+(*$S OpenClose *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   CheckCompiler;
+   for x := 1 to 10 do timeclear(x);
+   indentation := 0;
+(*$ENDC *)
+   tStart       := time;
+   initTable(TableInfo);                        {Set up the table information}
+   matState             := mmSuspend;
+   cStoredCols          := 0;
+   bandCnt              := 0;
+   CT                   := MatrixInfo;
+   UsingScrap           := false;
+   doingMove            := false;
+   assumption           := false;
+   reCalcNow            := false;
+   formatsMatch         := true;
+   IsCopyCells          := false;
+   IsErrorCells         := false;
+   reMapLevel           := 0;
+   FileRefnum           := -1;
+   newFBuffer           := true;
+   FBufPtr              := nil;
+   FBufDPtr             := nil;
+   FBufSave             := nil;
+   ScrapPtr             := nil;
+   pVector              := nil;
+   modeOpened           := mmIONull;
+   calcTime             := 0;
+   numPasses            := 0;
+   useDopeInfo          := false;
+   printSelection       := false;
+   diskErr              := false;
+   dopeSize             := 0;
+   dataFormat           := toolFormat;
+   StrToFind            := '';
+   FindInForms          := false;
+   FindInVals           := true;
+
+   with CT^ do begin
+      for snip := rowKind to colKind do begin
+         FillConst(@absent, sizeof(integer), @vecSnip[snip, 0], 1, idMax);
+         FillConst(@attrBlank, sizeof(TAttr), @vecAttrs[snip, 0], 1, idMax);
+         FillConst(@dftWidth[snip], sizeof(integer), @vecWid[snip, 0], 1, idMax);
+         lastSnip[snip] := 0;
+         for dataLen := 1 to idMax do begin
+            vecAttrTime[snip, dataLen]      := 0;
+            vecBreaks[true, snip, dataLen]  := false;
+            vecBreaks[false, snip, dataLen] := false
+         end
+      end;
+      SnipBds.rKind := aRectRg;
+      SnipBds.loRow := 1;
+      SnipBds.hiRow := idMax;
+      SnipBds.loCol := 1;
+      SnipBds.hiCol := idMax
+   end;
+
+   (**** read header information from the file ****)
+   if fileName^ <> '' then begin
+      FBufInit(mmRead, oDisk, @filename^, true, status);
+
+      dataLen := sizeOf(h);
+      FBufStuff(fRawData, @h, dataLen, status);
+      if h.version.stamp < 136 then begin
+         FbufPt  := 0;
+         dataLen := sizeOf(oldHeader);
+         FBufStuff(fRawData, @oldHeader, dataLen, status);
+         h.passWord        := oldHeader.passWord;
+         h.version.stamp   := oldHeader.version.stamp;
+         PrPrfDefault(defPrRec);
+         h.printer.config  := defPrRec;
+         h.segSize         := oldHeader.segSize;
+         h.app             := oldHeader.app;
+         h.nHandles        := 256
+      end;
+
+      if status <> ok then goto 2;
+      if h.version.stamp < 128 then begin
+         h.app            := appType;
+         h.segSize        := mmMemSize;
+         h.password       := LCpassWord + ord(appType)
+      end;
+(*$IFC DEBUGVERSION *)
+      if tracemmgr then dumpinfo(8);
+(*$ENDC *)
+      if loadFile then begin
+         if h.version.stamp > fileversion + 1 then status := NewerFile
+         else if (h.password <> LCpassWord+ord(appType)) or (appType <> h.app) or
+                 (h.version.stamp < 126) then status := BadFile;
+         if status <> 0 then goto 2
+      end;
+      VT.lintvar := h.segSize
+   end
+   else begin
+           PrPrfDefault(defPrRec);
+           h.version.stamp  := fileVersion;
+           h.Printer.config := defPrRec;
+           h.nHandles       := 256;
+           VT.lintvar       := mmMemSize
+        end;
+
+   (**** try to size the dataseg to the size of the matrix ****)
+   if VT.lintvar < mmMemsize then VT.lintvar := mmMemSize;
+   if VT.lintvar <> mmMemSize then begin
+
+      Info_DataSeg(errNum, mmRefNum, info_rec);
+
+(*$IFC DEBUGVERSION *)
+      writeln('before: d/m: ',info_rec.disc_size:1 ,'/',info_rec.mem_size:1,'  new: ',
+              VT.lintvar:1,'/',h.segSize:1,'  sizes: ',mmDisksize:1,'/',mmMemSize:1,' Info_DataSeg err: ',errNum:1);
+(*$ENDC *)
+
+      if errNum = 0 then
+         Size_DataSeg(errNum, mmRefNum, VT.lintvar - info_rec.mem_size, mmMemSize,
+                                        VT.lintvar - info_rec.disc_size, mmDiskSize);
+
+(*$IFC DEBUGVERSION *)
+      writeln('size_dataseg error: ',errNum:1,'  ');
+      Info_DataSeg(status, mmRefNum, info_rec);
+      writeln('after: d/m: ',info_rec.disc_size:1 ,'/',info_rec.mem_size:1,
+            '  sizes: ',mmDisksize:1,'/',mmMemSize:1);
+(*$ENDC *)
+
+      if errNum <> 0 then begin
+         status := DSpaceErr;
+         goto 2
+      end
+   end;
+   mxHz        := HzInit(pointer(mmHeapAddr), pointer(mmHeapAddr + mmMemSize),
+                              nil, h.nHandles, 0, @OutOfHeapSpace, nil, nil, nil);
+   numHandles  := 1;
+
+(*$IFC DEBUGVERSION *)
+   if skipflag then begin
+      write(chr(7),'NumHandles to skip: ');
+      readln(dataLen);
+      for x := 1 to dataLen do hContents := allocBlock(1);
+      if rodstuff(19) and rodstuff(20) then ;
+   end;
+(*$ENDC *)
+
+   FirstLogCell.start      := nullSnip;                      {set the first logical cell to nil}
+   tableState              := tValues;
+   ScrapInfo^              := MatrixInfo^;
+   mmUndoInfo.ptr^         := MatrixInfo^;
+   mmUndoInfo.op           := uNone;
+   mmUndoInfo.state        := false;
+   vecTimer.last           := false;
+   vecTimer.cnt            := 0;
+   printState.preview      := false;
+   printState.pGrids       := false;
+   printState.pPageHeader  := true;
+   printState.pColHeadings := false;
+
+   with ModeData do begin
+      Tfid        := CT^.TableFont;
+      calcMode    := app.LisaCalc;
+      circleMode  := cNone;
+      formulaMode := false;
+      application := appType;
+      fInVals     := FindInVals;
+      fInForms    := FindInForms;
+      pState      := printState
+   end;
+
+   status         := ok;
+   imageflag      := false;
+   recalcflag     := false;
+   formulaChanged := true;
+   circularFlag   := false;
+   circleState    := cNone;
+   skipForm       := false;
+   circleRg.rKind := aNullRg;
+   FixRange(circleRg);
+   if fileName^ <> '' then begin
+
+      dataLen := pinfSnip;
+      if h.version.stamp <= 127 then begin
+         dataLen := 384;
+         FBufStuff(fNull, nil, dataLen, status);
+         dataLen := pinfSnip;
+      end
+      else FBufStuff(fWord, @dopeSize, dataLen, status);
+
+      if h.version.stamp >= 132 then begin
+         dataLen := sizeOf(dataFormat);
+         FBufStuff(fRawData, @dataFormat, dataLen, status);
+{$IFC DEBUGVERSION}
+         writeln('status:', status);
+         writeln('decPt: ', dataFormat.decPt);
+         writeln('tSep : ', dataFormat.tSep);
+         writeln('dSign: ', dataFormat.dSign);
+         writeln('dSignPos: ', dataFormat.dSignPos);
+         writeln('dateFormat: ', dataFormat.dateFormat);
+         writeln('dollarBracket: ', dataFormat.dollarBracket);
+         writeln('useSColon: ', dataFormat.useSColon);
+{$ENDC}
+         with toolFormat do begin
+            formatsMatch := length(dSign) = length(dataFormat.dSign);
+            if formatsMatch then
+               for x := 1 to length(dSign) do
+                  formatsMatch := formatsMatch and (dSign[x] = dataFormat.dSign[x])
+         end
+      end
+      else formatsMatch := (length(toolFormat.dSign) = 1) and (toolFormat.dSign = '$');
+
+      FBufStuff(fWord, @maxrow, dataLen, status);
+      FBufStuff(fWord, @maxcol, dataLen, status);
+(*$IFC DEBUGVERSION *)
+      if tracemmgr or skipFlag then dumpInfo(1);
+(*$ENDC *)
+      dataLen := sizeof(vecWid);
+(*$IFC DEBUGVERSION *)
+      if tracemmgr then dumpInfo(7);
+(*$ENDC *)
+      FBufStuff(fRawData, @vecWid, dataLen, status);
+      if status <> ok then goto 2;
+
+      useDopeInfo := (dopeSize <> pInfSnip);
+
+      repeat
+         FBufStuff(fWord, @rowId, dataLen, status);
+         if rowId <> pInfSnip then begin
+            FBufStuff(fWord, @colId, dataLen, status);
+            if status <> ok then goto 2;
+
+            pCel := FindPCel(rowId, colId, true);
+            if pCel <> nil then begin
+
+               pCelAttr := @pCel^.attributes;
+               FBufStuff(fWord, @pCelAttr^, dataLen, status);
+               if not formatsMatch then ConvertFormats(pCel^.attributes);
+
+               FBufStuff(fWord, @dataType, dataLen, status);
+               if status <> ok then goto 2;
+               if dataType >= 10 then begin
+                  repeat
+(*$IFC DEBUGVERSION *)
+                     if tracemmgr then dumpinfo(5);
+(*$ENDC *)
+                     done := true;
+                     case dataType of
+                        10,
+                        12 : begin
+                                FBufStuff(fWord, @rowId, dataLen, status);
+                                FBufStuff(fWord, @colId, dataLen, status);
+                                if status <> ok then goto 2;
+(*$IFC DEBUGVERSION *)
+                                if tracemmgr then dumpinfo(6);
+(*$ENDC *)
+                                tempPCel := FindPCel(rowId, colId, false);
+                                if not skipForm then begin
+                                   if dataType = 12 then begin
+                                      pCel^.oh  := tempPCel^.oh;
+                                      hContents := GetHContents(pCel);
+                                      IncRefCnt(hContents, false)
+                                   end
+                                   else begin
+                                           hContents := GetHContents(pCel);
+                                           cell      := GetHContents(tempPcel);
+                                           hContents^^.rule.ohfmla := cell^^.rule.ohfmla
+                                        end
+                                end
+                             end;
+                        11,
+                        13 : begin
+                                FBufStuff(fWord, @dataLen, dataLen, status);
+                                if status <> ok then goto 2;
+                                x := dataLen;
+                                if h.version.stamp <= 133 then
+                                   if dataType = 13 then x := dataLen + sizeof(TCell);
+                                hContents := allocBlock(x);
+                                pCel := FindPCel(rowId, colId, false);
+                                if hContents <> nil then begin
+                                   if not skipForm then begin
+                                      if dataType = 11 then begin
+                                         cell := GetHContents(pCel);
+                                         cell^^.rule.ohfmla := GetOH(ord(hContents))
+                                      end
+                                      else pCel^.oh := GetOH(ord(hContents));
+                                      sizeKind := fRawData
+                                   end
+                                   else sizeKind := fNull;
+                                   FBufStuff(sizeKind, @hContents^^, dataLen, status);
+                                   if dataType = 13 then begin
+                                      if (h.version.stamp <= 133) and pCel^.attributes.pkHasrule then begin
+                                         pData := @hContents^^.rule.lBits;
+                                         for x := dataLen - sizeOf(TVinfo) - 1 downto 0 do
+                                            pdata^[x + sizeOf(TCell)] := pData^[x]
+                                      end;
+                                      hContents^^.vinfo.data.refCnt := 1;
+                                      if h.version.stamp <= 129 then
+                                         pcel^.attributes.moneybit := hContents^^.vinfo.data.cellseen
+                                   end
+                                 end
+                                 else begin
+                                         if diskErr then status := dSpaceErr
+                                         else status := OutOfMem;
+                                         goto 2
+                                      end
+                              end;
+                        14  : pCel^.oh := -1
+                     end;
+                     if skipForm then begin
+                        hContents := GetHContents(pCel);
+                        pCel^.attributes.pkHasRule := false;
+                        moveLfast(@hContents^^.rule.value, @hContents^^.value,
+                           numbytes-ord(@hContents^^.rule.value)+ ord(@hContents^^))
+                     end;
+                     skipForm := false;
+                     case dataType of
+                        12,
+                        13 : if pCel^.attributes.pkHasrule then begin
+                                skipForm := not loadFile and (dataType = 13);
+                                FBufStuff(fWord, @dataType, dataLen, status);
+                                if status <> ok then goto 2;
+                                numBytes := dataLen;
+                                done := false
+                             end
+                     end
+                  until done
+               end
+               else status := FileErr
+            end
+            else if (rowId = mInfsnip) and (colId = pInfSnip) then begin
+                    FBufStuff(fWord, @dataType, dataLen, status);
+                    FBufStuff(fWord, @dataLen, dataLen, status);
+                    FBufStuff(fNull, nil, dataLen, status)
+                 end
+            else if diskErr then status := dSpaceErr
+            else status := OutOfMem
+         end;
+         if status <> ok then goto 2
+      until rowId = pInfSnip;
+
+      if useDopeInfo then ClrDopeInfo;
+
+      if loadFile then begin
+         tmNewPars;
+         tmLoadBands
+      end;
+      repeat
+         FBufStuff(fTmBand, @aTmBand, dataLen, status);
+         if loadFile and (status = ok) then begin
+            tmLoadNextBand(aTmBand);
+            bandCnt := bandCnt + 1
+         end
+      until aTmBand.tmbLoId = nullsnip;
+
+      dataLen := sizeof(vecAttrs);
+      FBufStuff(fRawData, @vecAttrs, dataLen, status);
+      dataLen := sizeof(vecBreaks);
+      FBufStuff(fRawData, @vecBreaks, dataLen, status);
+      dataLen := sizeof(vecAttrTime);
+      FBufStuff(fRawData, @vecAttrTime, dataLen, status);
+      dataLen := sizeof(vecTimer);
+      FBufStuff(fRawData, @vecTimer, dataLen, status);
+
+      if h.version.stamp <= 127 then begin
+         dataLen := sizeof(Modes.m2);
+         FBufStuff(fRawData, @Modes.m2, dataLen, status);
+         with ModeData do begin
+            calcMode    := Modes.m2.calcMode;
+            Tfid        := Modes.m2.Tfid;
+            application := Modes.m2.application;
+            circleMode  := Modes.m2.circleMode
+         end
+      end
+      else begin
+              if h.version.stamp >= 134 then begin
+                 dataLen := sizeof(ModeData);
+                 FBufStuff(fRawData, @ModeData, dataLen, status)
+              end
+              else begin
+                      dataLen := sizeof(Modes.m3);
+                      FBufStuff(fRawData, @Modes.m3, dataLen, status);
+                      with ModeData do begin
+                         calcMode    := Modes.m3.calcMode;
+                         formulaMode := Modes.m3.formulaMode;
+                         Tfid        := Modes.m3.Tfid;
+                         application := Modes.m3.application;
+                         circleMode  := Modes.m3.circleMode
+                      end
+                   end;
+              if not formatsMatch then
+                 for x := 1 to 255 do begin
+                    ConvertFormats(VecAttrs[rowKind, x]);
+                    ConvertFormats(VecAttrs[colKind, x])
+                 end
+           end;
+
+      if h.version.stamp >= 134 then begin
+         dataLen := sizeof(StrToFind);
+         FBufStuff(fRawData, @StrToFind, dataLen, status)
+      end;
+
+      if h.version.stamp <= 131 then begin
+         dataLen := 190 {sizeof(PRinfo)};
+         FBufStuff(fNull, nil, dataLen, status)
+      end;
+
+      if status = ok then begin
+         SetModes;
+         for rowId := 1 to CT^.lastsnip[rowKind] do
+            if vecSnip[rowKind, rowId] <> 0 then
+               PatchFormats(rowId, hVecOfRow(rowId), 1, CT^.lastsnip[colKind]);
+         if loadFile then FxDataStuff(openInfo, true, status)
+      end;
+
+      FBufClose(status);
+      if status <> ok then goto 2
+   end;
+
+   if bandCnt <= 3 then begin
+      rg.rKind := a1CellRg;
+      rg.loRow := 1;
+      rg.loCol := 1;
+      FixRange(rg);
+      ReBldTbl(rg)
+   end;
+
+   goto 1;
+
+   {enter here if the file could not be read in - reset default state of modes}
+2: FBufClose(status);
+   h.Printer.config := curConfig;
+   with ModeData do begin
+      calcMode    := true;
+      circleMode  := cNone;
+      with Tfid do begin
+         fam      := p10tile;
+         seteface := [];
+         dev      := devScreen
+      end
+   end;
+   SetCharInfo(ModeData.Tfid);
+1: imageflag := true;
+   SetModes;
+   if status = ok then begin
+      if not formatsMatch then status := FormatsBad;
+      if (h.version.stamp < fileVersion) and (h.version.stamp <> 130) then status := OldFileErr;
+      matState := mmOpen
+   end
+   else matState := mmClose;
+   OpenTime := time - tStart;
+
+(*$IFC DEBUGVERSION *)
+   ;writeln('openmatrix time: ',OpenTime);
+    StatusMess(status)
+(*$ENDC *)
+end;
+
+(*$IFC DEBUGVERSION *)
+(*$S matMgrSeg *)
+procedure setDebuging;
+var x : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   debug[0] := false;
+   debug[1] := true;
+   debug[2] := false;
+   debug[3] := true;
+   debug[4] := false;
+   debug[5] := true;
+   debug[6] := false;
+   debug[7] := true;
+   debug[8] := false;
+   debug[9] := true;
+   debug[10] := false;
+   debug[11] := true;
+   debug[12] := false;
+   debug[13] := true;
+   debug[14] := false;
+   debug[15] := true;
+   debug[16] := false;
+   debug[17] := true;
+   debug[18] := false;
+   debug[19] := true;
+   debug[20] := false;
+   debug[21] := true;
+   debug[22] := false;
+   debug[23] := true;
+   debug[24] := false;
+   debug[25] := true;
+   debug[26] := false;
+   debug[27] := true;
+   debug[28] := false;
+   debug[29] := true;
+   debug[30] := false;
+   x := 31; debugmx := true;
+   x := 32; tracemmgr := false;
+end;
+(*$ENDC *)
+
+ÿ

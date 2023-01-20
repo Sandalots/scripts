@@ -1,0 +1,329 @@
+
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+
+  (*
+   *  performance
+   *  1.  Using new MDDF_io and BitMap_io procedures to flush
+   *)
+  {$S kr_fs }
+  procedure flushfs (* var ecode:error *);
+
+  label  1;
+
+  var
+       page   : longint;
+       actual : longint;
+       offset : integer;
+       device : integer;
+       ptrDCB : DCBptr;
+
+  begin
+
+  (*$IFC DEBUG2*)
+    if trace (FS, 12) then writeln ('FLUSHFS:  request to flush file system info');
+  (*$ENDC*)
+
+    for device := 0 to maxdev do
+    begin
+      ptrDCB := mounttable[device];
+      if ptrDCB <> pointer (badptr1) then with ptrDCB^ do
+      begin
+        if configinfo [device]^.blockstructured then
+        begin
+
+          (*  write the bitmap back to the disk  *)
+
+          if status > defmounted then
+          begin
+            if mapdirty then
+            begin
+              (*
+               *  Lock this process' segments down to preclude the need for
+               *  memory management when unblocking from IO.  Since the Memory
+               *  Manager allocates pages to disk files (e.g., stack expansion),
+               *  deadlock could occur on the semaphore protecting the volume
+               *  allocation map.
+               *)
+              LOCKDATA;
+              wait_sem (semmap, []);     (* to protect this from interruption from
+                                             sallocate/deallocate *)
+              bitmap_io(ecode, device, writeop, ord(allocmap));
+              mapdirty := false;
+              signal_sem (semmap);
+              UNLOCKDATA;
+            end;
+
+            (*  Write the MDDF back to the disk  *)
+            if MDDFdirty then
+            begin
+              wait_sem (semMDDF, []);       (* to protect this from interruption from
+                                               appendpages/releasepages, etc *)
+              MDDF_io(ecode, device, ord(MDDFdata), writeop);
+              MDDFdirty := false;
+              signal_sem (semMDDF);
+            end;
+
+            (*  Flush the directory tree  *)
+            if not flat_catalog(device) then
+              FlushNodes(device, FALSE {don't clear}, ecode);
+          end;
+        end;
+      end;
+
+    end;
+
+    flushqvm (ecode);        (* flush the virtual memory to real disk *)
+
+  1:  (* exit *)
+
+  (*$IFC DEBUG2*)
+    if trace (FS, 12) then writeln ('FLUSHFS:  exiting with ecode of ',ecode);
+  (*$ENDC*)
+
+  end; (* procedure flushfs *)
+
+
+
+
+
+(*$S fs2 *)
+(*
+ *  performance
+ *  1.  Uses new Appendpages procedure (passes NIL fmap ptr for hint allocation)
+ *)
+procedure new_sfile (*var ecode:error; device : integer; var snum:integer*);
+
+label 1;
+
+const perrbase = 29;
+
+var free, i : integer;
+    actual, actualb, newpage : longint;
+    tempaddr : s_entry;
+    ptrFmap : flmap_ptr;
+    temperr : error;
+    null_page : array [1..defpgdatasize] of byte;  (* bug #193 *)
+    small_map : boolean;
+
+begin
+  free := 0;
+
+  if mounttable [device] = pointer (badptr1) then   (* device not mounted *)
+  begin
+    ecode := E1_NO_DEV_MOUNTED;
+    goto 1;
+  end;
+
+  with mounttable [device]^ do
+  begin
+    i := MDDFdata^.empty_file;
+(*$IFC DEBUG2*)
+    if trace (FS, 15) then writeln ('NEW_SFILE:  looking for new s-file from ',i);
+(*$ENDC*)
+    repeat
+      slist_io (ecode, device, i, readop, tempaddr);
+      if (ecode=0) and (tempaddr.hintaddr=0) then     (* empty s-file entry *)
+      begin
+        free := i;     (* this is a critical section; do not interrupt *)
+                       (* This is protected by the caller, one call per device *)
+                       (* at any time. *)
+        tempaddr.hintaddr := -1;
+        slist_io (ecode, device, free, writeop, tempaddr);  (* mark fnum slot in use *)
+        if ecode > 0 then goto 1; (* probably no room on device for slist expansion *)
+      end;
+      i := i + 1;
+    until (free <> 0) or (i > MDDFdata^.maxfiles) or (ecode > 0);
+    snum := free;                     (* zero if couldn't get a free s_entry   *)
+    if free = 0 then
+    begin
+      ecode := E_NO_SNUMS;       (* no free slots for this sfile entry *)
+      goto 1;
+    end;
+
+    if free < MDDFdata^.maxfiles then
+    begin
+      wait_sem (semMDDF, []);     (* to prevent this from interfering flushfs *)
+      MDDFdata^.empty_file := free + 1;
+      MDDFdirty := true;
+      signal_sem (semMDDF);
+    end;
+
+    {appendpages(0, device, MDDFdata^.hintsize, true, newpage, actual, -free,
+                                                tempaddr.version, NIL, ecode);}
+    appendpages(0, device, MDDFdata^.hintsize, TRUE, newpage, actual, -free,
+                @tempaddr, NIL, ecode);
+                                            (* allocate pages for hints *)
+    if ecode > 0 then
+    begin                                       (* no room for hints on the device *)
+      tempaddr.hintaddr := 0;
+      tempaddr.fileaddr := 0;
+      slist_io (ecode, device, free, writeop, tempaddr); (* mark fnum slot not in use *)
+      ecode := E_ALLOC_HINTS;     (* no space for file hints *)
+      goto 1;
+    end;
+    tempaddr.hintaddr := newpage;
+    tempaddr.fileaddr := 0;
+    tempaddr.filesize := 0;   (* initially empty *)
+    slist_io (ecode, device, free, writeop, tempaddr);(* write new s_entry for s-file *)
+    wait_sem (semMDDF, []);     (* to prevent this from interfering flushfs *)
+    MDDFdata^.filecount := MDDFdata^.filecount + 1;  (* update count *)
+    MDDFdirty := true;
+    signal_sem (semMDDF);
+
+    (* Initialize leader/label block, and file map block for this s-file        *)
+    (* note:  leader/label block is initialized as a block of nulls, and later  *)
+    (*           selectively overwritten by the catalog manager (hentry) and    *)
+    (*           user or application (label).                                   *)
+    (*        HOWEVER, we must initialize the map block, so let's get to it!    *)
+
+    (* init the leader page *)
+
+    for i := 1 to defpgdatasize do
+    begin
+      null_page[i] := 0;
+    end;
+
+    vm(ecode, device, newpage, sizeof(pagelabel), ord(@null_page),
+       sizeof(null_page), writeop);
+
+    (* Init the file map *)
+
+    ptrFmap := @null_page;
+    with ptrFmap^ do
+    begin
+      size := 0;
+      ecount := 0;
+      if old_volume(device) then
+        max_entries := MAXMAPINDEX
+      else
+        max_entries := MAXSMALLINDEX;
+      for i := 0 to max_entries do with map[i] do
+      begin
+        address := 0;
+        cpages := 0;
+      end;
+      fmap_io(ecode, device, newpage, 0, ptrFmap, WRITEOP);
+    end;
+  end;
+(*$IFC DEBUG2*)
+if trace(FS,64) then
+begin
+  writeln('NEW_SFILE: initial map'); PrintFmap(ptrFmap, MAXMAPINDEX);
+end;
+(*$ENDC*)
+(*$IFC DEBUG2*)
+  if flush_level <= makeFlush then flushfs (temperr);
+                                      (* force fs buffers out for reliability *)
+(*$ENDC*)
+
+
+1:   (* error return jumps to here, else fall through *)
+
+  {if (ecode > 0) and (ecode < 100) then
+                           ecode := INTERRBASE + SFERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 15) then writeln ('NEW_SFILE:  created sfile ',snum,' and ecode of ',
+                                                                              ecode);
+(*$ENDC*)
+
+
+end; (* of procedure newfile *)
+
+
+
+
+(*$S fs2 *)
+(*
+ *  performance
+ *  1.  Uses new Releasepages procedure (passes NIL fmap ptr to release pages)
+ *  2.  Releases file data pages from the small map
+ *  3.  Assumes the file is closed totally!
+ *)
+procedure kill_sfile (*var ecode:error; device : integer; snum:integer*);
+
+label 1;
+
+const perrbase = 32;
+
+var s_addr : s_entry;
+    temperr : error;
+    Fm : filemap;
+    mappage : longint;
+    i : integer;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 15) then writeln ('KILL_SFILE:  request to kill s-file ',snum);
+(*$ENDC*)
+
+
+  slist_io (ecode, device, snum, readop, s_addr); (* read sfile entry for this sfile *)
+  if (ecode > 0) or (s_addr.hintaddr <= 0) then
+  begin
+    ecode := E2_SENTRY_BAD;                     (* sfile entry empty or locked or invalid     *)
+    goto 1;
+  end;
+
+  (* Read the file map *)
+  fmap_io(ecode, device, s_addr.hintaddr, 0, @Fm, readop);
+  if Fm.size > 0 then
+  begin
+    (* There are pages to be freed *)
+    if old_volume(device) then
+      {releasepages(ecode, device, snum, 0, NIL)}
+      releasepages(ecode, device, snum, 0, NIL, @s_addr)
+    else
+      (* disk version of file map can become inconsistent since file is dying *)
+      {releasepages(ecode, device, snum, 0, @Fm);}
+      releasepages(ecode, device, snum, 0, @Fm, @s_addr);
+    s_addr.fileaddr := 0;
+  end;
+
+  {releasepages(ecode, device, -snum, s_addr.hintaddr, NIL);} (* release hint pages *)
+  releasepages(ecode, device, -snum, s_addr.hintaddr, NIL, NIL); (* release hint pages *)
+
+  with s_addr do
+  begin
+    hintaddr := 0;
+    filesize := 0;
+    version := version + 1; (* so next time we use a new version num *)
+    if version = maxint then hintaddr := -1;  (* retire the slot *)
+  end;
+
+  slist_io (ecode, device, snum, writeop, s_addr);   (* write out empty sfile entry  *)
+
+  with mounttable[device]^ do with MDDFdata^ do
+  begin
+    wait_sem (semMDDF, []);     (* to prevent this from interfering flushfs *)
+    filecount := filecount - 1;
+
+    if snum < empty_file then empty_file := snum;
+                   (* performance optimization for future creation of new sfiles *)
+    MDDFdirty := true;
+    signal_sem (semMDDF);
+  end;
+
+(*$IFC DEBUG2*)
+  if flush_level <= makeFlush then flushfs (temperr);
+                                      (* force fs buffers out for reliability *)
+(*$ENDC*)
+
+
+  1:   (* error return or normal fall-through *)
+
+  {if (ecode > 0) and (ecode < 100) then
+                           ecode := INTERRBASE + SFERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 15) then writeln ('KILL_SFILE:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of procedure kill_sfile *)
+ÿ

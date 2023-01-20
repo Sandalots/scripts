@@ -1,0 +1,890 @@
+{#f     in:bldidx.text }
+{$S indexseg  }
+{*****************************************************************************
+
+                                movr_inc
+
+        used to update the record offsets in the leaf and nonleaf pages
+        after a record delete or add.
+
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the right, po2,po1 point at right ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movr_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+{*****************************************************************************
+
+                                movl_inc
+
+        used to update the record offsets in the leaf and nonleaf pages
+        after a record delete or add.
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the left, po2,po1 point at left ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movl_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+
+{^T20}
+{************************************************************************
+
+                          BuildNonleafPages
+
+        takes as input a file of sorted leaf pages.
+
+        1) if the last page is less than half full, then the entries
+           in the last two pages are redistributed.
+
+        2) builds nonleaf pages above the leaf pages
+
+        Input Parameters
+                biggest - largest leaf record
+                viafile - index of index file
+
+        Output Parameters
+                ddresult - return result
+
+                noerr
+                ioerr
+                noroom
+                nobuffs
+                inconsistent
+
+*************************************************************************}
+
+procedure BuildNonleafPages(var ddresult : integer;
+                                viafile : integer;
+                                biggest : integer);
+label
+        1,2,3,10,100;
+
+type
+
+        LevelDesc =
+            record
+                ikey : integer;
+                ThisAddr : fileptr;
+            end;
+var
+        loc_compact_state : states_de_compact;
+        pldesc,
+        pld  : ^ leveldesc;
+
+        pd1,pd2 : ptrpagedesc;
+        po1,po2 : ptroffsets;
+        pb1,pb2 : ptrdata;
+        nextpoo,poo,
+        pnk1,pnk2 : ^ integer;
+        buffer1,buffer2 : integer;
+        nkeys1,nkeys2 : integer;
+
+        pfd : ptrfiledesc;
+        pfileptr : ptrfileptr;
+
+        Npages,
+        newroot,
+        ifirstpage,
+        ilastpage,
+        Sibling,
+        LeafAddr,
+        NextLeaf,
+        PostAddr,
+        WriteAddr,
+        LowerAddr : fileptr;
+
+        relprio,
+        tresult,
+        cursize,
+        total,
+        rem,
+        nrecs,
+        nper,
+        halfpage,
+        offoff,
+        levels,
+        maxlevels,
+        lresult,
+        lsize,
+        rsize,
+        recsize,
+        ipagesize,
+        i : integer;
+
+        fit : boolean;
+
+
+        {************************************************************
+
+                                newpage
+
+                1) if the preceding page hasn't been written yet, force
+                   it out
+                2) assign address for new page
+                3) increment write address
+                4) get a buffer for this page
+                5) initialize page
+                6) set up the level descriptor for this level
+
+        *************************************************************}
+
+        procedure new_page(var ld : leveldesc);
+        label
+                1;
+        begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+                if PostAddr <> nilptr then
+                    begin
+                    force_out(lresult,viafile,PostAddr);
+                    PostAddr := nilptr;
+                    if lresult <> noerr then goto 1;
+                    end;
+                with ld do
+                    begin
+                    ThisAddr := WriteAddr;
+                    WriteAddr := WriteAddr + ipagesize;
+                    lockbuff(lresult,buffer2);
+                    if lresult <> noerr then goto 1;
+                    PostAddr := ThisAddr;
+                    ikey := 0;
+                    with buffpool^[buffer2] do
+                        begin
+                        pb2 := pbuff;
+                        po2 := pointer(ord(pb2)+offoff);
+                        pd2 := pointer(ord(po2)+sizeof(integer));
+                        po2^[0] := 0;
+                        pfile := viafile;
+                        page := ThisAddr;
+                        state := dirty;
+                        end;
+                    end;
+                pd2^.nkeys := 0;
+                pd2^.ptype := nonleaftype;
+        1:
+        end;
+
+        {****************************************************************
+
+                                do_new_root
+
+                1) make the new page for the root
+                2) if the tree is > 2 levels, copy up the left sibling key
+                   and page pointer.  the right key and pointer will be
+                   copied up as for any nonleaf page.
+                3) releases buffer from which left sibling key came
+                4) on error frees the buffer containing the root, too
+                5) returns the address of the new root
+
+        *****************************************************************}
+
+        function do_new_root : fileptr;
+        var
+                pfileptr : ptrfileptr;
+                pbs : ptrdata;
+                pos : ptroffsets;
+                pds : ptrpagedesc;
+                rsize,
+                sibbuff : integer;
+        begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+                levels := levels + 1;
+                new_page(pld^);
+                if lresult = noerr then
+                    begin
+                    do_new_root := pld^.ThisAddr;
+                    if levels <> 1 then { copy up left sibling key }
+                        begin
+                        getpage(lresult,sibbuff,viafile,Sibling,true);
+                        if lresult = noerr then
+                            begin
+                            with buffpool^[sibbuff] do
+                                begin
+                                state := dirty;
+                                pbs := pbuff;
+                                pos := pointer(ord(pbs)+offoff);
+                                pds := pointer(ord(pos)+sizeof(integer));
+                                end;
+                            rsize := pos^[-1]-pos^[0];
+                            movelf(pbs,pb2,rsize);
+                            pfileptr := @pb2^;
+                            pfileptr^ := Sibling;
+                            pld^.ikey := 1;
+                            po2^[-1] := rsize;
+                            pd2^.nkeys := 1;
+
+                            relbuff(lresult,sibbuff,-1);
+                            if lresult <> noerr then
+                                relbuff(lresult,buffer2,0);
+                            end;
+                        end;
+                    end;
+        end;
+
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+
+    {   check whether the index is a one page file.  if so, the root is the
+        one and only page, and there are no nonleaf pages }
+
+        levels := 0;
+        with pfiletable^[viafile]^ do
+            begin
+            ipagesize := pagesize;
+            ilastpage := lastpage;
+            ifirstpage := firstpage;
+            root := ifirstpage;
+            end;
+        offoff := ipagesize - (sizeof(pagedesc)+sizeof(integer));
+        halfpage := offoff div 2;
+
+        Npages := div424(ilastpage-ifirstpage,ipagesize,rem);
+        if Npages = 1 then
+            begin
+            dowritenon(lresult,viafile);
+            goto 1;
+            end;
+
+    {   nonleaf pages are necessary.  compute a worst case estimate of the
+        number of levels in the tree, using the biggest leaf record as the
+        nonleaf key size.  allocate the array of level descriptors for the
+        worst case. }
+
+
+        nper := offoff div (biggest+(sizeof(integer)+sizeof(fileptr)));
+        maxlevels := 2;
+        while comp44(nper,Npages) = lt do
+            begin
+            maxlevels := maxlevels + 1;
+            Npages := div424(Npages,nper,rem);
+            if rem <> 0 then Npages := Npages + 1;
+            end;
+
+{$IFC debug }
+        if dbdebug then
+            begin
+            writeln(dumpfile,'ip,il,if,ro:',ipagesize:6,ilastpage:14,
+                    ifirstpage:14);
+            writeln(dumpfile,'biggest,nper,maxl:',biggest:7,
+                    nper:7,maxlevels:7);
+            end;
+{$ENDC }
+
+
+        loc_compact_state := init_compact_state;
+
+100 :   lresult := nnew(@czone,maxlevels*sizeof(leveldesc),@pldesc);
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+        if lresult <> noerr then goto 1;
+
+        pfd := pfiletable^[viafile];
+        LeafAddr := ifirstpage;
+        WriteAddr := ilastpage;
+        PostAddr := nilptr;
+        Sibling := nilptr;
+
+        {  now we build the non leaf pages levels above the leafs   }
+
+        repeat
+            getpage(lresult,buffer1,viafile,LeafAddr,true);
+            if lresult <> noerr then goto 2;
+            pb1 := buffpool^[buffer1].pbuff;
+            po1 := pointer(ord(pb1)+offoff);
+            pd1 := pointer(ord(po1)+sizeof(integer));
+
+            LowerAddr := LeafAddr;
+            NextLeaf := pd1^.next;
+
+            {  if necessary redistribute keys in the last two leaf pages }
+
+            nkeys1 := pd1^.nkeys;
+            pnk1 := @po1^[-nkeys1];
+            rsize := pnk1^;
+            if (NextLeaf = nilptr) and (rsize < halfpage) then
+                begin
+                getpage(lresult,buffer2,viafile,pd1^.prior,true);
+                if lresult <> noerr then goto 3;
+                pb2 := buffpool^[buffer2].pbuff;
+                po2 := pointer(ord(pb2)+offoff);
+                pd2 := pointer(ord(po2)+sizeof(integer));
+                nkeys2 := pd2^.nkeys;
+                pnk2 := @po2^[-nkeys2];
+                poo := pnk2;
+                lsize := poo^;
+                nrecs := 0;
+                repeat
+                    recsize := poo^;
+                    nextpoo := pointer(ord(poo)+sizeof(integer));
+                    recsize := recsize - nextpoo^ + sizeof(integer);
+                    if ((lsize - recsize) < rsize) or
+                       ((rsize + recsize) > offoff)
+                    then goto 10;
+                    poo := nextpoo;
+                    lsize := lsize - recsize;
+                    rsize := rsize + recsize;
+                    nrecs := nrecs + 1;
+                until false;
+        10 :    if nrecs <> 0 then
+                    begin
+                    total := pnk2^ - poo^;
+                    moverf(pb1,pointer(ord(pb1)+total),pnk1^);
+                    movelf(pointer(ord(pb2)+poo^),pb1,total);
+                    movl_inc(@pnk1^,@po1^[-(nkeys1+nrecs)],nkeys1,total);
+                    movr_inc(@poo^,@po1^,nrecs-1,-poo^);
+                    pd1^.nkeys := nkeys1 + nrecs;
+                    pd2^.nkeys := nkeys2 - nrecs;
+                    buffpool^[buffer1].state := dirty;
+                    buffpool^[buffer2].state := dirty;
+                    end;
+{$IFC debug }
+                if dbdebug then
+                    begin
+                    dumpp(viafile,buffer2);
+                    dumpp(viafile,buffer1);
+                    end;
+{$ENDC}
+                relbuff(lresult,buffer2,-1);
+                if lresult <> noerr then goto 3;
+                end;
+
+            {   copy up the key and ripple up if necessary }
+
+            i := 0;
+            pld := pldesc;
+            repeat
+                with pld^ do
+                    begin
+                    if levels = i then newroot := do_new_root
+                    else getpage(lresult,buffer2,viafile,ThisAddr,true);
+                    if lresult <> noerr then goto 3;
+                    with buffpool^[buffer2] do
+                        begin
+                        state := dirty;
+                        pb2 := pbuff;
+                        po2 := pointer(ord(pb2)+offoff);
+                        pd2 := pointer(ord(po2)+sizeof(integer));
+                        end;
+
+                    if i > 0 then recsize := po1^[-1]-po1^[0]
+                    else recsize := sizeof(fileptr) +
+                                    entrysize(pfd^.firstvfld,
+                                              pfd^.lastvsfld,
+                                              pfd^.lastvsfld,
+                                              pfd^.kvflds,
+                                              pfd^.pedesc,
+                                              pb1);
+                    cursize := po2^[-ikey];
+                    fit := (cursize+recsize+sizeof(integer)) <= offoff;
+
+                    if not fit then
+                        begin
+                        Sibling := ThisAddr;
+                        relbuff(lresult,buffer2,-1);
+{$IFC debug }
+                        if dbdebug then
+                            begin
+                            dumpp(viafile,buffer2);
+                            end;
+{$ENDC}
+                        if lresult <> noerr then goto 3;
+                        new_page(pld^);
+                        if lresult <> noerr then goto 3;
+                        cursize := 0;
+                        end;
+
+                    {  copy entry }
+
+                    pb2 := pointer(ord(pb2)+cursize);
+                    if i <> 0 then
+                        begin
+                        movelf(pb1,pb2,recsize);
+                        relprio := isnonleaf;
+                        end
+                    else
+                        begin
+                        extractkey(pfd^.pedesc,pfd^.pedesc,pfd^.nsort,
+                                   pb1,pointer(ord(pb2)+sizeof(fileptr)),
+                                   pfd^.kvflds);
+                        relprio := -1;
+                        end;
+                    pfileptr := @pb2^;
+                    pfileptr^ := LowerAddr;
+                    LowerAddr := ThisAddr;
+                    ikey := ikey + 1;
+                    po2^[-ikey] := cursize+recsize;
+                    pd2^.nkeys := ikey;
+                    relbuff(lresult,buffer1,relprio);
+                    buffer1 := buffer2;
+                    if lresult <> noerr then goto 3;
+                    pb1 := pb2;
+                    pd1 := pd2;
+                    po1 := po2;
+                    end; { with }
+                i := i + 1;
+                pld := pointer(ord(pld)+sizeof(LevelDesc));
+            until fit;
+            LeafAddr := NextLeaf;
+{$IFC debug }
+            if dbdebug then
+                begin
+                dumpp(viafile,buffer1);
+                end;
+{$ENDC}
+            relbuff(lresult,buffer1,-1);
+            if lresult <> noerr then goto 2;
+        until LeafAddr = nilptr;
+
+        with pfiletable^[viafile]^ do
+            begin
+            lastpage := WriteAddr;
+            depth := levels+1;
+            root := newroot;
+            end;
+        goto 2;
+
+
+3 :     relbuff(tresult,buffer1,-1);
+        if tresult <> noerr then lresult := tresult;
+2 :     ndispose(@czone,@pldesc^);
+1 :     ddresult := lresult;
+
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'BuildNon:',lresult);
+{$ENDC }
+
+end; { BuildNonleafPages }
+{******************************************************************************
+
+                             readrecord
+
+        parameter procedure for sort:
+
+        if we need the next record, reads it.  returns eos if there aren't
+        any more records.  returns the size of the current record.
+
+        return results
+
+        noerr
+        nobuffs
+        ioerr
+        inconsistent
+        rectoobig
+
+
+******************************************************************************}
+
+function readrecord(var result : integer) : integer;
+label
+        1;
+var
+        rsize : integer;
+        nextpage : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with psort_globals^ do
+            begin
+            if needrecord then
+                begin
+                needrecord := false;
+                if rec >= pd^.nkeys then
+                    begin
+                    nextpage := pd^.next;
+                    relbuff(result,buffer,isleaf);
+                    havebuff := false;
+                    if result <> noerr then goto 1;
+                    if nextpage = nilptr then
+                        begin
+                        result := eos;
+                        stillreading := false;
+                        end
+                    else
+                        begin
+                        getpage(result,buffer,onfile,nextpage,true);
+                        if result <> noerr then goto 1;
+                        havebuff := true;
+                        pb := buffpool^[buffer].pbuff;
+                        pd := pointer(ord(pb)+descoff);
+                        po := pointer(ord(pd)-sizeof(integer));
+                        rec := 0;
+                        end;
+                    end;
+                end;
+            if stillreading then
+                begin
+                result := noerr;
+                rsize := entrysize(v1st,vnth,v1st,vflds,pkdesc,
+                                   pointer(ord(pb)+po^[-rec]));
+                if rsize > maxrsize then result := rectoobig
+                else if rsize > biggest then biggest := rsize;
+                readrecord := rsize;
+                end
+            else result := eos;
+            end;
+1 :
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'readrec:',rsize:7,result:7);
+{$ENDC }
+
+
+end;
+
+{****************************************************************************
+
+                             copyrec
+
+        parameter procedure for sort:
+
+        copies the current record.  also computes the maximum record.
+
+****************************************************************************}
+
+procedure copyrecord(prec : ptrdata);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with psort_globals^ do
+            begin
+            extractkey(pkdesc,pedesc,ifields,pointer(ord(pb)+po^[-rec]),
+                       prec,vflds);
+            rec := rec + 1;
+            needrecord := true;
+            end;
+end;
+{****************************************************************************
+
+                             closeinput
+
+        parameter procedure for sort:
+
+        frees the current buffer if it is allocated.
+
+        return results
+
+        noerr
+        inconsistent
+
+****************************************************************************}
+procedure closeinput(var result : integer);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with psort_globals^ do
+            begin
+            if havebuff then relbuff(result,buffer,isleaf)
+            else result := noerr;
+            end;
+end;
+{^T 30}
+{************************************************************************
+
+                                buildindex
+
+        builds an index on onfile, giving it the name ifilename.
+        see forward declaration for description.
+
+
+************************************************************************}
+
+procedure buildindex{(var ddresult : integer;
+                          ifilename,
+                          filename,
+                          tempdir1,
+                          tempdir2 : ptrpathname;
+                          temp_ldsn : integer;
+                          nisort,
+                          nikeys : integer;
+                          piflds : ptridesc;
+                          duplok : boolean;
+                      var onscan : integer;
+                      var needtoopen : boolean;
+                      var indexunique : uniqueid)};
+label
+        1,2,3,4,5,10;
+var
+        locsort_globals : sort_globals;
+        havedesc : boolean;
+        pifile : ptrfiledesc;
+        pftable : ptrdata;
+        pfd : ^ ptrfiledesc;
+        nirecords,
+        ilastpage,
+        datarecords : fileptr;
+        prec : ptrdata;
+        onfile,
+        ifields,
+        ipagesize,
+        NSortFields,
+        lresult,
+        tresult,
+        viafile,
+        i : integer;
+
+{*****************************************************************************
+
+                                  doidesc
+
+        allocates and sets up entire index file descriptor, including pkdesc.
+
+        results (returned in lresult)
+
+        noerr
+        nomem
+        rectoobig
+
+*****************************************************************************}
+procedure doidesc;
+label
+        1,3,100;
+var
+        havedesc : boolean;
+        loc_compact_state : states_de_compact;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        loc_compact_state := init_compact_state;
+        havedesc := false;
+
+100 :   {  compact retry point }
+
+        with pfiletable^[onfile]^ do
+            begin
+            needtoopen := writers <> 0;
+            ifields := nikeys+nkeys;
+            lresult := nnew(@czone,sizeof(filedesc),@pifile);
+            if lresult = nomem then goto 3;
+
+            lresult := nnew(@czone,ifields*(2*sizeof(flddesc)),@pifile^.pedesc);
+            if lresult = nomem then
+                begin
+                ndispose(@czone,@pifile^);
+                goto 3;
+                end;
+            havedesc := true;
+
+            pifile^.updateversion := updateversion;
+            with pifile^ do
+                begin
+                pfldset := nil;
+                pkdesc := pointer(ord(pedesc)+ifields*sizeof(flddesc));
+                pagesize := psize;
+                ipagesize := psize;
+                lastpage := 0;
+                USERvers := 0;
+                DBvers := myprod_vers;
+                clearset(@flags,16);
+                nfields := ifields;
+                if duplok then nkeys := ifields
+                else nkeys := nikeys;
+                nsort := nisort;
+                end;
+            end;
+
+        makeidesc(onfile,pifile,piflds);
+        if pifile^.vflds > maxrsize then
+            begin
+            lresult := rectoobig;
+            goto 3;
+            end;
+        goto 1;
+
+3 :     if havedesc then
+            begin
+            ndispose(@czone,@pifile^.pedesc^);
+            ndispose(@czone,@pifile^);
+            end;
+1:      if retry_compact(lresult,loc_compact_state) then goto 100;
+
+end; { doidesc }
+{*************************************************************************
+
+                                sort_setup
+
+        sets up for the sort.
+
+**************************************************************************}
+
+procedure sort_setup;
+label
+        1,10;
+var
+        pfptr : ptrfileptr;
+        relprio : integer;
+        bpage : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        locsort_globals.ifields := ifields;
+        locsort_globals.pedesc := pifile^.pedesc;
+        locsort_globals.pkdesc := pifile^.pkdesc;
+        locsort_globals.vflds := pifile^.vflds;
+        locsort_globals.v1st := pifile^.firstvfld;
+        locsort_globals.vnth  := pifile^.lastvfld;
+        with locsort_globals do
+            begin
+            with pfiletable^[onfile]^ do
+                begin
+                descoff := pagesize-sizeof(pagedesc);
+                bpage := root;
+                end;
+            relprio := isroot;
+            repeat
+                getpage(lresult,buffer,onfile,bpage,true);
+                if lresult <> noerr then goto 1;
+                pb := buffpool^[buffer].pbuff;
+                pd := pointer(ord(pb)+descoff);
+                if pd^.ptype = leaftype then goto 10;
+                pfptr := @pb^;
+                bpage := pfptr^;
+                relbuff(lresult,buffer,relprio);
+                if lresult <> noerr then goto 1;
+                relprio := isnonleaf;
+            until false;
+    10 :    po := pointer(ord(pd)-sizeof(integer));
+            biggest := 0;
+            rec := 0;
+            needrecord := true;
+            stillreading := true;
+            havebuff := true;
+            end;
+1  :
+
+end;
+
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+
+    {   1) open a readonly scan on the onfile
+        2) allocate and setup index file descriptor
+        3) create index file
+        4) if data file is empty, we are done
+           if data file is not empty, we
+             a) extract and sort index records
+             b) make sure duplicates are not allowed is not violated
+             c) build nonleaf pages
+        5) close index file }
+
+        psort_globals := @locsort_globals;
+        openscan(lresult,filename,filename,onscan,readonly);
+        if lresult <> noerr then goto 1;
+        onfile := pscantable^[onscan]^.onfile;
+        locsort_globals.onfile := onfile;
+
+        doidesc;
+        if lresult <> noerr then goto 2;
+
+        makefile(lresult,ifilename,pifile);
+        if lresult <> noerr then goto 3;
+        datarecords := pfiletable^[onfile]^.nrecs;
+        if datarecords = 0 then
+            begin
+            if lresult = noerr then close_object(lresult,pifile^.frefno);
+            end
+        else
+            begin
+
+            pfd := @pfiletable^;
+            for viafile := 0 to nfiles-1 do
+                begin
+                if pfd^ = nil then goto 10;
+                pfd := pointer(ord(pfd)+sizeof(ptrfiledesc));
+                end;
+
+        {   expand filetable }
+
+            lresult := nnew(@czone,(nfiles+1)*sizeof(ptrfiledesc),@pftable);
+            if lresult <> noerr then goto 4;
+            movelf(@pfiletable^,pftable,nfiles*sizeof(ptrfiledesc));
+            ndispose(@czone,@pfiletable^);
+            pfiletable := @pftable^;
+            pfiletable^[nfiles] := nil;
+            nfiles := nfiles + 1;
+
+    10:     pfiletable^[viafile] := pifile;
+            filldesc(lresult,pifile);
+            if lresult <> noerr then goto 5;
+
+            sort_setup;
+            if lresult <> noerr then goto 5;
+
+            if duplok then NSortFields := ifields
+            else NSortFields := nikeys;
+
+            sort(lresult,nirecords,ilastpage,pifile^.frefno,
+                 temp_ldsn,tempdir1,tempdir2,pifile^.firstpage,ipagesize,
+                 NSortFields,pifile^.pedesc,copyrecord,readrecord,
+                 closeinput,duplok);
+
+{$IFC debug }
+            if dbdebug then writeln(dumpfile,'after sort:',lresult);
+{$ENDC }
+
+            if lresult <> noerr then goto 5;
+
+            if nirecords <> datarecords then
+                begin
+                lresult := duplkey;
+                goto 5;
+                end;
+
+            pifile^.nrecs := nirecords;
+            pifile^.lastpage := ilastpage;
+            BuildNonLeafPages(lresult,viafile,locsort_globals.biggest);
+
+{$IFC debug }
+            if dbdebug then writeln(dumpfile,'after bnl:',lresult);
+{$ENDC }
+
+
+            doclose(tresult,viafile);
+            if tresult <> noerr then lresult := tresult;
+            end;
+        if lresult = noerr then
+            begin
+            indexunique := pifile^.funiqueid;
+            ndispose(@czone,@pifile^.pedesc^);
+            ndispose(@czone,@pifile^);
+            goto 1;
+            end;
+        goto 4;
+
+        { error exit }
+
+5 :     doclose(tresult,viafile);
+        if tresult <> noerr then lresult := tresult;
+4 :     prefix_name(ifilename);
+{af}    kill_secure(tresult,prefix,password);
+       {kill_object(tresult,prefix);}
+        if tresult > noerr then lresult := tresult;
+3 :     ndispose(@czone,@pifile^.pedesc^);
+        ndispose(@czone,@pifile^);
+2 :     if lresult <> noerr then closescan(tresult,onscan);
+
+1 :     ddresult := lresult;
+
+{$IFC debug }
+        if dbdebug then writeln('ic:',ddresult);
+{$ENDC }
+
+
+end; { buildindex }
+
+ÿ

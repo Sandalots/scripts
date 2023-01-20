@@ -1,0 +1,1056 @@
+{#F     libdb/RecProcs.text }
+{$S frecovseg   }
+{**************************************************************************
+
+
+                                CheckFileDesc
+
+        Checks if a pedesc makes sense and if it corresponds to its
+        file descriptor.
+
+        Input
+                fd - a file descriptor with a valid file label and a
+                     valid pedesc
+
+        Output
+                return result
+
+                noerr
+                BadFileDesc - returned if
+                    1) any field has
+                       a) a bad type,
+                       b) an odd offset, (if must be word aligned)
+                       c) a negative offset,
+                       d) an overlap with another field
+
+                    2) size of the fixed part of the record inferred from
+                       the pedesc does not correspond to that in fd
+
+                    3) ticketfield is not valid or is not a ticket field
+
+**************************************************************************}
+
+{$S frecovseg   }
+function CheckFileDesc(var fd : filedesc) : integer;
+label
+        10;
+var
+        oddoff : boolean;
+        lvflds,
+        lkvflds,
+        E_Off,
+        S_Off,
+        EndOff,
+        StartOff,
+        i,
+        j : integer;
+        pf : ptrflddesc;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        lvflds := 0;
+        lkvflds := 0;
+        CheckFileDesc := noerr;
+        pf := @fd.pedesc^;
+        for i := 0 to fd.nfields-1 do
+            with pf^ do
+                begin
+                if (ftype <> ftyppack2) and (size <= 0) then
+                    begin
+                    CheckFileDesc := BadFileDesc;
+                    goto 10;
+                    end;
+
+{$IFC debug }
+                writeln(dumpfile,'size, offset, type ',size,offset,ftype);
+{$ENDC }
+
+                oddoff := odd(offset);
+                j := noerr;
+                case ftype of
+                ftypstr,
+                ftypnull  : ;
+                ftypint1  : if size <> 1 then j := BadFileDesc;
+                ftypint2  : if (size <> 2) or oddoff then j := BadFileDesc;
+                ftypint4  : if (size <> 4) or oddoff then j := BadFileDesc;
+                ftypint8  : if (size <> 8) or oddoff then j := BadFileDesc;
+                ftypfptr  : if (size <> 4) or oddoff then j := BadFileDesc;
+                ftyptick  : if size > 6 then j := BadFileDesc;
+                ftyppack2 : if ((bo.sbit + bo.nbits) > 16) or
+                               (bo.sbit < 0) or (bo.sbit > 15) or
+                               (bo.nbits < 0) or oddoff then
+                                j := BadFileDesc;
+                ftypvstr,
+                ftypvnull : if (size <> 4) or oddoff then j := BadFileDesc;
+                ftypsvstr,
+                ftypsvnull: if (size <> 2) or oddoff then j := BadFileDesc;
+                otherwise   j := BadFileDesc;
+                end; { case }
+                if j <> noerr then
+                    begin
+                    CheckFileDesc := j;
+                    goto 10;
+                    end;
+                StartOff := offset;
+                if ftype = ftyppack2 then
+                    begin
+                    if bo.sbit > 7 then EndOff := offset+1
+                    else EndOff := offset + 2;
+                    if (bo.sbit + bo.nbits) <= 8 then
+                        StartOff := StartOff + 1;
+                    end
+                else EndOff := offset + size;
+
+                for j := 0 to i - 1 do
+                    with fd.pedesc^[j] do
+                        begin
+                        if ftype = ftyppack2 then
+                            begin
+                            if pf^.ftype = ftyppack2 then
+                                begin
+                                if (offset = pf^.offset) and
+                                   ((bo.sbit+bo.nbits) > pf^.bo.sbit) and
+                                   (bo.sbit < (pf^.bo.sbit+pf^.bo.nbits)) then
+                                    begin
+
+{$IFC debug }
+                            writeln(dumpfile,j,'overlaps ',i);
+{$ENDC}
+
+                                    CheckFileDesc := BadFileDesc;
+                                    goto 10;
+                                    end;
+                                end
+                            else
+                                begin
+                                S_Off := offset;
+                                if bo.sbit > 7 then E_Off := offset+1
+                                else E_Off := offset + 2;
+                                if (bo.sbit + bo.nbits) <= 8 then
+                                    S_Off := S_Off + 1;
+                                if (StartOff < E_Off) and
+                                   (EndOff > S_Off) then
+                                    begin
+
+{$IFC debug }
+                            writeln(dumpfile,j,'overlaps ',i);
+{$ENDC }
+
+                                    CheckFileDesc := BadFileDesc;
+                                    goto 10;
+                                    end;
+                                end;
+                            end
+                        else if (StartOff < (offset+size)) and
+                             (EndOff > offset) then
+                            begin
+
+{$IFC debug }
+                            writeln(dumpfile,j,'overlaps ',i);
+{$ENDC }
+
+                            CheckFileDesc := BadFileDesc;
+                            goto 10;
+                            end;
+                        end;
+                if i < fd.nsort then if EndOff > lkvflds then
+                    lkvflds := EndOff;
+                if EndOff > lvflds then lvflds := EndOff;
+                pf := pointer(ord(pf) + sizeof(flddesc));
+                end;
+
+{$IFC debug }
+        writeln(dumpfile,lvflds,lkvflds);
+{$ENDC }
+
+        if ((fd.ticketfld <> -1) and (fd.ticketfld >= fd.nfields)) or
+           (fd.ticketfld < -1) or
+           (fd.vflds < lvflds) or (fd.kvflds < lkvflds) then
+            CheckFileDesc := BadFileDesc
+        else if fd.ticketfld <> -1 then
+            if fd.pedesc^[fd.ticketfld].ftype <> ftyptick then
+                CheckFileDesc := BadFileDesc;
+10:
+end; { CheckFileDesc }
+{**************************************************************************
+
+                                RecOk
+
+        Checks whether a record is in good enough shape to insert into
+        the new file.  All variable length fields that have non-null length
+        must fall within rsize bytes of the start of the record and must start
+        after the fixed part of the record.
+
+        Input Parameters
+                prec - ptr to record
+                rsize - size of record
+                fid - file index
+
+        Output Parameters
+                output result
+                        true iff record is ok
+
+
+*************************************************************************}
+
+{$S frecovseg   }
+function RecOk ( prec : ptrdata;
+                 rsize : integer;
+                 fid : integer) : boolean;
+label
+        10;
+var
+        i : integer;
+        offset,
+        size : integer;
+        pf : ptrfiledesc;
+        pd : ptrflddesc;
+        pvf :
+           record case integer of
+           0:( l : ptrvfld);
+           1:( s : ptrsvfld);
+           end;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pf := pfiletable^[fid];
+        pd := @pf^.pedesc^;
+        RecOk := false;
+        for i := 0 to pf^.nfields-1 do
+            begin
+            if pd^.ftype > ftypvstr then
+                begin
+                pvf.s := pointer(ord(prec) + pd^.offset);
+                if pd^.ftype <= ftypvnull then
+                    begin
+                    size := pvf.l^.size;
+                    offset := pvf.l^.offset;
+                    end
+                else
+                    begin
+                    size := pvf.s^.size;
+                    offset := pvf.s^.offset;
+                    end;
+                if (size < 0) or
+                   ((size <> 0) and
+                       ((offset < pf^.vflds) or
+                        (size > (rsize - offset)))) then goto 10;
+                end;
+            pd := pointer(ord(pd) + sizeof(flddesc));
+            end;
+        RecOk := true;
+10:
+end; { RecOk }
+{******************************************************************************
+
+                                prefixDelete
+
+        Deletes all the files with names prefix cat suffix..
+
+        Input Parameters
+                the global prefix must be set to the prefix of the document
+                to recover
+                suffix - string to cat to prefix to make delete prefix
+
+        Output Parameters
+                ddresult - return result
+
+                noerr
+                OS(reset_catalog,get_next_entry,kill_object), except that all
+                    return codes from get_next_entry that denote an 'EOF'
+                    condition on the catalogue scan are filtered out
+
+
+******************************************************************************}
+
+{$S frecovseg   }
+procedure prefixDelete(var ddresult : integer;
+                            suffix : shortString);
+label
+        10;
+var
+        copyFrom,
+        catlength,
+        rootlength,
+        preflength,
+        killResult,
+        tresult,
+        result,
+        i : integer;
+        fname,
+        fprefix : e_name;
+        catname : pathname;
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        catname := prefix;
+        copyFrom := 0;
+        catlength := length(prefix);
+        while catlength >= 1 do
+            begin
+            if catname[catlength] = delimChar then
+                begin
+                copyFrom := catlength;
+                catlength := catlength - 1;
+                goto 10;
+                end;
+            catlength := catlength - 1;
+            end;
+10:     catname[0] := chr(catlength);
+
+{$IFC debug }
+        writeln(dumpfile,catname,':',catlength);
+{$ENDC }
+
+        rootlength := length(prefix)-copyFrom;
+        preflength := rootlength + length(suffix);
+        movelg(pointer(ord(@catname)+copyFrom),@fprefix,rootlength + 1);
+        fprefix[0] := chr(preflength);
+        movelg(pointer(ord(@suffix)+1),
+               pointer(ord(@fprefix)+rootlength+1),
+               length(suffix));
+
+{$IFC debug }
+        writeln(dumpfile,fprefix);
+{$ENDC }
+
+        killResult := noerr;
+        reset_catalog(result,catname);
+        while result = noerr do
+            begin
+            get_next_entry(result,fprefix,fname);
+            if result = noerr then
+                begin
+                if catlength = 0 then movelg(@fname,@catname,length(fname)+1)
+                else
+                    begin
+                    catname[0] := chr(catlength+length(fname)+1);
+                    catname[catlength+1] := delimChar;
+                    movelg(pointer(ord(@fname)+1),
+                           pointer(ord(@catname)+catlength+2),
+                           length(fname));
+                    end;
+
+{$IFC debug }
+                writeln(dumpfile,catname);
+{$ENDC }
+
+{af}            kill_secure(tresult,catname,password);
+               {kill_object(tresult,catname);}
+                if tresult > noerr then killResult := tresult;
+                catname[0] := chr(catlength);
+
+{$IFC debug }
+                writeln(dumpfile,fname,tresult:8);
+{$ENDC }
+                end;
+            end;
+
+{$IFC debug }
+        writeln(dumpfile,result);
+{$ENDC }
+
+        if result = catEOF then result := noerr;
+        if result = noerr then result := killResult;
+        ddresult := result;
+end;{ prefixDelete }
+
+{******************************************************************************
+
+                                recoverDelete
+
+        Deletes all indexes and the differential file under the prefix in
+        prefix.  All indexes look like 'prefix$Ixxx' while the differential
+        file looks like 'prefix$D'.
+
+        Input Parameters
+                the global prefix must be set to the prefix of the document
+                to recover
+
+        Output Parameters
+                ddresult - return result
+
+                noerr
+                noerr
+                OS(reset_catalog,get_next_entry,kill_object), except that all
+                    return codes from get_next_entry that denote an 'EOF'
+                    condition on the catalogue scan are filtered out as well
+                    as all return results from Kill_object(...'prefix$D'...)
+                    that denote 'notfound'
+
+******************************************************************************}
+
+{$S frecovseg   }
+procedure recoverDelete(var ddresult : integer);
+var
+        tresult : integer;
+        catname : pathname;
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{       First we delete all the indexes.  By convention, all indexes are named
+        'prefix$Ixxx', where 'xxx' can be any string  }
+
+        prefixDelete(ddresult,'$I');
+
+{       Now we delete the differential file if it exists.  By convention
+        the differential file is called
+
+        'prefix$D' }
+
+        movelf(@prefix,@catname,length(prefix)+1);
+        catname[0] := chr(length(catname)+2);
+        catname[length(catname)-1] := '$';
+        catname[length(catname)] := 'D';
+{af}    kill_secure(tresult,catname,password);
+       {kill_object(tresult,catname);}
+        if (tresult > noerr)and(tresult <> NotInCat) then ddresult := tresult;
+end;{ RecoverDelete }
+{****************************************************************************
+
+                                      FindEof
+
+        finds the address of the last occupied page of the file in a
+        resilient manner (don't trust the OS).
+
+        as a byproduct, reads that page into pb^
+
+        Input Parameters
+
+        FID - refno for file to find eof on
+        firstpage - address of first page
+        pagesize - size of pages
+        pb - address of buffer (at least pagesize big) into which we read data
+
+        Output Parameters
+
+        ddresult - return result
+
+        noerr
+        OS(info,read_data)
+
+        FindEof - address of last occupied page of the file, returns 0 if
+            that address is < firstpage
+
+*****************************************************************************}
+
+{$S frecovseg   }
+function FindEof(var ddresult : integer;
+                     Fid : integer;
+                     firstpage : fileptr;
+                     pagesize : integer;
+                     pb : ptrdata) : fileptr;
+label
+        1,
+        10;
+var
+        FInfo : Fs_info;
+        actual,
+        EndPage : fileptr;
+        rem,
+        result : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        info(result,FId,FInfo);
+        if result <> noerr then goto 1;
+        EndPage := FInfo.size;
+
+    {   compute the real end of file - don't depend on any hints
+        & make sure that we start on a page boundary }
+
+        if comp44(EndPage,firstpage) = lt then EndPage := firstpage;
+        EndPage := mult424(div424(EndPage-firstpage,pagesize,rem),pagesize)+
+                    firstpage;
+
+{$IFC debug }
+        writeln(dumpfile,'compute end ',firstpage,EndPage);
+{$ENDC }
+
+        repeat
+            read_data(result,FId,ord(pb),pagesize,actual,Absolute,EndPage);
+            if (result = PastLEOF) or (result = AtEOF) then goto 10;
+            EndPage := EndPage + pagesize
+        until false;
+10:
+
+        repeat
+            if EndPage = firstpage then
+                begin
+                EndPage := 0;
+                goto 1;
+                end;
+            EndPage := EndPage - pagesize;
+            read_data(result,FId,ord(pb),pagesize,actual,Absolute,EndPage);
+            if (result <> PastLEOF) and (result <> AtEOF) then goto 1;
+        until false;
+
+1:      ddresult := result;
+
+{$IFC debug }
+        writeln(dumpfile,'end computed ',EndPage);
+{$ENDC }
+
+        FindEof := EndPage;
+end; { FindEof }
+{*************************************************************************
+
+                              LabelRecover
+
+        reads the pages of InFile, looking for label pages.  except for index
+        label entries, tries to insert every valid label record into the recovery
+        file via the scan ReLabel.  for every valid index entry, it tries to
+        rebuild the index via indexmake.  if indexmake returns an error then,
+        a warning is returned (WarnIndex).  tries to retrieve as much data as
+        it can, and so it ignores read errors and bad data.  Computes new
+        labelticket.
+
+        Input Parameters
+
+        warnings - our current accumulated set of warnings
+        squish - if true, then we compact and truncate behind us
+        InFile - OS refno of source file for recovery
+        ReLabel - scan id of label scan for new file
+        pagesize - page size
+        firstpage - firstpage of InFile
+        pb - pts to a buffer to use for reading InFile
+        pnewname - name of newfile, used for recreating indexes
+        indexmake - a procedure to rebuild indexes, parameters follow
+                those of makeindex (see unit indexbuild)
+
+        Output Parameters
+
+        ddresult - return result
+                noerr
+                ioerr
+                nobuffs
+                noroom
+                inconsistent
+                nomem
+
+        warnings - as noted above, we may add the warning WarnIndex to the set
+        EndPage - set to the starting address of the last page with data in
+            it (meaningfull only if squish = true)
+
+
+
+************************************************************************}
+
+{$S frecovseg   }
+procedure LabelRecover(var ddresult : integer;
+                       var warnings : elemset;
+                           squish : boolean;
+                           OldVersion : boolean;
+                           InFile : integer;
+                           ReLabel : integer;
+                           pagesize : integer;
+                           firstpage : fileptr;
+                       var lastpage : fileptr;
+                           pb : ptrdata;
+                           pnewname : ptrpathname;
+                 procedure indexmake(var ddresult : integer;
+                                         ifilename,
+                                         filename,
+                                         tempdir1,
+                                         tempdir2 : ptrpathname;
+                                         temp_ldsn : integer;
+                                         nisort,
+                                         nikeys : integer;
+                                         piflds : ptridesc;
+                                         duplok : boolean));
+label
+        1,
+        10,
+        20,
+        22;
+var
+        ppath : ptrpathname;
+        pi : ptrientry;
+        pb2 : ptrdata;
+        pd,
+        pd2 : ptrpagedesc;
+        po : ptroffsets;
+        havebuffer : boolean;
+        EndPage,
+        Hole,
+        actual : fileptr;
+        locbuffer,
+        pathoff,
+        nextOff,
+        dataBnd,
+        tresult,
+        result,
+        ReFile,
+        nflds,
+        rsize,
+        j,
+        i : integer;
+        MaxTicket : fileptr;
+        LocHeader :
+            record
+            L : labelentry;
+            H : Header;
+            end;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        havebuffer := false;
+        Hole := firstpage;
+
+        if squish then
+            begin
+            lockbuff(result,locbuffer);
+            if result <> noerr then goto 1;
+            pb2 := buffpool^[locbuffer].pbuff;
+            pd2 := pointer(ord(pb2)+pagesize - sizeof(pagedesc));
+            havebuffer := true;
+            end
+        else lastpage := EndPage;
+
+        MaxTicket := 0;
+        pd := pointer(ord(pb)+pagesize - sizeof(pagedesc));
+        po := pointer(ord(pd)-sizeof(integer));
+        ReFile := pscantable^[ReLabel]^.onfile;
+        nflds := pfiletable^[ReFile]^.nfields;
+
+        EndPage := FindEof(result,InFile,firstpage,pagesize,pb);
+
+        while comp44(Hole,EndPage) <> gt do
+            begin
+            if result <> noerr then
+                begin
+
+{$IFC debug }
+                writeln(dumpfile,'error on page ',EndPage:14,result);
+{$ENDC }
+
+                squish := false;
+                lastpage := EndPage;
+                goto 10; { trundle on }
+                end;
+            case pd^.ptype of
+            labeltype :
+                begin
+
+{$IFC debug }
+                writeln(dumpfile,'a label page of ',pd^.nkeys ,'records ');
+{$ENDC }
+
+                dataBnd := pagesize - sizeof(pagedesc) -
+                           (pd^.nkeys+1)*2;
+                nextOff := po^[0];
+                if (nextOff <> 0) or
+                   (pd^.nkeys <= 0) or
+                   (pd^.nkeys >= pagesize) or
+                   (dataBnd <= 0) then goto 10;
+                for i := 0 to pd^.nkeys-1 do
+                    begin
+                    pi := pointer(ord(pb)+nextOff);
+                    rsize := -nextOff;
+                    nextOff := po^[-i-1];
+                    rsize := rsize + nextOff;
+                    if (rsize < sizeof(labelentry)) or (rsize > maxrsize) or
+                       odd(nextOff) or (nextOff > dataBnd) then goto 10;
+                    if (pi^.lab.varfld.offset = sizeof(labelentry)) and
+                       (pi^.lab.varfld.size <=
+                                  (rsize - sizeof(labelentry))) and
+                       (pi^.lab.varfld.size >= 0) and
+                       (pi^.lab.enum <> nilptr) then
+                       begin
+                       if (pi^.lab.ltype = indexFile) then
+                           begin
+                           tresult := ioerr;
+                           if (ord(pi^.iduplok) < 0) or
+                              (ord(pi^.iduplok) > 1) or
+                              (pi^.isort <= 0) or
+                              (pi^.isort > pi^.ikeys) or
+                              (pi^.ikeys > nflds) then goto 22;
+
+{$IFC debug }
+                           writeln(dumpfile,'parms ok');
+{$ENDC }
+
+                           for j := 0 to pi^.ikeys-1 do
+                              if pi^.iflds[j].field >= nflds then
+                                  goto 22;
+
+{$IFC debug }
+                           writeln(dumpfile,'flds ok');
+{$ENDC }
+
+                           pathoff := (ord(@pi^.iflds) - ord(pi) +
+                                      pi^.ikeys*sizeof(isegment));
+
+{$IFC debug }
+                           writeln(dumpfile,rsize,pathoff);
+{$ENDC }
+
+                           if pathoff >= rsize then goto 22;
+                           ppath:=pointer(ord(pi)+pathoff);
+                           if length(ppath^) >= (rsize-pathoff) then
+                               goto 22;
+
+{$IFC debug }
+                           writeln(dumpfile,'ppath:',ppath^);
+{$ENDC }
+
+                           indexmake(tresult,ppath,pnewname,nil,nil,16,
+                                     pi^.isort,pi^.ikeys,
+                                     @pi^.iflds,pi^.iduplok);
+
+                   22:
+
+{$IFC debug }
+                           writeln(dumpfile,'tres :',tresult);
+{$ENDC }
+
+                           if tresult <> noerr then warnings :=
+                               warnings + [WarnIndex];
+                           end
+                       else if pi^.lab.ltype <> QueryCheckPoint then
+                           begin
+                           if OldVersion then
+                               if (pi^.lab.ltype = fileschema) and
+                                  (pi^.lab.seq = 0) and
+                                  (pi^.lab.varfld.size >= sizeof(V0Header)) then
+                                   begin
+                                   movelf(@pi^,@LocHeader,sizeof(labelentry)+
+                                          sizeof(V0Header));
+                                   LocHeader.L.varfld.size := sizeof(Header);
+                                   LocHeader.L.varfld.offset := sizeof(labelentry);
+                                   LocHeader.H.MarketCode := MCodeNil;
+                                   rsize := sizeof(LocHeader);
+                                   pi := @LocHeader;
+                                   end;
+
+                           linsert(result,ReLabel,@pi^.lab,rsize,false);
+                           if result <> noerr then
+                               begin
+
+{$IFC debug }
+                               writeln(dumpfile,'label error on page ',
+                                       firstpage, ' record #',i,':',result);
+{$ENDC }
+
+                               if result <> duplkey then goto 1;
+                               end
+                           else if comp44(pi^.lab.enum,MaxTicket) = gt then
+                               MaxTicket := pi^.lab.enum;
+                           end;
+                       end;
+                    end;
+                flushscan(result,ReLabel);
+                if result <> noerr then goto 1;
+                end;
+
+            leaftype :
+                begin
+                if squish then
+                    begin
+                    while comp44(Hole,EndPage) <> gt do
+                        begin
+                        read_data(tresult,InFile,ord(pb2),pagesize,actual,
+                                  Absolute,Hole);
+                        if ((tresult = DAltered) or (tresult = DMaybeAltered)) and
+                           (actual = pagesize) then tresult := noerr;
+                        if tresult <> noerr then
+                            begin
+                            squish := false;
+                            lastpage := EndPage;
+                            goto 10;
+                            end;
+                        if pd2^.ptype <> leaftype then
+                            begin
+                            write_data(tresult,InFile,ord(pb),pagesize,actual,
+                                       Absolute,Hole);
+                            if tresult <> noerr then
+                                begin
+                                squish := false;
+                                lastpage := EndPage;
+                                goto 10;
+                                end;
+                            Hole := Hole + pagesize;
+                            if pd2^.ptype = labeltype then
+                                begin
+
+                        {   we swap the leaf page for the label page and then
+                            we process the End page over again since it now
+                            has label records }
+
+                                write_data(tresult,InFile,ord(pb2),pagesize,
+                                           actual,Absolute,EndPage);
+                                if tresult <> noerr then
+                                    begin
+                                    squish := false;
+                                    lastpage := EndPage;
+                                    goto 10;
+                                    end;
+                                result := noerr;
+                                ppath := @pb2^;
+                                pb2 := pb;
+                                pb := @ppath^;
+                                ppath := @pd2^;
+                                pd2 := pd;
+                                pd := @ppath^;
+                                po := pointer(ord(pd)-sizeof(integer));
+                                goto 20;
+                                end;
+
+                {   we just schlepped the leaf page back to some nonleaf or
+                    free page, so we can truncate the End page. we do this
+                    by exiting loop without incrementing Hole }
+
+                            goto 10;
+                            end;
+                        Hole := Hole + pagesize;
+                        end;
+
+                {   the page at End is data and shouldn't be truncated }
+
+                    end;
+                end;
+
+{$IFC debug }
+            freetype,
+            nonleaftype :
+                begin
+                writeln(dumpfile,'skip a free or nonleaf page at ',EndPage);
+                end;
+
+            otherwise
+                writeln(dumpfile,'bad page type on page ',firstpage);
+{$ENDC }
+                end; {case }
+
+        10: if comp44(Hole,EndPage) <> gt then
+                begin
+                if EndPage <> firstpage then
+                    begin
+                    EndPage := EndPage - pagesize;
+                    read_data(result,InFile,ord(pb),pagesize,actual,
+                              Absolute,EndPage);
+                    if ((result = DAltered) or (result = DMaybeAltered)) and
+                       (actual = pagesize) then result := noerr;
+                    end
+                else
+                    begin
+                    EndPage := 0;
+                    read_data(result,InFile,ord(pb),512,actual,
+                              Absolute,firstpage-512);
+                    if ((result = DAltered) or (result = DMaybeAltered)) and
+                       (actual = 512) then result := noerr;
+                    end;
+                if squish then
+                    begin
+                    truncate(tresult,InFile);
+                    compact(tresult,InFile);
+                    end;
+                end;
+        20:     {continue}
+            end; { while }
+
+        result := noerr;
+        MaxTicket := MaxTicket + 1;
+        with pfiletable^[ReFile]^ do
+            if comp44(MaxTicket,labeltickets) = gt then labeltickets := MaxTicket;
+        if squish then lastpage := EndPage;
+
+1:      if havebuffer then
+            begin
+            relbuff(tresult,locbuffer,0);
+            if tresult <> noerr then result := tresult;
+            end;
+        ddresult := result;
+end; { LabelRecover }
+{*****************************************************************************
+
+                                DataRecover
+
+        Recovers all the data that won't make the DB intrinsics barf.  Ignores
+        read errors and bad data.  Computes new ticket.
+
+        Input Parameters
+
+        InFile - OS refno of source file for recovery
+        ReData - scan id of data scan for new file
+        pagesize - page size
+        firstpage - firstpage of InFile
+        EndPage - the address of the last leaf page in the file, 0 -> empty file
+        pb - pts to a buffer to use for reading InFile
+
+        Output Parameters
+
+        ddresult - return result
+                noerr
+                ioerr (an ioerr that it can't ignore)
+                nobuffs
+                noroom
+                inconsistent
+                nomem
+
+*****************************************************************************}
+
+{$S frecovseg   }
+procedure DataRecover(var ddresult : integer;
+                          InFile,
+                          ReData,
+                          pagesize : integer;
+                          firstpage,
+                          EndPage : fileptr;
+                          pb : ptrdata);
+label
+        1,
+        10;
+var
+        MaxTicket : ticket;
+        tDesc,
+        mtDesc : flddesc;
+        haveticket : boolean;
+        pd : ptrpagedesc;
+        po : ptroffsets;
+        pMaxTicket,
+        prec : ptrdata;
+        actual : fileptr;
+        offender,
+        ReFile,
+        nextOff,
+        dataBnd,
+        minsize,
+        rsize : integer;
+        tresult,
+        result,
+        j,
+        i : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{       set up ticket comparison descriptors - taking into account smaller
+        ticket sizes - if there is no ticket field, set flag }
+
+        MaxTicket.low := 0;
+        MaxTicket.high := 0;
+        ReFile := pscantable^[ReData]^.onfile;
+
+        with pfiletable^[ReFile]^ do
+            begin
+            minsize := vflds;
+            haveticket := ticketfld <> -1;
+            if haveticket then
+                begin
+                tDesc := pedesc^[ticketfld];
+                mtDesc := tDesc;
+                mtDesc.offset := 0;
+                pMaxTicket :=
+                    pointer(ord(@MaxTicket) - tDesc.size + sizeof(ticket));
+                end;
+            end;
+        pd := pointer(ord(pb)+pagesize - sizeof(pagedesc));
+        po := pointer(ord(pd)-sizeof(integer));
+        read_data(result,InFile,ord(pb),pagesize,actual,Absolute,EndPage);
+        if ((result = DAltered) or (result = DMaybeAltered)) and
+           (actual = pagesize) then result := noerr;
+        while EndPage <> 0 do
+            begin
+            if result <> noerr then
+                begin
+
+{$IFC debug }
+                writeln(dumpfile,'error on page ',firstpage:14,result);
+{$ENDC }
+                goto 10;
+                end;
+            if pd^.ptype = leaftype then
+                begin
+                dataBnd := pagesize - sizeof(pagedesc) - (pd^.nkeys+1)*2;
+                nextOff := po^[0];
+                if (nextOff <> 0) or
+                   (pd^.nkeys <= 0) or
+                   (pd^.nkeys >= pagesize) or
+                   (dataBnd <= 0) then goto 10;
+
+{$IFC debug }
+                writeln(dumpfile,'a leaf page of ',pd^.nkeys ,'records ');
+{$ENDC }
+
+                for i := 0 to pd^.nkeys-1 do
+                    begin
+                    prec := pointer(ord(pb)+nextOff);
+                    rsize := -nextOff;
+                    nextOff := po^[-i-1];
+                    rsize := rsize + nextOff;
+                    if (rsize < minsize) or (rsize > maxrsize) or
+                       odd(nextOff) or (nextOff > dataBnd) then goto 10;
+                    if RecOK(prec,rsize,ReFile) then
+                        begin
+                        if haveticket then
+                            begin
+                            result := ticketoverflow;
+                            for j := 0 to tDesc.size-1 do
+                                if pMaxTicket^[j] <> -1 then result := noerr;
+                            end;
+                        if result = noerr then
+                            einsert(result,offender,ReData,prec,rsize,false);
+                        if result <> noerr then
+                            begin
+
+{$IFC debug }
+                            writeln(dumpfile,'insert error on page ',
+                                    firstpage,' record #',i);
+{$ENDC }
+
+                            if (result <> duplkey) and
+                               (result <> ticketoverflow) then goto 1;
+                            end;
+
+                        if haveticket and (result = noerr) then
+                            begin
+
+                    {   here we keep a running max over tickets }
+
+                            if compare(@mtDesc,@tDesc,1,
+                                       pMaxTicket,prec) = lt then
+                                movelg(pointer(ord(prec)+tDesc.offset),
+                                       pMaxTicket,
+                                       tDesc.size);
+                            end;
+                        end;
+                    end;
+                end;
+        10: if EndPage = firstpage then
+                begin
+                EndPage := 0;
+                read_data(tresult,InFile,ord(pb),512,actual,Absolute,
+                          firstpage-512);
+                if ((tresult = DAltered) or (tresult = DMaybeAltered)) and
+                   (actual = 512) then tresult := noerr;
+                end
+            else
+                begin
+                EndPage := EndPage -  pagesize;
+                read_data(tresult,InFile,ord(pb),pagesize,actual,Absolute,EndPage);
+                if ((tresult = DAltered) or (tresult = DMaybeAltered)) and
+                   (actual = pagesize) then tresult := noerr;
+                end;
+            flushscan(result,ReData);
+            if result <> noerr then goto 1;
+            truncate(result,InFile);
+            compact(result,InFile);
+            result := tresult;
+            end;
+        result := noerr;
+        with pfiletable^[ReFile]^ do
+            begin
+            if not haveticket then tickets.low := nrecs + 1
+            else
+                begin
+                with MaxTicket do
+                    begin
+                    low := low + 1;
+                    if low = 0 then high := high + 1;
+                    end;
+                tickets := MaxTicket;
+                end;
+            end;
+        dowritenon(result,ReFile);
+1:      ddresult := result;
+end; { DataRecover }
+
+ÿ

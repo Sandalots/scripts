@@ -1,0 +1,751 @@
+{#f     libdb/vlsup0.text }
+{$S access }
+{*****************************************************************************
+
+                                movr_inc
+
+        this routine is used to update the record offsets during a delete or
+        insert
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the right, po2,po1 point at right ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movr_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+{*****************************************************************************
+
+                                movl_inc
+
+        this routine is used to update the record offsets during a delete or
+        insert
+
+        po2^ := po1^ + [increment,....,increment] (vector addition & := )
+
+        move is done from the left, po2,po1 point at left ends of vectors;
+
+        Input Parameters
+                po1 - source vector
+                po2 - dest vector
+                increment - amount to add to source vector
+                cnt - vector lengths
+
+*****************************************************************************}
+
+procedure movl_inc(po1,po2 : ptroffsets;
+                   cnt,
+                   increment : integer);
+        external;
+{^T20}
+{**************************************************************************
+
+                             bsearchv
+
+        performs binary search to find lowest entry that
+        is greater than or equal to the search entry (if beyond end of array
+        then returns nentries+1).  returns true if key was found.
+
+        Input Parameters
+                pentries - pts to array of records
+                po - pts to array of offsets in pentries
+                skey - pts to search key
+                nentries - # of records
+                nfields - # of fields to search on
+                edescript - descriptor for records
+                kdescript - descriptor for search key
+
+         Output Parameters
+                sresult - true iff there was a match
+                index - index of where search stopped, if sresult then this
+                        is a matching record, else it is where the record
+                        would go in the page
+
+
+*************************************************************************}
+
+procedure bsearchv(var sresult : boolean;
+                       pentries : ptrdata;
+                       po : ptroffsets;
+                       skey : ptrdata;
+                       nentries,
+                       nfields : integer;
+                   var index : integer;
+                       edescript,
+                       kdescript : ptrrecptr);
+        external;
+
+{**************************************************************************
+
+                                ktouched
+
+        sets touched to touch_by_vltree for all affected scans on a file.
+
+        Input Parameters
+                scan - # of first scan for file
+                page - page that was touched
+
+***************************************************************************}
+
+{$S access }
+procedure ktouched(scan : integer;
+                   page : fileptr);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        while scan <> nilval do
+            with pscantable^[scan]^ do
+                begin
+                if keypage = page then touched := touch_by_vltree;
+                scan := fnext;
+                end;
+end; { ktouched }
+
+{**************************************************************************
+
+                                solomon
+
+        Finds the split point in a hypothetical page (for split: an existing
+        page + the insert record, for rotate: two existing records + an
+        optional insert record), given an initial split point and the
+        correspond leftpage size and rightpage size.
+
+        Input Parameters
+
+        leftsize - initial size of left page
+        rightsize - initial size of right page
+        index - initial last record in left page
+        csizeof - a function that returns the size of the ith record in the
+                virtual page
+
+        Output Parameters
+
+        leftsize - final size of left page
+        rightsize - final size of right page
+        return result - final last record in left page
+
+
+
+***************************************************************************}
+
+
+{$S access }
+function solomon(var leftsize,
+                     rightsize : integer;
+                     index : integer;
+                 function csizeof(virtualIndex : integer) : integer) : integer;
+label
+        10;
+var
+        lsize,
+        rsize : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        repeat
+            if leftsize < rightsize then begin
+                lsize := leftsize + csizeof(index+1);
+                rsize := rightsize - csizeof(index+1);
+                if abs(rsize-lsize) < (rightsize - leftsize)
+                then index := index + 1
+                else goto 10;
+            end
+            else if leftsize > rightsize then begin
+                lsize := leftsize - csizeof(index);
+                rsize := rightsize + csizeof(index);
+                if abs(rsize-lsize) < (leftsize - rightsize)
+                then index := index - 1
+                else goto 10;
+            end
+            else goto 10;
+            leftsize := lsize;
+            rightsize := rsize;
+        until false;
+10:     solomon := index;
+end;
+
+{***************************************************************************
+
+                              splitpoint
+
+        given an array of record offsets (starts at zero and goes back),
+        and a size and index of a record to insert, determines the split
+        point.  first we choose the middle of the offset array as a
+        guess.  then we compute the size of the left and right pages that
+        would result.  we seek to minimize the difference of the size
+        of the left and right pages by moving the split point towards the
+        smaller of the two pages.
+
+        note that for nonleaf pages, pointer[i+1] goes with key[i].
+        thus nonleaf records are composed of a key followed by a page
+        pointer.  each nonleaf page also starts with an extra pointer
+        (there is one more pointer, pointer[0], which in at offset 0
+        in the page).  when you split a nonleaf page, the leftmost
+        key of the right page is not necessary, so we must subtract
+        the first entry from the rightsize.
+
+
+        Input Parameters:
+
+        poff - ptr to 0th offset.  offset n is at poff^[-n]
+        nkeys - # of records currently in array of offsets
+        index - offset at which new record will go
+        size - size of new record
+        nonleaf - true iff we are splitting a leaf page
+
+        Output Paramater:
+
+        splitindex - the highest record # that will go in the left page
+
+***************************************************************************}
+
+{$S openclose }
+procedure splitpoint(    poff : ptroffsets;
+                         nkeys : integer;
+                         index : integer;
+                         size : integer;
+                     var splitindex : integer);
+var
+        i,
+        leftsize,
+        rightsize : integer;
+
+{***************************************************************************
+
+                                csizeof
+
+        computes the size of entry i in the hypothetical complete page.
+        this requires simulating the insertion of record at index.
+
+        note:
+                assert(0 <= i <= nkeys)
+
+***************************************************************************}
+
+{$S access }
+function csizeof(i : integer) : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if i < index then csizeof := poff^[-i-1] - poff^[-i]
+        else if i = index then csizeof := size
+        else csizeof := poff^[-i] - poff^[-i+1];
+end; { csizeof }
+
+
+{$S openclose }
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        i := (nkeys+1) div 2;
+        if i < index then leftsize := poff^[-i-1]
+        else leftsize := poff^[-i] + size;
+        rightsize := poff^[-nkeys]+size-leftsize;
+        splitindex := solomon(leftsize,rightsize,i,csizeof);
+end; { splitpoint }
+{**************************************************************************
+
+                              delrecord
+
+        removes a record from a page.
+
+        Input Parameters:
+                pb - points to start of records in buffer
+                po - points to right end of offsets vector
+                pd - points to pagedesc
+                index - which record to delete
+
+
+**************************************************************************}
+
+{$S access }
+procedure delrecord(pb : ptrdata;
+                    po : ptroffsets;
+                    pd : ptrpagedesc;
+                    index : integer);
+var
+        pioff,
+        pnoff : ^ integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pioff := @po^[-index];
+        pnoff := @po^[-index-1];
+        movelf(pointer(ord(pb)+pnoff^),
+               pointer(ord(pb)+pioff^),po^[-pd^.nkeys]-pnoff^);
+        pd^.nkeys := pd^.nkeys-1;
+        movr_inc(@pnoff^,@pioff^,pd^.nkeys-index,pioff^-pnoff^);
+end;
+{**************************************************************************
+
+                              mergepages
+
+        merges pages in leftbuff and rightbuff into one page in leftbuff.
+        returns true iff it could do the merge. leftbuff must precede
+        rightbuff.
+
+        Input Parameters:
+                leftbuff - left page buffer
+                rightbuff - right page buffer
+                pagesize - size of pages
+
+
+**************************************************************************}
+
+{$S access }
+function mergepages(leftbuff,
+                    rightbuff : integer;
+                    pagesize : integer) : boolean;
+var
+        pbd1,pbd2 : ^ buffdesc;
+        po1,po2 : ptroffsets;
+        pd1,pd2 : ptrpagedesc;
+        pb1,pb2 : ptrdata;
+        totalsize : integer;
+        pnk1,pnk2 : ^ integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pbd1 := @buffpool^[leftbuff];
+        pbd2 := @buffpool^[rightbuff];
+        pb1 := pbd1^.pbuff;
+        pd1 := pointer(ord(pb1)+pagesize-sizeof(pagedesc));
+        po1 := pointer(ord(pd1)-sizeof(integer));
+        pnk1 := @po1^[-pd1^.nkeys];
+        pb2 := pbd2^.pbuff;
+        pd2 := pointer(ord(pb2)+pagesize-sizeof(pagedesc));
+        po2 := pointer(ord(pd2)-sizeof(integer));
+        pnk2 := @po2^[-pd2^.nkeys];
+
+        totalsize := pnk1^ + pnk2^ + sizeof(pagedesc) +
+                     (pd1^.nkeys+pd2^.nkeys+1) * sizeof(integer);
+
+        if totalsize > pagesize then mergepages := false
+        else begin
+            pbd1^.state := dirty;
+            pbd2^.state := dirty;
+            mergepages := true;
+
+            {   copy over the records from rightbuff, if there are any }
+
+            if pnk2^ <> 0 then begin
+                movelf(pb2,pointer(ord(pb1)+pnk1^),pnk2^);
+                movr_inc(pointer(ord(po2)-sizeof(integer)),
+                         pointer(ord(pnk1)-sizeof(integer)),
+                         pd2^.nkeys-1,pnk1^);
+                pd1^.nkeys := pd1^.nkeys + pd2^.nkeys;
+            end;
+        end;
+
+{$IFC debug }
+        if bdebug then
+            begin
+            writeln(dumpfile,'mergepages');
+            dumpp(pbd1^.pfile,leftbuff);
+            dumpp(pbd2^.pfile,rightbuff);
+            end;
+{$ENDC }
+end;
+{*****************************************************************************
+
+                                   allocpage
+
+        gets a free page.  uses the freelist if it isn't empty.  if
+        freelist is empty, then allocates page at end of file.  sets
+        up pool descriptor so that post can do a putpage if the page
+        came off the end of the file.  we use the putpage to allocate
+        the page physically.
+
+        Input Parameters
+                fileid - file in which to allocate page
+
+        Output Parameters
+                kresult - return result
+                buffer - # of buffer for allocated page
+
+        Return Results
+                noerr
+                noroom
+                inconsistent
+                ioerr
+
+*****************************************************************************}
+
+{$S access }
+procedure allocpage(var kresult : integer;
+                        fileid : integer;
+                    var buffer : integer);
+var
+        pd : ptrpagedesc;
+        lresult,
+        sizepage : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+            sizepage := pagesize;
+            if dont_use_freelist or (freelist = nilptr) then
+                begin
+
+                (*dbif bdebug then writeln(dumpfile,'newpage');db*)
+
+                if comp44(lastpage,nilptr-sizepage) = gt then lresult := noroom
+                else
+                    begin
+                    lockbuff(lresult,buffer);
+                    if lresult = noerr then
+                        begin
+                        with buffpool^[buffer] do
+                            begin
+                            pfile := fileid;
+                            page := lastpage;
+                            end;
+                        lastpage:=lastpage+sizepage;
+                        end;
+
+                    (*db
+                    if bdebug then writeln(dumpfile,'page:',lastpage:14);*)
+
+                    end; { else }
+                end { then }
+            else { use one off the freelist }
+                begin
+
+                (*dbif bdebug then writeln(dumpfile,'free:',freelist:14);*)
+                getpage(lresult,buffer,fileid,freelist,true);
+                if lresult = noerr then
+                    begin
+                    pd := pointer(ord(buffpool^[buffer].pbuff)+
+                                      sizepage-sizeof(pagedesc));
+                    freelist := pd^.free;
+                    end;
+                end; { else }
+            end; { with pfiletable^[fileid]^ }
+            kresult := lresult;
+end; { allocpage }
+{******************************************************************************
+
+                                  post
+
+        checks whether the buffer has been newly allocated (state = empty).
+        if so, then post attempts to force the page out to disk to make
+        sure that there is enough room in the file.  if the write fails then
+        the allocation is rolled back.  post assumes that allocpage has
+        been called to setup the buffer.
+
+        Input Parameter
+                buffer - buffer to post
+
+        Output Parameter
+                kresult - return result
+
+        Return Results
+                noerr
+                inconsistent
+                ioerr
+                noroom
+
+******************************************************************************}
+
+{$S access }
+procedure post (var kresult : integer;
+                    buffer : integer);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with buffpool^[buffer] do
+            if state = empty then
+                begin
+                putpage(kresult,buffer,pfile,page);
+                if kresult <> noerr then pfiletable^[pfile]^.lastpage := page;
+                end
+            else
+                begin
+                state := dirty;
+                kresult := noerr;
+                end;
+end; { post }
+{**************************************************************************
+
+                             quickinsert
+
+        see interface
+
+
+***************************************************************************}
+
+{$S access }
+function quickinsert{(    fileid : integer;
+                          pagetype : integer;
+                          pnewrec : ptrdata;
+                          size : integer;
+                          pfptr : ptrfileptr;
+                          canmove : boolean;
+                          index,
+                          buff1 : integer;
+                      var ipage : fileptr;
+                      var iindex : integer) : boolean};
+var
+        pbd1 : ^ buffdesc;
+        prec,
+        pb1 : ptrdata;
+        po1 : ptroffsets;
+        pd1 : ptrpagedesc;
+        pfd : ptrfiledesc;
+        pfileptr : ptrfileptr;
+        descoff,
+        pagesize,
+        total,ioff : integer;
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pfd := pfiletable^[fileid];
+        pbd1 := @buffpool^[buff1];
+        pb1 := pbd1^.pbuff;
+        pagesize := pfd^.pagesize;
+        descoff := pagesize-sizeof(pagedesc);
+        pd1 := pointer(ord(pb1)+descoff);
+        po1 := pointer(ord(pd1)-sizeof(integer));
+        total := po1^[-pd1^.nkeys];
+        ioff := po1^[-index];
+
+        (*dbif bdebug then writeln(dumpfile,'split,canmove ',ord(split):2,
+                               ord(canmove):2);*)
+
+        quickinsert := true;
+        if (total+sizeof(pagedesc)+(pd1^.nkeys+2)*sizeof(integer)+size)
+                                <= pagesize then
+            begin { simple insert }
+            quickinsert := false;
+
+{$IFC debug }
+            if bdebug then writeln(dumpfile,'simple insert');
+{$ENDC }
+
+            ktouched(pfd^.scans,pbd1^.page);
+            ipage := pbd1^.page;
+            iindex := index;
+
+            moverf(pointer(ord(pb1)+ioff),
+                   pointer(ord(pb1)+ioff+size),total-ioff);
+            movl_inc(@po1^[-pd1^.nkeys],@po1^[-pd1^.nkeys-1],
+                     pd1^.nkeys-index,size);
+            prec := pointer(ord(pb1)+ioff);
+            pd1^.nkeys := pd1^.nkeys+1;
+            if pagetype = nonleaftype then
+                begin
+                if canmove then movelf(pnewrec,prec,size)
+                else extractkey(pfd^.pedesc,pfd^.pedesc,pfd^.nsort,
+                                pnewrec,
+                                pointer(ord(prec)+sizeof(fileptr)),pfd^.kvflds);
+                pfileptr := @prec^;
+                pfileptr^ := pfptr^;
+                end
+            else
+                begin
+                if canmove then movelf(pnewrec,prec,size)
+                else extractkey(pfd^.pkdesc,pfd^.pedesc,pfd^.nfields,
+                                pnewrec,prec,pfd^.vflds);
+                end;
+            pbd1^.state := dirty;
+
+{$IFC debug }
+            if bdebug then dumpp(fileid,buff1);
+{$ENDC }
+
+            end; { simple insert }
+end; { quickinsert }
+{**************************************************************************
+
+                             quickDelete
+
+        see interface
+
+
+***************************************************************************}
+
+{$S access }
+function quickDelete{(var kresult : integer;
+                         onfile : integer;
+                         qpage : fileptr;
+                         qindex : integer) : boolean};
+label
+        1,
+        2;
+var
+        pagesize,
+        lresult,
+        buffer : integer;
+
+        pfd : ptrfiledesc;
+        pd : ptrpagedesc;
+        po : ptroffsets;
+
+        pb : ptrdata;
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif bdebug then
+            begin
+            writeln('qDelete ',qpage,qindex);
+            end;*)
+        quickDelete := false;
+        getpage(kresult,buffer,onfile,qpage,true);
+        if kresult <> noerr then goto 1;
+
+        pfd := pfiletable^[onfile];
+        pagesize := pfd^.pagesize;
+        pb := buffpool^[buffer].pbuff;
+        pd := pointer(ord(pb)+pagesize-sizeof(pagedesc));
+        po := pointer(ord(pd)-sizeof(integer));
+
+     {  verify no overflow and no underflow }
+
+        if (po^[-pd^.nkeys] - po^[-qindex-1] + po^[-qindex] +
+            (pd^.nkeys+1)*sizeof(integer))
+            >= ((pagesize - sizeof(pagedesc)) div 2) then
+            begin
+            (*dbif bdebug then
+                begin
+                writeln('doing qDelete ');
+                dumpp(onfile,buffer);
+                end;*)
+            delrecord(pb,po,pd,qindex);
+            ktouched(pfd^.scans,qpage);
+            buffpool^[buffer].state := dirty;
+            if pd^.ptype = leaftype then pfd^.nrecs := pfd^.nrecs-1;
+            quickDelete := true;
+            end;
+
+2:      relbuff(kresult,buffer,isleaf);
+1:
+end; { quickDelete }
+{**************************************************************************
+
+                              quickUpdate
+
+        see interface
+
+
+***************************************************************************}
+
+{$S access }
+function quickUpdate{(var kresult : integer;
+                          onfile : integer;
+                          pnewrec : ptrdata;
+                          size : integer;
+                          qpage : fileptr;
+                          qindex : integer) : boolean};
+label
+        1,
+        2;
+var
+        nkeys,
+        pagesize,
+        delta,
+        buffer,
+        NextOff,
+        Total,
+        MoveAmount : integer;
+
+        pfd : ptrfiledesc;
+        pd : ptrpagedesc;
+        po : ptroffsets;
+
+        poQ,
+        poPrior,
+        poNext : ^ integer;
+
+        pb : ptrdata;
+
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif bdebug then
+            begin
+            writeln('qUpdate ',qpage,qindex);
+            end;*)
+        quickUpdate := false;
+        getpage(kresult,buffer,onfile,qpage,true);
+        if kresult <> noerr then goto 1;
+
+        pfd := pfiletable^[onfile];
+        pagesize := pfd^.pagesize;
+        pb := buffpool^[buffer].pbuff;
+        pd := pointer(ord(pb)+pagesize-sizeof(pagedesc));
+        po := pointer(ord(pd)-sizeof(integer));
+
+        poQ := @po^[-qindex];
+
+        poPrior := pointer(ord(poQ)+sizeof(integer));
+        poNext := pointer(ord(poQ)-sizeof(integer));
+
+        nkeys := pd^.nkeys;
+
+        if qindex = 0 then { make sure we're at eof }
+            begin
+            if pd^.prior <> nilptr then goto 2;
+            end
+        else { make sure we're greater than our left neighbor }
+            begin
+            if compare(pfd^.pedesc,pfd^.pedesc,pfd^.nkeys,pnewrec,
+                       pointer(ord(pb)+poPrior^)) <> gt then
+                goto 2;
+            end;
+
+        if qindex = (nkeys-1) then { make sure we're at eof }
+            begin
+            if pd^.next <> nilptr then goto 2;
+            end
+        else { make sure we're less than our right neighbor }
+            begin
+            if compare(pfd^.pedesc,pfd^.pedesc,pfd^.nkeys,pnewrec,
+                       pointer(ord(pb)+poNext^)) <> lt then
+                goto 2;
+            end;
+
+
+     {  verify no overflow and no underflow }
+
+        NextOff := poNext^;
+        delta := size - NextOff + poQ^;
+        Total := po^[-nkeys];
+        MoveAmount := Total - NextOff;
+        Total := Total + delta +(nkeys+1)*sizeof(integer);
+
+        (*dbif bdebug then writeln('delta,MoveAmount ',delta,MoveAmount);*)
+
+        if delta < 0 then { check for underflow }
+            begin
+            if Total < ((pagesize - sizeof(pagedesc)) div 2) then goto 2;
+            movelf(pointer(ord(pb)+NextOff),
+                   pointer(ord(pb)+NextOff+delta),
+                   MoveAmount);
+            end
+        else if delta > 0 then { check for overflow }
+            begin
+            if (Total+sizeof(pagedesc)) > pagesize then goto 2;
+            moverf(pointer(ord(pb)+NextOff),
+                   pointer(ord(pb)+NextOff+delta),
+                   MoveAmount);
+            end;
+        movelf(pnewrec,pointer(ord(pb)+poQ^),size);
+        movr_inc(@poNext^,@poNext^,nkeys-qindex-1,delta);
+
+        (*dbif bdebug then
+            begin
+            writeln('doing qUpdate ');
+            dumpp(onfile,buffer);
+            end;*)
+
+        ktouched(pfd^.scans,qpage);
+        buffpool^[buffer].state := dirty;
+        quickUpdate := true;
+
+2:      relbuff(kresult,buffer,isleaf);
+1:
+end; { quickUpdate }
+
+ÿ

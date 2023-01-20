@@ -1,0 +1,780 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+(*  MM2  *)
+
+
+procedure SAVE_OC(* c_sdb_ptr: sdb_ptr; ordpcb: absptr *);
+  (* convert an overlay candidate to a present segment *)
+  (* make the passed pcb a referencer of the segment   *)
+
+  (*$IFC DEBUG1*)
+  type
+    ev_log = record
+               ev_type: int1;             { type = 12 }
+               ev_segT: int1;             { seg type 1=private code }
+                                          {          2=data }
+                                          {          3=stack}
+               ev_sdb: sdb_ptr;           { seg sdb ptr }
+               ev_maddr: int2;            { memory address}
+               ev_res2: int4;             { reserved }
+             end;
+
+  var
+    errnum: int2;
+    c_event: ev_log;                      { logging event }
+  (*$ENDC*)
+
+  begin
+    with c_sdb_ptr^ do
+      begin
+        {
+        RECORDIT(53,ord(sdbtype),memaddr,memsize,ord(c_sdb_ptr));             (*P*)
+        RECORDIT(53,15,0,ordpcb,ord(c_sdb_ptr));                              (*P*)
+        }
+        sdbstate.overlayF:=false;
+        if (sdbtype <> code) then ADDTO_SRB(c_sdb_ptr,ordpcb);
+
+        (*$IFC DEBUG1*)
+        if sdbtype = code
+          then measTable.misc[cntCsoc]:=measTable.misc[cntCsoc]+1
+          else measTable.misc[cntDsoc]:=measTable.misc[cntDsoc]+1;
+
+        if TRACE(spare2,9) then
+          begin
+            if LOGGING then
+              begin
+                with c_event do
+                  begin
+                    ev_type:=12;
+                    ev_segT:=ord(sdbtype);
+                    ev_sdb:=c_sdb_ptr;
+                    ev_maddr:=memaddr;
+                    ev_res2:=0;
+                    LOG(errnum,ord(@c_event));
+                  end;
+              end;
+          end;
+        (*$ENDC*)
+
+      end;
+  end; (* SAVE_OC *)
+
+
+
+
+procedure MAKE_OC(* c_sdb: sdb_ptr *);
+  (* the segment will be converted to an overlay candidate; the mapping *)
+  (* of the segment by all domains will be made illegal                 *)
+
+  (*$IFC DEBUG1*)
+  type
+    ev_log = record
+               ev_type: int1;             { type = 13 }
+               ev_segT: int1;             { seg type 1=private code }
+                                          {          2=data }
+                                          {          3=stack}
+               ev_sdb: sdb_ptr;           { seg sdb ptr }
+               ev_maddr: int2;            { memory address }
+               ev_res2: int4;             { reserved }
+             end;
+  (*$ENDC*)
+
+  var
+    old_memaddr, old_memsize: int2;
+
+    (*$IFC DEBUG1*)
+    errnum: int2;
+    c_event: ev_log;                      { logging event }
+    (*$ENDC*)
+
+  begin
+    with c_sdb^ do
+      begin
+        {
+        RECORDIT(51,ord(sdbtype),memaddr,memsize,ord(c_sdb));                 (*P*)
+        }
+        sdbstate.overlayF:=true;
+
+        CLEAR_SRB(c_sdb);
+
+        (* make segment look like it's not in memory so it will be marked *)
+        (* as mmuabsent in all domains                                    *)
+        old_memaddr:=memaddr; (* save memaddr *)
+        old_memsize:=memsize;
+        memaddr:=0;
+        REMAP_SEGMENT(c_sdb,old_memaddr,old_memsize);
+        memaddr:=old_memaddr; (* restore memaddr *)
+
+        (*$IFC DEBUG1*)
+        if sdbtype = code
+          then measTable.misc[cntCmoc]:=measTable.misc[cntCmoc]+1
+          else measTable.misc[cntDmoc]:=measTable.misc[cntDmoc]+1;
+
+        if TRACE(spare2,9) then
+          begin
+            if LOGGING then
+              begin
+                with c_event do
+                  begin
+                    ev_type:=13;
+                    ev_segT:=ord(sdbtype);
+                    ev_sdb:=c_sdb;
+                    ev_maddr:=memaddr;
+                    ev_res2:=0;
+                    LOG(errnum,ord(@c_event));
+                  end;
+              end;
+          end;
+        (*$ENDC*)
+
+      end;
+  end;(*MAKE_OC*)
+
+
+procedure CREATE_SPACE(space_needed: int2);
+  (* Create enough free space to satisfy space_needed.                        *)
+  (* The clock pointer is pointing to the last segment visited by the segment *)
+  (* replacement algorithm.  Do the following until free space exists.        *)
+  (* Bump the clock pointer to the next allocated segment and if the segment *)
+  (* is an overlay candidate then toss the segment else make the segment an  *)
+  (* overlay candidate.                                                      *)
+
+  var
+    c_sdb, n_sdb: sdb_ptr;
+    start_addr: int2;
+    cycle: int2;
+    c_mmrb: mmrb_ptr;
+    error: int2;
+
+  function SegSwappable: boolean;
+     (* Checks the swappable state of seg "n_sdb".  Segment is swappable if *)
+     (* o Not free sdb or header sdb                                        *)
+     (* o lockcount = 0                                                     *)
+     (* o iocount = 0                                                       *)
+     (* o freezecount = 0                                                   *)
+     (* o length >= disclength                                              *)
+
+    begin
+      SegSwappable:=false;
+      with n_sdb^ do
+        begin
+          if (sdbtype <> free) and (sdbtype <> header)
+            then if lockcount = 0
+                   then if sdbtype = code
+                          then SegSwappable:=true
+                          else if (io_count = 0) and
+                                  (freeze_count = 0) and
+                                  (ubd_pcb_ptr = ord(nil)) and
+                                  (disclength >= length)
+                                 then SegSwappable:=true;
+        end;
+    end;(*SegSwappable*)
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    with c_mmrb^ do
+      begin
+        if numbRelSegs > 0 then
+          begin  (*release any sdb's that are no longer needed*)
+            n_sdb:=pointer(ord(head_sdb.memchain.fwd_link));
+            while numbRelSegs > 0 do
+              begin
+                c_sdb:=n_sdb;
+                n_sdb:=pointer(ord(c_sdb^.memchain.fwd_link));
+                if c_sdb^.sdbstate.releaseF then
+                  begin (* seg is to be released *)
+                    DEALLOC_MEM(c_sdb);
+                    RELSPACE(ord(c_sdb),b_sysglobal_ptr);
+                    numbRelSegs:=numbRelSegs-1;
+                  end;
+              end;(*while*)
+          end;
+
+        c_sdb:=clock_ptr;
+      end;(*with c_mmrb*)
+    start_addr:=c_sdb^.memaddr;
+    cycle:=0;
+
+    (* cycle through sdb's with memory until avail_space >= space_needed or *)
+    (* we have cycled through memory till nothing more can be done.         *)
+    while (c_mmrb^.avail_space < space_needed) and
+          (cycle < 3) do
+      begin
+        n_sdb:=pointer(ord(c_sdb^.memchain.fwd_link));
+        with n_sdb^ do
+          begin
+            if memaddr = start_addr then cycle:=cycle + 1;
+            if not SegSwappable then
+               begin
+                 {
+                 RECORDIT(50,ord(sdbtype),memaddr,memsize,ord(n_sdb));        (*P*)
+                 }
+                 c_sdb:=n_sdb;
+               end
+              else
+               begin
+                 (* swappable segment - if overlay candidate then toss it else *)
+                 (*                     make it an overlay candidate           *)
+                 if sdbstate.overlayF then
+                   begin
+                     (*$IFC DEBUG2*)
+                     if TRACE(mm,0)
+                       then writeln(' bump_clock - tossing sdb at ',memaddr);
+                     (*$ENDC*)
+
+                     TOSS_SEG(error,n_sdb,true);
+                     if error >0 then
+                       begin (* i/o error prevented swap out of segment - *)
+                             (* seg is left in memory.                    *)
+                         sdbstate.overlayF:=true;
+                         sdbstate.memoryF:=true;
+                         c_sdb:=n_sdb;
+                       end;
+                   end
+                  else
+                   begin
+                     (*$IFC DEBUG2*)
+                     if TRACE(MM,0)
+                       then WRITELN(' bump_clock - sdb to O.C.  at ',memaddr);
+                     (*$ENDC*)
+
+                     MAKE_OC(n_sdb);
+                     c_sdb:=n_sdb;
+                   end;
+               end;
+          end;(*with*)
+      end;(*while*)
+
+    c_mmrb^.clock_ptr:=c_sdb;
+    if c_sdb^.sdbtype = free then TSTCLKPTR(c_sdb);
+  end;(*CREATE_SPACE*)
+
+
+function FIND_FREE(space_needed: int2; var free_sdb: sdb_ptr): boolean;
+  (* Find a free region of sufficient size to satisfy the request.  Adjacent *)
+  (* free regions will be coalesced into one region.  The first free region  *)
+  (* of sufficient size will be used.                                        *)
+
+  label 10;
+
+  var
+    c_mmrb: mmrb_ptr;
+
+  begin
+    (*$IFC DEBUG2*)
+    if TRACE(mm,0) then writeln(' find_free beginning');
+    (*$ENDC*)
+
+    c_mmrb:=pointer(mmrb_addr);
+    find_free:=false;
+    free_sdb:=pointer(ord(c_mmrb^.head_sdb.freechain.fwd_link) - oset_freechain);
+    while free_sdb <> @c_mmrb^.tail_sdb do
+      begin
+        if free_sdb^.memsize < space_needed
+          then free_sdb:=pointer(ord(free_sdb^.freechain.fwd_link)-oset_freechain)
+          else
+           begin
+             find_free:=true;
+
+             (*$IFC DEBUG2*)
+             if TRACE(mm,0)
+               then writeln(' found free - memaddr = ',free_sdb^.memaddr,
+                                                     ' size = ',free_sdb^.memsize);
+             (*$ENDC*)
+
+             goto 10;  (* get out of loop *)
+           end;
+      end;(*while*)
+
+10:
+    (*$IFC DEBUG2*)
+    if TRACE(mm,0) then writeln(' find_free done');
+    (*$ENDC*)
+
+  end;(*FIND_FREE*)
+
+
+procedure CLEAR_SPACE(hole_memaddr, space_needed: int2;
+                                    force_to_hole_memaddr: boolean);
+  (* clear memory of sdb's which prevent consolidation of the free regions *)
+  (* memory is shuffled in an attempt to make the new hole at the location *)
+  (* specified by hole_memaddr.                                            *)
+
+  type
+    movedir = (toleft,toright);
+
+  var
+    space_gained: int2;
+    free_sdb, next_sdb, moving_sdb: sdb_ptr;
+    free_start, free_end: int2;
+    c_mmrb: mmrb_ptr;
+
+  procedure SET_INMOTION_SEG;
+     (* moving_sdb will be flagged as in motion.  If seg is frozen then *)
+     (* process will block waiting for the unfreeze.                    *)
+
+  var
+    int_level,intlev2: intson_type;
+
+  begin
+    with moving_sdb^ do
+      begin
+        INTSOFF(clokints, int_level); (*only clock interrupts off when call wait_sem*)
+        INTSOFF(allints,intlev2); (* all interrupts off *)
+        if sdbtype <> code
+          then while freeze_count <> 0 do
+                    begin (* must wait for segment to become movable *)
+                      sdbstate.pcb_wF:=true;   (* set flag that pcb is waiting *)
+                      INTSON(intlev2); (*restore to clockints*)
+                      WAIT_SEM(c_mmrb^.seg_wait_sem,[]);
+                      INTSOFF(allints,intlev2); (* all interrupts back off *)
+                    end; (* while *)
+
+        (* seg is moving *)
+        sdbstate.motionF:=true;
+        INTSON(int_level); (* interrupts on *)
+      end;
+  end; (* SET_INMOTION_SEG *)
+
+
+  procedure CLR_INMOTION_SEG;
+     (* The segment is flagged as not being in motion.  If any i/o request *)
+     (* are waiting pending an unfreeze then they will be restarted.       *)
+  type
+    ptr_qioreq = ^qioreq;
+
+  var
+    c_qioreq, l_qioreq, nxt_qioreq: ptr_qioreq;
+    err, index: int2;
+    request: reqptr_type;
+    parm: params;
+
+  begin
+    moving_sdb^.sdbstate.motionF:=false;    (* clear motion flag *)
+
+    if moving_sdb^.sdbtype <> code then
+      begin (* only data segs can have pending i/o requests *)
+        c_qioreq:=pointer(c_mmrb^.hd_qioreq_list.fwd_link+b_sysglobal_ptr);
+        l_qioreq:=@c_mmrb^.hd_qioreq_list.fwd_link;
+        while c_qioreq <> l_qioreq do
+          begin
+            with c_qioreq^ do
+              begin
+                nxt_qioreq:=pointer(qioreq_list.fwd_link+b_sysglobal_ptr);
+                request:=pointer(pioreq); (* queued i/o request *)
+                parm.fnctn_code:=reqrestart;
+                parm.req:=request;
+                CALLDRIVER(err,request^.cfigptr,@parm);
+                DEQUEUE(qioreq_list,b_sysglobal_ptr);
+                RELSPACE(ORD(c_qioreq),b_sysglobal_ptr);
+                c_qioreq:=nxt_qioreq;
+              end;
+          end; (*while *)
+      end;
+  end; (* CLR_INMOTION_SEG *)
+
+
+  procedure MOVE_SEG(dir: movedir);
+    (* move the segment "moving_sdb" to one end or another of the free region *)
+    (* defined by free_sdb.                                                   *)
+
+    (*$IFC DEBUG1*)
+    type
+      ev_log = record
+                 ev_type: int1;             { type = 19 }
+                 ev_segT: int1;             { seg type 1=private code }
+                                            {          2=data }
+                                            {          3=stack}
+                 ev_sdb: sdb_ptr;           { seg sdb ptr }
+                 ev_smaddr: int2;           { source memory address }
+                 ev_dmaddr: int2;           { destination memory address }
+                 ev_res2: int2;             { reserved }
+               end;
+    (*$ENDC*)
+
+    var
+      srcsize, srcaddr, destsize, destaddr: int2;
+
+      (*$IFC DEBUG1*)
+      errnum: int2;
+      c_event: ev_log;                      { logging event }
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      if TRACE(mm,17) then
+        begin
+          if moving_sdb^.sdbtype = code
+            then writeln(' moving code segment - sdb = ',ord(moving_sdb))
+            else writeln(' moving data segment - sdb = ',ord(moving_sdb));
+          if TRACE(mm,0) then
+            begin
+              writeln(' move_seg - memaddr = ',moving_sdb^.memaddr,
+                      ' size = ',moving_sdb^.memsize);
+              writeln('       to - memaddr = ',free_sdb^.memaddr,
+                      ' size = ',free_sdb^.memsize);
+            end;
+        end;
+      (*$ENDC*)
+
+      SET_INMOTION_SEG;
+
+      (* remove the free area from the memory chains *)
+      TAKE_FREE(free_sdb,true);
+
+
+      (*$IFC DEBUG1*)
+      measTable.misc[cntPageMov]:=measTable.misc[cntPageMov]+moving_sdb^.memsize;
+      (*$ENDC*)
+
+      (* calculate the source and destination addresses and move the segment *)
+      srcsize:=moving_sdb^.memsize;
+      srcaddr:=moving_sdb^.memaddr;
+      destsize:=free_sdb^.memsize;
+      if dir = toleft then destaddr:=free_sdb^.memaddr
+                      else destaddr:=free_sdb^.memaddr + destsize - srcsize;
+      MOVER(ord4(srcaddr)*hmempgsize*2 + logrealmem,
+            ord4(destaddr)*hmempgsize*2+ logrealmem,
+            ord4(srcsize)*hmempgsize*2);
+      (* adjust the memaddr of the moved sdb *)
+      moving_sdb^.memaddr:=destaddr;
+
+      (* make a new free area *)
+      if dir = toleft then MAKE_FREE(destaddr+srcsize,destsize)
+                      else MAKE_FREE(srcaddr,destsize);
+      (* change mapping of seg in all domains *)
+      REMAP_SEGMENT(moving_sdb,srcaddr,srcsize);
+
+      CLR_INMOTION_SEG;
+
+      (*$IFC DEBUG1*)
+      if moving_sdb^.sdbtype = code
+        then measTable.misc[cntCmov]:=measTable.misc[cntCmov]+1
+        else measTable.misc[cntDmov]:=measTable.misc[cntDmov]+1;
+
+      if TRACE(spare2,1) then
+        begin
+          if LOGGING then
+            begin
+              with c_event do
+                begin
+                  ev_type:=19;
+                  ev_segT:=ord(moving_sdb^.sdbtype);
+                  ev_sdb:=moving_sdb;
+                  ev_smaddr:=srcaddr;
+                  ev_dmaddr:=destaddr;
+                  ev_res2:=0;
+                  LOG(errnum,ord(@c_event));
+                end;
+            end;
+        end;
+
+      if TRACE(mm,0) then writeln(' move_seg completed');
+      (*$ENDC*)
+
+    end;(*MOVE_SEG*)
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    free_sdb:=pointer(ord(c_mmrb^.head_sdb.freechain.fwd_link) - oset_freechain);
+    free_start:=free_sdb^.memaddr;
+    free_end:=free_start+free_sdb^.memsize;
+    while (free_sdb^.memsize < space_needed) or
+          (force_to_hole_memaddr and ((free_start > hole_memaddr) or
+                                      (free_end < hole_memaddr)))  do
+      begin (* continue to slide segments in memory *)
+        if free_end < hole_memaddr then
+          begin (* slide segments which are in way towards low memory *)
+            moving_sdb:=pointer(ord(free_sdb^.memchain.fwd_link));
+            MOVE_SEG(toleft);
+          end
+         else
+          begin (* slide segments which are in way towards high memory *)
+            (* determine how high in memory we must move segments *)
+            space_gained:=free_sdb^.memsize;
+            while space_gained < space_needed do
+              begin
+                next_sdb:=pointer(ord(free_sdb^.memchain.fwd_link));
+                if next_sdb^.sdbtype = free then
+                  begin
+                    space_gained:=space_gained + next_sdb^.memsize;
+                  end
+                 else
+                  begin
+                    free_sdb:=pointer(ord(free_sdb^.freechain.fwd_link)
+                                                              - oset_freechain);
+                    space_gained:=space_gained + free_sdb^.memsize;
+                  end;
+              end;(*while*)
+
+            (* free_sdb is highest addressed free region which must be consolidated *)
+            moving_sdb:=pointer(ord(free_sdb^.memchain.bkwd_link));
+            MOVE_SEG(toright);
+          end;
+        (* get head of free list again *)
+        free_sdb:=pointer(ord(c_mmrb^.head_sdb.freechain.fwd_link) - oset_freechain);
+        free_start:=free_sdb^.memaddr;
+        free_end:=free_start+free_sdb^.memsize;
+      end;(*while*)
+
+    (*$IFC DEBUG2*)
+    if TRACE(mm,0) then writeln(' clear_space completed');
+    (*$ENDC*)
+
+  end;(*CLEAR_SPACE*)
+
+
+procedure ALLOC_MEM(var error: int2; aSeg_sdb_ptr: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Memory for the segment aSeg_sdb_ptr is obtained and *)
+       (*    allocated to the segment.                           *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  free_link, stop_link: ptr_p_linkage;
+  free_sdb: sdb_ptr;
+  c_mmrb: mmrb_ptr;
+  space_needed: int2;
+
+begin
+  c_mmrb:=pointer(mmrb_addr);
+
+  (* get amount of memory required *)
+  with aSeg_sdb_ptr^ do
+    begin
+      space_needed:=(length + mempgsize - 1) div mempgsize;(* use current size *)
+      if sdbtype = code                                                       (*P*)
+        then space_needed:=space_needed+1 (*extra page for i/o-freed later*)  (*P*)
+        else if newlength <> 0
+               then space_needed:=newlength; (* use modified size in pages*)
+
+      (*$IFC DEBUG2*)
+      if TRACE(mm,10) then
+        begin
+          writeln(' ALLOC_MEM for sdb_ptr = ',ord(aSeg_sdb_ptr),
+                  ' size = ',space_needed);
+        end;
+      (*$ENDC*)
+
+      if memaddr <> 0 then SYSTEM_ERROR(10597);
+    end;(*with*)
+
+   (*$IFC DEBUG2*)
+   if TRACE(mm,0) then
+     begin
+       writeln(' system pausing--hit return to continue');
+       readln;
+     end;
+   (*$ENDC*)
+
+   error:=e_mmbase+e_nomem;
+
+   (* create free space to satisfy request *)
+   CREATE_SPACE(space_needed);
+   if c_mmrb^.avail_space < space_needed then goto 10; (* did not create enough *)
+
+   (* sufficient free space should exist  *)
+   if not FIND_FREE(space_needed,free_sdb) then   (* find a free region *)
+     begin
+       (* shuffle memory around to create free region *)
+       with c_mmrb^.clock_ptr^ do CLEAR_SPACE(memaddr+memsize,space_needed,false);
+       if not FIND_FREE(space_needed,free_sdb) then goto 10;
+     end;
+
+   (* take the free space and allocate it to the segment *)
+   TAKE_FREE(free_sdb,true);
+
+   aSeg_sdb_ptr^.memaddr:=free_sdb^.memaddr;
+   aSeg_sdb_ptr^.memsize:=space_needed;
+
+   (* if excess free space then return the excess *)
+   if free_sdb^.memsize > space_needed
+     then MAKE_FREE(free_sdb^.memaddr+space_needed,
+                    free_sdb^.memsize-space_needed);
+
+   (*$IFC DEBUG2*)
+   if TRACE(mm,10) then
+     begin
+       writeln('    allocated space - memaddr = ',aSeg_sdb_ptr^.memaddr,
+               ' size = ',aSeg_sdb_ptr^.memsize);
+     end;
+   (*$ENDC*)
+
+   (* insert sdb into chain of allocated segs *)
+   INSERTSDB(aSeg_sdb_ptr);
+
+   with c_mmrb^ do if ord(clock_ptr^.memchain.fwd_link) = ord(aSeg_sdb_ptr)   (*P*)
+                     then clock_ptr:=aSeg_sdb_ptr;                            (*P*)
+
+   error:=0;
+
+10: (* error exit *)
+end; (*ALLOC_MEM *)
+
+
+procedure Exp_SegDiskSize (* c_sdb_ptr : sdb_ptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    segfcb_ptr : sfcb_ptr;                { ptr to FCB for file behind data seg }
+    delta_diskPages : int2;               { additional disk pages needed for seg }
+    errnum : int2;                        { error return from AllocPages }
+
+  begin
+    { allocate additional disk pages for a data segment expansion }
+    with c_sdb_ptr^ do
+      if discaddr.fid <> 0 then
+        begin  { segment has disk space }
+          segfcb_ptr := pointer(discaddr.fid + b_sysglobal_ptr);
+          delta_diskPages := memsize - (disclength DIV mempgsize);
+          AllocPages (errnum, segfcb_ptr, delta_diskPages);
+          if errnum = 0 then disclength := length
+        end { segment has disk space }
+  end { Exp_SegDiskSize };
+
+
+procedure GET_SEG(var error: int2; aSeg_sdb_ptr: sdb_ptr);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Space for the segment aSeg_sdb_ptr is obtained.  The*)
+       (*    segment is then swapped into memory.                *)
+       (*                                                        *)
+       (**********************************************************)
+
+(*$IFC DEBUG1*)
+type
+  ev_log = record
+             ev_type: int1;             { type = 15/16 }
+             ev_segT: int1;             { seg type 1=private code }
+                                        {          2=data }
+                                        {          3=stack}
+             ev_sdb: sdb_ptr;           { seg sdb ptr }
+             ev_maddr: int2;            { memory address }
+             ev_err: int2;              { error code }
+             ev_res1: int2;             { reserved }
+           end;
+(*$ENDC*)
+
+(*$IFC DEBUG1*)
+var
+  errnum: int2;
+  c_event: ev_log;                      { logging event }
+(*$ENDC*)
+
+begin
+  (*$IFC DEBUG2*)
+  if TRACE(mm,20) then WRITELN(' GETSEG for segment sdb_ptr = ',ord(aSeg_sdb_ptr));
+  (*$ENDC*)
+  (*$IFC DEBUG1*)
+  if TRACE(spare2,9) then
+    begin
+      if LOGGING then
+        begin
+          with c_event do
+            begin
+              ev_type:=15;
+              ev_segT:=ord(aSeg_sdb_ptr^.sdbtype);
+              ev_sdb:=aSeg_sdb_ptr;
+              ev_err:=0;
+              ev_maddr:=0;
+              ev_res1:=0;
+              LOG(errnum,ord(@c_event));
+            end;
+        end;
+    end;
+  (*$ENDC*)
+  {
+  RECORDIT(54,ord(aSeg_sdb_ptr^.sdbtype),0,0,ord(aSeg_sdb_ptr));              (*P*)
+  }
+  ALLOC_MEM(error,aSeg_sdb_ptr);
+  if error = 0 then
+    begin
+      SWAP_SEG(error,aSeg_sdb_ptr,readop);
+      with aSeg_sdb_ptr^ do
+        begin
+          if error <= 0 then
+            begin (* swap error free *)
+              if sdbtype = code then                                          (*P*)
+                begin                                                         (*P*)
+                  (*free extra page allocated for i/o *)                      (*P*)
+                  memsize:=memsize-1;                                         (*P*)
+                  MAKE_FREE(memaddr+memsize,1);                               (*P*)
+                end                                                           (*P*)
+               else if newlength <> 0 then
+                       begin (* a size change just occurred *)
+                         length:=ord4(newlength)*hmempgsize*2;
+
+                         if (length > disclength) and
+                            ((sdbtype = stack) or (sdbtype = slocal)) then
+                           Exp_SegDiskSize (aSeg_sdb_ptr);
+
+                         newlength:=0;
+                       end;
+            end
+           else
+            begin (* swap error occurred *)
+              (* return free memory allocated to segment *)
+              DEALLOC_MEM(aSeg_sdb_ptr);
+            end;
+        end;(*with*)
+    end;
+
+  (*$IFC DEBUG1*)
+
+  if TRACE(spare2,9) then
+    begin
+      if LOGGING then
+        begin
+          with c_event do
+            begin
+              ev_type:=16;
+              ev_segT:=ord(aSeg_sdb_ptr^.sdbtype);
+              ev_sdb:=aSeg_sdb_ptr;
+              ev_err:=error;
+              ev_maddr:=aSeg_sdb_ptr^.memaddr;
+              ev_res1:=0;
+              LOG(errnum,ord(@c_event));
+            end;
+        end;
+    end;
+  (*$ENDC*)
+
+  {
+  RECORDIT(55,ord(aSeg_sdb_ptr^.sdbtype),aSeg_sdb_ptr^.memaddr,               (*P*)
+           aSeg_sdb_ptr^.memsize,ord(aSeg_sdb_ptr));                          (*P*)
+  }
+end; (* GET_SEG *)
+
+ÿ

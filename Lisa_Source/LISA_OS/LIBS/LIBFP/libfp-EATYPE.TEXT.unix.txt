@@ -1,0 +1,773 @@
+        .title     'SUBROUTINES FOR FRONT/BACK END OF THE MC68341'
+        .proc   mc%EATYPE ; 0,0
+        .def    mc_calcea,mc%type
+        .ref    mc%iop
+;
+;************************************************************************
+;
+;       REVISION HISTORY:
+;         DATE           REVISIONIST     REASON
+;       08.JAN.81       G.WALKER        CORRECT EAUSXT AND EASUPXT CODE
+;       18.JAN.81       J.BONEY         PREPARATION FOR DOWNLOAD
+;       13.FEB.81       G.WALKER        DOUBLE INC/DEC FOR BYTE ON STACK
+;       15.FEB.81       G.WALKER        MAKE PIC AND MORE READABLE
+;       18.FEB.81       G.WALKER        FIX 'SIZE' AND IMMED BYTE FETCH
+;       09.MAR.81       G.WALKER        FIX A7DEC FOR BYTE OFF STACK
+;       21.APR.81       G.WALKER        DOCUMENT EXCEPTION FLAGS AND
+;                                           REMOVE UNUSED ADDR REG CODE
+;       05.MAY.81       G.WALKER        FINISH WORK OF 21.APR
+;       25.JUN.81       D.CAWTHRON      SET Z BIT ON EXIT FOR FP REGISTER CASE
+;       7.JUL.81        DWC             CHANGED TO EXORMACS STRUCTURED ASM SYNTA
+;       19.JUL.81       G.WALKER        SPEED OPTIMIZE
+;       18 Jan 83       Hough           Remove padding NOPs added by Laura Okin.
+;       21 Jan 83       Hough           Add conditional assembly for few or full
+;                                       EA types.
+;
+;
+;************************************************************************
+;       CREATE DATA SIZE TABLE (THIS IS DUPLICATE FOR SEVERAL SUBRS.)
+;
+SZTAB   .word   4,8,10,1,2,4,14,14    ; SIZE OF DATA TYPES
+;
+;
+;************************************************************************
+;************************************************************************
+;
+;       SIZE --
+;               THIS MACRO TAKES THE 'mc%type' INFORMATION IN THE LOW-
+;       ORDER WORD OF IT FIRST ARGUMENT AND CHANGES IT TO THE SIZE
+;       OF THE MEMORY FORMAT FOR THAT mc%type.
+;
+;       ARGUMENTS:
+;               %1 -- REGISTER TO RECEIVE DATA OPERAND SIZE
+;       DESTROYS: A2.
+;******
+;       NOTE:
+;               YOU MUST INCLUDE A LINE LIKE THE FOLLOWING IN YOUR
+;       DATA DECLARATIONS:
+;
+;    SZTAB   DC.W    4,8,10,1,2,4,14,14              ARGUMENT SIZE TABLE
+;
+        .macro  SIZE
+        MOVE.B      DATYP(A1),%1  ; GET OPERAND mc%type IN WORD OF D7
+        EXT.W       %1
+        LSL.W       #1,%1             ; CHANGE mc%type TO SIZE INDEX IN D1
+        LEA         SZTAB,A2
+        MOVE.W      0(A2,%1),%1
+        EXT.L       %1                    ; AND EXTEND
+       .endm
+;
+;*********************************************************************
+;
+;       MAKEDISP --
+;               THIS MACRO PERFORMS THE "REGISTER PLUS DISPLACEMEMT"
+;       EFFECTIVE ADDRESS CALCULATION.
+;
+;       INPUT: NO ARGUMENTS.
+;
+;       OUTPUT: D0 -- DISPLACEMENT FROM EA EXTENSION WORD.
+;
+        .macro  MAKEDISP
+  MOVE          TMPWD(A1),D6  ; GET EXTENSION WORD FROM BUFFER
+  MOVE          D6,D7
+  AND.W         #$FF,D6       ; DISPLACEMENT IS IN D6
+  EXT.W         D6                ; \1 (THIS GETS RID OF DUMB ERROR)
+  EXT.L         D6               ; AND IS SIGN EXTENDED
+  ROL.W         #4,D7         ; MOVE REGISTER INDICATOR TO RIGHT SIDE
+  TST.W         D7
+  blt           @1
+    AND.W       #$F,D7        ; USE ONLY LOW-ORDER WORD OF REGISTER
+    LSL.W       #2,D7         ; OFFSET TO WORD IN USER REGISTER BLOCK
+    MOVE.W      2(A5,D7.W),D0    ; AND FETCH WORD INTO D0
+    EXT.L         D0          ; EXTEND 16-BIT REGISTER VALUE
+    bra         @2
+@1
+    AND.W       #$F,D7        ; USE ENTIRE LONG USER REGISTER
+    LSL.W       #2,D7         ; MULTIPLY OFFSET BY 4
+    MOVE.L      0(A5,D7.W),D0  ; FETCH ENTIRE USER REGISTER
+@2
+  ADD.L         D6,D0         ; ADD DISPLACEMENT TO REGISTER VALUE
+ .endm
+;
+;************************************************************************
+;***********************************************************************
+;
+;       mc_calcea --
+;               THIS SUBROUTINE CALCULATES THE EFFECTIVE ADDRESS AND
+;       RETURNS WHETHER IT IS IN USER OR SUPERVISOR SPACE.
+;
+;       INPUT:
+;               A1 -- POINTER TO UNPACKED INSTRUCTION BLOCK
+;       OUTPUT:
+;               D0 -- BIT0: =0 --> ADDRESS IN USER SPACE
+;                           =1 --> ADDRESS IN SUPERVISOR SPACE
+;                     BIT1: =0 --> OPERAND IS INTERNAL FP REGISTER
+;                           =1 --> OPERAND IS IN MEMORY FORMAT
+;                     BIT2: =0 --> OPERAND IS IN PROGRAM SPACE
+;                           =1 --> OPERAND IS IN DATA SPACE
+;               A0 -- EFFECTIVE ADDRESS (IN CALLER'S SPACE)
+;               D4 --  = $FF   --> EFFECTIVE ADDRESS CALCULATED
+;                      = 0     --> ERROR OCCURRED IN EA (D0-D3 HAS NAN)
+;               Z-BIT  = SET     IF EFFECTIVE ADDRESS OK    (FOLLOWS )
+;                      = UN-SET  IF ERROR OCCURRED IN EA    (   D4   )
+;
+;       TRASHES: CCR,D6,D7.
+;
+;       RESTORES: A1-A6,D5.
+;
+;       mc_calcea CALLS:   mc%iop, USER FETCH/STORE (A4).
+;
+;       mc_calcea IS CALLED BY:  FRNT, STFP, STFLOAT.
+;
+;***********************  F L A G S   ******************************
+;
+;  EXCEPTION    SET BY     REASON
+;
+;  RSVX         ---        NOT AFFECTED
+;  IOVF         ---        NOT AFFECTED
+;  INEX         ---        NOT AFFECTED
+;  DZ           ---        NOT AFFECTED
+;  UNFL         ---        NOT AFFECTED
+;  OVFL         ---        NOT AFFECTED
+;  iop          mc_calcea     (CODE = 13)  ILLEGAL ADDRESS IN F-LINE
+;                               INSTRUCTION
+;************************************************************************
+;
+;       LOCAL STORAGE:  THE FOLLOWING ARE SUPPLIED BY THE FRONT/BACK
+;             ROUTINES, POINTED TO BY A1.
+;
+; FLINE   EQU     0       (W) STORES F-LINE WORD
+; FPINST  EQU     2       (W) STORES FLOATING-POINT INSTRUCTION WORD
+; FPOPR   EQU     4       (B) STORES FP OPCODE FIELD
+; EAFLD   EQU     5       (B) STORES EA FIELD FROM F-LINE WORD
+; DATYP   EQU     6       (B) DATA-mc%type FIELD
+; FPREG   EQU     7       (B) FLOATING-POINT ACCUMULATOR FIELD
+; SPECL   EQU     8       (B) SPECIAL VALUE FIELD ('K' AND SOME OPCODES)
+;               NOTE: ONE BYTE WASTED FOR WORD ALIGNMENT.
+; TMPWD   EQU     10      (L) FOURTEEN-BYTE INSTRUCTION/IMMED. FETCH BUFFER
+; REGBLK  EQU     24      (L) POINTER TO REGISTER BLOCK
+; XCPVCT  EQU     28      (L) POINTER TO EXCEPTION VECTOR TABLE
+;
+;**********************************************************************
+;
+BADINST   EQU     13    ; ILLEGAL INSTRUCTION mc%iop CODE
+;
+mc_calcea  EQU     *
+        debugbegin
+  MOVEM.L       A1/A2/A3,-(SP)        ; SAVE REGISTERS
+  CLR           D0                    ; CLEAR UPPER BYTE OF D0
+  MOVE.B        EAFLD(A1),D0          ; PUT EAFIELD IN LOWER BYTE
+  BTST          #6,D0
+    bne         @3                   ; IF IT IS AN INTERNAL FP REGISTER
+    EXT.W       D0
+;
+;********       THE FOLLOWING INSTRUCTION IS TOO SLOW!!!!!!!!!!!
+;                               REPLACE AS SUGGESTED BY JOEL.
+    ADD.W       D0,D0                 ; TWO ADDS ARE EQUIVALENT TO MUL BY 4
+    ADD.W       D0,D0
+;
+    MOVE.W      #0,A0               ; CLEAR DESTINATION ADDR REG
+    ADD.W       D0,A0                 ; THREE ADDS INTO \2 ARE A MUL BY 3
+    ADD.W       D0,A0                    ; TO GIVE A TOTAL MUL BY 12 (=SIZEAC)
+    ADD.W       D0,A0
+;
+;*********************
+;
+    ADD.L       REGBLK(A1),A0          ; ADD START OF FP ACCUMULATORS TO
+    ADD.L       #FP0,A0                   ; OFFSET IN A0
+    MOVE.L      #5,D0                     ; SHOW AS FP REGISTER IN SUPER SPACE
+    MOVE.B      #0,D4                     ; SHOW ADDRESS CORRECT
+    BRA         EAXIT
+;
+;               IT IS 68K EA, SO JUMP THROUGH EA TABLE.
+;
+@3
+  BCLR          #6,D0                 ; REMOVE UPPER EA BIT
+  LSL           #1,D0                 ; MULTIPLY EA BY 2 TO GET TABLE OFFSET
+  MOVE.W        EATAB(D0),A0          ; JUMP THROUGH EA ROUTINE TABLE
+  JMP           EATAB(A0)
+;
+;               BELOW IS A TABLE OF RELATIVE OFFSETS (.W) TO THE
+;       ROUTINES FOR CALCULATING THE VARIOUS 68000 EFFECTIVE ADDRESS
+;       MODES.
+;
+EATAB   EQU     *
+;       DATA REGISTER DIRECT
+  .word         EAD0-EATAB
+  .word         EAD1-EATAB
+  .word         EAD2-EATAB
+  .word         EAD3-EATAB
+  .word         EAD4-EATAB
+  .word         EAD5-EATAB
+  .word         EAD6-EATAB
+  .word         EAD7-EATAB
+;       ADDRESS REGISTER DIRECT (IS INVALID OPERATION ERROR)
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+;       ADDRESS REGISTER INDIRECT
+  .word         A0AT-EATAB
+  .word         A1AT-EATAB
+  .word         A2AT-EATAB
+  .word         A3AT-EATAB
+  .word         A4AT-EATAB
+  .word         A5AT-EATAB
+  .word         A6AT-EATAB
+  .word         A7AT-EATAB
+        .if     allea
+;       ADDRESS REGISTER INDIRECT W/AUTO-INCREMENT
+  .word         A0INC-EATAB
+  .word         A1INC-EATAB
+  .word         A2INC-EATAB
+  .word         A3INC-EATAB
+  .word         A4INC-EATAB
+  .word         A5INC-EATAB
+  .word         A6INC-EATAB
+  .word         A7INC-EATAB
+;       ADDRESS REGISTER INDIRECT W/AUTO-DECREMENT
+  .word         A0DEC-EATAB
+  .word         A1DEC-EATAB
+  .word         A2DEC-EATAB
+  .word         A3DEC-EATAB
+  .word         A4DEC-EATAB
+  .word         A5DEC-EATAB
+  .word         A6DEC-EATAB
+  .word         A7DEC-EATAB
+;       ADDRESS REGISTER INDIRECT W/DISPLACEMENT
+  .word         A0DISP-EATAB
+  .word         A1DISP-EATAB
+  .word         A2DISP-EATAB
+  .word         A3DISP-EATAB
+  .word         A4DISP-EATAB
+  .word         A5DISP-EATAB
+  .word         A6DISP-EATAB
+  .word         A7DISP-EATAB
+;       ADDRESS REGISTER INDIRECT W/INDEX & DISP.
+  .word         A0_REG-EATAB
+  .word         A1_REG-EATAB
+  .word         A2_REG-EATAB
+  .word         A3_REG-EATAB
+  .word         A4_REG-EATAB
+  .word         A5_REG-EATAB
+  .word         A6_REG-EATAB
+  .word         A7_REG-EATAB
+;       ABSOLUTE SHORT AND LONG
+  .word         ABSW-EATAB
+  .word         ABSL-EATAB
+;       PC RELATIVE
+  .word         PCATDS-EATAB
+  .word         PCATRG-EATAB
+;       IMMEDIATE DATA (ALL FP FORMATS ALLOWED)
+  .word         IMMED-EATAB
+;       UNDEFINED 68000 EA MODES
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+  .word         EAERR-EATAB
+        .endc
+;
+;               EFFECTIVE ADDRESS CALCULATION ROUTINES
+;
+;               OPERAND IS IN A DATA REGISTER.
+;
+EAD0    EQU     *
+  LEA           USRD0(A5),A0
+  BRA.S         DRGADJ
+;
+EAD1    EQU     *
+  LEA           USRD0+4(A5),A0
+  BRA.S         DRGADJ
+;
+EAD2    EQU     *
+  LEA           USRD0+8(A5),A0
+  BRA.S         DRGADJ
+;
+EAD3    EQU     *
+  LEA           USRD0+12(A5),A0
+  BRA.S         DRGADJ
+;
+EAD4    EQU     *
+  LEA           USRD0+16(A5),A0
+  BRA.S          DRGADJ
+;
+EAD5    EQU     *
+  LEA           USRD0+20(A5),A0
+  BRA.S         DRGADJ
+;
+EAD6    EQU     *
+  LEA           USRD0+24(A5),A0
+  BRA.S          DRGADJ
+;
+EAD7    EQU     *
+  LEA           USRD0+28(A5),A0
+;
+;       ADJUST POINTER TO DATA REGISTER FOR BYTE OR WORD DATA.
+;
+DRGADJ  EQU     *
+  MOVE.B        DATYP(A1),D0
+  cmp.b         #typbyt,d0
+  bne           @12
+;                                                  ADJUST POINTER FOR BYTE
+    ADD.L       #3,A0                            ; IN REGISTER
+@12
+  cmp.b         #typwrd,d0
+  bne           @129
+;                                                  ADJUST POINTER FOR WORD
+    ADD.L       #2,A0
+@129                                                ; IN REGISTER
+  BRA           EASUPXT
+;
+;               ADDRESS REGISTER INDIRECT.
+;
+A0AT    EQU     *
+  MOVE.L        USRA0(A5),A0
+  BRA           EAUSRXT
+;
+A1AT    EQU     *
+  MOVE.L        USRA0+4(A5),A0
+  BRA           EAUSRXT
+;
+A2AT    EQU     *
+  MOVE.L        USRA0+8(A5),A0
+  BRA           EAUSRXT
+;
+A3AT    EQU     *
+  MOVE.L        USRA0+12(A5),A0
+  BRA           EAUSRXT
+;
+A4AT    EQU     *
+  MOVE.L        USRA0+16(A5),A0
+  BRA           EAUSRXT
+;
+A5AT    EQU     *
+  MOVE.L        USRA0+20(A5),A0
+  BRA           EAUSRXT
+;
+A6AT    EQU     *
+  MOVE.L        USRA0+24(A5),A0
+  BRA           EAUSRXT
+;
+A7AT    EQU     *
+  MOVE.L        USRA0+28(A5),A0
+  BRA           EAUSRXT
+        .if     allea
+;
+;               ADDRESS REGISTER POST-INCREMENT.
+;
+A0INC   EQU     *
+  MOVE.L        USRA0(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0(A5)          ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A1INC   EQU     *
+  MOVE.L        USRA0+4(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+4(A5)        ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A2INC   EQU     *
+  MOVE.L        USRA0+8(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+8(A5)        ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A3INC   EQU     *
+  MOVE.L        USRA0+12(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+12(A5)       ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A4INC   EQU     *
+  MOVE.L        USRA0+16(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+16(A5)       ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A5INC   EQU     *
+  MOVE.L        USRA0+20(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+20(A5)       ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A6INC   EQU     *
+  MOVE.L        USRA0+24(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+24(A5)       ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+A7INC   EQU     *
+  MOVE.L        USRA0+28(A5),A0
+  MOVE.L        A0,D1
+  SIZE          D0                    ; GET DATA SIZE IN D0
+  cmp.l         #1,d0
+  bne           @20
+;                                          MAKE SURE A7 IS INCREMENTED BY 2
+    ADDQ.L      #1,D0                    ; FOR BYTE DATA (KEEP STACK ALIGNED)
+@20
+  ADD.L         D0,D1                 ; ADD SIZE TO ADDRESS
+  MOVE.L        D1,USRA0+28(A5)       ; PUT FINAL ADDR. BACK IN USER REG.
+  BRA           EAUSRXT
+;
+;               ADDRESS REGISTER INDIRECT W/PRE-DECREMENT.
+;
+A0DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0(A5)          ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A1DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+4(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+4(A5)        ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A2DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+8(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+8(A5)        ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A3DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+12(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+12(A5)       ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A4DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+16(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+16(A5)       ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A5DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+20(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+20(A5)       ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A6DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+24(A5),A0
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+24(A5)       ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+A7DEC   EQU     *
+  SIZE          D0                    ; SIZE OF OPERAND IN D1
+  MOVE.L        USRA0+28(A5),A0
+  cmp.l         #1,d0
+  bne           @30
+    ADDQ.L      #1,D0                 ; MAKE SURE IS DECREMENTED BY 2 FOR
+@30                                   ; BYTE DATA (KEEP STACK ALIGNED)
+  SUB.L         D0,A0                 ; DECREMENT ADDR. BY OPERAND SIZE
+  MOVE.L        A0,USRA0+28(A5)       ; STORE TO REG. AND RETURN AS EA
+  BRA           EAUSRXT
+;
+;               ADDRESS REGISTER INDIRECT W/DISPLACEMENT MODES.
+;
+A0DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A1DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+4(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A2DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+8(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A3DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+12(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A4DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+16(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A5DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+20(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A6DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+24(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+A7DISP  EQU     *
+  FETCH         2,TMPWD(A1)
+  MOVE.W        TMPWD(A1),D0          ; FETCH DISPLACEMENT WORD
+  EXT.L         D0                    ; EXTEND TO LONG REGISTER
+  MOVE.L        USRA0+28(A5),A0
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO REGISTER
+  BRA EAUSRXT
+;
+;               ADDRESS REGISTER INDIRECT W/INDEX PLUS DISPLACEMENT.
+;
+A0_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A1_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+4(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A2_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+8(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A3_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+12(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A4_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+16(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A5_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+20(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A6_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+24(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+A7_REG   EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EA EXTENSION WORD
+  MAKEDISP                            ; CREATE DISPLACEMENT
+  MOVE.L        USRA0+28(A5),A0
+  ADD.L         D0,A0                 ; ADD DISP TO ADDRESS REGISTER CONTENTS
+  BRA           EAUSRXT
+;
+;               ABSOLUTE-WORD MODE.
+;
+ABSW    EQU     *
+  FETCH         2,TMPWD(A1)           ; FETCH EXTENSION WORD
+  MOVE.W        TMPWD(A1),D0              ; INTO D0
+  EXT.L         D0                        ; AND EXTEND IT
+  MOVE.L        D0,A0                  ; ADDRESS NOW IN A0
+  BRA           EAUSRXT
+;
+;               ABSOLUTE-LONG WORD MODE.
+;
+ABSL    EQU     *
+  FETCH         4,TMPWD(A1)
+  MOVE.L        TMPWD(A1),A0          ; LONG ADDRESS INTO A0
+  BRA           EAUSRXT
+;
+;               PC PLUS DISPLACEMENT MODE.
+;
+PCATDS  EQU     *
+  MOVE.L        USRPC(A5),A0          ; ADD DISP. TO ADDR OF EXTENSION WORD
+  FETCH         2,TMPWD(A1)           ; FETCH EXTENSION WORD
+  MOVE          TMPWD(A1),D0
+  EXT.L         D0                        ; AND EXTEND IT INTO D0
+  ADD.L         D0,A0                  ; ADD DISPLACEMENT TO USER PC
+  BRA           USRPGXT                   ; (EXTN. WORD ADDR.)
+;
+;               BELOW IS THE CODE FOR PC PLUS REGISTER&DISPLACEMENT.
+;
+PCATRG  EQU     *
+  MOVE.L        USRPC(A5),A0          ; USE PC POINTING TO EXTENSION WORD
+  FETCH         2,TMPWD(A1)           ; FETCH EXTENSION WORD
+  MAKEDISP                               ; AND CREATE EFFECTIVE DISPLACEMENT
+  ADD.L         D0,A0                 ; ADD DISPLACEMENT TO USER PC
+  BRA           USRPGXT
+;
+;               BELOW IS THE CODE FOR IMMEDIATE OPERANDS.
+;
+IMMED   EQU     *
+  SIZE          D0                   ; GET DATA OPERAND SIZE IN D0
+  MOVE.L        USRPC(A5),A3
+  LEA           TMPWD(A1),A2         ; FETCH IMMED OPERAND TO TMP BUFFER
+  moveq         #1,D6                    ; FROM USER PROGRAM SPACE
+  MOVE.W        D0,D7
+  cmp.w         #1,d7
+  bne           @40
+    ADDQ.W      #1,D7                 ; FETCH WORD TO GET A BYTE
+@40
+  JSR           (A4)
+  LEA           TMPWD(A1),A0         ; POINT A0 TO IMMEDIATE DATA
+  cmp           #1,d0
+  bne           @50
+    ADDQ.L  #1,A0                    ; ADJUST POINTER FOR BYTE DATA
+    ADDQ.W  #1,D0                       ; AND ADJUST INSTR OFFSET
+@50                                     ; TO SKIP ENTIRE WORD
+  MOVE.L        USRPC(A5),A3
+  ADD.L         D0,A3
+  MOVE.L        A3,USRPC(A5)         ; MOVE PC PAST IMMED DATA
+  MOVE.B        #0,D4                ; SHOW ADDRESS CORRECT
+  BRA.S         EASUPXT              ; IMMEDIATE DATA IN TMP SUPERVISOR BUFFER
+        .endc
+;
+EAUSRXT EQU     *
+  MOVE.L        #6,D0                 ; SHOW OPERAND IN USER/DATA SPACE
+  MOVE.B        #0,D4                 ; SHOW ADDRESS CORRECT
+  BRA.S         EAXIT                     ; AND MEMORY FORMAT
+;
+USRPGXT EQU     *
+  MOVE.L        #2,D0                 ; SHOW OPERAND IN USER/PROGRAM SPACE
+  MOVE.B        #0,D4                 ; SHOW ADDRESS CORRECT
+  BRA.S         EAXIT                     ; AND MEMORY FORMAT
+;
+EASUPXT EQU     *
+  MOVE.L        #7,D0                 ; SHOW IN SUPERVISOR/DATA SPACE
+  MOVE.B        #0,D4                 ; SHOW ADDRESS CORRECT
+  BRA.S         EAXIT                     ; AND MEMORY FORMAT
+;
+;       SIGNAL EFFECTIVE ADDRESS ERROR.
+;
+EAERR   EQU     *
+  MOVE.L       REGBLK(A1),A3
+  MOVE.L       #BADINST,D0
+  jsr          mc%iop                    ; SET INVALID INSTRUCTION FLAG
+  MOVE.B       #$FF,D4
+;
+EAXIT   EQU     *
+  MOVEM.L       (SP)+,A1/A2/A3        ; RESTORE ADDRESS REGISTERS
+  RTS
+        debugend 'MC_CALCE',0
+;
+;************************************************************************
+;
+;       mc%type --
+;               THIS SUBROUTINE WILL SET THE TAG BITS OF AN INTERNAL
+;       FLOATING-POINT NUMBER IN REGISTERS D0-D3.
+;
+;       INPUT:
+;               D0-D3 -- FLOATING-POINT NUMBER.
+;       OUTPUT:
+;                D0-D3 -- FLOATING-POINT NUMBER WITH PROPER TAGS.
+;       RESTORES:  A0-A7.
+;                  D4-D7.
+;
+;       EXCEPTION BITS:  NONE AFFECTED.
+;
+;       SUBROUTINES CALLED:  NONE.
+;
+;       CALLED BY:  FRNT, mc_calcea, LDFP...
+;
+mc%type    EQU     *
+        debugbegin
+  MOVE.L   D4,-(SP)
+  AND.L   #$8000FFFF,D0               ; CLEAR OLD TAG BITS
+  cmp        #extmaxp,d0
+  bne        @62
+    MOVE.L   D1,D4                        ; IF NUMBER HAS MAX. EXPONENT
+    LSL.L    #1,D4
+    OR.L     D2,D4                        ; TEST FOR ZERO FRACTION
+    bne      @60
+      OR.L   #INF_L,D0                    ; ZERO FRACT. --> INFINITY
+      bra    @61
+@60
+      OR.L   #NAN_L,D0                   ; ELSE IS NAN
+@61
+      bra    @68
+@62                                      ; NUMBER IS NOT MAX. EXP
+    cmp      #extminxp,d0
+    bne      @66
+      MOVE.L D1,D4                        ; IF NUMBER HAS MINIMUM EXPONENT
+      OR.L   D2,D4
+      bne    @63
+         OR.L      #ZERO_L,D0             ; ZERO FRACT. --> NORMAL ZERO
+         bra       @65
+@63                                       ; NON-ZERO MANTISSA
+        BTST       #31,D1
+        bne        @64
+          OR.L     #NNORM_L,D0            ; ELSE IS DENORMALIZED
+          bra      @65
+@64
+          OR.L     #NORM_L,D0          ; ELSE IS NORMALIZED
+@65
+                                        ; ELSE EXPONENT IS NOT EXCEPTIONAL
+      bra          @68
+@66
+      BTST         #31,D1
+      bne          @67                  ; IF MSBIT SET IN FRACTION
+        OR.L       #NNORM_L,D0          ; IT IS NORMALIZED NUMBER
+        bra        @68
+@67
+        OR.L       #NORM_L,D0        ; ELSE IS UNNORMALIZED
+@68
+;
+;               REMOVE LOCAL STORAGE AND EXIT mc%type ROUTINE.
+;
+  MOVE.L         (SP)+,D4
+  RTS
+        debugend 'MC%TYPE',1
+
+ÿ

@@ -1,0 +1,449 @@
+{------------------------------------------------------------------------------------------}
+{                      Copyright 1983, 1984, Apple Computer Inc.                           }
+{------------------------------------------------------------------------------------------}
+UNIT PrEvents;
+INTRINSIC;
+
+{------------------------------------------------------------------------------------------}
+                                        INTERFACE
+{------------------------------------------------------------------------------------------}
+
+USES
+  {$U LibSM/UnitStd    } UnitStd,
+  {$U LIbOS/SysCall    } SysCall,
+  {$U LibPM/PMDecl     } PMDecl,
+  {$U LibSM/UnitHz     } UnitHz,
+  {$U LibQD/Storage    } Storage,
+  {$U LibQD/QuickDraw  } QuickDraw,
+  {$U LibQD/GrafUtil   } GrafUtil,
+  {$U LibFM/FontMgr    } FontMgr,
+  {$U LibPr/PrStdInfo  } PrStdInfo,
+  {$U LibPr/PrStdProcs } PrStdProcs;
+
+{------------------------------------------------------------------------------------------}
+{  Each background process creates at least three event channels consisting of a pathname
+derived from its process ID number.  For example, background process $0000001A would open a
+channel for receiving and another for transmitting using "0000001A" as the pathname string.
+A third call channel is opened using "0000001A.K" as the pathname string.  This last channel
+is used for dialogs or other events which require immediate response from the background.
+
+This unit is used by both the background and foreground processes to communicate with each
+other.  It is assumed that when this unit is used that the background channels have been
+established and that the process number for the desired background process is known.  In the
+case of dialogs, the desired process number can be found in the shared data segment associated
+with the desired printer.
+}
+{------------------------------------------------------------------------------------------}
+
+CONST
+  ECNameSize  = 8;
+  maxstuff    = 38;    {Maximum number of bytes that can be stuffed in an event channel message}
+
+TYPE
+  PrMessages  = (ENull,EWake,EDone,EPrintRequest,EPrintDialog,ESettingsDialog,EPrListDialog,
+                  EMonitorDialog,ESendData,ETalkToMe,EMetrics,EJobCount,EPrintTerminate,EReply,
+                  EAbort,EStuffed,EConfigure);
+
+{--SYSCall event_text record paraphinalia included here for reference.
+     t_eheader = record                          (* event header *)
+                   send_pid : longint;           (* sender's process id *)
+                   event_type : longint;         (* type of event *)
+                 end;
+
+     t_event_text = array [0..size_etext] of longint;
+     p_r_eventblk = ^r_eventblk;
+     r_eventblk = record
+                    event_header : t_eheader;
+                    event_text : t_event_text;
+                  end;
+}
+
+  PrEventBlk  = RECORD
+    event_header  : t_eheader; {.SysCall}
+    CASE INTEGER OF
+      0 : (event_text : t_event_text); {.SysCall}
+      1 : (eventBytes : ARRAY [0..39] OF -128..127);
+      2 : (eventInts  : ARRAY [0..19] OF INTEGER);
+      3 : (eventLongs : ARRAY [0..9] OF LONGINT);
+                          {40 bytes (needs to be changed if Syscall, size_etext, is ever changed)}
+  END;
+
+  Channel = RECORD
+      ChName  : Pathname;
+      RefNum  : INTEGER;
+      Exname  : t_ex_name;
+      EvBlock : PrEventBlk;
+      Interval: timestmp_interval;
+      ClkTime : time_rec;
+      Waits   : t_waitlist;
+  END;
+
+{------------------------------------------------------------------------------------------}
+{                                   PROCEDURE DIRECTORY                                    }
+{------------------------------------------------------------------------------------------}
+  {--Given an open valid channel, PrAccept waits for an event to arrive on that channel.}
+FUNCTION  PrAccept       (VAR Chan:Channel):PrMessage;
+  {--Sends a message over a call channel}
+PROCEDURE PrCall         (VAR cError:TC;PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL);
+  {--Close a channel}
+PROCEDURE PrCloseChan    (VAR Chan:Channel);
+  {--Sends the Message to the background process with process ID: PrID}
+PROCEDURE PrDeferToBgd   (PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL);
+
+  {--Converts PrID to a valid PathName}
+  PROCEDURE PrIDtoPath   (PrID:TL;VAR path:PathName);
+
+  {--Sends an event, contained in event_text, over the channel}
+PROCEDURE PrOffer        (VAR Chan:Channel;Message:PrMessages);
+
+  {--Open a Channel}
+PROCEDURE PrOpenChan     (VAR Chan:Channel;Rx:TF);
+PROCEDURE PrOpenCall     (VAR Chan:Channel;ExProc:LongAdr);
+
+  {--Gets the number of print jobs from the background parent process with ID: PrID}
+PROCEDURE PrJobCount     (PrID:TL;VAR cjob:INTEGER);
+
+  {--Sends a simple message to process, PrID}
+  PROCEDURE PrNotify     (PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL);
+
+  {--Sends a print request to a process with filename and printer ID as specified}
+PROCEDURE PrPrintRequest (PrID:TL;lFileName,ncopies,PrntrID,PortID:TL);
+  {--Sends a specific stop printing command to a process which previously received a lFileName and hPrinter}
+PROCEDURE PrPrintStop    (PrID:TL;lFileName,ncopies,PrntrID,PortID:TL);
+
+  {--Sends a message over the given channel.  Used by PrNotify}
+  PROCEDURE PrSendMessage(VAR cError: INTEGER;VAR Chan:Channel;Message:PrMessages);
+  {--Waits for a given message on channel.}
+  FUNCTION  PrWaitMessage(VAR Chan:Channel):PrMessage;
+
+PROCEDURE PrStuffData(PrID:TL;dataPtr:TP;nbytes:TC);
+
+  {--Lets the parent process know that a new configuration has been logged by the user.
+     This is intended to be used by PM manager applications such as Preferences.}
+PROCEDURE PrUpdate;
+{------------------------------------------------------------------------------------------}
+
+{------------------------------------------------------------------------------------------}
+                                      IMPLEMENTATION
+{------------------------------------------------------------------------------------------}
+
+{$IFC PrSymbols}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+{$IFC PrDebug}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{------------------------------------------------------------------------------------------}
+{$S PrMgr}
+FUNCTION  PrAccept{(VAR Chan:Channel):PrMessage};
+VAR
+  cError    : INTEGER;
+  pans      : ^PrMessage;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+PrAccept:=ENull;
+  WITH Chan DO BEGIN
+    Waits.Length:=1;
+    Waits.refnum[0]:=refnum;
+    WAIT_EVENT_CHN(cError,Waits,refnum,@EvBlock);
+    IF cError <= 0 THEN BEGIN
+      pans:=@EvBlock.eventBytes[0];
+      PrAccept:=pans^;
+    END;
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrCall{(VAR cError:TC;PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL)};
+VAR
+  Chan    : Channel;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  WITH Chan DO BEGIN
+    PrIDtoPath(PrID,ChName);
+    ChName:=CONCAT(ChName,'.K');    {Our sign for a Call Channel}
+    EvBlock.event_text[1]:=mess1;
+    EvBlock.event_text[2]:=mess2;
+    EvBlock.event_text[3]:=mess3;
+    EvBlock.event_text[4]:=mess4;
+    PrSendMessage(cError,Chan,Message);
+    IF cError <= 0 THEN BEGIN
+      ChName[0]:=CHR(ECNameSize);   {Switch to the wait channel to wake him up}
+      PrSendMessage(cError,Chan,ENull);
+    END;
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrCloseChan{(VAR Chan:Channel)};
+VAR
+  cError  : TC;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+WITH Chan DO BEGIN
+  CLOSE_EVENT_CHN(cError,RefNum);
+  KILL_EVENT_CHN(cError,ChName);
+END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrDeferToBgd{(PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL)};
+VAR
+  cError  : INTEGER;
+
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  IF (PrID <> PrNilProcess) AND (PrID <> 0) THEN BEGIN
+    PrCall(cError,PrID,Message,0,0,0,0);
+    IF cError = 0 THEN BEGIN
+      {We've sent the background the command and tried to wake him up.
+       Now we'll wait for him to wake us back up.}
+      {This may have to be implemented with a wait event mechanism
+       in order to assure proper synchronization between us and background.}
+      WHILE fBackGround DO PsYieldCPU;
+      fBackGround:=TRUE;
+      SUSPEND_PROCESS(cError,MY_ID,FALSE);
+      WHILE fBackGround DO PsYieldCPU;
+      {When we're reactivated we assume everything has been properly completed in the background.}
+    END;
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrOffer{(VAR Chan:Channel;Message:PrMessages)};
+VAR
+  cError    : TC;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  WITH Chan DO BEGIN
+    interval.sec:=0;
+    interval.msec:=0;
+    EvBlock.eventBytes[0]:=ORD(Message);
+    SEND_EVENT_CHN(cError,refnum,@EvBlock.event_text,Interval,ClkTime);
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrOpenChan{(VAR Chan:Channel;Rx:TF)};
+VAR
+  cError  : TC;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+WITH Chan DO BEGIN
+  PrIDtoPath(MY_ID,ChName);
+  Exname:='';
+  MAKE_EVENT_CHN(cError,ChName);
+  OPEN_EVENT_CHN(cError,ChName,refnum,exname,Rx);
+END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrOpenCall{(VAR Chan:Channel;ExProc:LongAdr)};
+VAR
+  cError  : TC;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+WITH Chan DO BEGIN
+  PrIDtoPath(MY_ID,ChName);
+  Exname:=COPY(ChName,1,LENGTH(ChName));
+  DECLARE_EXCEP_HDL(cError,Exname,ExProc);
+  ChName:=CONCAT(ChName,'.K');    {--Our sign for a Call Channel}
+  MAKE_EVENT_CHN(cError,ChName);
+  OPEN_EVENT_CHN(cError,ChName,refnum,exname,TRUE);
+END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrIDtoPath{(prid:TL;VAR path:PathName)};
+VAR
+  k       : INTEGER;
+
+  FUNCTION Hex(result:INTEGER):INTEGER;
+  BEGIN
+  IF result > 9 THEN result:=result+7;
+  result:=result+ORD('0');
+  Hex:=result;
+  END;
+
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  path[0]:=CHR(ECNameSize);
+  FOR k:=ECNameSize-1 DOWNTO 0 DO BEGIN
+    path[ECNameSize-k]:=CHR(Hex(BitAnd(BitShift(prid,-k*4),$0000000F)));
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrJobCount{(PrID:TL;VAR cjob:INTEGER)};
+VAR
+  Chan   : Channel;
+  cError : INTEGER;
+
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  cjob:=0;
+  IF (PrID <> PrNilProcess) AND (PrID <> 0) THEN WITH Chan DO BEGIN
+    PrOpenChan(Chan,TRUE{Receive Channel});
+    PrNotify(PrID,EJobCount,0,0,0,0);
+    IF (PrAccept(Chan) = EReply) THEN BEGIN
+        cjob:=EvBlock.eventLongs[1];  {--The reply to an EJobCount is here}
+    END;
+    PrCloseChan(Chan);
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrNotify{(PrID:TL;Message:PrMessages;mess1,mess2,mess3,mess4:TL)};
+VAR
+  Chan    : Channel;
+  cError  : INTEGER;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  IF (PrID <> PrNilProcess) AND (PrID <> 0) THEN WITH Chan DO BEGIN
+    PrIDtoPath(PrID,ChName);
+    EvBlock.event_text[1]:=mess1;
+    EvBlock.event_text[2]:=mess2;
+    EvBlock.event_text[3]:=mess3;
+    EvBlock.event_text[4]:=mess4;
+    PrSendMessage(cError,Chan,Message);
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrPrintRequest{(PrID:TL;lFileName,ncopies,PrntrID,PortID:TL)};
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrNotify(PrID,EPrintRequest,lFileName,ncopies,PrntrID,PortID);
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrPrintStop{(PrID:TL;lFileName,ncopies,PrntrID,PortID:TL)};
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrNotify(PrID,EPrintTerminate,lFileName,ncopies,PrntrID,PortID);
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrSendMessage{(VAR cError: INTEGER;VAR Chan:Channel;Message:PrMessages)};
+{cError lets the caller know that the message was sent correctly in case a reply is expected.
+ If cError is greater than 0 then something went wrong and caller should not wait for reply.}
+VAR
+  cdError   : INTEGER;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  WITH Chan DO BEGIN
+    Exname:='';
+    OPEN_EVENT_CHN(cError,ChName,refnum,exname,FALSE);
+    IF cError <= 0 THEN BEGIN
+      PrOffer(Chan,Message);
+      CLOSE_EVENT_CHN(cdError,refnum);
+    END;
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+PROCEDURE PrTxStuff(VAR Chan:Channel;dataPtr:TP;nbytes:TC;callnum:TC);
+VAR
+  cError  : INTEGER;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  WITH Chan DO BEGIN
+    EvBlock.eventBytes[1]:=callnum;
+    IF (nbytes > SIZEOF(t_event_text)-4) THEN BEGIN
+      MoveLeft(dataPtr^,EvBlock.eventBytes[2],maxstuff);
+      PrSendMessage(cError,Chan,EStuffed);
+      PrTxStuff(Chan,POINTER(ORD4(dataPtr)+maxstuff),nbytes-maxstuff,callnum+1);
+    END
+    ELSE BEGIN
+      MoveLeft(dataPtr^,EvBlock.eventBytes[2],nbytes);
+      PrSendMessage(cError,Chan,EStuffed);
+    END;
+  END;
+END;
+
+{$S PrMgr}
+PROCEDURE PrStuffData{(PrID:TL;dataPtr:TP;nbytes:TC)};
+VAR
+  Chan    : Channel;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  IF (PrID <> PrNilProcess) AND (PrID <> 0) THEN WITH Chan DO BEGIN
+    PrIDtoPath(PrID,ChName);
+    PrTxStuff(Chan,dataPtr,nbytes,0);
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+
+{$S PrMgr}
+FUNCTION  PrWaitMessage{(VAR Chan:Channel):PrMessage};
+VAR
+  cError  : INTEGER;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrWaitMessage:=ENull;
+  WITH Chan DO BEGIN
+    Exname:='';
+    {ChName is already defined at this point, RIGHT!!!, i.e. we know who we're talking to.}
+    OPEN_EVENT_CHN(cError,ChName,refnum,exname,TRUE);
+    IF (cError <= 0) THEN BEGIN
+      PrWaitMessage:=PrAccept(Chan);
+      CLOSE_EVENT_CHN(cError,refnum);
+    END
+    ELSE BEGIN
+      EvBlock.eventBytes[0]:=ORD4(ENull);
+    END;
+  END;
+END;
+
+{------------------------------------------------------------------------------------------}
+{$S PrMgr}
+PROCEDURE PrUpdate;
+VAR
+  cErr  : TC;
+BEGIN
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  PrCall(cErr,lParentID,EMetrics,0,0,0,0);
+END;
+
+{------------------------------------------------------------------------------------------}
+
+END.
+
+{
+Unit PrEvents Change Log --
+     11/15/83 BH: Created.
+}
+
+ÿ

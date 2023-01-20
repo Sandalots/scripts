@@ -1,0 +1,809 @@
+; MODEMASM
+; Copyright 1983, 1984, Apple Computer Inc.
+
+;ENTRIES IN DEVREC
+CB_ADDR        EQU  4
+
+;ENTRIES IN PARAMS
+CONFIGPTR      EQU  0
+FNCTN_CODE     EQU  CONFIGPTR+4
+INTPAR         EQU  FNCTN_CODE+2
+
+;ENTRIES IN MODEMA PORTREC
+frozen_addr    EQU  0
+flags          EQU  FROZEN_ADDR+4
+xmit_wait      EQU  0
+cur_read_flag  EQU  XMIT_WAIT+1
+no_cur_req     EQU  CUR_READ_FLAG+1
+DCD_wait       EQU  NO_CUR_REQ+1
+
+restrt_out     EQU  FLAGS+2        ;STARTS ON WORD
+prev_char      EQU  RESTRT_OUT+1
+autolf         EQU  PREV_CHAR+1
+lastwr1        EQU  AUTOLF+1
+hwcontrol      EQU  LASTWR1+1
+DATA           EQU  4
+
+cur_req_ptr    EQU  HWCONTROL+4
+sdb_ptr        EQU  CUR_REQ_PTR+4
+offset         EQU  SDB_PTR+4
+xfercnt        EQU  OFFSET+4
+numbytes       EQU  XFERCNT+4
+hi_speed       EQU  NUMBYTES+4
+xmt_hs         EQU  HI_SPEED+1
+HW_HS          EQU  0
+XMT_XON        EQU  HW_HS+1
+XMIT_DELAY     EQU  XMT_XON+1
+
+xmit_ref       EQU  XMT_HS+1
+xmit_timeout   EQU  XMIT_REF+2
+crlfdelay      EQU  XMIT_TIMEOUT+4
+waitb4next     EQU  CRLFDELAY+4
+hschar_pending EQU  WAITB4NEXT+1
+NO_CHAR        EQU  0
+XOFF_CHAR      EQU  NO_CHAR+1
+
+strip_parity   EQU  HSCHAR_PENDING+1
+size_typeah    EQU  STRIP_PARITY+2        ;STARTS ON WORD
+start_typeah   EQU  SIZE_TYPEAH+2
+get_typeah     EQU  START_TYPEAH+4
+put_typeah     EQU  GET_TYPEAH+4
+start_errbuf   EQU  PUT_TYPEAH+4
+er_framing     EQU  START_ERRBUF+4
+er_parity      EQU  ER_FRAMING+4
+er_overrun     EQU  ER_PARITY+4
+er_ovflow      EQU  ER_OVERRUN+4
+er_lostcary    EQU  ER_OVFLOW+4
+rec_hs         EQU  ER_LOSTCARY+4
+HWHS           EQU  0
+REC_XON        EQU  HWHS+1
+
+last_stopped   EQU  REC_HS+1
+num_typeah     EQU  LAST_STOPPED+1
+full_thresh    EQU  NUM_TYPEAH+2
+wr5            EQU  FULL_THRESH+2
+prior_rr0      EQU  WR5+2          ;WR5 REQUIRES FULL WORD
+DCD            EQU  3
+
+rr0_changes    EQU  PRIOR_RR0+2    ;PRIOR_RR0 REQUIRES FULL WORD
+wr15           EQU  RR0_CHANGES+2  ;RR0_CHANGES REQUIRES FULL WORD
+await_tx       EQU  WR15+1
+allow_status   equ  AWAIT_TX+1
+
+
+
+     .PROC     DRIVER
+     .REF      MODEMA,RSOUT,ALARMRELATIVE,UNFREEZE_SEG,COPYBYTES,ALARMOFF,RESTORE
+     ;-------------------------------------------------------------------------
+     ; function DRIVER (parameters: param_ptr): integer;
+     ;
+     ; Handle interrupt for MODEMA driver
+     ; On entry: D0 has intpar (if dinterrupt), D1 has function-code, A1 has configptr
+     ;-------------------------------------------------------------------------
+
+     TST       D1                  ;TEST FUNCTION CODE
+     BNE       CALLPASC            ;NOT AN INTERRUPT, CALL PASCAL TO HANDLE
+     MOVE.L    A4,-(SP)            ;SAVE REG A4
+     MOVE.L    CB_ADDR(A1),A4      ;ADDRESS OF PORT CONTROL BLOCK
+     MOVE.L    HWCONTROL(A4),A0
+     TST       D0                  ;TEST INTPAR
+     BEQ.S     XMIT                ;OUTPUT INTERRUPT
+     SUBQ      #2,D0
+     BGT       INERR               ;INPUT ERROR INTERRUPT
+     BLT       MODEM               ;MODEM CHANGE INTERRUPT
+     BEQ       RECV                ;INTPUT INTERRUPT
+
+     ;HAVE OUTPUT INTERRUPT -- HANDLE IT HERE
+
+XMIT MOVE.B    #$29,(A0)           ;CLEAR PENDING OUTPUT INTERRUPT & SELECT WR1
+     NOP
+     MOVEQ     #0,D0
+     MOVE.B    D0,(A0)             ;CLEAR INT STATUS REG FOR THIS PORT
+     NOP
+     MOVE.B    #$38,(A0)           ;RESET IUS
+     MOVE      ALLOW_STATUS(A4),SR ;SET INT PRIO SO OTHER PORT CAN INTERRUPT
+     MOVE.B    D0,LASTWR1(A4)      ;=0. RECORD CLEARED WR1
+     MOVE.B    D0,AWAIT_TX(A4)     ;WE'RE NOT WAITING FOR TX INTERRUPT ANY MORE
+     CMPI.B    #NO_CHAR,HSCHAR_PENDING(A4)
+     BEQ.S     @11                 ;SKIP IF DON'T HAVE XOFF OR XON TO SEND
+     MOVE.L    A4,-(SP)
+     JSR       RSOUT               ;SEND IT
+     BRA.S     OUT                 ;EXIT WITHOUT CALLING PASCAL
+
+@11  TST.B     FLAGS(A4)           ;IF NO_CUR_REQ OR CUR_READ_FLAG OR XMIT_WAIT
+                                   ;OR DCD_WAIT THEN
+     BNE.S     OUT                 ;EXIT WITHOUT CALLING PASCAL
+     TST.B     WAITB4NEXT(A4)
+     BEQ.S     @1                  ;SKIP IF NOT STARTING UP DELAY AFTER CR,LF
+     CLR.B     WAITB4NEXT(A4)
+     MOVE.W    XMIT_REF(A4),-(SP)
+     MOVE.L    CRLFDELAY(A4),-(SP)
+     JSR       ALARMRELATIVE       ;START UP ALARM
+     BSET      #XMIT_WAIT,FLAGS(A4)
+     TST.L     FROZEN_ADDR(A4)
+     BEQ.S     OUT                 ;UNFREEZE ALREADY CALLED
+     CLR.L     FROZEN_ADDR(A4)     ;NOPE, CALL IT NOW
+     MOVE.L    SDB_PTR(A4),-(SP)
+     JSR       UNFREEZE_SEG
+     BRA.S     OUT
+
+@1   MOVE.L    XFERCNT(A4),D0
+     CMP.L     NUMBYTES(A4),D0
+     BGE.S     @2                  ;SKIP IF XFER COUNT >= NUM BYTES
+     MOVE.L    A4,-(SP)
+     JSR       RSOUT               ;SEND NEXT BYTE
+     BRA.S     OUT                 ;EXIT WITHOUT CALLING PASCAL
+
+@2   MOVE.L    (SP)+,A4            ;PREPARE TO CALL DRIVER TO FINISH THE REQUEST
+     MOVE.L    4(SP),A1            ;ADDRESS OF PARAMETERS TO DRIVER
+     CLR       INTPAR(A1)          ;SET INTPAR FOR OUTPUT INTERRUPT
+CALLPASC
+     JMP       MODEMA              ;CALL THE PASCAL DRIVER
+
+     ;CLEAN UP THE STACK, THEN CALL "RESTORE" WITHOUT RETURNING HERE
+
+OUT  MOVE.L    HWCONTROL(A4),A0
+     BTST      #0,(A0)             ;IF INPUT INTERRUPT IS PENDING, GET NEXT CHAR
+     BNE.S     REREAD              ;CHAR PENDING
+     MOVE.L    A4,8(SP)            ;PORT_PTR PARAM TO PASS TO RESTORE
+     MOVE.L    (SP)+,A4            ;RESTORE ORIG A4
+     MOVE.L    (SP)+,D0            ;RETURN ADDRESS FROM CALLER OF "DRIVER"
+     MOVE      #$0617,-(SP)        ;AND VALUES TO RESTORE (6 TO SR, 17 TO WR1)
+     MOVE.L    D0,-(SP)            ;FAKE RESTORE INTO RETURNING TO CALLER OF "DRIVER"
+     JMP       RESTORE             ;RE-ENABLE INTS THIS CHAN & CHECK FOR MISSED INTS
+
+RECV MOVEQ     #0,D1               ;NO INPUT ERRS (KEPT IN HIGH HALF OF D1)
+     BRA.S     CONT                ;CONTINUE IN RECEIVE INTERRUPT HANDLER
+
+REREAD
+     MOVE      #$2600,SR           ;PREPARE TO READ ANOTHER INPUT CHARACTER
+INERR
+     MOVE.B    #1,(A0)             ;SELECT RR1
+     NOP
+     MOVEQ     #$70,D1
+     AND.B     (A0),D1             ;READ ERROR STATUS FROM REG 1
+     BEQ.S     CONT                ;SKIP IF NO ERRORS DETECTED
+     MOVE.B    #$30,(A0)           ;RESET ERROR LATCH
+     SWAP      D1
+CONT MOVE.B    DATA(A0),D1         ;GET INPUT CHAR
+     NOP
+     MOVE.B    #1,(A0)             ;SELECT WR1
+     NOP
+     MOVEQ     #0,D0
+     MOVE.B    D0,(A0)             ;CLEAR INT STATUS REG FOR THIS PORT
+     NOP
+     MOVE.B    #$38,(A0)           ;RESET IUS
+     MOVE      ALLOW_STATUS(A4),SR ;SET INT PRIO SO OTHER PORT CAN INTERRUPT
+     MOVE.B    D0,LASTWR1(A4)      ;=0. RECORD CLEARED WR1
+     TST.B     D1
+     BNE.S     @5                  ;NON-ZERO CHARACTER
+     TST.B     PRIOR_RR0(A4)
+     BLT       @50                 ;ZERO DATA DURING BREAK GETS IGNORED
+@5   TST.B     STRIP_PARITY(A4)
+     BEQ.S     @10
+     ANDI      #$7F,D1             ;STRIP PARITY
+@10  SWAP      D1
+     TST.B     D1                  ;INPUT ERRORS?
+     BEQ.S     @20                 ;SKIP IF NONE
+     MOVE.L    PUT_TYPEAH(A4),D0   ;SET BIT IN ERROR TABLE FOR NEXT CHAR
+     SUB.L     START_TYPEAH(A4),D0 ;BIT #
+     MOVEQ     #$7,D2
+     AND       D0,D2               ;BIT WITHIN BYTE
+     ASR       #3,D0               ;BYTE OFFSET
+     MOVE.L    START_ERRBUF(A4),A1 ;BASE ADDR OF BIT TABLE
+     BSET      D2,0(A1,D0)         ;SET IT
+     BTST      #0,D1
+     BEQ.S     @12                 ;NO INPUT BUFFER OVERFLOW
+     ADDQ.L    #1,ER_OVFLOW(A4)    ;YES, BUFFER OVERFLOW
+     BRA       @38                 ;DON'T SAVE THE CHARACTER, BUT SEND XOFF IF NEC
+
+@12  BTST      #6,D1
+     BEQ.S     @14                 ;NO FRAMING ERROR
+     ADDQ.L    #1,ER_FRAMING(A4)   ;FRAMING ERROR
+     BRA       @50                 ;DON'T SAVE THE CHARACTER
+
+@14  BTST      #4,D1
+     BEQ.S     @16                 ;NO PARITY ERROR
+     ADDQ.L    #1,ER_PARITY(A4)    ;PARITY ERROR
+     BRA       @50                 ;DON'T SAVE THE CHARACTER
+
+@16  BTST      #5,D1               ;INPUT OVERRUN?
+     BEQ.S     @20                 ;NOPE
+     ADDQ.L    #1,ER_OVERRUN(A4)   ;YUP
+@20  SWAP      D1                  ;PUT INPUT CHAR BACK IN LOW HALF
+
+     ;ORIGINAL "BYTEIN" ROUTINE
+
+     CMPI.B    #XMT_XON,XMT_HS(A4)
+     BNE       @30                 ;NOT LOOKING FOR XON/XOFF
+     CMPI.B    #$13,D1             ;XOFF?
+     BNE.S     @25
+     BSET      #XMIT_WAIT,FLAGS(A4) ;YES
+     BTST      #NO_CUR_REQ,FLAGS(A4)
+     BNE       @50                 ;IGNORE REST IF NO CUR REQ
+     BTST      #CUR_READ_FLAG,FLAGS(A4)
+     BNE       @50                 ;IGNORE REST IF CURRENTLY READING
+     MOVE.L    XMIT_TIMEOUT(A4),D0
+     BEQ.S     @22                 ;GOT XOFF, BUT DON'T START ALARM IF TIMEOUT = 0
+     MOVE      XMIT_REF(A4),-(SP)
+     MOVE.L    D0,-(SP)
+     JSR       ALARMRELATIVE       ;START TIMEOUT
+@22  TST.L     FROZEN_ADDR(A4)
+     BEQ       @50                 ;IF ALREADY UNFROZEN, THEN WE'RE DONE
+     MOVE.L    SDB_PTR(A4),-(SP)
+     JSR       UNFREEZE_SEG        ;ELSE UNFREEZE DATA DURING HANDSHAKE PAUSE
+     CLR.L     FROZEN_ADDR(A4)
+     BRA       @50
+
+@25  CMPI.B    #$11,D1             ;XON?
+     BNE.S     @30
+     BCLR      #XMIT_WAIT,FLAGS(A4)
+     BEQ       @50                 ;GOT XON, BUT NOT WAITIN FOR IT
+     BTST      #NO_CUR_REQ,FLAGS(A4)
+     BNE       @50                 ;IGNORE REST IF NO CUR REQ
+     BTST      #CUR_READ_FLAG,FLAGS(A4)
+     BNE       @50                 ;IGNORE REST IF CURRENTLY READING
+     MOVE      XMIT_REF(A4),-(SP)  ;KILL TIMEOUT
+     JSR       ALARMOFF
+     TST.B     FLAGS(A4)
+     BNE       @50                 ;IGNORE REST IF DCD_WAIT
+     MOVE.L    A4,-(SP)
+     JSR       RSOUT               ;START SENDING
+     BRA.S     @50
+
+     ;HAVE REAL INPUT CHAR -- PUT INTO TYPEAHEAD BUFFER
+
+@30  MOVE      NUM_TYPEAH(A4),D0
+     ADDQ      #1,D0               ;KEEP NEW VALUE OF NUM_TYPEAH IN D0
+     CMP       SIZE_TYPEAH(A4),D0  ;ROOM IN BUFFER?
+     BLE.S     @32
+     MOVEQ     #1,D1               ;YES, FULL
+     SWAP      D1                  ;CREATE BUFFER OVERFLOW ERROR FLAG
+     BRA.S     @10
+@32  MOVE.L    PUT_TYPEAH(A4),A0   ;NOT FULL, GET ADDRESS FOR NEXT BUFFER CHAR
+     MOVE.B    D1,(A0)             ;STORE THE CHAR
+     ADDQ      #1,A0               ;INCREMENT BUFFER POINTER
+     CMPA.L    START_ERRBUF(A4),A0
+     BNE.S     @35                 ;WITH WRAPAROUND TO START OF BUFFER
+     MOVE.L    START_TYPEAH(A4),A0
+@35  MOVE.L    A0,PUT_TYPEAH(A4)
+     MOVE      D0,NUM_TYPEAH(A4)   ;COUNT IS ONE GREATER THAN PREVIOUSLY
+     CMP       FULL_THRESH(A4),D0  ;TIME TO SEND HANDSHAKE OUT?
+     BNE.S     @50                 ;NO
+
+     ;AT FULL THRESHHOLD
+
+@38  CMPI.B    #REC_XON,REC_HS(A4)
+     BNE.S     @50
+     MOVE.B    #1,LAST_STOPPED(A4)
+     MOVE.B    #XOFF_CHAR,HSCHAR_PENDING(A4) ;SEND XOFF
+     MOVE.L    A4,-(SP)
+     JSR       RSOUT
+
+@50  MOVE.L    HWCONTROL(A4),A0
+     BTST      #0,(A0)             ;ANOTHER CHAR AVAILABLE?
+     BNE.S     REREAD              ;YES, GET IT, WITH INTS OFF TEMPORARILY
+     BTST      #NO_CUR_REQ,FLAGS(A4)
+     BNE.S     OUT                 ; OR IF NOT CURRENTLY READING
+     BTST      #CUR_READ_FLAG,FLAGS(A4)
+     BEQ.S     OUT
+     MOVE.L    A4,-(SP)
+     JSR       COPYBYTES           ;COPY INPUT INTO USER BUFFER
+     BRA       OUT
+
+MODEM
+     MOVE.B    AWAIT_TX(A4),D1
+     MOVE.B    (A0),D0             ;GET MODEM STATUS
+     AND.B     D0,D1
+     BNE       XMIT                ;BRANCH TO OUTPUT INT IF FAKE MODEM CHANGE INT
+     MOVE.B    #$11,(A0)           ;RESET MODEM LATCH & SELECT WR1
+     NOP
+     MOVEQ     #0,D2
+     MOVE.B    D2,(A0)             ;ZERO INT STATUS REG FOR THIS PORT
+     NOP
+     MOVE.B    #$38,(A0)           ;RESET IUS
+     MOVE      ALLOW_STATUS(A4),SR ;SET INT PRIO SO OTHER PORT CAN INTERRUPT
+     MOVE.B    D2,LASTWR1(A4)      ;=0. RECORD CLEARED WR1
+     MOVE      #$2600,SR           ;OFF BRIEFLY AGAIN
+     MOVE.B    #15,(A0)            ;SELECT WR15
+     MOVE.B    WR15(A4),D1
+     MOVE.B    D1,(A0)             ;CLEAR THE ZERO-COUNT ENABLE IN CASE FAKED INT
+     MOVE      ALLOW_STATUS(A4),SR ;SET INT PRIO SO OTHER PORT CAN INTERRUPT
+     MOVE.B    PRIOR_RR0(A4),D2
+     MOVE.B    D0,PRIOR_RR0(A4)    ;REMEMBER LAST STATE OF RR0
+     EOR.B     D0,D2
+     AND.B     D1,D2
+     BEQ       OUT                 ;IGNORE THE INTERRUPT IF NOTHING CHANGED
+     MOVE.B    D2,RR0_CHANGES(A4)  ;RECORD THE CHANGES THAT CAN CAUSE INTERRUPTS
+     BTST      #DCD,D2
+     BEQ.S     @9                  ;SKIP TO CALL PASCAL IF DCD DIDN'T CHANGE
+     BTST      #DCD,D0
+     BNE.S     @9                  ; OR IF DCD JUST CAME ON
+     MOVE.L    PUT_TYPEAH(A4),D0   ;DROPPED DCD, SO SET BIT IN ERROR TABLE FOR NEXT CHAR
+     SUB.L     START_TYPEAH(A4),D0 ;BIT #
+     MOVEQ     #$7,D2
+     AND       D0,D2               ;BIT WITHIN BYTE
+     ASR       #3,D0               ;BYTE OFFSET
+     MOVE.L    START_ERRBUF(A4),A1 ;BASE ADDR OF BIT TABLE
+     BSET      D2,0(A1,D0)         ;SET ERROR BIT
+     ADDQ.L    #1,ER_LOSTCARY(A4)  ;FRAMING ERROR
+@9   MOVE.L    (SP)+,A4            ;PREPARE TO CALL DRIVER
+     JMP       MODEMA              ;CALL THE PASCAL DRIVER
+
+
+     .PROC     RSOUT
+; RSOUT is equivalent to the following pascal routine, BYTEO.
+
+;      procedure BYTEO (port: portrec_ptr);
+;       (*************************************************************)
+;       (*                                                           *)
+;       (* Description:  Write one byte on MODEMA.                   *)
+;       (*                                                           *)
+;       (* Input Parameters:  Port points to the current port in the *)
+;       (*         MODEMA device control block.                      *)
+;       (*                                                           *)
+;       (* Output Parameters:  none                                  *)
+;       (*                                                           *)
+;       (* Side Effects:  Starts timer if hardware handshake requires*)
+;       (*                                                           *)
+;       (* Special Conditions of Use:  RS-232 interrupts must be off.*)
+;       (*************************************************************)
+;      VAR
+;        data_ptr: int1ptr;
+;        status,err: integer;
+;
+;      begin
+;        WITH port^, hwcontrol^ do
+;          begin
+;            status := controlreg;  (*read hardware control reg 0*)
+;
+;            if ALLSET ($04, status) then (*output buffer is empty*)
+;              if (hschar_pending <> no_char) then
+;              begin  (*need to send xoff or xon*)
+;                if hschar_pending = xoff_char then
+;                begin
+;                  hwdata^ := $13; (*xoff char*)
+;                end
+;                else
+;                begin (*send xon*)
+;                  hwdata^ := $11; (*xon char*)
+;                end;
+;                hschar_pending := no_char
+;              end
+;              else
+;                begin
+;                      err := 0;
+;                      if frozen_addr = ord(nil) then
+;                        FREEZE_SEG (err, sdb_ptr, offset, ord(cur_req_ptr),
+;                          frozen_addr);
+;                      if err <> 0 then
+;                      begin
+;                        controlreg := $28;  (*clear output interrupts with $28*)
+;                        restrt_out := true (*reqrestart will be called to contin*)
+;                      end
+;                      else
+;                      begin (*freeze_seg succeeded*)
+;                        if autolf and ((prev_char = $0D) or
+;                           (not strip_parity and (prev_char = -115(*=$8D*) )) (*bug #161*)
+;                          then
+;                          prev_char := $0A (*insert auto LF*)
+;                        else (*no automatic linefeed*)
+;                        begin
+;                          data_ptr := pointer(frozen_addr + xfercnt);
+;                          xfercnt := xfercnt + 1;
+;                          prev_char := data_ptr^
+;                        end;
+;
+;                        hwdata^ := prev_char;  (*do the write*)
+;
+;                        if xmt_hs = xmit_delay then
+;                          if (prev_char = $0D) or (prev_char = $0A) then
+;                            waitb4next := true;  (*start delay after CR or LF interrupts*)
+;
+;                        if not hi_speed then
+;                        begin
+;                          frozen_addr := ord(nil);
+;                          UNFREEZE_SEG (sdb_ptr) (*allow buffer to move again*)
+;                        end
+;                      end
+;                end
+;          end
+;      end; (* BYTEO *)
+
+
+     .REF      FREEZE_SEG, UNFREEZE_SEG
+     ;--------------------------------------------------------------------------
+     ; procedure RSOUT (port: portrec_ptr);
+     ;
+     ; D1 HOLDS HSCHAR_PENDING OR PREV_CHAR
+     ; D2 HOLDS SCC STATUS REGISTER 0 CONTENTS
+     ; A4 HOLDS DRIVER CONTROL BLOCK ADDRESS
+     ;--------------------------------------------------------------------------
+
+     MOVE.L    A4,-(SP)            ;SAVE REG USED
+     MOVE.L    8(SP),A4            ;DRIVER CONTROL BLOCK ADDRESS
+     MOVE.L    HWCONTROL(A4),A0
+     MOVE.B    (A0),D2             ;READ SCC STATUS REGISTER
+     BTST      #2,D2
+     BEQ       @99                 ;JUST RETURN IF OUTPUT BUFFER ISN'T EMPTY
+     MOVE.B    HSCHAR_PENDING(A4),D1; GET PENDING HANDSHAKE CHARACTER
+     BEQ.S     @1                  ;SKIP IF HSCHAR_PENDING = NO_CHAR
+
+     ;SEND XOFF OR XON
+
+     MOVE.B    #NO_CHAR,HSCHAR_PENDING(A4) ;SET NEXT CHAR PENDING TO "NO_CHAR"
+     MOVEQ     #$11,D0             ;PRE-LOAD XON CHARACTER
+     CMPI.B    #XOFF_CHAR,D1
+     BNE.S     @0
+     MOVEQ     #$13,D0             ;XOFF CHARACTER IS SENT INSTEAD
+@0   MOVE.B    D0,DATA(A0)         ;SEND THE XOFF OR XON
+     MOVE.B    #$04,AWAIT_TX(A4)   ;FLAGS THE FACT THAT WE'RE AWAITING AN OUTPUT INT
+     BRA       @99                 ;RETURN
+
+     ;NOT XOFF OR XON TO SEND
+
+@1   TST.L     FROZEN_ADDR(A4)     ;OK TO SEND CHARACTER NOW
+     BNE.S     @2                  ;SKIP IF NO NEED TO CALL FREEZE_SEG
+     SUBQ      #2,SP               ;PREPARE TO CALL FREEZE_SEG
+     MOVE.L    SP,-(SP)            ;ADDR OF ERRNUM ON STACK
+     MOVE.L    SDB_PTR(A4),-(SP)
+     MOVE.L    OFFSET(A4),-(SP)
+     MOVE.L    CUR_REQ_PTR(A4),-(SP)
+     PEA       FROZEN_ADDR(A4)
+     JSR       FREEZE_SEG
+     TST.W     (SP)+               ;TEST ERRNUM RETURNED FROM FREEZE_SEG
+     BEQ.S     @2
+     MOVE.B    #1,RESTRT_OUT(A4)   ;GOT ERROR FROM FREEZE_SEG - WAIT FOR REQRESTART
+     BRA       @98                 ;EXIT AND CLEAR PRIOR INTERRUPT
+
+     ;NO ERROR FROM FREEZE_SEG
+
+@2   TST.B     AUTOLF(A4)
+     BEQ.S     @3                  ;SKIP IF NOT AUTOMATIC LF AFTER CR
+     MOVE.B    PREV_CHAR(A4),D0    ;GET PREVIOUS CHARACTER
+     TST.B     STRIP_PARITY(A4)
+     BEQ.S     @21                 ;SKIP IF NOT STRIPPING PARITY
+     ANDI.B    #$7F,D0             ;STRIP PARITY BEFORE COMPARING WITH CR
+@21  MOVEQ     #$0A,D1             ;PRE-LOAD REGISTER WITH LF CHARACTER
+     CMPI.B    #$0D,D0             ;WAS PREV CHAR = CR?
+     BEQ.S     @4                  ;YES, LEAVE LF IN D1
+@3   MOVE.L    FROZEN_ADDR(A4),A0  ;NO AUTOMITIC LINEFEED INSERTION NOW
+     MOVE.L    XFERCNT(A4),D0
+     MOVE.B    0(A0,D0.L),D1       ;GETNEXT CHARACTER FROM USER'S BUFFER
+     ADDQ.L    #1,D0
+     MOVE.L    D0,XFERCNT(A4)      ;INCREMENT XFER COUNT
+@4   MOVE.L    HWCONTROL(A4),A0
+     MOVE.B    D1,DATA(A0)         ;WRITE OUT THE CHARACTER
+     MOVE.B    D1,PREV_CHAR(A4)    ;SAVE AS PREV CHAR
+     MOVE.B    #$04,AWAIT_TX(A4)   ;FLAGS THE FACT THAT WE'RE AWAITING AN OUTPUT INT
+     CMPI.B    #XMIT_DELAY,XMT_HS(A4)
+     BNE.S     @6                  ;SKIP IF NOT DELAYING AFTER CR, LF
+     CMPI.B    #$0D,D1
+     BEQ.S     @5                  ;JUST SENT CR?
+     CMPI.B    #$0A,D1
+     BNE.S     @6                  ;OR JUST SENT LF?
+@5   MOVE.B    #1,WAITB4NEXT(A4)   ;YES, FLAG TO DELAY WHEN THIS CHAR IS SENT
+@6   TST.B     HI_SPEED(A4)
+     BNE.S     @99                 ;DON'T CALL UNFREEZE NOW IF HIGH SPEED
+     CLR.L     FROZEN_ADDR(A4)     ;AT LOW SPEED WE CAN AFFORD TO CALL ON EACH BYTE
+     MOVE.L    SDB_PTR(A4),-(SP)
+     JSR       UNFREEZE_SEG
+     BRA.S     @99                 ;EXIT
+
+@98  MOVE.L    HWCONTROL(A4),A0
+     MOVE.B    #$28,(A0)           ;CLEAR PRIOR INTERRUPTS
+@99  MOVE.L    (SP)+,A4
+     MOVE.L    (SP)+,A0
+     ADDQ      #4,SP
+     JMP       (A0)
+
+
+     .PROC     WR_SCC
+; WR_SCC is equivalent to the following pascal routine.
+
+;      procedure WR_SCC (regno: int1; val: int1; port_ptr: portrec_ptr);
+;       (*************************************************************)
+;       (*           Procedure to write to the SCC control registers *)
+;       (*    Assures necessary delay between accesses.              *)
+;       (*************************************************************)
+;      VAR
+;        i: integer;
+;        prevints: intson_type;
+;      begin
+;        WITH port_ptr^.hwcontrol^ do
+;        begin
+;          INTSOFF (rsints, prevints);
+;          controlreg := regno;
+;          i := 128;  (*NOP to assure delay between accesses*)
+;          controlreg := val;
+;          INTSON (prevints)
+;        end
+;      end;
+
+     .REF      INTSOFF,INTSON
+     ;-------------------------------------------------------------------
+     ; procedure WR_SCC (regno: int1; val: int1; port_ptr: portrec_ptr);
+     ;-------------------------------------------------------------------
+
+     SUBQ      #2,SP          ;HOLDS PREVINTS VALUE
+     MOVE      #$0600,-(SP)
+     PEA       2(SP)          ;ADDR OF PREVINTS
+     JSR       INTSOFF        ;DISABLE RS232 INTS
+     MOVE.L    6(SP),A0       ;PORT_PTR
+     MOVE.L    HWCONTROL(A0),A0
+     MOVE.B    12(SP),(A0)    ;REGNO TO SCC
+     MOVE.B    10(SP),(A0)    ;VAL TO SCC (NO NOP'S REQUIRED - ACCESS 10(SP) ENOUGH
+     JSR       INTSON         ;RESTORE INTS
+     MOVE.L    (SP)+,A0
+     ADDQ      #8,SP
+     JMP       (A0)
+
+
+     .PROC     ALLOW_OTHER
+     .REF      INTSOFF,INTSON
+     ;-------------------------------------------------------------------
+     ; procedure ALLOW_OTHER (port_ptr: portrec_ptr; var prevstatus: integer);
+     ;
+     ;  Set interrupt priority to "slotints" but disable interrupts on this
+     ;  SCC port.  Return previous value of WR1 and processor SR in prevstatus.
+     ;  lastwr1 must be initialized to zero or $17 before use.
+     ;-------------------------------------------------------------------
+
+     MOVE      #$0600,-(SP)
+     MOVE.L    6(SP),-(SP)    ;ADDR OF PREVSTATUS
+     JSR       INTSOFF        ;DISABLE RS232 INTS
+     MOVE.L    4(SP),A0       ;ADDR OF PREVSTATUS
+     MOVE.L    8(SP),A1       ;PORT_PTR
+     MOVE.B    LASTWR1(A1),1(A0) ;SAVE PREV REG1 VALUE IN LOW BYTE OF PREVSTATUS
+     BEQ.S     @5             ;WR1 ALREADY EQUALS ZERO
+     MOVE.L    HWCONTROL(A1),A0
+     MOVE.B    #1,(A0)        ;SELECT WR1
+     MOVEQ     #0,D0
+     MOVE.B    D0,LASTWR1(A1) ;REMEMBER CURRENT STATE
+     MOVE.B    D0,(A0)        ;SET WR1 TO 0 -- NO MORE INTS THIS PORT
+@5   MOVE.L    (SP)+,A0       ;RETURN ADDR
+     ADDQ      #8,SP          ;POP PARAMETERS FROM CALLER
+     MOVE      ALLOW_STATUS(A1),D0
+     ANDI      #$0700,D0      ;CLEAR SUPERVIS BIT FROM ALLOW_STATUS
+     MOVE      D0,-(SP)
+     MOVE.L    A0,-(SP)       ;CAUSE INTSON TO RETURN TO CALLER OF THIS ROUTINE
+     JMP       INTSON         ;SET INTERRUPT LEVEL TO "SLOTINTS" SO OTHER PORT
+                              ; CAN INTERRUPT
+
+     .PROC     RESTORE
+     ;-------------------------------------------------------------------
+     ; procedure RESTORE (port_ptr: portrec_ptr; prevstatus: integer);
+     ;
+     ; Restore processor SR and WR1 to previous state.  prevstatus must
+     ;  contain value returned from prior call to Allow_Other.
+     ; Cause a "zero-count" interrupt if output or modem change interrupt
+     ;  was lost while WR1 was equal to 0.
+     ;-------------------------------------------------------------------
+
+     MOVE.L    6(SP),A1       ;PORT_PTR
+     MOVE.L    (SP)+,2(SP)    ;OVERWRITE PORT_PTR ON STACK WITH RETURN ADDR
+     MOVE      SR,D1
+     ANDI      #$2000,D1
+     OR        (SP)+,D1       ;COMBINE CALLER'S SUPERVISOR STATUS WITH "PREVSTATUS"
+     LEA       @1,A0
+     MOVE      #$2600,D0      ;SET INTS OFF AND FORCE INTO SUPERVISOR STATE
+     TRAP      #7      ;CALL OS TO SET SR TO VALUE IN D0; CONTINUE AT ADDRESS IN A0
+@1   MOVE      D1,-(SP)       ;PUSH MODIFIED PREVSTATUS ON TOP OF SUPERVIS STACK
+     TST.B     D1             ;TEST LOW BYTE OF PREVSTATUS
+     BEQ.S     @9             ;EXIT IF WR1 BEING LEFT AT 0
+     MOVE.L    HWCONTROL(A1),A0
+     MOVE.B    #1,(A0)        ;SELECT WR1
+     MOVE.B    D1,LASTWR1(A1) ;REMEMBER NEW STATE
+     MOVE.B    D1,(A0)        ;RESTORE WR1 TO ITS PRIOR VALUE (OF $17)
+     MOVE.B    AWAIT_TX(A1),D2 ;EQUALS 4 IFF CURRENTLY WAITING FOR TRANSMIT INTERRUPT
+     MOVE.B    (A0),D1        ;READ RR0
+     BTST      #0,D1
+     BNE.S     @9             ;IF INPUT INTERRUPT IS PENDING, CAN RETURN NOW
+
+     ;SEE IF HAVING WR1 SET TO 0 CAUSED ANY LOST INTERRUPTS
+
+     MOVE.B    WR15(A1),D0
+     AND.B     D1,D2
+     BNE.S     @4             ;IF OUTPUT INTERRUPT IS PENDING & WOULD INT
+     MOVE.B    PRIOR_RR0(A1),D2
+     EOR.B     D2,D1
+     AND.B     D0,D1
+     BEQ.S     @9             ;NO INTERRUPTS LOST
+
+     ;FORCE ZERO-COUNT INTERRUPT TO SIMULATE THE LOST XMIT OR MODEM-CHANGE INT
+
+@4   MOVE.B    #15,(A0)       ;SELECT WR15
+     ORI.B     #$02,D0        ;SET "ZERO COUNT" BIT
+     MOVE.B    D0,(A0)        ;ENABLE INTERRUPT ON NEXT ZERO COUNT (1/16 OF BAUD)
+
+@9   MOVE      (SP)+,SR       ;SET SR TO VALUE FROM PREVSTATUS & CALLER'S "S" BIT
+     RTS                      ;THIS WORKS BECAUSE RE-ORDERED STACK ON ENTRY
+
+
+     .PROC     FINDBIT
+     ;-----------------------------------------------------------------------
+     ;  procedure FINDBIT(var newlen: integer; base: absptr; start: integer;
+     ;                   len: integer; size: integer);
+     ;
+     ;    Find the first "1" in bit array "base", for "len" bits starting
+     ;      at "start".  The bit array is "size" bits in length,
+     ;      and is circular, such that the first bit of the array logically
+     ;      follows the last bit of the array.  Return in newlen, the number of
+     ;      zero-bits encountered before a 1 or end of search.  The bit
+     ;      array must extend past the end to fill a multiple of 4 bytes,
+     ;      with the unused bits at the end equal to 0 (and 8 byte minimum
+     ;      total array length).
+     ;
+     ;    D0.L      SCRATCH
+     ;    D1.W      OUTER LOOP COUNTER
+     ;    D2.W      MIDDLE LOOP COUNTER
+     ;    D3.W      INNER LOOP COUNTER
+     ;    D4.W      BYTE NUMBER OF START BIT
+     ;    D5.W      BYTE NUMBER OF LAST BIT TO TEST
+     ;    D6.W      SUM OF OUTER AND MIDDLE LOOP COUNTERS
+     ;    D7.W      HOLDS BYTE READ IN MIDDLE LOOP
+     ;    A0.L      BASE ADDRESS OF BIT ARRAY
+     ;    A1.W      OUTER LOOP LIMIT
+     ;    A2.W      MIDDLE LOOP LIMIT
+     ;    A3.W      INNER LOOP LIMIT
+     ;    A4.W      MODE (-1 = NO WRAPAROUND, 0 = PART BEFORE WRAPAROUND,
+     ;                    1 = PART AFTER WRAPAROUND)
+     ;    A5.W      ENDING BIT # TO TEST
+     ;--------------------------------------------------------------------------
+
+SIZE       EQU 4+26
+LEN        EQU SIZE+2
+START      EQU LEN+2
+BASE       EQU START+2
+NEWLEN     EQU BASE+4
+
+     MOVEM.W   D3-D7,-(SP)         ;SAVE LOW WORD OF DATA REGS USED
+     MOVEM.L   A2-A5,-(SP)         ; AND ALL OF ADDRESS REGS USED
+     MOVE.L    BASE(SP),A0         ;BASE ADDRESS OF ARRAY HELD IN A0
+     MOVE      START(SP),D4
+     MOVE      D4,D0               ;D0 TEMPORARILY HOLDS START BIT #
+     ASR       #3,D4               ;HOLD LONGINT OF START IN D4
+     MOVE      LEN(SP),D5
+     BEQ       @11                 ;JUST RETURN IF LENGTH = 0
+     SUBQ      #1,D5
+     BEQ       @13                 ;ONLY ONE BIT TO TEST!
+     ADD       D0,D5               ;BIT POSITION OF FINAL BIT (BEFORE WRAPAROUND)
+     CMP       SIZE(SP),D5
+     BLT.S     @77                 ;TEST FOR WRAPAROUND
+     SUB       SIZE(SP),D5
+@77  MOVE      D5,A5               ;HOLD FINAL BIT# IN A5
+     ASR       #3,D5               ;HOLD BYTE # OF FINAL BIT IN D5
+
+     ;SET UP OUTER LOOP
+
+     MOVEQ     #-4,D1              ;=FFFC
+     AND       D4,D1               ;INITIALIZE OUTER LOOP COUNTER IN D1
+     CMP       A5,D0
+     BGT.S     @1
+     MOVEA     #-1,A4              ;START <= ENDING BIT POSITION.  MODE = -1
+@0   MOVE      D5,D0               ;FOR OUTER LOOP LIMIT
+     BRA.S     @2
+@1   SUBA      A4,A4               ;START > ENDING BIT POSITION. MODE = 0
+     MOVE      SIZE(SP),D0
+     SUBQ      #1,D0
+     ASR       #3,D0             ;CONVERTS #BITS TO #BYTES FOR OUTER LOOP LIM
+@2   ANDI      #$FFFC,D0
+     MOVE      D0,A1               ;OUTER LOOP LIMIT IN A1 IS MULTIPLE OF 4
+
+     ;OUTER LOOP
+
+@3   TST.L     0(A0,D1.W)          ;CHECK NEXT 32 BITS FOR NON-ZERO
+     BEQ       @10                 ;SKIP REST IF = 0
+
+     ;SET UP MIDDLE LOOP
+
+     CLR       D2               ;MIDDLE LOOP COUNTER DEFAULT STARTING VALUE=0
+     MOVE      A4,D0               ;SETS CONDITION CODES
+     BGT.S     @4                  ;LEAVE AT 0 WHEN MODE = 1
+     MOVEQ     #-4,D0              ;=FFFC
+     AND       D4,D0
+     CMP       D0,D1            ;SEE IF THIS IS FIRST ITERATION OF OUTER LOOP
+     BNE.S     @4                  ;LEAVE AT 0 WHEN NOT FIRST ITERATION
+     MOVEQ     #3,D2
+     AND       D4,D2            ;1ST ITERATION.START MIDDLE LOOP @ START BYTE
+@4   MOVEA     #3,A2               ;MIDDLE LOOP LIMIT DEFAULT =3
+     MOVE      A4,D0               ;SETS CONDITION CODES
+     BEQ.S     @5                  ;LEAVE AT 3 WHEN MODE = 0
+     MOVEQ     #-4,D0              ;=FFFC
+     AND       D5,D0
+     CMP       D0,D1             ;SEE IF THIS IS LAST ITERATION OF OUTER LOOP
+     BNE.S     @5                  ;LEAVE AT 3 WHEN NOT LAST ITERATION
+     MOVEQ     #3,D0
+     AND       D5,D0              ;LAST ITERATION..END MIDDLE LOOP @ FINAL BYTE
+     MOVE      D0,A2               ;OVERRIDES DEFAULT MIDDLE LOOP LIMIT
+
+     ;MIDDLE LOOP
+
+@5   MOVE      D1,D6
+     ADD       D2,D6               ;SUM OF OUTER & MIDDLE LOOP COUNTERS IN D6
+     MOVE.B    0(A0,D6),D7         ;TEST NEXT 8 BITS FOR NON-ZERO
+     BEQ.S     @9                  ;SKIP THE REST IF ZERO
+
+     ;SET UP INNER LOOP
+
+     CLR       D3                  ;INNER LOOP COUNTER DEFAULT STARTING VALUE=0
+     MOVE      A4,D0               ;SETS CONDITION CODES
+     BGT.S     @6                  ;LEAVE AT 0 WHEN MODE = 1
+     CMP       D6,D4             ;SEE IF THIS IS 1ST ITERATION OF OUTER LOOPS
+     BNE.S     @6                  ;LEAVE AT 0 WHEN NOT FIRST ITERATION
+     MOVE      START(SP),D3
+     ANDI      #7,D3             ;1ST ITERATION..START INNER LOOP @ START BIT
+@6   MOVEA     #7,A3               ;INNER LOOP LIMIT DEFAULT =7
+     MOVE      A4,D0               ;SETS CONDITION CODES
+     BEQ.S     @7                  ;LEAVE AT 7 WHEN MODE = 0
+     CMP       D6,D5            ;SEE IF THIS IS LAST ITERATION OF OUTER LOOPS
+     BNE.S     @7                  ;LEAVE AT 3 WHEN NOT LAST ITERATION
+     MOVE      A5,D0
+     ANDI      #7,D0               ;LAST ITERATION..END INNER LOOP @ FINAL BIT
+     MOVE      D0,A3               ;OVERRIDES DEFAULT INNER LOOP LIMIT
+
+     ;INNER LOOP
+
+@7   BTST      D3,D7               ;TEST NEXT BIT FOR NON-ZERO
+     BEQ.S     @8                  ;SKIP THE REST IF ZERO
+
+     ;FINALLY FOUND THE NON-ZERO BIT
+
+     BCLR      D3,0(A0,D6)         ;CLEAR THE ERROR BIT
+     ASL       #3,D6
+     ADD       D3,D6               ;BIT # OF THE 1
+     SUB       START(SP),D6        ;RELATIVE POSITION OF 1 (W/O WRAPAROUND)
+     BGE.S     @72
+     ADD       SIZE(SP),D6         ;INCLUDE WRAPAROUND
+@72  MOVE.L    NEWLEN(SP),A0
+     MOVE      D6,(A0)             ;RETURN NEW XFER LENGTH
+     BRA.S     @12                 ;EXIT
+
+     ;INCREMENT INNER LOOP COUNTER
+
+@8   ADDQ      #1,D3
+     CMP       A3,D3
+     BLE.S     @7                  ;REPEAT
+
+     ;INCREMENT MIDDLE LOOP COUNTER
+
+@9   ADDQ      #1,D2
+     CMP       A2,D2
+     BLE.S     @5                  ;REPEAT
+
+     ;INCREMENT OUTER LOOP COUNTER
+
+@10  ADDQ      #4,D1
+     CMP       A1,D1
+     BLE.S     @3                  ;REPEAT
+     MOVE      A4,D0               ;TEST MODE
+     BNE.S     @11                 ;EXIT WITHOUT ERROR IF DONE
+     CLR       D1                 ;WRAP-AROUND TO BEGINNING OF ARRAY & CONTIN
+     MOVE      #1,A4               ;MODE = 1
+     BRA.S     @0                  ;CONTINUE
+
+     ;ONLY 1 BIT TO TEST -- IGNORE ALL THAT OTHER JUNK
+
+@13  MOVEQ     #7,D1
+     AND       D0,D1               ;ISOLATE BIT #
+     BCLR      D1,0(A0,D4)
+     BEQ.S     @11                 ;RETURN WITH NEWLEN = LEN WHEN BIT = 0
+     MOVE.L    NEWLEN(SP),A0
+     CLR       (A0)                ;RETURN WITH LENGTH OF ZERO IF ONLY-BIT = 1
+     BRA.S     @12                 ;EXIT
+
+     ;EXIT
+
+@11  MOVE.L    NEWLEN(SP),A0
+     MOVE      LEN(SP),(A0)        ;SET NEWLEN = LEN SINCE ALL BITS = 0
+@12  MOVEM.L   (SP)+,A2-A5         ;RESTORE REGS
+     MOVEM.W   (SP)+,D3-D7         ;RESTORE REGS
+     MOVE.L    (SP)+,A0            ;RETURN ADDR
+     LEA       14(SP),SP
+     JMP       (A0)                ;RETURN
+
+
+     .END
+
+
+ÿ

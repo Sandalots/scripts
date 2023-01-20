@@ -1,0 +1,864 @@
+{#F     in:lmupdate.text }
+{$S lmscanseg }
+{***********************************************************************
+
+                                lmcopy
+
+        see interface
+
+
+***************************************************************************}
+
+procedure lmcopy{(var lmresult : integer;
+                      scanid : integer;
+                      prec : ptrdata)};
+var
+        pcurhandle : ptrlmhandle;
+        pcur : ptrdata;
+        range: range_rec;
+        diff_code,
+        recsize,
+        diffscan,
+        buffer,
+        lresult : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'>lmcopy');
+            printdcos(scanid);
+            end;*)
+
+     {  woe betide he who does not call lmfetch and allocate enough
+        space before calling lmcopy }
+
+        with pdifftable^[scanid]^,pscantable^[diffid]^ do
+            begin
+            if position <> exact then lresult := notfound
+            else
+                begin
+                movelf(ptrcos,@range,sizeof(range));
+                diff_code := extract(@range.code,diff_nbits,diff_sbit);
+                if (diff_code = 0) then
+                    begin
+                    get_phys(lresult,scanid,range,pcur,recsize,buffer);
+                    if lresult = noerr then
+                        begin
+                        movelf(pcur,pointer(ord(prec)+sizeof(preamble)),
+                               recsize);
+                        relbuff(lresult,buffer,isleaf);
+                        movelf(@curhandle,prec,sizeof(lmhandle));
+                        end;
+                    end
+                else { it's already in cos!}
+                    begin
+                    lresult := noerr;
+                    movelf(ptrcos,prec,cossize);
+                    end;
+                end;
+            end;
+        lmresult := lresult;
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'<lmcopy:',lmresult:7,recsize:7);
+            printdcos(scanid);
+            end;*)
+end; { lmcopy }
+{$S lmscanseg }
+{**********************************************************************************
+
+                                break_range
+
+        checks if the two handles are part of a range.  if so, the range is
+        broken between the two handles.
+
+        Input Parameters
+                scanid - differential scan id
+                priorrec - lower of two handles
+                nextrec - higher of two handles
+
+        Output Parameters
+                lmresult - return result
+
+        Return Results
+                same as lmfetch
+
+**********************************************************************************}
+
+procedure break_range(var lmresult : integer;
+                          scanid : integer;
+                          priorrec,
+                          nextrec : lmhandle);
+label
+        1;
+var
+        reversed : boolean;
+        user_error,
+        offender,
+        tresult,
+        recsize,
+        diffscan,
+        lresult : integer;
+        range_left,
+        range_right,
+        range : range_rec;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        lresult := noerr;
+
+        {  first of all, make sure the handles have low = 0 and are adjacent }
+
+        if ((priorrec.low = 0) and (nextrec.low = 0)) and
+           ((priorrec.high+1) = nextrec.high)  then
+            begin
+            lmfetch(lresult,user_error,nil,scanid,exact,priorrec,recsize);
+            if lresult = noerr then
+                begin
+                with pdifftable^[scanid]^ do
+                    begin
+                    diffscan := diffid;
+                    reversed := reversescan;
+                    end;
+
+                movelf(pscantable^[diffscan]^.ptrcos,@range,sizeof(range));
+
+                { check that priorrec and nextrec are in same range
+                  note that we now know that they are consecutive }
+
+                if extract(@range.code,diff_nbits,diff_sbit) = 0 then
+                    if priorrec.high <> range.handle.high then
+                        begin
+
+                    {   compute the two replacement ranges }
+
+                        range_right := range;
+                        range_right.code := range.handle.high - nextrec.high;
+                        range_left.handle := priorrec;
+                        range_left.code := range.code - (range_right.code+1);
+                        if reversed then
+                             range_left.physaddr := range.physaddr +
+                                               (range_right.code + 1)
+                        else
+                             range_left.physaddr := range.physaddr -
+                                               (range_right.code + 1);
+
+                    {   delete the old range and insert the new ones.
+                        if there's an error, put things back the way
+                        they came }
+
+                        edelete(lresult,diffscan,current,0,nil);
+                        if lresult = noerr then
+                            begin
+                            einsert(lresult,offender,diffscan,@range_left,
+                                    sizeof(range_rec),false);
+                            if lresult = noerr then
+                                begin
+                                einsert(lresult,offender,diffscan,
+                                        @range_right,sizeof(range_rec),false);
+                                if lresult = noerr then goto 1;
+                                edelete(tresult,diffscan,exact,0,@range_left);
+                                end;
+                            einsert(tresult,offender,diffscan,@range,
+                                    sizeof(range_rec),false);
+                            end;
+                        end;
+                end
+                else if lresult <= eos then lresult := noerr;
+            end;
+1 :     lmresult := lresult;
+end; { break_range }
+{*****************************************************************************
+
+                                lminsert
+
+        see interface
+
+*****************************************************************************}
+
+procedure lminsert{(var lmresult : integer;
+                        scanid : integer;
+                        prec : ptrdata;
+                        recsize : integer)};
+label
+        1;
+var
+        SpecialDispensation : boolean;
+        ppreamble : ptrpreamble;
+        insertplace : (at_end,all_in_range,other);
+        diffscan,
+        offender,
+        trash,
+        lresult : integer;
+        diff : fileptr;
+        range : range_rec;
+        priorrec,
+        nextrec,
+        newhandle : lmhandle;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'>lminsert');
+            printdcos(scanid);
+            end;*)
+
+     {  0) get the handle for the current record into priorrec and the handle
+           for the following record into nextrec
+        1) choose the handle for the inserted record. the algorithm for
+           selecting handles is biased towards leaving a good range for
+           the insertion of many records one after another, since this is
+           the easiest way to insert records in a table.
+        2) check if we couldn't compute one (handle overflow). this is
+           indicated by setting newhandle.low := 0.  the flag
+           SpecialDispensation is used to allow the usual case of inserting
+           a row at the end of the table.
+        3) if we could compute a handle, insert the new record in the
+           differential file }
+
+        lresult := notfound;
+        with pdifftable^[scanid]^ do
+            begin
+            have_an_update := true;
+            diffscan := diffid;
+            priorrec := curhandle;
+            end;
+
+        insertplace := other;
+        with pscantable^[diffscan]^ do
+            begin
+            if position = last then insertplace := at_end
+            else if position = first then
+                begin
+                priorrec.high := 0;
+                priorrec.low := 0;
+                end
+            else if position <> exact then goto 1
+            else { be carefull if insert is within range }
+                begin
+                movelf(pscantable^[diffscan]^.ptrcos,@range,sizeof(range_rec));
+                if extract(@range.code,diff_nbits,diff_sbit) = tretrieve then
+                    begin
+                    if comphand(priorrec,range.handle) <> eq then
+                        begin
+                        insertplace := all_in_range;
+                        nextrec := priorrec;
+                        nextrec.high := nextrec.high + 1;
+                        end;
+                    end;
+                end;
+            end;
+
+        if insertplace = at_end then { at end of file }
+            begin
+            nextrec.high := nilptr;
+            nextrec.low := nilptr;
+            efetch(lresult,diffscan,prior,0,nil);
+            if lresult = noerr then
+                movelf(pscantable^[diffscan]^.ptrcos,@priorrec,sizeof(lmhandle))
+            else if lresult = eos then
+                begin
+                priorrec.high := 0;
+                priorrec.low := 0;
+                end
+            else goto 1;
+            end
+        else if insertplace = other then { first or in middle of file
+                                           (but not in a range) }
+            begin
+            efetch(lresult,diffscan,next,0,nil);
+
+        {   beware the before image, my boy and shun the frumious retrieve range }
+
+            if lresult = noerr then
+                begin
+                movelf(pscantable^[diffscan]^.ptrcos,@range,sizeof(range_rec));
+                if extract(@range.code,diff_nbits,diff_sbit) = tbefore then
+                    efetch(lresult,diffscan,next,0,nil);
+                end;
+
+            if lresult = noerr then
+                begin
+
+            {   be carefull a retrieve range }
+
+                movelf(pscantable^[diffscan]^.ptrcos,@range,sizeof(range_rec));
+                nextrec := range.handle;
+                if extract(@range.code,diff_nbits,diff_sbit) = tretrieve then
+                    nextrec.high := nextrec.high - range.code;
+                end
+            else if lresult = eos then
+                begin
+                nextrec.high := nilptr;
+                nextrec.low := nilptr;
+                end
+            else goto 1;
+            end;
+
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'priorrec:<',priorrec.high,',',
+                    priorrec.low,'>');
+            writeln(dumpfile,'nextrec:<',nextrec.high,',',nextrec.low,'>');
+            end;*)
+
+        (*if lmdebug then writeln(dumpfile,h_increment);*)
+
+        SpecialDispensation := false;
+        newhandle.high := priorrec.high;
+        newhandle.low := h_increment;
+        if (priorrec.high = 0) and (priorrec.low = 0) then { at start of file }
+            begin
+            if (nextrec.high = nilptr) and (nextrec.low = nilptr) then {empty}
+                begin
+                newhandle.high := 1;
+                newhandle.low := h_increment;
+                end
+            else if (nextrec.high = 0) and
+                    (comp44(nextrec.low,h_increment) <> gt) then
+                newhandle.low := div424(nextrec.low,2,trash);
+            end
+        else  { interior or end of file }
+            begin
+            if (nextrec.high = nilptr) and (nextrec.low = nilptr) then {end}
+                begin
+                if comp44(priorrec.high,nilptr-1) = lt then
+                    begin
+                    newhandle.high := priorrec.high + 1;
+                    newhandle.low := 0;
+                    SpecialDispensation := true;
+                    end
+                else if comp44(priorrec.low,nilptr-h_increment) = lt then
+                    newhandle.low := priorrec.low + h_increment
+                else if priorrec.high = nilptr then
+                    newhandle.low := 0
+                else newhandle.high := priorrec.high + 1;
+                end
+            else { interior }
+                begin
+                if priorrec.high = nextrec.high then
+                    begin
+                    diff := nextrec.low-priorrec.low;
+                    if comp44(diff,h_increment) <> gt then
+                        begin
+                        if diff < 2 then newhandle.low := 0
+                        else newhandle.low := priorrec.low +
+                                              div424(diff,2,trash);
+                        end
+                    else newhandle.low := priorrec.low + h_increment;
+                    end
+                else
+                    begin
+
+                    { check to see if we must break a range }
+
+                    break_range(lresult,scanid,priorrec,nextrec);
+                    if lresult <> noerr then goto 1;
+
+                    if comp44(priorrec.low,nilptr-h_increment) = lt then
+                        newhandle.low := priorrec.low + h_increment
+                    else
+                        begin {##}
+
+                    {   try between <priorrec.high,priorrec.low> and
+                                    <priorrec.high,nilptr> }
+
+                        diff := nilptr-priorrec.low;
+                        if diff > 2 then
+                            newhandle.low := priorrec.low +
+                                             div424(diff,2,trash)
+                        else {##}
+                            begin{##}
+                            newhandle.high := nextrec.high;
+
+                        {   try         <nextrec.high,h_increment  and
+
+                                between <nextrec.high,0> and
+                                        <nextrec.high,nextrec.low> }
+
+                            if comp44(nextrec.low,h_increment) <> gt then
+                                newhandle.low := div424(nextrec.low,2,trash);
+                            end;
+                        end;
+                    end;
+                end;
+            end;
+
+        if (newhandle.low <> 0) or SpecialDispensation then
+            begin
+
+            (*dbif lmdebug then
+                begin
+                writeln(dumpfile,'newhandle:<',newhandle.high,',',
+                        newhandle.low,'>');
+                end;*)
+
+            ppreamble := @prec^;
+            ppreamble^.handle := newhandle;
+            ppreamble^.code := 0;
+            deposit(tinsert,@ppreamble^.code,diff_nbits,diff_sbit);
+
+            einsert(lresult,offender,diffscan,prec,recsize,false);
+            if lresult = noerr then
+                pdifftable^[scanid]^.curhandle := newhandle;
+            end
+        else lresult := handle_overflow;
+
+1 :     lmresult := lresult;
+
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'<lminsert:',lmresult:7);
+            printdcos(scanid);
+            end;*)
+end; { lminsert }
+{$S lmreadseg }
+{********************************************************************************
+
+                                update_preamble
+
+        an update of the preamble of the cos of a differential scan that is
+        transparent to the slings and arrows of outrageous fortune.
+
+        Input Parameters
+                diffscan - scanid of scan of differential file (not the
+                    differential scan index
+                pnewreamble - new preamble for this entry
+
+        Output Parameters
+                lmresult - return result
+
+        Return Results
+                same as lmupdate
+
+********************************************************************************}
+
+procedure update_preamble(var lmresult : integer;
+                              diffscan : integer;
+                              pnewpreamble : ptrdata);
+label
+        1,100;
+var
+        cos_size,
+        offender,
+        lresult : integer;
+        loc_compact_state : states_de_compact;
+        ppream : ptrdata;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        loc_compact_state := init_compact_state;
+
+100 :   {  compaction recovery point }
+
+        {  make a new preamble for cos }
+
+        with pscantable^[diffscan]^ do
+            begin
+            cos_size := cossize;
+            lresult := nnew(@czone,cos_size,@ppream);
+            if lresult <> noerr then goto 1;
+            movelf(ptrcos,ppream,cos_size);
+            movelf(pnewpreamble,ppream,sizeof(preamble));
+            end;
+
+        eupdate(lresult,offender,diffscan,current,0,nil,ppream,cos_size);
+
+        ndispose(@czone,@ppream^);
+1:      if retry_compact(lresult,loc_compact_state) then goto 100;
+
+        lmresult := lresult;
+end;
+{$S lmscanseg }
+{****************************************************************************
+
+                             update_sort
+
+        deletes or updates a tsorted entry (cos of scanid).  changes
+        the entry code in the tsorted entry, which changes the sort
+        entry to a tdelete or tbefore  entry.  then, if pnewrec <> nil
+        it inserts the new value.
+
+        Input Parameters
+                scanid - differential scan index
+                range - used to hold the preamble from the cos entry
+                pnewrec - pts to new record (including preamble), if nil
+                        it's just a delete
+                newrecsize - size of new record (including preamble)
+
+         Output Parameters
+                lmresult - return result
+
+         Return Results
+                same as lmupdate
+
+*****************************************************************************}
+
+procedure update_sort(var lmresult : integer;
+                          scanid : integer;
+                          range : range_rec;
+                          pnewrec : ptrdata;
+                          newrecsize : integer);
+label
+        1;
+var
+        lresult : integer;
+        loc_compact_state : states_de_compact;
+        pcur,
+        prec : ptrdata;
+        pream : preamble;
+        ppream : ptrpreamble;
+        cur_handle : lmhandle;
+        offender,
+        diff_code,
+        buffer,
+        cos_size,
+        on_id,
+        diffscan,
+        tresult : integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        with pdifftable^[scanid]^ do
+            begin
+            on_id := on;
+            cur_handle := curhandle;
+            diffscan := diffid;
+            end;
+
+
+        movelf(pscantable^[diffscan]^.ptrcos,@pream,sizeof(preamble));
+        if pnewrec = nil then diff_code := tdelete
+        else diff_code := tbefore;
+        deposit(diff_code,@pream.code,diff_nbits,diff_sbit);
+        update_preamble(lresult,diffscan,@pream);
+
+        if (lresult = noerr) and (pnewrec <> nil) then
+            begin
+            ppream := @pnewrec^;
+            ppream^.handle := cur_handle;
+            ppream^.code := 0;
+            deposit(tupdate,@ppream^.code,diff_nbits,diff_sbit);
+            einsert(lresult,offender,diffscan,pnewrec,newrecsize,false);
+            if lresult <> noerr then
+                begin
+                deposit(diff_code,@pream.code,diff_nbits,diff_sbit);
+                update_preamble(lresult,diffscan,@pream);
+                if tresult <> noerr then lresult := tresult;
+                end;
+            end;
+
+1:      lmresult := lresult;
+end; { update_sort }
+{****************************************************************************
+
+                             update_in_range
+
+        deletes or updates a tretrieve entry (cos of scanid).  if
+        pnewrec <> nil it inserts the new value.
+
+        breaks the cos range into three (four) entries:
+
+        1) a range of records to the left of the curhandle
+        2) curhandle
+           a) tdelete or tbefore entry for curhandle
+           b) (if pnewrec <> nil) a tupdate entry for pnewrec
+        3) a range of records to the right of curhandle
+
+        Input Parameters
+                scanid - differential scan index
+                range - used to hold the preamble from the cos entry
+                pnewrec - pts to new record (including preamble), if nil
+                        it's just a delete
+                newrecsize - size of new record (including preamble)
+
+         Output Parameters
+                lmresult - return result
+
+         Return Results
+                same as lmupdate
+
+*****************************************************************************}
+
+procedure update_in_range(var lmresult : integer;
+                              scanid : integer;
+                              range : range_rec;
+                              pnewrec : ptrdata;
+                              newrecsize : integer);
+label
+        1,2,3,100;
+var
+        lresult : integer;
+        loc_compact_state : states_de_compact;
+        pcur,
+        prec : ptrdata;
+        ppream : ptrpreamble;
+        cur_range,
+        range_right,
+        range_left : range_rec;
+        reversed,
+        have_right,
+        have_left : boolean;
+        cur_handle : fileptr;
+        offender,
+        diff_code,
+        buffer,
+        recsize,
+        on_id,
+        diffscan,
+        tresult,
+        nright,
+        nleft : integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+
+        have_right := false;
+        have_left := false;
+
+        with pdifftable^[scanid]^ do
+            begin
+            on_id := on;
+            cur_handle := curhandle.high;
+            diffscan := diffid;
+            reversed := reversescan
+            end;
+
+
+    {   compute the size of the lefthand and righthand subranges.  they may
+        be null, in which case nright or nleft are < 0  }
+
+        nright := (range.handle.high - cur_handle) - 1;
+        nleft := range.code - (nright + 2);
+
+        range_right := range;
+
+        if nleft >= 0 then
+           begin
+           range_left.handle.high := cur_handle - 1;
+           range_left.handle.low := 0;
+           if reversed then
+               range_left.physaddr := range.physaddr + (nright + 2)
+           else
+               range_left.physaddr := range.physaddr - (nright + 2);
+           end;
+
+        range_right.code := nright;
+        range_left.code := nleft;
+
+        cur_range.handle.high := cur_handle;
+        cur_range.handle.low := 0;
+        cur_range.code := 0;
+        if pnewrec = nil then diff_code := tdelete
+        else diff_code := tbefore;
+        deposit(diff_code,@cur_range.code,diff_nbits,diff_sbit);
+
+        {  delete old range and insert left and right ranges (if they exist) }
+
+        edelete(lresult,diffscan,current,0,nil);
+        if lresult <> noerr then goto 1;
+
+        if nleft >= 0 then
+            begin
+            einsert(lresult,offender,diffscan,@range_left,sizeof(range_rec),
+                    false);
+            if lresult <> noerr then goto 2;
+            have_left := true;
+            end;
+
+        if nright >= 0 then
+            begin
+            einsert(lresult,offender,diffscan,@range_right,sizeof(range_rec),
+                    false);
+            if lresult <> noerr then goto 2;
+            have_right := true;
+            end;
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compaction recovery point }
+
+        {  construct a tdelete or tbefore record for diff. file }
+
+        get_phys(lresult,scanid,range,pcur,recsize,buffer);
+        if lresult <> noerr then goto 3;
+        lresult := nnew(@czone,recsize+sizeof(preamble),@prec);
+        if lresult <> noerr then
+            begin
+            relbuff(tresult,buffer,isleaf);
+            goto 3;
+            end;
+
+        movelf(@cur_range,prec,sizeof(preamble));
+        movelf(pcur,pointer(ord(prec)+sizeof(preamble)),recsize);
+        relbuff(lresult,buffer,isleaf);
+
+        if lresult = noerr then
+            einsert(lresult,offender,diffscan,prec,recsize+sizeof(preamble),
+                    false);
+
+        ndispose(@czone,@prec^);
+3:      if retry_compact(lresult,loc_compact_state) then goto 100;
+
+        if (lresult = noerr) and (pnewrec <> nil) then
+            begin
+            ppream := @pnewrec^;
+            ppream^.handle := cur_range.handle;
+            deposit(tupdate,@ppream^.code,diff_nbits,diff_sbit);
+            einsert(lresult,offender,diffscan,pnewrec,newrecsize,false);
+            if lresult <> noerr then
+                edelete(tresult,diffscan,exact,0,@cur_range);
+            end;
+        if lresult = noerr then goto 1;
+
+2:      if have_left then edelete(tresult,diffscan,exact,0,@range_left);
+        if have_right then edelete(tresult,diffscan,exact,0,@range_right);
+        einsert(tresult,offender,diffscan,@range,sizeof(range_rec),false);
+
+1:      lmresult := lresult;
+end; { update_in_range }
+{****************************************************************************
+
+                                lmdelete
+
+        see interface
+
+*****************************************************************************}
+
+procedure lmdelete{(var lmresult : integer;
+                        scanid : integer)};
+label
+        1;
+var
+        range : range_rec;
+        lresult,
+        diff_code,
+        diffscan : integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'>lmdelete');
+            printdcos(scanid);
+            end;*)
+
+        with pdifftable^[scanid]^ do
+            begin
+            have_an_update := true;
+            diffscan := diffid;
+            end;
+
+        lresult := notfound;
+        with pscantable^[diffscan]^ do
+            begin
+            if position <> exact then goto 1
+            else
+                begin
+                movelf(ptrcos,@range,sizeof(range));
+                diff_code := extract(@range.code,diff_nbits,diff_sbit);
+                end;
+            end;
+
+        if diff_code = tinsert then { a new record - only in diff file }
+            edelete(lresult,diffscan,current,0,nil)
+        else if diff_code = tupdate then { an update of a rec. in real file }
+            begin
+
+        {   delete tupdate record and change tbefore to tdelete }
+
+            edelete(lresult,diffscan,current,0,nil);
+            if lresult <> noerr then goto 1;
+            efetch(lresult,diffscan,next,0,nil);
+            if lresult <> noerr then goto 1;
+            movelf(pscantable^[diffscan]^.ptrcos,@range,sizeof(range));
+            deposit(tdelete,@range.code,diff_nbits,diff_sbit);
+            update_preamble(lresult,diffscan,@range);
+            if lresult <> noerr then goto 1;
+            end
+        else if diff_code = tretrieve then { only retrieved from real file }
+            begin
+            update_in_range(lresult,scanid,range,nil,0);
+            end
+        else if diff_code = tsorted then { whole record }
+            begin
+            update_sort(lresult,scanid,range,nil,0)
+            end;
+    {   else (tfyi,tbefore,tdelete, etc.) lresult := notfound }
+
+
+1 :     lmresult := lresult;
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'<lmdelete:',lmresult:7);
+            printdcos(scanid);
+            end;*)
+end; { lmdelete }
+
+{****************************************************************************
+
+                                lmupdate
+
+        see interface
+
+
+*****************************************************************************}
+
+procedure lmupdate{(var lmresult : integer;
+                        scanid : integer;
+                        prec : ptrdata;
+                        recsize : integer)};
+label
+        1;
+var
+        range : range_rec;
+        lresult,
+        offender,
+        diff_code,
+        diffscan : integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'>lmupdate');
+            printdcos(scanid);
+            end;*)
+
+        lresult := notfound;
+        with pdifftable^[scanid]^ do
+            begin
+            have_an_update := true;
+            diffscan := diffid;
+            end;
+
+        with pscantable^[diffscan]^ do
+            begin
+            if position <> exact then goto 1
+            else
+                begin
+                movelf(ptrcos,@range,sizeof(range));
+                diff_code := extract(@range.code,diff_nbits,diff_sbit);
+                end;
+            end;
+
+        movelf(@range,prec,sizeof(preamble));
+        if (diff_code = tinsert) or   { a new record - only in diff file }
+           (diff_code = tupdate) then { or an update of a rec. in real file }
+            eupdate(lresult,offender,diffscan,current,0,nil,prec,recsize)
+        else if diff_code = tretrieve then { only retrieved from real file }
+            update_in_range(lresult,scanid,range,prec,recsize)
+        else if diff_code = tsorted then { whole record }
+            begin
+            update_sort(lresult,scanid,range,prec,recsize)
+            end;
+    {   else (tfyi,tbefore,tdelete, etc.) lresult := notfound }
+
+
+1 :     lmresult := lresult;
+        (*dbif lmdebug then
+            begin
+            writeln(dumpfile,'<lmupdate:',lmresult:7);
+            printdcos(scanid);
+            end;*)
+end; { lmupdate }
+ÿ

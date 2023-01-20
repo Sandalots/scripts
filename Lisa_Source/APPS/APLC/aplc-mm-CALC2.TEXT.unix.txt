@@ -1,0 +1,716 @@
+
+                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+
+(***************************************.*******.************************************
+   ClrFormErrors - changes all formulas which had coordinates which were set to
+                   error because they were involved in a move back to the
+                   original coordinates before the move occurred.  This is the
+                   result of the users somehow destroying the move information.
+****************************************.*******.***********************************)
+(*$S CutPaste *)
+procedure ClrFormErrors;
+var pVector  : pMapInfoRec;
+    rg       : range;
+    estimate : longint;
+    alloc    : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   pVector   := @pVector;
+   mmMapFormulas(true, rg, rg, mmClrFormErrors, pVector^, estimate, alloc);
+   doingMove := false;
+   if circleState = cError then SetCircleMode(cError)
+end;
+
+
+(***************************************.*******.************************************
+   convertformula - takes the formula pointed to by PFORMULA (located at ROWID,
+                    COLID) and converts all of the coordinate/range referneces
+                    such that they directly refer to the cells in the matrix.  The
+                    effect is to take any coordinates/ranges that are calculated
+                    using paste relative displacements and convert them to direct
+                    references.
+
+   NOTE: no validation is made on PFORMULA to see if it is nil, or that ROWID, COLID
+         are valid snipIds; only valid parameters are expected.  Also, only the
+         formula data is changed by this routine, the shared information header
+         for the formula is not changed or removed.
+****************************************.*******.***********************************)
+(*$S CutPaste *)
+procedure convertformula
+  (* rowId, colId : idType;             {location of cell}
+     pFormula     : TPFmla              {ptr to formula}
+  *);
+var formindex : integer;                {index into formula}
+    formula   : ptrData;                {ptr to formula data}
+    opCode    : byte;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   {get pointer to formula data and a handle to the formula}
+   with pFormula^ do
+      formula := pointer(ord(@sData.vecOp) + sData.info.numcoords div 4 + 1);
+   lastformula.formPtr := @pFormula;
+
+   {setup LASTFORMULA record info to be used by "getoperand"}
+   SetLastFormula(lastformula.formPtr);
+
+   {check out all coordinate references and convert them to direct references}
+   formindex := 0;
+   while formula^[formindex] <> PUSHEND do begin
+      if formula^[formindex] = PUSHNOP then formindex := formindex + 1;
+      if formula^[formindex] <= ENDCOORD then begin
+         getoperand(formula, formindex, rowId, colId, opCode);
+         moveLfast(@VT, @formula^[formindex + 1], pcodesize[opCode])
+      end;
+      NextPcode(formula, formindex)
+   end
+end;
+
+
+(***************************************.*******.************************************
+   mmMapFormulas - map all of the coodinate references for the formulas in the matrix
+                   to reflect to new enviornment.  This will require making changes
+                   to the formulas themselves and maybe breaking up a shared
+                   structure to do the change.
+****************************************.*******.***********************************)
+(*$S CutPaste *)
+procedure mmMapFormulas
+  (* pasting      : boolean;
+     uRg,
+     sRg          : range;
+     passNum      : mmMapKind;
+     var vector   : mapInfoRec;
+     var estimate : longint;
+     var resFlag  : boolean
+  *);
+label 2,3;
+type tPtr  = array [0..0] of longint;
+     TPPtr = ^tPtr;
+     THPtr = ^TPPtr;
+var row, col   : integer;
+    dh, dv     : integer;
+    formindex  : integer;                       {index into formula}
+    numByte1   : integer;                       {length of formula info - header info}
+    numByte2   : integer;                       {length of cell contents}
+    coordcnt   : integer;                       {# of coordinate seen}
+    rowStatus  : integer;                       {change status for row/col coord}
+    colStatus  : integer;
+    rowId      : idType;                        {new id's for a changed coord}
+    colId      : idType;
+    status     : integer;
+    allocSize  : longint;
+    tEstimate  : longint;
+    opCode     : byte;
+    FormBool   : boolean;
+    errClred   : boolean;                       {has cell been changed from an error: y/n}
+    ClrErrors  : boolean;                       {are we to clear cells with error coordinates: y/n}
+    estimating : boolean;                       {are we estimating the space needed for remapping: y/n}
+    noEstimate : boolean;                       {       opposite of ESTIMATING}
+    marking    : boolean;                       {not pasting: y/n}
+    cellMoved  : boolean;                       {cell coordinated move: t/f}
+    baseMoved  : boolean;                       {paste relative base coord move: t/f}
+    baseDel    : boolean;                       {paste relative base coord deleted: t/f}
+    markedCell : boolean;                       {cell is already marked: t/f}
+    ToBeMarked : boolean;                       {cell should be marked: t/f}
+    cellChged  : boolean;                       {use temp version of formula: t/f}
+    doingCopy  : boolean;                       {make temp version of formula: t/f}
+    cell       : cnRecord;                      {cell info record}
+    formula    : ptrData;                       {ptr to temp version of the formula}
+    marker     : bitKind;                       {cell mark bit to be set}
+    RelAbsPtr  : TPRTfmla;                      {ptr to rel/abs info in formula}
+    formPtr    : THFmla;                        {handle to orig formula}
+    hContents  : THContents;                    {handle to cell's contents}
+    allocPtr   : THPtr;
+    oldAllocPtr: THPtr;
+    pCel       : TPCel;
+    cntHandles : longint;
+
+(*$IFC DEBUGVERSION *)
+
+    (*$S debug2 *)
+    procedure dump2info;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       writeln('Dh, Dv, numpasses: ',dh, dv, ord(passNum))
+    end;
+(*$ENDC *)
+
+    (*
+       MakeCopy - sets up FORMULA to point at the formula's data.  RELABSPTR will
+                  be set to point to the formula's rel/abs information and FORMPTR
+                  will be set to the handle of the formula.  In the case of a
+                  shared formula, a copy of the formula will be made in the EVAL array
+                  and FORMULA will be set pointing to it.  The coordinates in the copy
+                  will be adjusted by calling "convertformula" to get direct
+                  references.  Once the copy is made, all changes to the coordinate
+                  information will occur in the copy not in the original.  NUMBYTE1
+                  will be the size needed in the heap for the formula data without
+                  out any formula sharing information.
+    *)
+    (*$S CutPaste *)
+    procedure MakeCopy;
+    var newPtr   : TPFmla;                      {ptr to temp formula}
+        formsize : integer;                     {size of the formula}
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       formula   := lastformula.ptr;
+       formPtr   := lastformula.formPtr;
+       RelAbsPtr := lastformula.PRdata;
+       newPtr    := @eval[0];
+       if doingCopy then begin
+          formsize := CbDataOfH(mxHz, @lastformula.formPtr^);
+          moveLfast(@lastformula.formPtr^^, @eval[0], formsize);
+          if lastformula.shared then begin
+             if noEstimate then begin
+                convertformula(row, col, @eval[0]);
+                lastformula.PRdata := nil
+             end;
+             numByte1 := formsize - sizeof(STFmla);
+             with newPtr^ do
+                formula := pointer(ord(@sData.vecOp) + sData.info.numcoords div 4+1)
+          end
+          else begin
+                  formula  := @newPtr^.vecOp;
+                  numByte1 := formsize
+               end
+       end
+    end;
+
+
+    (*
+       GenError - makes the current pCode pointed to be formindex into an error code
+    *)
+    procedure GenError;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if noEstimate then
+          case opCode of
+             PUSHECRANGE,
+             PUSHCRANGE : formula^[formindex] := PUSHECRANGE;
+             otherwise    formula^[formindex] := PUSHECOORD
+          end
+    end;
+
+
+    (*
+       ChgCoord - determines if the coordinate in COORD will change.  A check is
+                  made on the row coord and column coord to determine the
+                  type of change.  Since the change could affect the row coord but
+                  not the column coord, they must be checked independently.  The
+                  type of change could be: rmDel - coord was deleted, rmRename -
+                  coord has changed, or rmOk - coord ok.  The results of these
+                  changes will cause the coordinate to change within the formula.
+                  This is signalled by CHGCOORD.  A special case is made with
+                  shared formula in order to preserve their shared nature.
+                  Coordinate changes within shared formula may result in the formula
+                  with the change to be broken away from the others which it is
+                  shared.  This is signalled by CELLCHGED being TRUE.
+
+       Note: when doing an estimate, CHGCOORD is always false
+    *)
+    (*$S CutPaste *)
+    function ChgCoord(var coord : pident) : boolean;
+    var rowStatus  : integer;                   {change status for row/col coord}
+        colStatus  : integer;
+        coordMoved : boolean;                   {coordinates move: t/f}
+        rowId      : idType;                    {new id's for a changed coord}
+        colId      : idType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       with vector[rowKind, coord.length] do begin
+          rowId := newSnipId;
+          rowStatus := mapType
+       end;
+       with vector[colKind, coord.start] do begin
+          colId := newSnipId;
+          colStatus := mapType
+       end;
+       ChgCoord := false;
+
+(*$IFC DEBUGVERSION *)
+       if debug[7] then
+           writeln('mmMapF: cell:',row:1,',',col:1,'  coord:',coord.length:1,',',coord.start:1,
+                   '   mapping:',rowId:1,',',colId:1,'  ',wMap(colStatus),'/',wMap(rowStatus));
+(*$ENDC *)
+
+       {this is the only change which means that the cell that the coord referenced
+        no longer exists.  In this case the formula will be broken away from its
+        shared buddies, and the coordinate's p-code changed to signal an error.
+       }
+       if (rowstatus = rmDel) and (colstatus = rmDel) then begin
+          if marking then begin
+             ToBeMarked := true;
+             if noEstimate then begin
+                resFlag := true;
+                if not lastformula.shared then SetCellBit(row, col, true, marker)
+             end
+          end
+       end
+       else begin
+               {this is the catch all for the other types of changes.  Basically,
+                only reReNames of either the row or column coordinate will cause
+                a change in the formula.
+               }
+               coordMoved := (rowStatus = rmReName) or (colStatus = rmReName);
+               ChgCoord   := coordMoved and noEstimate;
+               if (rowId >= 1) and (rowId <= idMax) and (colId >= 1) and (colId <= idMax) then begin
+                  if rowStatus = rmReName then coord.length := rowId;
+                  if colStatus = rmReName then coord.start  := colId;
+
+                  {with shared formulas, the problem is not as simple.  To preserve the
+                   rule sharing info, the dynamics of how the sharing must be checked
+                   to determine if the formula should be broken away or left alone.
+                   Here, besides if the coordinate moved, a check is made to see if
+                   the paste relative base cooridinate moved and if the actual cell's
+                   coordinate moved.  These checks need only be made when an entire
+                   row/col has been affected (i.e., a row was cut or inserted).
+                  }
+                  if formBool then
+                     if RelAbsPtr^[coordcnt * 2] or RelAbsPtr^[coordcnt * 2 + 1] then begin
+(*$IFC DEBUGVERSION *)
+                        if debug[7] then
+                           writeln('   ',row:1,',',col:1,' cell: ',cellmoved,' base: ',
+                                   basemoved,',',basedel,' coord: ',coordMoved);
+(*$ENDC *)
+                        if cellMoved then begin
+                           if baseMoved then begin
+                              if not coordMoved then cellChged := true;
+                              coordMoved := not(RelAbsPtr^[coordcnt * 2] and RelAbsPtr^[coordcnt * 2 + 1])
+                           end
+                           else cellChged := true
+                        end
+(*$IFC DEBUGVERSION *)
+                        else if baseMoved and not baseDel then FatalMess(36)
+(*$ENDC *)
+                        else if coordMoved then cellChged := true
+                     end;
+                  cellChged := cellChged or coordMoved;
+                  exit(ChgCoord)
+               end
+            end;
+       GenError;
+       cellChged := true
+    end;
+
+
+    (*
+       correctCoord,
+       correctRange - these two routines add the displacments to the coordinates.
+    *)
+    (*$S CutPaste *)
+    procedure correctCoord;
+    var badCoord : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       formula^[formindex] := PUSHCOORD;
+       badCoord := addDhDv(dh, dv, VT.coordvar);
+       moveLfast(@VT, @formula^[formindex + 1], pcodesize[PUSHCOORD]);
+       if badCoord then GenError
+       else errClred := true
+    end;
+
+
+    (*$S CutPaste *)
+    procedure correctRange;
+    var badUCoord : boolean;
+        badLCoord : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       formula^[formindex] := PUSHCRANGE;
+       badUCoord := addDhDv(dh, dv, VT.rangevar.first);
+       badLCoord := addDhDv(dh, dv, VT.rangevar.second);
+       moveLfast(@VT, @formula^[formindex + 1], pcodesize[PUSHCRANGE]);
+       if badUCoord or badLCoord then GenError
+       else errClred := true
+    end;
+
+
+
+(*$S CutPaste *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   if debug[7] then dump2info;
+(*$ENDC *)
+
+   noEstimate := (passNum <> mmEstimate);
+   clrErrors  := (passNum = mmClrFormErrors);
+   estimating := not noEstimate;
+   marking    := not pasting;
+   if marking then resFlag := false;
+   if not app.LisaCalc then begin
+      resFlag := estimating;
+      setMapVector(vector);
+      exit(mmMapFormulas)
+   end;
+   if clrErrors then begin
+      dh := 0;
+      dv := 0
+   end
+   else begin
+           setMapVector(vector);
+           {calculate the displacements to the new location}
+           if uRg.loCol < 1 then dh := 0
+           else dh := uRg.loCol - sRg.loCol;
+           if uRg.loRow < 1 then dv := 0
+           else dv := uRg.loRow - sRg.loRow
+        end;
+
+   cntHandles := 0;
+   estimate   := 0;
+   col := 0;
+   row := 1;
+   while NextFormula(row, col) do begin
+      markedCell := CellBit(row, col, B1Marked);
+      case passNum of
+         mmMarkFirst,
+         mmMarkSecond : begin
+                           if passNum = mmMarkSecond then marker := B2Marked
+                           else begin
+                                   marker := B1Marked;
+                                   if markedCell and marking then SetCellBit(row, col, true, B2Marked)
+                                end;
+                           SetCellBit(row, col, false, marker)
+                        end;
+         mmEstimate   : SetCellBit(row, col, true, BCellSeen)
+      end;
+      if marking or (pasting and markedCell) then begin
+         GetFormula(row, col, false);
+         ToBeMarked := false;
+         cellChged  := false;
+         errClred   := false;
+         coordcnt   := 0;
+         doingCopy  := (lastformula.shared or (lastformula.refcnt > 1)) and marking;
+         if estimating then begin
+            if not doingcopy then goto 2
+         end
+         else if marking then
+                 if not CellBit(row, col, BCellSeen) then goto 2;
+
+         MakeCopy;
+         if lastformula.shared and not clrErrors then begin
+            FormBool :=  (RelAbsPtr <> nil) and (uRg.rKind <> aRectRg) and (uRg.rKind <> a1CellRg);
+            with formPtr^^ do begin
+               with vector[rowKind, row] do begin
+                  rowId     := newSnipId;
+                  rowStatus := mapType
+               end;
+               with vector[colKind, col] do begin
+                  colId     := newSnipId;
+                  colStatus := mapType
+               end;
+               cellMoved := (rowStatus = rmReName) or (colStatus = rmReName);
+               with vector[rowKind, sData.info.rowId] do begin
+                  rowId     := newSnipId;
+                  rowStatus := mapType
+               end;
+               with vector[colKind, sData.info.colId] do begin
+                  colId     := newSnipId;
+                  colStatus := mapType
+               end;
+               baseDel   := (rowStatus = rmDel) and (colStatus = rmDel);
+               baseMoved := (rowStatus = rmReName) or (colStatus = rmReName) or baseDel
+            end
+         end
+         else FormBool := false;
+
+         formindex := 0;
+         while formula^[formindex] <> PUSHEND do begin
+            if formula^[formindex] = PUSHNOP then formindex := formindex + 1;
+            if formula^[formindex] <= ENDCOORD then begin
+               getoperand(formula, formindex, row, col, opCode);
+               case opCode of
+                  PUSHECOORD  : if pasting or clrErrors then correctCoord;
+                  PUSHCOORD   : if marking then
+                                   if ChgCoord(VT.coordvar) then
+                                      moveLfast(@VT, @formula^[formindex + 1], pcodesize[PUSHCOORD]);
+                  PUSHECRANGE : if pasting or clrErrors then correctRange;
+                  PUSHCRANGE  : if marking then
+                                   if ChgCoord(VT.rangevar.first) or ChgCoord(VT.rangevar.second) then
+                                      moveLfast(@VT, @formula^[formindex + 1], pcodesize[PUSHCRANGE])
+               end;
+               coordcnt := coordcnt + 1
+            end;
+            if cellChged then
+               if estimating then goto 3;
+            NextPcode(formula, formindex)
+         end;
+         if errClred then SetCellBit(row, col, true, BInvalid);
+         if estimating then SetCellBit(row, col, false, BCellSeen);
+
+         {take the temporary copy of the formula in then EVAL array with all the
+          changes to it and make it an actual cell.  The shared formula which the
+          formula came from will be adjusted to forget about the formula.
+         }
+      3: if doingCopy and cellChged then begin
+            CellContents(mmRead, row, col, false, cell, status);
+            numByte2 := CbDataOfH(mxHz, @cell.cnHContents^);
+            if noEstimate then begin
+               (* allocated space for the formula and the cell information *)
+               formPtr   := pointer(ord(allocBlock(numByte1)));
+               hContents := pointer(ord(allocBlock(numByte2)));
+
+               if (formPtr <> nil) and (hContents <> nil) then begin
+                  (* copy the formula and cell information into the new blocks *)
+                  with formptr^^ do begin
+                     moveLfast(@formula^, @vecOp, numByte1 - sizeof(shared));
+                     shared := fSingle
+                  end;
+                  moveLfast(@cell.cnHContents^^, @hContents^^, numByte2);
+
+                  (* remove references to the old information *)
+                  DecRefCnt(cell.cnHContents, true, true);
+                  DecRefCnt(cell.cnHContents, false, true);
+
+                  (* fix up any stray data and mark the newly allocated blocks *)
+                  with hContents^^ do begin
+                     rule.ohfmla := GetOH(ord(formPtr));
+                     vinfo.data.refcnt := 1
+                  end;
+                  pCel     := FindPcel(row, col, false);
+                  pCel^.oh := GetOH(ord(hContents));
+                  SetCellBit(row, col, ToBeMarked, marker)
+               end
+(*$IFC DEBUGVERSION *)
+               else FatalMess(11)
+(*$ENDC *)
+            end
+            else begin
+                    estimate   := estimate + numbyte1 + numbyte2 + 10;
+                    cntHandles := cntHandles + 2
+                 end
+         end;
+      2:
+      end
+   end;
+   if estimating then begin
+      if (cntHandles + numHandles <= maxInt) and (estimate > 0) then begin
+         tEstimate := estimate;
+         allocPtr  := nil;
+         repeat
+            oldAllocPtr := allocPtr;
+            if tEstimate > 32000 then allocSize := 32000
+            else allocSize := tEstimate;
+            allocPtr := pointer(ord(allocBlock(allocsize)));
+            if allocPtr <> nil then allocPtr^^[0] := ord(oldAllocPtr);
+            tEstimate := tEstimate - allocSize
+         until (tEstimate <= 0) or (allocPtr = nil);
+
+         resFlag := (allocPtr <> nil);
+         if resFlag then oldAllocPtr := allocPtr;
+
+         while oldAllocPtr <> nil do begin
+            allocPtr := pointer(oldAllocPtr^^[0]);
+            FreeH(mxHz, @oldAllocPtr^);
+            numHandles  := numHandles - 1;
+            oldAllocPtr := allocPtr
+         end
+      end
+      else resFlag := (estimate = 0)
+
+(*$IFC DEBUGVERSION *)
+      ;writeln('need approximately ',estimate:1,' bytes, alloc: ',resflag,'/',debug[1]);
+      writeln( FCheckHzOK(mxHz, dh),'  # blocks: ',dh:1,'/',numHandles:1,'/',cntHandles:1,'=',cntHandles+numHandles:1);
+      if debug[1] then resFlag := false;
+(*$ENDC *)
+   end
+end;
+
+
+(***************************************.*******.************************************
+   NumOfCoords - determines the # of coordinate/range references in the formula
+                 pointed to by FORMULA.  The actual # of refs is returned as the
+                 value of the function.
+
+                 The routine also is used to set the relative/absolute information
+                 for the formula.  This action is triggered by SETRELINFO.  RELATIVE
+                 is a flag which is true if a paste relative is being performed in
+                 which case all the relative/absoulte bits will be set to true.
+                 Otherwise, RG is the used to see if the coordinate/range references
+                 are within RG thus setting the relative/absoulte bits to true.  The
+                 final information is passed back through RELINFO.
+
+   NOTE: it is assumed that enough space has been allocated for all the
+         relative/absolute bits to be stored in RELINFO.
+****************************************.*******.***********************************)
+(*$S CutPaste *)
+function NumOfCoords
+  (* formula     : ptrData;             {direct ptr to formula}
+     rg          : range;               {inclusion range to check coords against}
+     aFormula    : ptrData;             {direct ptr to formula to remap (maybe nil)}
+     vector      : mapInfoRec;          {range being pasted into}
+     mapExternal : boolean;             {should external references be changed: y/n}
+     relative    : boolean;             {paste releative operation: y/n}
+     setRelInfo  : boolean;             {setting rel/abs info: y/n}
+     var relInfo : PRTfmla              {rel/abs bits}
+  ) : integer *);
+var formindex : integer;
+    count     : integer;
+    newCoord  : integer;
+    opCode    : byte;
+    inSideRg  : boolean;
+    coordChg  : boolean;
+    opChged   : boolean;
+    inRange   : boolean;
+
+    function mapExtCoord(coord : integer; var newCoord : integer) : boolean;
+    var mapCoord   : integer;
+        snip       : snipKind;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       newCoord := coord;
+       case rg.rKind of
+          aRowRg : begin
+                      if newCoord > rg.hiRow then newcoord := newCoord - (rg.hiRow - rg.loRow + 1);
+                      snip := rowKind
+                   end;
+          aColRg : begin
+                      if newCoord > rg.hiCol then newcoord := newCoord - (rg.hiCol - rg.loCol + 1);
+                      snip := colKind
+                   end
+       end;
+       with vector[snip, newCoord] do
+          case mapType of
+             rmRename : newCoord := newSnipId;
+             rmDel    : opChged := true
+          end;
+       if newCoord <> coord then coordChg := true;
+       mapExtCoord := (newCoord <> coord)
+    end;
+
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   formindex := 0;
+   count     := 0;
+   lastformula.PRdata := nil;
+   repeat
+      if formula^[formindex] <= ENDCOORD then begin
+         if setRelInfo then begin
+            getoperand(formula, formindex, 0, 0, opCode);
+
+            {look at the coordinate and determine if it references a cell on the scrap.  Note
+             that VT.coordvar and VT.rangevar.first are one in the same.  Thus checking VT.coordvar
+             will do the right check for a single coordinate and also for the top left corner
+             of a range.
+            }
+            inRange  := (opCode = PUSHRANGE) or (opCode = PUSHECRANGE);
+            inSideRg := CoordInRange(VT.coordvar.length, VT.coordvar.start, rg);
+            if mapExternal then
+               if not inSideRg then begin
+(*$IFC DEBUGVERSION *)
+                  if debug[7] then
+                     writeln('mapExternal: coords:',VT.coordvar.length:1,',', VT.coordvar.start:1,'  ',
+                          VT.rangeVar.second.length:1,',', VT.rangeVar.second.start:1,' ',inRange,' ',wrg(rg));
+(*$ENDC *)
+                  opChged   := false;
+                  coordChg  := false;
+                  if inRange then normCoord(VT.rangeVar);
+                  if rg.rKind = aRowRg then begin
+                     if mapExtCoord(VT.coordvar.length, newCoord) then VT.coordvar.length := newCoord;
+                     if inRange then
+                        if mapExtCoord(VT.rangeVar.second.length, newCoord) then
+                           VT.rangeVar.second.length := newCoord
+                  end;
+
+                  if rg.rKind = aColRg then begin
+                     if mapExtCoord(VT.coordvar.start, newCoord) then VT.coordvar.start := newCoord;
+                     if inRange then
+                        if mapExtCoord(VT.rangeVar.second.start, newCoord) then
+                           VT.rangeVar.second.start := newCoord
+                  end;
+(*$IFC DEBUGVERSION *)
+                  if debug[7] then
+                     writeln('  newCoords: ',VT.coordvar.length:1,',', VT.coordvar.start:1,'  ',
+                             VT.rangeVar.second.length:1,',', VT.rangeVar.second.start:1,
+                             '  chged: ',coordChged,'  opChged: ',opChged);
+(*$ENDC *)
+                  if opChged then
+                     if inRange then aFormula^[formindex] := PUSHECRANGE
+                     else aFormula^[formindex] := PUSHECOORD;
+                  if coordChged then
+                     if inRange then moveLfast(@VT, @aformula^[formindex + 1], pcodesize[PUSHRANGE])
+                     else moveLfast(@VT, @aformula^[formindex + 1], pcodesize[PUSHCOORD])
+               end;
+
+            relInfo[count]   := relative or inSideRg;
+            relInfo[count+1] := relInfo[count]
+         end;
+         count := count + 2
+      end;
+      NextPcode(formula, formindex)
+   until formula^[formindex] = PUSHEND;
+   NumOfCoords := count div 2
+end;
+
+
+(***************************************.*******.************************************
+   mmSendPRinfo - returns the rel/abs information for the next formula.  The
+                  location of the next formula is dervied from the PRDATA that is
+                  pasted into the routine.  The new rel/abs info will be passed
+                  backed through PRDATA.
+
+   NOTE: the information in PRDATA should be considered read-only.  People calling
+         "mmSendPRinfo" should not be changing the contents of the record.
+****************************************.*******.***********************************)
+(*$S PRdialog *)
+procedure mmSendPRinfo;                 {shared formula information}
+var x        : integer;
+    relative : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   with PRdataPtr^ do begin
+      GetFormula(rowId, colId, false);
+      relative := false;
+      with lastformula.formPtr^^ do begin
+         for x := 0 to sData.info.numcoords-1 do
+            with info[x] do begin
+               sData.PRdata[x*2]   := rowRelative;
+               sData.PRdata[x*2+1] := colRelative;
+               relative := relative or rowRelative or colRelative
+            end;
+         if not relative then shared := fAbsolute
+      end
+   end
+end;
+
+
+(***************************************.*******.************************************
+   resetPRdata - The abs/rel bits for the formula at ROWID,COLID are transferred to
+                 the PRdata structure.  The abs/rel bits for the formula will be set
+                 to true at the end of this routine.
+****************************************.*******.***********************************)
+(*$S PRdialog *)
+procedure resetPRdata
+  (* rowId, colId : idType;
+     PRdata       : TPPRrecord
+  *);
+var x : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   GetFormula(rowId, colId, false);
+   if lastformula.shared then begin
+      with lastformula.formPtr^^ do begin
+         for x := 0 to sData.info.numCoords * 2 - 1 do begin
+            with PRdataPtr^.info[x div 2] do
+               if odd(x) then colRelative := sData.PRdata[x]
+               else rowRelative := sData.PRdata[x];
+            sdata.PRdata[x] := true
+         end;
+         shared := fShared
+      end
+   end
+end;
+
+ÿ

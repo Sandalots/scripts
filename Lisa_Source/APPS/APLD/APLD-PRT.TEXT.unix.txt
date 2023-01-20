@@ -1,0 +1,693 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE Printing Routines *)
+
+(* ********************************************************************* *)
+
+UNIT Prt;
+
+(* Segment PRT*)
+INTERFACE
+USES
+    (*$U UNITSTD*)     UnitStd,     (* interface dependency  *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/Syscall *)    Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)      Hdr,
+
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+    (*$U WM.EVENTS*)   Events,      (* implementation units  *)
+    (*$U WM.MENUS*)    Menus,
+    (*$U WM.FOLDERS*)  Folders,
+
+    (*$U ApLd/DMGR*)        DMgr,
+    (*$U ApLd/DAT*)      Dat,
+    (*$U ApLd/TXT*)      Txt,
+    (*$U ApLd/SEL*)      Sel,
+    (*$U ApLd/UOP*)      UOp,
+    (*$U ALERTMGR*)    AlertMgr,
+    (*$U ApLd/DBX*)      Dbx,
+    (*$U ApLd/DRW*)      Drw,
+
+    (*$U OBJ:WMLSTD*)      WMLStd,
+    (*$U OBJ:WMLSB*)       WMLSB,
+    (*$U ApLd/SCR*)      Scr;
+
+
+    procedure SetGEStl;
+    procedure PrPrfCmd;
+    procedure PrInsCmd(asIs:Boolean);
+    procedure PrBgdCmd;
+    {function  PrCkFont(face,font: Integer): Boolean;}
+    function  NewHPrRec: TPrfHnd;
+    procedure InitPrt;
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+(*$S Print*)
+
+(* ********************************************************************* *)
+
+CONST
+    gePrLdsn    = 2;
+{TYPE
+    TPrfPtr   = ^TPrRec;
+    TPrfHnd   = ^TPrfPtr;}
+
+VAR
+    hiResFlag: Boolean; (*BBB 4/27/83*)
+    myRPrintable: Rect;
+
+(* ********************************************************************* *)
+
+(* Private Procedures *)
+
+
+
+(* ********************************************************************* *)
+
+
+    procedure RoundRPrintable;
+Var   hPg,vPg: Integer;
+
+    (* ***************************************************************** *)
+
+        function  GetSize(dist,res: Integer): Integer;
+        var rDist,rRes: Real;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* get dist in real num *)
+            rDist := dist;
+            rRes  := res;
+            rDist := rDist/rRes;
+            (* sub 1/2" *)
+            rDist := rDist-0.5;
+            (* round to nearest inch *)
+            GetSize := Round(rDist)*res;
+        end; (* GetSize *)
+
+    (* ***************************************************************** *)
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* round rPrintable to 8x10,10x13,10x8,13x10 *)
+        With curDoc.hPrRec^^.prInfo,rPrintable do begin
+            hPg := GetSize(right-left,hRes);
+            vPg := GetSize(bottom-top,vRes);
+            myRPrintable.left := left;
+            myRPrintable.top  := top;
+            myRPrintable.right  := left+hPg;
+            myRPrintable.bottom := top +vPg;
+        end;
+    end;
+
+    (* ***************************************************************** *)
+
+    procedure GetPrScl(VAR prScl2D: Point2D);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* see if hiRes so can make gray pen 2x2 instead of 1x1 *)
+        hiResFlag := TRUE; (*BBB 1/17/84*)
+
+        (* get screen to device conversion factor *)
+        With curDoc.hPrRec^^.prInfo do begin
+            prScl2D.x  := hRes/xInchDots;
+            prScl2D.y  := vRes/yInchDots;
+
+            If traceCmd then begin
+                Writeln('GetPrScl, prScl2D:   ',prScl2D.x:6:2,prScl2D.y:6:2);
+                Writeln('    hRes,vRes: ',hRes:2,',',vRes:2);
+            end;
+        end;
+    end; (* GetPrScl *)
+
+(* ********************************************************************* *)
+
+    procedure CkTxtBBox;
+    var thisObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* go through all text objects and recompute their bBox,
+           since change in prStl may affect their display.
+           no pending ops, so can sequence directly *)
+        thisObj := curDoc.oLst.tBeg;
+        while thisObj<>NIL do begin
+            GetBBox(thisObj);
+            thisObj := thisObj^.fLink;
+        end;
+    end; (* CkTxtBBox *)
+
+
+(* ********************************************************************* *)
+
+    procedure PrintGEDoc;
+
+    VAR
+        outOfPages:     Boolean;
+        prRec:          TPrRec;
+        prPort:         TPrPort;
+        (* misc pr vars *)
+        errNum:         Integer;
+        gridOn:         Boolean;
+        prBand:         Rect;
+        dwgBBox:        Rect;
+        (* device coordinate transformation vars *)
+        prScl2D:        Point2D;                (* scale factor       *)
+        prCtr2D:        Point2D;                (* scale origin       *)
+        prPgOSet:       Point;                  (* in printer coords  *)
+        gePgOSet:       Point;                  (* in local GE coords *)
+        geRSafe:        Rect;
+        (* multi-page vars *)
+        hPgIndx,vPgIndx:Integer;
+        cPgs:           Point;
+        saveZoomOn:     Integer;
+
+    (* ***************************************************************** *)
+
+        procedure OLstBBox(oLst: TObjLst; Var bBox: Rect);
+        var obj: TObjPtr;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            obj := oLst.lBeg;
+            if obj<>NIL then begin
+                bBox := obj^.bBox;
+                obj := obj^.fLink;
+            end else
+                bBox := nilRect;
+            while obj<>NIL do begin
+                UnionRect(bBox,obj^.bBox,bBox);
+                obj := obj^.fLink;
+            end;
+        end; (* OLstBBox *)
+
+    (* ***************************************************************** *)
+
+        procedure FHndToPoly(Var thisObj:TObjPtr);
+        Var newCLst: TCLstHnd;
+            crd2D: Point2D;
+            i: Integer;
+        begin
+            OpenCLst(curDoc.hHz,newCLst,thisObj^.oDat.cLst^^.crdCnt+2,
+                     iObjPoly);
+            With thisObj^.oDat,cLst^^ do begin
+                          kind   := iObjPoly;
+                newCLst^^.crdKind:= iObjPoly;
+                newCLst^^.cClose := cClose;
+                newCLst^^.beg2D  := beg2D;
+                          crd2D  := beg2D;
+                newCLst^^.c2DLst[0] := beg2D;
+                newCLst^^.crdCnt := crdCnt;
+                newCLst^^.crdMax := crdMax;
+
+                For i := 1 to crdCnt do begin
+                    GetNode2D(cLst,i,crd2D);
+                    {$R-}
+                    newCLst^^.c2DLst[i] := crd2D;
+                end;
+                newCLst^^.c2DLst[crdCnt+1] := beg2D;
+                {$IfC rangeOn} {$R+} {$EndC}
+                FreeCLst(cLst);
+                cLst := newCLst;
+            end;
+        end;{FHndToPoly}
+
+    (* ***************************************************************** *)
+
+        procedure ShowPrObj(obj: TObjPtr);
+        var thisObj: TObjPtr;
+            thisArc: TArcRec;
+            grp: TObjPtr;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if traceCmd then
+                Writeln('ShowPrObj(',Ord(obj):8,',',prScl2D.x:7:2,prScl2D.y:7:2,')');
+
+            if obj^.oDat.kind=iObjGroup then begin
+                grp := obj^.oDat.grp.lBeg;
+                while grp<>NIL do begin
+                    ShowPrObj(grp);
+                    grp := grp^.fLink;
+                end;
+            end else begin
+                (* scale a copy of the obj to printer resolution *)
+                DupObj(obj,thisObj);
+                If thisObj^.oDat.kind=iObjFHnd then FHndToPoly(thisObj);
+                with thisObj^.oDat do begin
+                    locked := 0;
+                    if kind=iObjRndR then begin
+                        with rndSizes[curDoc.atr.rlrUnit,inf.dat] do
+                        SetPt(rndSizes[curDoc.atr.rlrUnit,iRndVar],
+                              Round(prScl2D.x*h),Round(prScl2D.y*v));
+                        inf.dat := iRndVar;
+                    end;
+                    if kind<>iObjText then begin
+                        with penSizes[inf.pnSiz] do
+                        SetPt(penSizes[iPenVar],
+                              Round(prScl2D.x*h),Round(prScl2D.y*v));
+                        if (kind in [iObjSLin,iObjRLin]) and (inf.dat>0) then begin
+                            penSizes[iPenArw] := penSizes[iPenVar];
+                            inf.flPat := inf.pnSiz;
+                        end;
+                        if inf.pnSiz=1 then
+                            if inf.pnPat=iPenBlack then
+                                SetPt(penSizes[iPenVar],1,1)
+                            else if hiResFlag then (*BBB 4/27/83*)
+                                SetPt(penSizes[iPenVar],2,2);
+                        inf.pnSiz := iPenVar;
+                    end;
+                end;
+                (* offset the object to the page 1,1 *)
+                OffsetObj(thisObj,-gePgOSet.h,-gePgOSet.v);
+                (* scale the object relative to topleft page *)
+                ScaleObj(thisObj,prCtr2D,prScl2D.x,prScl2D.y);
+                (* offset the object to the proper printer page location *)
+                OffsetObj(thisObj,prPgOSet.h,prPgOSet.v);
+                (* show the scaled copy of object *)
+                if traceCmd then WrtObj(thisObj,1);
+                ShowObj(thisObj);
+                (* dispose copies of auxiliary data *)
+                FreeObj(thisObj);
+            end;
+        end; (* ShowPrObj *)
+
+    (* ********************************************************************* *)
+
+        procedure ShowOLst(thisBand: Rect);
+        var obj: TObjPtr;
+            thisObj: TObjRec;
+            tempRect: Rect;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if traceCmd then
+                WLnRect('    ShowOLst band=',thisBand);
+
+            (* intersect band with dwgBBox *)
+            if SectRect(thisBand,dwgBBox,thisBand) then begin
+                (* show all objects that intersect band *)
+                (* since there are no pending ops, sequence directly through list *)
+                EraseRect(curDoc.hPrRec^^.prInfo.rPrintable);
+                obj := curDoc.oLst.lst.lBeg;
+                while obj <> NIL do begin
+                    if SectRect(obj^.bBox,thisBand,tempRect) then
+                        ShowPrObj(obj);
+                    obj := obj^.fLink;
+                end;
+            end;
+        end; (* ShowOLst *)
+
+    (* ***************************************************************** *)
+
+        procedure MyDocStart;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        If traceFio then begin
+            With prRec.prInfo.pgSize do begin
+                WriteLn(
+                 'After PrDocStart we have prRec.prInfo.pgSize.width height = ',
+                   width:8,height:8);
+            end;
+        end;
+
+            (* commit any pending ops so don't have to filter objs *)
+            TxtCommit;
+            CommitLastOp;
+
+            (* draw only in bands that intersect objects in dwg *)
+            OLstBBox(curDoc.oLst.lst,dwgBBox);
+
+            (* set scaling factors to device coordinates *)
+            prCtr2D.x := 0;
+            prCtr2D.y := 0;
+            GetPrScl(prScl2D);
+            (* see how many pages to print *)
+            GetPgCnt(curDoc.atr.dwgSz,cPgs);
+
+            ClipRect(myRPrintable);
+
+            if traceCmd then
+                Writeln('MyDocStart,cPgs:',cPgs.h:2,',',cPgs.v:2);
+        end; (* MyDocStart *)
+
+    (* ***************************************************************** *)
+
+        procedure MyPageStart;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            If traceCmd then begin
+                Writeln;
+                Writeln('MyPageStart Page# ',hPgIndx:1,',',vPgIndx:1);
+            end;
+
+            With curDoc,myRPrintable do begin
+                {Set page offset in pr coords }
+                SetPt(prPgOSet,left,top );
+
+                (* set page offset in ge coords *)
+                SetPt(gePgOSet,(hPgIndx-1)*atr.pageSz.h,(vPgIndx-1)*atr.pageSz.v);
+
+            end;
+        end; (* MyPageStart *)
+
+    (* ***************************************************************** *)
+
+        procedure PrintMyPage;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if traceCmd then
+                WLnRect('    PrNextBand=   ',prBand);
+
+            { ClipRect(geRSafe);  Moves to MyDocStart}
+
+            prBand := myRPrintable;
+            {Make background white}
+            BackColor(whiteColor);
+
+
+            (* offset and scale band to GE coords for hit testing *)
+            OffsetRect(prBand,-prPgOSet.h,-prPgOSet.v);
+            with prBand do begin
+                left   := Round(left  /prScl2D.x);
+                top    := Round(top   /prScl2D.y);
+                right  := Round(right /prScl2D.x);
+                bottom := Round(bottom/prScl2D.y);
+            end;
+            OffsetRect(prBand,gePgOSet.h,gePgOSet.v);
+
+            (* check for abort *)
+            {if Abort then begin
+                hPgIndx := cPgs.h;
+                vPgIndx := cPgs.v;
+            end else     The printing loop is being controled now by PrPageEnd }
+
+            ShowOLst(prBand);
+        end; (* PrintMyPage *)
+
+    (* ***************************************************************** *)
+
+        procedure MyDocEnd;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        end; (* MyDocEnd *)
+
+    (* ***************************************************************** *)
+
+begin{PrintGEDoc}
+    printing := TRUE;
+    saveZoomOn := curDoc.atr.zoomOn;
+    curDoc.atr.zoomOn := 0;
+    outOfPages := FALSE;
+    prRec := curDoc.hPrRec^^;
+    If traceFio then begin
+        With prRec.prInfo.pgSize do begin
+            WriteLn('Before PrDocStart we have prRec.prInfo.pgSize.width height = ',
+                width:8,height:8);
+        end;
+    end;
+
+    If PrDocStart(prRec,prPort,gePrLdsn,TRUE) then begin{was put in with new libraries}
+        MyDocStart;
+
+        {Initialize page counts}
+        hPgIndx := 1;
+        vPgIndx := 1;
+
+        {Print the pages}
+        Repeat
+            If PrPageStart(prRec,prPort) then begin
+
+                If traceFio then begin
+                    With prRec.prInfo.pgSize do begin
+                        WriteLn(
+             'After PrPageStart (TRUE) we have prRec.prInfo.pgSize.width height = ',
+                            width:8,height:8);
+                    end;
+                end;
+                MyPageStart;
+                PrintMyPage;
+
+            end else begin
+
+                If traceFio then begin
+                    With prRec.prInfo.pgSize do begin
+                        WriteLn(
+            'After PrPageStart (FALSE) we have prRec.prInfo.pgSize.width height = ',
+                            width:8,height:8);
+                    end;
+                end;
+            end;
+
+            {Update page counts}
+            vPgIndx := vPgIndx + 1;
+            If vPgIndx > cPgs.v then begin
+                vPgIndx := 1;
+                hPgIndx := hPgIndx + 1;
+                If hPgIndx > cPgs.h then
+                    outOfPages := TRUE;
+            end;
+        until outOfPages OR PrPageEnd(prRec,prPort);
+    end;
+    PrDocEnd(prRec,prPort);
+    printing := FALSE;
+    curDoc.atr.zoomOn := saveZoomOn;
+    CkGEUpdate;
+
+end;(* PrintGEDoc *)
+
+
+(* ********************************************************************* *)
+
+(* Public Procedures *)
+
+(* ********************************************************************* *)
+
+    procedure SetGEStl;
+    var xPg,yPg: Real;
+        cPg,oPg: Point;
+        rSafe: Rect;
+        prScl2D: Point2D;
+        gBox: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* the print format style has changed, reformat the geDoc *)
+        (* get the current page size from PrMgr *)
+        curDoc.hdrChgd := TRUE;
+        {curDoc.hdrChgd := fNewStl;}
+        RoundRPrintable;
+        GetPrScl(prScl2D);
+        with myRPrintable do begin
+            If (prScl2D.x<>0) AND (prScl2D.y<>0) then begin
+                xPg := (right-left)/prScl2D.x;
+                yPg := (bottom-top)/prScl2D.y;
+            end else begin
+                xPg := 768;     { 8X10 }
+                yPg := 640;
+            end;
+        end;
+        (* set dwgSz and pageSz in geAtr according to PrMgr pageSz *)
+        with curDoc.atr do begin
+            (* remember the old page count *)
+            GetPgCnt(curDoc.atr.dwgSz,oPg);
+            (* set new pageSz *)
+            SetPt(pageSz,Round(xPg),Round(yPg));
+            (* get min page count for dwg GBox *)
+            GetDwgGBox(gBox);
+            GetPgCnt(gBox.botRight,cPg);
+            (* if old page count will fit dwg GBox, then use it *)
+            SetPt(cPg,CMax(cPg.h,oPg.h),CMax(cPg.v,oPg.v));
+            SetPt(dwgSz,CMin(cHDwgMax,cPg.h*pageSz.h),
+                        CMin(cVDwgMax,cPg.v*pageSz.v));
+            sizeLBox.botRight := dwgSz;
+            if (scrollPt.h<0) OR (scrollPt.v<0) then
+                SetPt(scrollPt,0,0);
+        end;
+        (* reset all dimensions that depend on pageSz *)
+        SetGEBox(TRUE);
+        SetMseLmt(sizeLBox);
+        SetThumb(hSBox,DwgThumbPos(iDirLft));
+        SetThumb(vSBox,DwgThumbPos(iDirTop));
+        (* handle fonts *)
+
+
+
+        CkTxtBBox;
+        InvalRect(curDoc.fldr^.portRect);
+
+
+        if traceCmd then with curDoc.atr.pageSz do
+            Writeln('SetGEStl: pageSz:   ',h:2,',',v:2);
+    end; (* SetGEStl *)
+
+(* ********************************************************************* *)
+
+
+    procedure PrPrfCmd;
+    var fNewStl: Boolean;
+        prRec: TPrRec;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on 'Intended for Printer...' menu command *)
+        CommitLastOp;
+        (* make sure GE dBox is not open *)
+        if theDBox.isOpen then
+            ClearDBox;
+        (* initiate prMgr dialog *)
+        prRec := curDoc.hPrRec^^;
+
+        If traceFio then begin
+            With prRec.prInfo.pgSize do begin
+                WriteLn(
+                    'Before PrPrfDlg we have prRec.prInfo.pgSize.width height = ',
+                     width:8,height:8);
+            end;
+        end;
+
+        PrPrfDlg(prRec,fNewStl,TRUE); {PrPrfDlg(Var prprf: TPrRec: Var fNewStl: TF
+                                       fPgSzSuppress: TF) }
+
+        If traceFio then begin
+            With prRec.prInfo.pgSize do begin
+                WriteLn('After PrPrfDlg we have prRec.prInfo.pgSize.width height = ',
+                    width:8,height:8);
+            end;
+        end;
+
+        curDoc.hPrRec^^ := prRec;
+        SetGEStl;
+
+    end; (* PrPrfCmd *)
+
+(* ********************************************************************* *)
+
+    procedure PrInsCmd(* asIs:Boolean *);
+    var fDoIt,fNewStl: Boolean;
+        prRec: TPrRec;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on 'Print...' menu command *)
+        CommitLastOp;
+        (* make sure GE dBox is not open *)
+        if theDBox.isOpen then
+            ClearDBox;
+        (* initiate prMgr dialog *)
+        prRec := curDoc.hPrRec^^;
+        If asIs then
+            fDoIt := FPrInsDlg(prRec,fNewStl,ePrDialogSuppress)
+        else
+            fDoIt := FPrInsDlg(prRec,fNewStl,ePrNormal);
+        curDoc.hPrRec^^ :=  prRec;
+        SetGEStl;
+        (* print the document *)
+        If fDoIt then
+            PrintGEDoc;
+    end; (* PrInsCmd *)
+
+(* ********************************************************************* *)
+
+    procedure PrBgdCmd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on 'Printing in Progress...' menu command *)
+        CommitLastOp;
+        (* make sure GE dBox is not open *)
+        If theDBox.isOpen then
+            ClearDBox;
+        (* initiate prMgr dialog *)
+        PrBgdDlg;
+    end; (* PrInsCmd *)
+
+(* ********************************************************************* *)
+
+   { function  PrCkFont(* face,font: Integer): Boolean *);
+    var lFntID:   TLFntID;
+        doItFlag: Boolean;
+        errNum:   Integer;
+        gePrPrf:  TPrPrf;
+        gePrIns:  TPrIns;
+    begin
+        (* see if any substitution occurs *)
+        PrCkFont := TRUE;
+        if face=iFmtFont (* setFont *) then begin
+            GetPrCurrent(gePrPrf,gePrIns);
+            PrLFntID(gePrPrf,font,[],lFntID);
+            SetPrCurrent(gePrPrf,gePrIns);
+            FMMapFont(lfntID,errNum);
+            if traceCmd then
+                writeln('    PrCkFont:',errNum:2);
+            if errNum<0 then
+                PrCkFont := GECaution(iCtnFont);
+        end;
+    end; (* PrCkFont *)}
+
+
+(* ********************************************************************* *)
+(*$S IO*)
+    function  NewHPrRec(*: TPrfHnd *);
+    Var tempHPrRec: TPrfHnd;
+        tempPrRec:  TPrRec;
+        heapCheck:  TF;
+        cBkStd:     TC;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        If traceFio then begin
+            WriteLn('NewHPrRec');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+        tempHPrRec := Pointer(Ord(HAllocate(geHHz,SizeOf(TPrRec))));
+        PrPrfDefault(tempPrRec);
+        tempHPrRec^^ := tempPrRec;
+        NewHPrRec := tempHPrRec;
+    end; (* NewHPrRec *)
+
+
+
+(* ********************************************************************* *)
+
+(*$S Init*)
+    procedure InitPrt;
+    {var rSafe: Rect;
+        prScl2D: Point2D;
+        xPg,yPg: Real;
+        errNum:   Integer;
+        gePrPrf:  TPrPrf;
+        gePrIns:  TPrIns;
+        gePrfHnd: TPrfHnd;
+        geInsHnd: TInsHnd;}
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* init unshared intrinsic print manager code   InitAlert must be called
+        first.*)
+        PrMgrInit;
+
+
+        (* init all dimensions that depend on pageSz set in gePrPrf *)
+       { PrPrfDefault(gePrPrf);
+        GetPrScl(gePrPrf,rSafe,prScl2D);
+        with rSafe do begin
+            xPg := (right-left)/prScl2D.x;
+            yPg := (bottom-top)/prScl2D.y;
+        end;
+        with curDoc.atr do begin
+            (* set new pageSz *)
+            SetPt(pageSz,Round(xPg),Round(yPg));
+            SetPt(dwgSz,pageSz.h,pageSz.v);
+            sizeLBox.botRight := dwgSz;
+            SetMseLmt(sizeLBox);
+        end;}
+    end; (* InitPrt *)
+
+END. (* unit *)
+
+
+
+
+
+ÿ

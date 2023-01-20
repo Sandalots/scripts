@@ -1,0 +1,3879 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT fs_directory;
+
+INTERFACE
+
+  USES
+
+    {$U object/driverdefs.obj }       driverdefs,
+    {$U object/hwint.obj      }       hwint,
+    {$U object/sysglobal.obj  }       globalda,
+    {$U object/procprims.obj  }       proc_prims,
+    {$U object/mmprim.obj     }       mmprimitives,
+    {$U object/asynctr.obj    }       asynctr,
+    {$U object/genio.obj      }       genio,
+    {$U object/twiggy.obj     }       twiggy,
+    {$U object/vmstuff.obj    }       vmstuff,
+    {$U object/sfileio.obj    }       sfileio;
+
+    {$SETC DIRBUG := FALSE}
+
+  const
+       ROOT_NID   = 0;     (* Root directory node ID *)
+       KEY_SIZE   = 36;    (* Size of record key in bytes *)
+       BAD        = -1;    (* Generic bad value *)
+       TREE_ID    = 4;     (* s-file ID if directory tree node pages *)
+
+       (* Exported error codes *)
+       E_TREE_EMPTY = 1280;
+       E_DIR_NOT_EMPTY = 1284;
+       E_TREE_MUNCH    = 1288;
+
+  type
+       {  The following type definitions are exported by unit SysGlobal
+          and are included here for convenience
+
+       NodeIdent = integer;  (* File System directory unique identifier *)
+
+       NodeScanType = ( dirscan, treescan );
+
+       (* Record key *)
+       RecKey = string[35];
+       key_ptr = ^RecKey;
+
+       (*
+        *  Frame of the SysLocal-resident stack describing the preorder traversal
+        *  of a subtree in the file system hierarchy.  Each frame is a placemark
+        *  indicating where to resume the traversal within a superior directory.
+        *)
+       dirmrk_ptr = ^DirMarker;
+       DirMarker = record
+                     link    : dirmrk_ptr;  (* to next frame *)
+                     page    : longint;     (* loc of next record in directory *)
+                     index   : integer;
+                     id      : NodeIdent;   (* id of directory *)
+                     saveKey : RecKey;      (* key of next record in directory *)
+                     topol   : longint;     (* tree topology at frame creation *)
+                   end;
+       }
+
+       (* Generic pointer to record *)
+       SomeData = array[0..0] of byte;
+       rec_ptr = ^SomeData;
+
+       (* Array of offsets to records in the node *)
+       Offsets = array[0..0] of integer;
+       offset_ptr = ^Offsets;
+
+       (*
+        *  B-tree record
+        *)
+       ObjStatBits = ( fMaster, fProtect, fSafety, fCrashed, fScavenged, fClosed );
+       ObjRec = record
+                  key      : RecKey;           {36}
+                  case eType : EntryType of    { 2 38}
+                  DIRENTRY:
+                  (
+                  id        : NodeIdent;       { 2 40}
+                  dirDTC    : longint;         { 4 44}
+                  dirUnused : longint          { 4 48}
+                  );
+                  THREADENTRY:
+                  (
+                  parID    : NodeIdent;        { 2 40}
+                  myName   : e_name;           {34 74}
+                  threadUnused : longint       { 4 78}
+                  );
+                  FILEENTRY:
+                  (
+                  sfile    : integer;                                 { 2 40}
+                  fileDTC  : longint;                                 { 4 44}
+                  fileDTM  : longint;                                 { 4 48}
+                  size     : longint;                                 { 4 52}
+                  physSize : longint;                                 { 4 56}
+                  fsOvrhd  : integer;                                 { 2 58}
+                  flags    : packed array[ObjStatBits] of boolean;    { 2 60}
+                  fileUnused : longint                                { 4 64}
+                  );
+                end;
+       entry_ptr = ^ObjRec;
+
+       (*
+        *  Record definitions referenced in sizeof expressions.
+        *)
+       ObjectRec = record
+                     key      : RecKey;                               {36}
+                     eType    : EntryType;                            { 2 38}
+                     sfile    : integer;                              { 2 40}
+                     fileDTC  : longint;                              { 4 44}
+                     fileDTM  : longint;                              { 4 48}
+                     size     : longint;                              { 4 52}
+                     physSize : longint;                              { 4 56}
+                     fsOvrhd  : integer;                              { 2 58}
+                     flags    : packed array[ObjStatBits] of boolean; { 2 60}
+                     unused   : longint;                              { 4 64}
+                   end;
+
+       DirectRec = record
+                     key     : RecKey;          {36}
+                     eType   : EntryType;       { 2 38}
+                     id      : NodeIdent;       { 2 40}
+                     DtCreat : longint;         { 4 44}
+                     unused  : longint;         { 4 48}
+                end;
+
+       ThreadRec = record
+                     key    : RecKey;        {36}
+                     eType  : EntryType;     { 2 38}
+                     parID  : NodeIdent;     { 2 40}
+                     myName : e_name;        {34 74}
+                     unused : longint;       { 4 78}
+                   end;
+
+       ename_ptr = ^e_name;
+
+       (*
+        *  Frame of stack of nodes visited during a B-tree search
+        *)
+       StackRec = record
+                    page  : longint;
+                    index : integer;
+                    nkeys : integer;
+                    leftSplit  : longint;
+                    rightSplit : longint;
+                  end;
+
+       (* Types of nodes *)
+       NodeKind = ( leaf, nonleaf );
+
+       (* Node descriptor *)
+       NodeDesc = record
+                    nkeys : integer;   (* number of records in the node *)
+                    prior : longint;   (* node containing the predecessor key *)
+                    next  : longint;   (* node containing the successor key *)
+                    kind  : NodeKind;  (* type of node *)
+                    cksum : byte;      (* checksum byte *)
+                  end;
+       node_ptr = ^NodeDesc;
+       page_ptr = ^longint;
+
+var
+     (*
+      *  The NodeStack and DirStack are global now because access to
+      *  readers and writers is mutually exclusive.  Going to a multiple-
+      *  readers-or-one-writer scheme would require each process owning its
+      *  own NodeStack and DirStack.
+      *)
+     (* Path of tree traversal to find a record *)
+     NodeStack : array[0..15] of StackRec;
+
+     (* Stack of ID's of directories visited during a pathname parse *)
+     DirStack   : array[0..15] of NodeIdent;
+     g_dirLevel : integer;
+
+
+  (*
+   *  Must change assembly procedures if NodeIdent type decl changes.
+   *)
+  procedure  MakeKey ( parentID  : NodeIdent;
+                       ptrName   : ename_ptr;
+                       ptrKey    : key_ptr );
+
+  procedure  DecompKey (     ptrKey    : key_ptr;
+                             ptrName   : ename_ptr;
+                         var parentID  : NodeIdent );
+
+  procedure  FreeBuf ( ptrBuf : buffer_ptr );
+
+  procedure  GetNode (     ptrDCB : DCBptr;
+                           page   : longint;
+                           readPg : boolean;
+                       var ptrBuf : buffer_ptr;
+                       var ecode  : integer );
+
+  procedure  Search (     ptrDCB : DCBptr;
+                          ptrKey : key_ptr;
+                      var ptrBuf : buffer_ptr;
+                      var found  : boolean;
+                      var ecode  : integer );
+
+  procedure  E_Search (     ptrDCB   : DCBptr;
+                            ptrKey   : key_ptr;
+                        var ptrBuf   : buffer_ptr;
+                        var ptrEntry : entry_ptr;
+                        var found    : boolean;
+                        var ecode    : integer );
+
+  procedure  Gobble ( var path      : pathname;
+                      var index     : integer;
+                      var name      : e_name;
+                      var delimiter : char );
+
+  procedure  PathSearch (     ptrDCB   : DCBptr;
+                              parID    : NodeIdent;
+                              path     : Pathname;
+                              ptrKey   : key_ptr;
+                          var ptrBuf   : buffer_ptr;
+                          var ptrEntry : entry_ptr;
+                          var found    : boolean;
+                          var ecode    : integer );
+
+  procedure  Insert (     ptrDCB  : DCBptr;
+                          ptrRec  : rec_ptr;
+                          size    : integer;
+                          ptrBuf  : buffer_ptr;
+                      var ecode   : integer );
+
+  procedure  SeqRec (     ptrDCB : DCBptr;
+                      var ptrBuf : buffer_ptr;
+                      var index  : integer;
+                          ptrKey : rec_ptr;
+                      var ecode  : integer );
+
+  procedure  Ddelete (     ptrDCB : DCBptr;
+                           ptrRec : rec_ptr;
+                           ptrBuf : buffer_ptr;
+                       var size   : integer;
+                       var ecode  : integer );
+
+  procedure  ResetDir (     ptrDCB : DCBptr;
+                            parID  : NodeIdent;
+                        var pathn  : Pathname;
+                        var ecode  : integer );
+
+  procedure  GetNextEntry ( var nextEntry : e_name;
+                            var NextRec   : ObjRec;
+                            var level     : integer;
+                            var ecode     : integer );
+
+  procedure  SetWorkingDir (     ptrDCB : DCBptr;
+                                 parID  : NodeIdent;
+                                 path   : Pathname;
+                             var ecode  : integer );
+
+  procedure  GetDirPath (     ptrDCB : DCBptr;
+                              id     : NodeIdent;
+                          var pathn  : Pathname;
+                          var ecode  : integer );
+
+  procedure  GetWorkingDir ( var pathn : Pathname;
+                             var ecode : integer );
+
+
+IMPLEMENTATION
+
+  const
+       DIRLEVEL   = 97;    (* trace fence *)
+
+       (* Unit local error codes *)
+       E_DBL_FREE      = 10800;
+       E_NOT_ALLOC     = 10801;
+       E_COLD_LOCK     = 10802;
+       E_BUF_LOCKED    = 10803;
+       E_PATHNAME      = 1281;
+       E_PATH_SYNTAX   = 1282;
+       E_NOT_DIR       = 1283;
+       E_SCANSTK_NOSPACE = 1287;
+       E_EOF           = 848;
+       E_ENTRY_EXISTS  = 1287;
+       E_NO_ENTRY      = 1289;
+
+  type
+
+       stack_ptr = ^StackRec;
+
+       Transform = ( node_split,
+                     key_rotate,
+                     node_merge,
+                     node_delete,
+                     tree_empty,
+                     no_operation,
+                     flame_out );
+
+
+
+  procedure  MakeKey (* parentID  : NodeIdent;
+                        ptrName   : ename_ptr;
+                        ptrKey    : key_ptr *);  external;
+
+  procedure  MoveLt ( ptrSrc : rec_ptr;
+                      ptrDst : rec_ptr;
+                      nbytes : integer );   external;
+
+  procedure  MoveRt ( ptrSrc : rec_ptr;
+                      ptrDst : rec_ptr;
+                      nbytes : integer );   external;
+
+  procedure  MovlOffsets ( ptrSrc : offset_ptr;
+                           ptrDst : offset_ptr;
+                           nbytes : integer;
+                           delta  : integer );   external;
+
+  procedure  MovrOffsets ( ptrSrc : offset_ptr;
+                           ptrDst : offset_ptr;
+                           nbytes : integer;
+                           delta  : integer );   external;
+
+  procedure  SearchNode ( ptrRec     : rec_ptr;
+                          ptrOffst   : offset_ptr;
+                          nentries   : integer;
+                          ptrKey     : key_ptr;
+                          keySize    : integer;
+                      var index      : integer;
+                      var result     : boolean );   external;
+
+  procedure  DecompKey (*     ptrKey    : key_ptr;
+                              ptrName   : ename_ptr;
+                          var parentID  : NodeIdent *);  external;
+
+
+
+{$IFC DIRBUG}
+{$I source/fsdirDebug}   (* include debugging procedure definitions *)
+{$ENDC}
+
+
+
+
+
+  {$S fs7 }
+  procedure  TouchNode ( ptrBuf : buffer_ptr );
+
+  var
+       ptrDCB : DCBptr;
+
+  begin
+      (* Bump the tree topology counter *)
+      ptrDCB := mounttable[ptrBuf^.device];
+      ptrDCB^.topol := ptrDCB^.topol + 1;
+  end{proc TouchNode};
+
+
+
+  {$S fs7 }
+  procedure  Post (     ptrBuf : buffer_ptr;
+                    var ecode  : integer );
+
+  var
+       actual : longint;
+       block  : longint;
+
+  begin
+      {
+      block :=  ptrBuf^.page +
+                    mounttable[ptrBuf^.device]^.MDDFdata^.geography.firstblock;
+      LisaIO(ecode, ptrBuf^.device, ord(@ptrBuf^.Data), NODE_BLKS, block,
+             actual, WITHOUT_HEADER, NIL, WRITEOP);
+      }
+      (*
+       *  Mark the indicated buffer as dirty.  The buffer will eventually be
+       *  written to disk.  The above code could be reincarnated to provide
+       *  write-through, thus making tree updates slower but more reliable.
+       *)
+      TouchNode(ptrBuf);
+      ptrBuf^.dirty := TRUE;
+  end{proc Post};
+
+
+
+  {$S fs7 }
+  procedure  FreeBuf (* ptrBuf : buffer_ptr *);
+
+  begin
+{$IFC DIRBUG}
+      if ptrBuf^.page = BAD then System_Error(E_DBL_FREE);
+      if ptrBuf^.lock = FALSE then System_Error(E_NOT_ALLOC);
+{$ENDC}
+
+      ptrBuf^.lock := FALSE;
+      signal_sem(ptrBuf^.sem);  (* release the buffer *)
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        write('Free buffer '); PrHex(ord(ptrBuf)); PrBuff(ptrBuf);
+      end;
+{$ENDC}
+  end{proc FreeBuf};
+
+
+
+  {$S fs7 }
+  procedure  DQbuf ( ptrBuf : buffer_ptr );
+  begin
+      ptrBuf^.link.b^.link.f := ptrBuf^.link.f;
+      ptrBuf^.link.f^.link.b := ptrBuf^.link.b;
+  end{proc DQbuf};
+
+  {$S fs7 }
+  procedure  NQbuf ( ptrBuf : buffer_ptr;
+                     ptrPt  : buffer_ptr );
+  begin
+      ptrBuf^.link.f := ptrPt^.link.f;
+      ptrPt^.link.f^.link.b := ptrBuf;
+      ptrBuf^.link.b := ptrPt;
+      ptrPt^.link.f := ptrBuf;
+  end{proc NQbuf};
+
+
+
+  {$S fs7 }
+  procedure  GetNode (*     ptrDCB : DCBptr;
+                            page   : longint;
+                            readPg : boolean;
+                        var ptrBuf : buffer_ptr;
+                        var ecode  : integer *);
+
+  label   1, 2, 3;  (* horrors *)
+
+  var
+       actual : longint;
+       ptrS   : buffer_ptr;
+       ptrRe  : buffer_ptr;
+       ptrRc  : buffer_ptr;
+       ptrRd  : buffer_ptr;
+       block  : longint;
+       PlRec  : plrect;
+
+  begin
+      ecode := 0;
+
+      (* Set-up page label record used by the disk driver *)
+      with PlRec do with plabel do
+      begin
+        volume := 0;
+        datastat := dataok;
+        version := 0;
+        fileid := TREE_ID;
+        dataused := DEFPGDATASIZE;
+        relpage := 0;
+        bkwdlink := REDLIGHT;
+        lflink := REDLIGHT;
+        ldataused := DEFPGDATASIZE;
+      end{with};
+
+      (* Acquire the catalog buffer pool *)
+      wait_sem(g_semBufPool, []);
+
+{$IFC DIRBUG}
+      if (ptrCold <> ptrHot^.link.f) or
+         (ptrHot <> ptrCold^.link.b) then
+      begin
+        writeln(chr(7));
+        writeln('* Buffer pool is inconsistent');
+        ShowPool;
+        ShowBufs;
+        write('ptrHot = '); PrHex(ord(ptrHot)); write('   ptrCold = ');
+        PrlnHex(ord(ptrCold));
+        writeln;
+        readln;
+      end;
+{$ENDC}
+
+      (*
+       *  Search for the requested page.
+       *  Remember the first free empty buffer, the first free clean buffer, and
+       *  the first free dirty buffer.
+       *)
+      ptrRe := NIL;
+      ptrRc := NIL;
+      ptrRd := NIL;
+      ptrS := ptrHot;
+      repeat
+        if (ptrS^.page = page) and
+           (ptrS^.device = ptrDCB^.dnum) then goto 2;  (* found it *)
+        (* Coldest free buffer *)
+        if ptrS^.page = BAD then ptrRe := ptrS;
+        (* Unlocked buffer *)
+        if not ptrS^.lock then
+          if ptrS^.dirty then
+            (* Coldest dirty unlocked buffer *)
+            ptrRd := ptrS
+          else
+            (* Coldest clean unlocked buffer *)
+            ptrRc := ptrS;
+        ptrS := ptrS^.link.b;
+      until ptrS = ptrHot;
+
+      (* Didn't find the requested page in a buffer *)
+
+      if ptrRe <> NIL then
+      begin
+        ptrS := ptrRe;  (* select the first empty buffer *)
+        goto 1;
+      end;
+      if ptrRc <> NIL then
+      begin
+        ptrS := ptrRc;  (* select the first free clean buffer *)
+        goto 1;
+      end;
+      if ptrRd <> NIL then
+      begin
+        ptrS := ptrRd;  (* select the first free dirty buffer *)
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          writeln('GetNode:  post cold node ',ptrS^.page:5);
+{$ENDC}
+        (*
+         *  ** Should really maintain one reserved free buffer so that the fetch
+         *  of the requested node from disk is concurrent with the selection and
+         *  possible write of the new free buffer. **
+         *)
+        (* Write the contents of the buffer to disk *)
+        PlRec.plabel.abspage := ptrS^.page;
+        PlRec.plabel.fwdlink := ptrS^.page + 1;
+        block := ptrS^.page +
+                  mounttable[ptrS^.device]^.MDDFdata^.geography.firstblock;
+        LisaIO(ecode, ptrS^.device, ord(@ptrS^.Data), block, NODE_BLKS,
+               actual, WITH_HEADER, @PlRec, WRITEOP);
+        if ecode > 0 then goto 3;
+      end
+      else
+      begin
+{$IFC DIRBUG}
+        writeln;
+        ShowPool;
+        ShowBufs;
+        write('ptrHot = '); PrHex(ord(ptrHot)); write('   ptrCold = ');
+        PrlnHex(ord(ptrCold));
+        writeln;
+{$ENDC}
+        (* All buffers are locked *)
+        System_Error(E_COLD_LOCK);
+      end;
+
+  1:
+      (*
+       *  Buffer has been selected.  Fetch the requested
+       *  node into the buffer.
+       *)
+      if readPg then
+      begin
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          writeln('GetNode:  read node ',page:5);
+{$ENDC}
+        block := page + ptrDCB^.MDDFdata^.geography.firstblock;
+        LisaIO(ecode, ptrDCB^.dnum, ord(@ptrS^.Data), block, NODE_BLKS,
+               actual, CHAINED_HDRS, @PlRec, READOP);
+        if ecode > 0 then goto 3;
+      end{if};
+
+      (* Update the buffer header *)
+      ptrS^.page := page;
+      ptrS^.device := ptrDCB^.dnum;
+      ptrS^.dirty := FALSE;
+      init_sem(ptrS^.sem, 1);
+
+  2:
+      (*
+       *  Buffer contains the requested node.
+       *)
+
+      (*
+       *  If selected buffer was the coldest, update the pointer to
+       *  the cold end of the buffer list.
+       *)
+      if ptrS = ptrCold then
+        ptrCold := ptrS^.link.f;
+
+      (*
+       *  Buffer just referenced becomes the hottest.
+       *  ** The requeueing should really be done at FreeBuf time. **
+       *  There is a problem dequeueing if the buffer being dequeued
+       *  is the ptrHot buffer.
+       *)
+      if ptrS <> ptrHot then
+      begin
+        DQbuf(ptrS);
+        NQbuf(ptrS, ptrHot);
+        ptrHot := ptrS;
+      end{if};
+
+      (*  Acquire the buffer and return a pointer to it *)
+      ptrBuf := ptrS;
+      wait_sem(ptrBuf^.sem, []);
+      ptrBuf^.lock := TRUE;
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        write('GetNode:  page = ',ptrBuf^.page:5,'  buffer = '); PrlnHex(ord(ptrBuf));
+      end;
+{$ENDC}
+
+  3:  (* exit *)
+
+      signal_sem(g_semBufPool);
+
+  end{proc GetNode};
+
+
+
+
+  {$S fs7 }
+  procedure  AllocNode (     ptrDCB : DCBptr;
+                         var ptrBuf : buffer_ptr;
+                         var ecode  : integer );
+
+  var
+       page   : longint;
+       actual : longint;
+       i      : integer;
+       ignore : boolean;
+
+  begin
+      ecode := 0;
+      (* Allocate NODE_BLKS contiguous disk pages *)
+      with ptrDCB^ do
+      begin
+        sallocate(ecode, dnum, page, actual, MDDFdata^.freestart, NODE_BLKS);
+        if ecode > 0 then exit(AllocNode);
+
+        (* Remove any allocated pages from the disk page cache *)
+        i := 3;
+        repeat
+          ignore := InVm(ptrDCB^.dnum, page+i, TRUE);
+          i := i - 1;
+        until i < 0;
+
+        wait_sem(semMDDF, []);
+        with MDDFdata^ do
+        begin
+          (* Update free block count and file system overhead for volume *)
+          freecount := freecount - NODE_BLKS;
+          fs_overhead := fs_overhead + NODE_BLKS;
+        end{with};
+        signal_sem(semMDDF);
+      end{with};
+
+      (* Allocate a buffer for the new node *)
+      GetNode(ptrDCB, page, FALSE, ptrBuf, ecode);
+  end{proc AllocNode};
+
+
+
+
+  {$S fs7 }
+  procedure  FreeNode ( ptrBuf : buffer_ptr );
+
+  var
+       ecode     : integer;
+       loclEcode : integer;
+
+  begin
+      (* Deallocate the disk pages *)
+      with ptrBuf^ do
+        deallocate(ecode, device, page, NODE_BLKS);
+
+      (* Clear the node on disk to make the Scavenger's job easier *)
+      ClearMem(ord(@ptrBuf^.Data), NODE_SIZE);
+      ptrBuf^.dirty := TRUE;
+
+      (* Commit the cleared node and rest of tree to disk *)
+      FlushNodes(ptrBuf^.device, FALSE, loclEcode);
+
+      with mounttable[ptrBuf^.device]^ do
+      begin
+        wait_sem(semMDDF, []);
+        with MDDFdata^ do
+        begin
+          (* Update free block count and file system overhead for volume *)
+          freecount := freecount + NODE_BLKS;
+          fs_overhead := fs_overhead - NODE_BLKS;
+        end{with};
+        signal_sem(semMDDF);
+      end{with};
+
+      FreeBuf(ptrBuf);
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('FreeNode');
+        write  ('  ptrBuf   '); PrHex(ord(ptrBuf)); PrBuff(ptrBuf);
+        writeln;
+      end;
+{$ENDC}
+  end{proc FreeNode};
+
+
+
+  {$S fs7 }
+  procedure  UpdateLinks (     ptrDCB   : DCBptr;
+                               page     : longint;
+                               backLink : longint;
+                               foreLink : longint;
+                           var ecode    : integer );
+
+  var
+       ptrBuf  : buffer_ptr;
+       ptrNode : node_ptr;
+
+  begin
+      GetNode(ptrDCB, page, TRUE {read}, ptrBuf, ecode);
+      if ecode > 0 then exit(UpdateLinks);
+      ptrNode := pointer(ord(@ptrBuf^.Data) + (NODE_SIZE - sizeof(NodeDesc)));
+      if backLink <> 0 then
+        ptrNode^.prior := backLink;
+      if foreLink <> 0 then
+        ptrNode^.next := foreLink;
+      ptrBuf^.dirty := TRUE;
+      FreeBuf(ptrBuf);
+  end{proc UpdateLinks};
+
+
+
+
+  {$S fs7 }
+  procedure  FirstRec (     ptrDCB   : DCBptr;
+                            ptrRec   : rec_ptr;
+                            size     : integer;
+                        var ecode    : integer );
+
+  var
+       ptrBuf   : buffer_ptr;
+       ptrNode  : node_ptr;
+       ptrOffst : offset_ptr;
+       ptrBase  : rec_ptr;
+
+  begin
+{$IFC DIRBUG}
+       if trace(FS,DIRLEVEL) then
+       begin
+         writeln('FirstRec');
+         PrEntry(@ptrRec^);
+         writeln('size      ',size);
+       end;
+{$ENDC}
+      ecode := 0;
+      (* Allocate the root node of the B-tree *)
+      AllocNode(ptrDCB, ptrBuf, ecode);
+      if ecode > 0 then exit(FirstRec);
+
+      (* Record the root node of the B-tree in the volume MDDF *)
+      ptrDCB^.MDDFdata^.root_page := ptrBuf^.page;
+      ptrDCB^.MDDFdata^.tree_depth := 1;
+      ptrDCB^.MDDFdirty := TRUE;
+
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+
+      (* Initialize the root node *)
+      with ptrNode^ do
+      begin
+        nkeys := 1;
+        next := BAD;
+        prior := BAD;
+        kind := leaf;
+        {$R-}
+        ptrOffst^[-1] := size;
+        ptrOffst^[0] := 0;
+        {$IFC DEBUG2} {$R+} {$ENDC}
+
+        (* Copy the first record into the node *)
+        MoveLt(ptrRec, ptrBase, size);
+      end{with};
+
+      (* Post the node to disk *)
+      Post(ptrBuf, ecode);
+      FreeBuf(ptrBuf);
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('>ecode    ',ecode);
+        writeln;
+      end;
+{$ENDC}
+  end{proc FirstRec};
+
+
+
+
+  {$S fs7 }
+  procedure  DeleteRec ( ptrBase  : rec_ptr;
+                         ptrOffst : offset_ptr;
+                         ptrNode  : node_ptr;
+                         index    : integer );
+
+  var
+       ptrDelOffst : ^integer;
+       ptrNxtOffst : ^integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('DeleteRec');
+        write  ('  ptrBase    '); PrlnHex(ord(ptrBase));
+        write  ('  ptrOffst   '); PrlnHex(ord(ptrOffst));
+        write  ('  ptrNode    '); PrHex(ord(ptrNode)); PrNode(ptrNode);
+        writeln('  index      ',index);
+        writeln;
+      end;
+{$ENDC}
+      {$R-}
+      (* Pointer to offset to deletion record *)
+      ptrDelOffst := @ptrOffst^[-index];
+      (* Pointer to offset to record following deletion record *)
+      ptrNxtOffst := pointer(ord(ptrDelOffst) - sizeof(integer));
+
+      (* Compact the remaining records/offsets and decrement key count *)
+      MoveLt(pointer(ord(ptrBase) + ptrNxtOffst^),
+             pointer(ord(ptrBase) + ptrDelOffst^),
+             ptrOffst^[-ptrNode^.nkeys] - ptrNxtOffst^);
+      ptrNode^.nkeys := ptrNode^.nkeys - 1;
+      MovrOffsets(@ptrNxtOffst^,
+                  @ptrDelOffst^,
+                  ptrNode^.nkeys - index,
+                  ptrDelOffst^ - ptrNxtOffst^);
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+  end{proc DeleteRec};
+
+
+
+
+  {$S fs7 }
+  procedure  SimpleInsert (     ptrRec : rec_ptr;
+                                size   : integer;
+                                ptrP   : page_ptr;
+                                ptrBuf : buffer_ptr;
+                                index  : integer;
+                            var result : boolean );
+
+  var
+       ptrBase   : rec_ptr;
+       ptrNode   : node_ptr;
+       ptrOffst  : offset_ptr;
+       used      : integer;
+       insOffset : integer;
+       ptrPg     : page_ptr;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('SimpleInsert');
+        write  ('  ptrRec   '); PrlnHex(ord(ptrRec));
+        writeln('  size     ',size);
+        write  ('  ptrP     '); PrHex(ord(ptrP)); write('     ptrP^ = '); PrPage(ptrP);
+        write  ('  ptrBuf   '); PrlnHex(ord(ptrBuf));
+        writeln('  index    ',index);
+        writeln;
+      end;
+{$ENDC}
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+      {$R-}
+      used := ptrOffst^[-ptrNode^.nkeys];
+      insOffset := ptrOffst^[-index];
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      if ( used + sizeof(NodeDesc) + (ptrNode^.nkeys + 2) * sizeof(integer)
+           + size ) <= NODE_SIZE then
+      begin
+        (*
+         *  Simple insertion.  Shuffle records/offsets to make a hole for
+         *  the new record.  Increment key count.
+         *)
+        MoveRt(pointer(ord(ptrBase) + insOffset),
+               pointer(ord(ptrBase) + insOffset + size),
+               used - insOffset);
+        {$R-}
+        MovlOffsets(@ptrOffst^[-ptrNode^.nkeys],
+                    @ptrOffst^[-ptrNode^.nkeys - 1],
+                    ptrNode^.nkeys - index,
+                    size);
+        {$IFC DEBUG2} {$R+} {$ENDC}
+        ptrNode^.nkeys := ptrNode^.nkeys + 1;
+        ptrPg := pointer(ord(ptrBase) + insOffset);
+
+        (*
+         *  Copy the new record into the node.  In index nodes, the record
+         *  is preceded by a page pointer.
+         *)
+        if ptrNode^.kind = leaf then
+          MoveLt(ptrRec, @ptrPg^, size)
+        else
+        begin
+          MoveLt(ptrRec, pointer(ord(ptrPg) + sizeof(longint)),
+                 size - sizeof(longint));
+          ptrPg^ := ptrP^;
+        end{if};
+
+        (* Tree has changed *)
+        TouchNode(ptrBuf);
+        ptrBuf^.dirty := TRUE;
+        result := TRUE;
+      end
+      else
+        (* Node cannot accomodate insertion of this record *)
+        result := FALSE;
+
+  end{proc SimpleInsert};
+
+
+
+
+(***********THIS PROCEDURE IS NOT REFERENCED**************
+
+  procedure  SimpleDelete (     page   : longint;
+                                index  : integer;
+                            var result : boolean );
+
+  var
+       ecode    : integer;
+       ptrBuf   : buffer_ptr;
+       ptrBase  : rec_ptr;
+       ptrNode  : node_ptr;
+       ptrOffst : offset_ptr;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('SimpleDelete');
+        writeln('  page    ',page);
+        writeln('  index   ',index);
+        writeln;
+      end;
+{$ENDC}
+
+      result := FALSE;
+      GetNode(ptrDCB, page, TRUE {read}, ptrBuf, ecode);
+      if ecode > 0 then exit(SimpleDelete);
+
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+
+      {$R-}
+      if (ptrOffst^[-ptrNode^.nkeys] - ptrOffst^[-index - 1] +
+          ptrOffst^[-index] + ((ptrNode^.nkeys + 1) * sizeof(integer)))
+          >=
+         ((NODE_SIZE - sizeof(NodeDesc)) div 2) then
+      begin
+        {* Simple deletion *}
+        DeleteRec(ptrBase, ptrOffst, ptrNode, index);
+        {* Tree has changed *}
+        TouchNode(ptrBuf);
+        ptrBuf^.dirty := TRUE;
+        result := TRUE;
+      end;
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      {* else record deletion will cause underflow *}
+
+      FreeBuf(ptrBuf);
+  end{proc SimpleDelete};
+***************************************)
+
+
+
+
+  {$S fs7 }
+  procedure  MergeNodes (     ptrLftBuf : buffer_ptr;
+                              ptrRgtBuf : buffer_ptr;
+                          var result    : boolean );
+
+  var
+       ptrLftBase  : rec_ptr;
+       ptrRgtBase  : rec_ptr;
+       ptrLftNode  : node_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrLftOffst : offset_ptr;
+       ptrRgtOffst : offset_ptr;
+       ptrLftUsed  : ^integer;
+       ptrRgtUsed  : ^integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('MergeNodes');
+        write  ('  ptrLftBuf   '); PrHex(ord(ptrLftBuf)); PrBuff(ptrLftBuf);
+        write  ('  ptrRgtBuf   '); PrHex(ord(ptrRgtBuf)); PrBuff(ptrRgtBuf);
+        writeln;
+      end;
+{$ENDC}
+
+      (* Enter with left and right nodes locked *)
+
+      ptrLftBase := @ptrLftBuf^.Data;
+      ptrRgtBase := @ptrRgtBuf^.Data;
+      ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+      ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+
+      {$R-}
+      (* Get a pointer to the greatest offset (bytes used) in each node *)
+      ptrLftUsed := @ptrLftOffst^[-ptrLftNode^.nkeys];
+      ptrRgtUsed := @ptrRgtOffst^[-ptrRgtNode^.nkeys];
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      (*
+       *  Calculate the size of the node that would result from a merge,
+       *  and compare to the maximum node size.
+       *)
+      if (ptrLftUsed^ + ptrRgtUsed^ +
+          ((ptrLftNode^.nkeys + ptrRgtNode^.nkeys + 1) * sizeof(integer)))
+           >
+         (NODE_SIZE - sizeof(NodeDesc)) then
+      begin
+        (* Resulting node is too big; merge cannot be done *)
+        result := FALSE;
+      end
+      else
+      begin
+        (* Perform the merge; left and right nodes will be dirtied *)
+        TouchNode(ptrLftBuf);
+        ptrLftBuf^.dirty := TRUE;
+        TouchNode(ptrRgtBuf);
+        ptrRgtBuf^.dirty := TRUE;
+        result := TRUE;
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln('LEFT NODE (BEFORE MERGE)');
+          ShowNode(ptrLftBuf);
+          writeln('RIGHT NODE (BEFORE MERGE)');
+          ShowNode(ptrRgtBuf);
+        end;
+{$ENDC}
+        if ptrRgtUsed^ <> 0 then
+        begin
+          (*
+           *  Move all records in the right node into the left node.  Adjust
+           *  the key count in the left node accordingly.
+           *)
+          MoveLt(ptrRgtBase,
+                 pointer(ord(ptrLftBase) + ptrLftUsed^),
+                 ptrRgtUsed^);
+          MovrOffsets(pointer(ord(ptrRgtOffst) - sizeof(integer)),
+                      pointer(ord(ptrLftUsed) - sizeof(integer)),
+                      ptrRgtNode^.nkeys - 1,
+                      ptrLftUsed^);
+          ptrLftNode^.nkeys := ptrLftNode^.nkeys + ptrRgtNode^.nkeys;
+{$IFC DIRBUG}
+          if trace(FS,DIRLEVEL) then
+          begin
+            writeln('LEFT NODE (AFTER MERGE)');
+            ShowNode(ptrLftBuf);
+          end;
+{$ENDC}
+        end{if};
+      end{if};
+
+      (* Exit with left and right nodes locked *)
+
+  end{proc MergeNodes};
+
+
+
+  {$S fs7 }
+  procedure  OneRotate ( ptrSrcBase  : rec_ptr;
+                         ptrSrcOffst : offset_ptr;
+                         srcIndex    : integer;
+                         dstIndex    : integer;
+                         ptrDstBuf   : buffer_ptr );
+
+  var
+       ptrDstBase   : rec_ptr;
+       ptrDstNode   : node_ptr;
+       ptrDstOffst  : offset_ptr;
+       insOffset    : integer;
+       size         : integer;
+       nkeys        : integer;
+       ptrDstUsed   : ^integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('OneRotate');
+        write  ('  ptrSrcBase    '); PrlnHex(ord(ptrSrcBase));
+        write  ('  ptrSrcOffst   '); PrlnHex(ord(ptrSrcOffst));
+        writeln('  srcIndex      ',srcIndex);
+        writeln('  dstIndex      ',dstIndex);
+        write  ('  ptrDstBuf     '); PrHex(ord(ptrDstBuf)); PrBuff(ptrDstBuf);
+        writeln;
+      end;
+{$ENDC}
+
+      ptrDstBase := @ptrDstBuf^.Data;
+      ptrDstNode := pointer(ord(ptrDstBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrDstOffst := pointer(ord(ptrDstNode) - sizeof(integer));
+
+      {$R-}
+      insOffset := ptrDstOffst^[-dstIndex];
+      size := ptrSrcOffst^[-srcIndex - 1] - ptrSrcOffst^[-srcIndex];
+      nkeys := ptrDstNode^.nkeys;
+      ptrDstUsed := @ptrDstOffst^[-nkeys];
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      (*  Make a hole for the rotation record in the destination node *)
+      MoveRt(pointer(ord(ptrDstBase) + insOffset),
+             pointer(ord(ptrDstBase) + insOffset + size),
+             ptrDstUsed^ - insOffset);
+      MovlOffsets(@ptrDstUsed^,
+                  pointer(ord(ptrDstUsed) - sizeof(integer)),
+                  nkeys - dstIndex,
+                  size);
+      {$R-}
+      (* Rotate the record from the source node into the destination node *)
+      MoveLt(pointer(ord(ptrSrcBase) + ptrSrcOffst^[-srcIndex]),
+             pointer(ord(ptrDstBase) + ptrDstOffst^[-dstIndex]),
+             size);
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      (*
+       *  Update the key count in the destination node.  Note that the
+       *  key count in the source node must also be updated.
+       *)
+      ptrDstNode^.nkeys := nkeys + 1;
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('DESTINATION NODE');
+        ShowNode(ptrDstBuf);
+      end;
+{$ENDC}
+  end{proc OneRotate};
+
+
+
+  {$S fs7 }
+  procedure  ManyRotates (     ptrLftBuf : buffer_ptr;
+                               ptrRgtBuf : buffer_ptr;
+                               rotPt     : integer;
+                           var undoPt    : integer );
+
+  var
+       ptrRgtBase  : rec_ptr;
+       ptrLftBase  : rec_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrLftNode  : node_ptr;
+       ptrRgtOffst : offset_ptr;
+       ptrLftOffst : offset_ptr;
+       leftKeys    : integer;
+       rightKeys   : integer;
+       oldLeftKeys : integer;
+       oldRightKeys : integer;
+       ptrLftUsed   : ^integer;
+       ptrRgtUsed   : ^integer;
+       ptrLftNewUsed : ^integer;
+       rotateCount  : integer;
+       rotSize      : integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('ManyRotates');
+        write  ('  ptrLftBuf   '); PrHex(ord(ptrLftBuf)); PrBuff(ptrLftBuf);
+        write  ('  ptrRgtBuf   '); PrHex(ord(ptrRgtBuf)); PrBuff(ptrRgtBuf);
+        writeln('  rotPt       ',rotPt);
+        writeln;
+      end;
+{$ENDC}
+      ptrRgtBase := @ptrRgtBuf^.Data;
+      ptrLftBase := @ptrLftBuf^.Data;
+      ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+      ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+
+      oldLeftKeys := ptrLftNode^.nkeys;
+      oldRightKeys := ptrRgtNode^.nkeys;
+      undoPt := oldLeftKeys - 1;
+      rightKeys := oldRightKeys + oldLeftKeys - rotPt - 1;
+      rotateCount := oldRightKeys - rightKeys;
+
+      {$R-}
+      ptrLftUsed := @ptrLftOffst^[-oldLeftKeys];
+      ptrRgtUsed := @ptrRgtOffst^[-oldRightKeys];
+      ptrLftNewUsed := @ptrLftOffst^[-oldLeftKeys - rotateCount];
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      if rotateCount > 0 then
+      begin
+        (* Rotate right to left *)
+        {$R-}
+        rotSize := ptrRgtOffst^[-rotateCount];
+        {$IFC DEBUG2} {$R+} {$ENDC}
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln('right to left  rotSize = ',rotSize);
+        end;
+{$ENDC}
+        (* Copy the records from the right node to the left node *)
+        MoveLt(ptrRgtBase,
+               pointer(ord(ptrLftBase) + ptrLftUsed^),
+               rotSize);
+        MovrOffsets(pointer(ord(ptrRgtOffst) - sizeof(integer)),
+                    pointer(ord(ptrLftUsed) - sizeof(integer)),
+                    rotateCount - 1,
+                    ptrLftUsed^);
+
+        (* Close-up the hole left in the right node by the exiting records *)
+        MoveLt(pointer(ord(ptrRgtBase) + rotSize),
+               ptrRgtBase,
+               ptrRgtUsed^ - rotSize);
+        {$R-}
+        MovrOffsets(@ptrRgtOffst^[-rotateCount],
+                    ptrRgtOffst,
+                    rightKeys,
+                    -rotSize);
+        {$IFC DEBUG2} {$R+} {$ENDC}
+      end
+      else if rotateCount < 0 then
+      begin
+        (* Rotate left to right *)
+        rotateCount := -rotateCount;
+        rotSize := ptrLftUsed^ - ptrLftNewUsed^;
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln('left to right  rotSize = ',rotSize);
+        end;
+{$ENDC}
+        (* Make a hole in the right node for the rotation records *)
+        MoveRt(ptrRgtBase,
+               pointer(ord(ptrRgtBase) + rotSize),
+               ptrRgtUsed^);
+        {$R-}
+        MovlOffsets(@ptrRgtUsed^,
+                    @ptrRgtOffst^[-rightKeys],
+                    oldRightKeys,
+                    rotSize);
+        {$IFC DEBUG2} {$R+} {$ENDC}
+
+        (* Copy the records from the left node to the right node *)
+        MoveLt(pointer(ord(ptrLftBase) + ptrLftNewUsed^),
+               ptrRgtBase,
+               rotSize);
+        MovrOffsets(@ptrLftNewUsed^,
+                    ptrRgtOffst,
+                    rotateCount - 1,
+                    -ptrLftNewUsed^);
+      end{if};
+
+      (* Update the key count in each node and mark each node dirty *)
+      ptrRgtNode^.nkeys := rightKeys;
+      ptrLftNode^.nkeys := rotPt + 1;
+      TouchNode(ptrLftBuf);
+      ptrLftBuf^.dirty := TRUE;
+      TouchNode(ptrRgtBuf);
+      ptrRgtBuf^.dirty := TRUE;
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('LEFT NODE (AFTER ROTATE)');
+        ShowNode(ptrLftBuf);
+        writeln('RIGHT NODE (AFTER ROTATE)');
+        ShowNode(ptrRgtBuf);
+        writeln('  undoPt>     ',undoPt);
+        writeln;
+      end;
+{$ENDC}
+  end{proc ManyRotates};
+
+
+
+  {$S fs7 }
+  function  Solomon (      index     : integer;
+                       var leftSize  : integer;
+                       var rightSize : integer;
+                       function SizeofRec( virtIndex : integer ) : integer )
+                       : integer;
+  label 1;
+
+  var
+       newLeft  : integer;
+       newRight : integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Solomon');
+        writeln('  index       ',index);
+        writeln('  leftSize    ',leftSize);
+        writeln('  rightSize   ',rightSize);
+      end;
+{$ENDC}
+      repeat
+        if leftSize < rightSize then
+        begin
+          (* Simulate moving record from right side to left side *)
+          newLeft := leftSize + SizeofRec(index + 1);
+          newRight := rightSize - SizeofRec(index + 1);
+          if abs(newRight - newLeft) < (rightSize - leftSize) then
+            index := index + 1
+          else goto 1;
+        end
+        else if leftSize > rightSize then
+        begin
+          (* Simulate moving record from left side to right side *)
+          newLeft := leftSize - SizeofRec(index);
+          newRight := rightSize + SizeofRec(index);
+          if abs(newRight - newLeft) < (leftSize - rightSize) then
+            index := index - 1
+          else goto 1;
+        end
+        else goto 1;  (* leftSize = rightSize *)
+
+        leftSize := newLeft;
+        rightSize := newRight;
+      until FALSE;  (* forever *)
+
+  1:
+      Solomon := index;
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('  leftSize>   ',leftSize);
+        writeln('  rightSize>  ',rightSize);
+        writeln('  (ret)>      ',index);
+        writeln;
+      end;
+{$ENDC}
+  end{func Solomon};
+
+
+
+  {$S fs7 }
+  procedure  SplitPoint (     ptrOffst   : offset_ptr;
+                              nkeys      : integer;
+                              index      : integer;
+                              size       : integer;
+                          var splitIndex : integer );
+
+  var
+       leftSize  : integer;
+       rightSize : integer;
+       mid       : integer;
+
+       function  SizeofRec ( i : integer ) : integer;
+       begin
+           {$R-}
+           if i < index then
+             SizeofRec := ptrOffst^[-i-1] - ptrOffst^[-i]
+           else if i = index then
+             SizeofRec := size
+           else
+             SizeofRec := ptrOffst^[-i] - ptrOffst^[-i+1];
+           {$IFC DEBUG2} {$R+} {$ENDC}
+       end{func SizeofRec};
+
+  begin
+{$IFC DIRBUG}
+       if trace(FS,DIRLEVEL) then
+       begin
+         writeln;
+         writeln('SplitPoint');
+         write  ('  ptrOffst     '); PrlnHex(ord(ptrOffst));
+         writeln('  nkeys        ',nkeys);
+         writeln('  index        ',index);
+         writeln('  size         ',size);
+       end;
+{$ENDC}
+      mid := (nkeys + 1) div 2;
+      (* Compute size of left page of middle split *)
+      {$R-}
+      if mid < index then
+        leftSize := ptrOffst^[-mid-1]  { -(mid+1) }
+      else
+        leftSize := ptrOffst^[-mid] + size;  (* include insertion record *)
+
+      (* Compute size of right page of middle split *)
+      rightSize := ptrOffst^[-nkeys] + size - leftSize;
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      (* Compute how the real split should occur *)
+      splitIndex := Solomon(mid, leftSize, rightSize, SizeofRec);
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('  splitIndex>  ',splitIndex);
+        writeln;
+      end;
+{$ENDC}
+  end{proc SplitPoint};
+
+
+
+
+  {$S fs7 }
+  function  RotatePoint (     ptrLftBuf  : buffer_ptr;
+                              ptrRgtBuf  : buffer_ptr;
+                              ptrInsBuf  : buffer_ptr;
+                              size       : integer;
+                          var index      : integer ) : integer;
+  var
+       ptrRgtNode  : node_ptr;
+       ptrLftNode  : node_ptr;
+       ptrRgtOffst : offset_ptr;
+       ptrLftOffst : offset_ptr;
+       leftKeys    : integer;
+       rightKeys   : integer;
+       i           : integer;
+       leftSize    : integer;
+       rightSize   : integer;
+       virtIndex   : integer;
+
+
+       function  SizeofRec ( i : integer ) : integer;
+       begin
+           if i < virtIndex then
+           begin
+             {$R-}
+             if i < leftKeys then
+               SizeofRec := ptrLftOffst^[-i-1] - ptrLftOffst^[-i]
+             else
+               SizeofRec := ptrRgtOffst^[-i+leftKeys-1] -
+                                                  ptrRgtOffst^[-i+leftKeys];
+             {$IFC DEBUG2} {$R+} {$ENDC}
+           end
+           else if i = virtIndex then
+             SizeofRec := size
+           else
+           begin  (* i > virtIndex *)
+             i := i - 1;
+             {$R-}
+             if i < leftKeys then
+               SizeofRec := ptrLftOffst^[-i-1] - ptrLftOffst^[-i]
+             else
+               SizeofRec := ptrRgtOffst^[-i+leftKeys-1] -
+                                                  ptrRgtOffst^[-i+leftKeys];
+             {$IFC DEBUG2} {$R+} {$ENDC}
+           end{if};
+       end{func SizeofRec};
+
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('RotatePoint');
+        write  ('  ptrLftBuf   '); PrHex(ord(ptrLftBuf)); PrBuff(ptrLftBuf);
+        write  ('  ptrRgtBuf   '); PrHex(ord(ptrRgtBuf)); PrBuff(ptrRgtBuf);
+        write  ('  ptrInsBuf   '); PrHex(ord(ptrInsBuf)); PrBuff(ptrInsBuf);
+        writeln('  size        ',size);
+        writeln;
+      end;
+{$ENDC}
+      ptrRgtNode := pointer(ord(@ptrRgtBuf^.Data) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+      ptrLftNode := pointer(ord(@ptrLftBuf^.Data) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+      leftKeys := ptrLftNode^.nkeys;
+      rightKeys := ptrRgtNode^.nkeys;
+      i := leftKeys - 1;
+      {$R-}
+      leftSize := ptrLftOffst^[-leftKeys];
+      rightSize := leftSize + ptrRgtOffst^[-rightKeys] + size;
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+      if ptrInsBuf = ptrRgtBuf then
+        (* Insertion point is in right node *)
+        virtIndex := index + leftKeys
+      else
+      begin
+        (* Insertion point is in left node *)
+        virtIndex := index;
+        i := i + 1;
+        leftSize := leftSize + size;  (* include insertion record *)
+      end{if};
+
+      (* Compute the index of the rotation *)
+      rightSize := rightSize - leftSize;
+      i := Solomon(i, leftSize, rightSize, SizeofRec);
+
+      (* If either node will overflow, the rotate is not possible *)
+      if ((((i + 2) * 2) + leftSize) > (NODE_SIZE - sizeof(NodeDesc))) or
+         ((((leftKeys + rightKeys + 1 - i) * 2) + rightSize) >
+                    (NODE_SIZE - sizeof(NodeDesc))) then   i := -1;
+
+      RotatePoint := i;
+      if i >= 0 then index := virtIndex;
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('  index>        ',index);
+        writeln('  (ret)>        ',i);
+        writeln;
+      end;
+{$ENDC}
+  end{func RotatePoint};
+
+
+
+
+  {$S fs7 }
+  procedure  Siblings (     ptrDCB   : DCBptr;
+                            level    : integer;
+                        var rightSib : longint;
+                        var leftSib  : longint;
+                        var ecode    : integer );
+
+  var
+       ptrStack : stack_ptr;
+       ptrBuf   : buffer_ptr;
+       ptrPg    : page_ptr;
+       ptrBase  : rec_ptr;
+       ptrOffst : offset_ptr;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Siblings');
+        writeln('  level       ',level);
+      end;
+{$ENDC}
+      ecode := 0;
+      if level > 1 then
+      begin
+        (* Stack frame describing parent node *)
+        ptrStack := @NodeStack[level - 1];
+        if ptrStack^.nkeys = 1 then
+        begin
+          (* One key in parent indicates only one child exists *)
+          leftSib := BAD;
+          rightSib := BAD;
+        end
+        else
+        begin
+          (* Read the parent node; should be cooling in a buffer *)
+          GetNode(ptrDCB, ptrStack^.page, TRUE {read}, ptrBuf, ecode);
+          if ecode > 0 then exit(Siblings);
+
+          ptrBase := @ptrBuf^.Data;
+          ptrOffst := pointer(ord(ptrBase) +
+                              (NODE_SIZE - sizeof(NodeDesc) - sizeof(integer)));
+
+          (* See if node is the rightmost node at this level in the tree *)
+          if ptrStack^.index = (ptrStack^.nkeys - 1) then
+            rightSib := BAD
+          else
+          begin
+            (* Extract page pointer (to sibling) from parent node *)
+            {$R-}
+            ptrPg := pointer(ord(ptrBase) + ptrOffst^[-ptrStack^.index - 1]);
+            {$IFC DEBUG2} {$R+} {$ENDC}
+            rightSib := ptrPg^;
+          end{if};
+
+          (* See if node is the leftmost node at this level in the tree *)
+          if ptrStack^.index = 0 then
+            leftSib := BAD
+          else
+          begin
+            (* Extract page pointer (to sibling) from parent node *)
+            {$R-}
+            ptrPg := pointer(ord(ptrBase) + ptrOffst^[-ptrStack^.index + 1]);
+            {$IFC DEBUG2} {$R+} {$ENDC}
+            leftSib := ptrPg^;
+          end{if};
+        end{if};
+
+        FreeBuf(ptrBuf);
+      end
+      else
+      begin
+        (* Root node has no siblings *)
+        leftSib := BAD;
+        rightSib := BAD;
+      end{if};
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln('  leftSib>    ',leftSib);
+        writeln('  rightSib>   ',rightSib);
+        writeln;
+      end;
+{$ENDC}
+  end{proc Siblings};
+
+
+
+
+  {$S fs7 }
+  procedure  Split_Rotate (     ptrDCB      : DCBptr;
+                                ptrRec      : rec_ptr;
+                                size        : integer;
+                                ptrP        : page_ptr;
+                                index       : integer;
+                                ptrBuf      : buffer_ptr;
+                                leftSib     : longint;
+                                rightSib    : longint;
+                                ptrStack    : stack_ptr;
+                            var ptrSibBuf   : buffer_ptr;
+                            var insPage     : longint;
+                            var insIndex    : integer;
+                            var rotPage     : longint;
+                            var result      : Transform;
+                            var ecode       : integer );
+
+  label   1;
+
+  var
+       rotPt     : integer;
+       ptrBase   : rec_ptr;
+       ptrNode   : node_ptr;
+       ptrOffst  : offset_ptr;
+       ptrRgtBuf   : buffer_ptr;
+       ptrSibBase  : rec_ptr;
+       ptrSibNode  : node_ptr;
+       ptrSibOffst : offset_ptr;
+       insOffset  : integer;
+       splitIndex : integer;
+       ptrCpyOffst : ^integer;
+       ptrHole    : page_ptr;
+       aftIndex   : integer;
+       used       : integer;
+       ptrTmpBuf  : buffer_ptr;
+       ptrTmpNode : node_ptr;
+       ptrPg      : page_ptr;
+       ptrRotBuf  : buffer_ptr;
+       ptrLftBuf  : buffer_ptr;
+       undoPt     : integer;
+       sibLock    : boolean;
+       done       : boolean;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Split_Rotate');
+        write  ('  ptrRec    '); PrHex(ord(ptrRec)); PrKey(@ptrRec^);
+        writeln('  size      ',size);
+        write  ('  ptrP      '); PrHex(ord(ptrP)); write('     ptrP^ = '); PrPage(ptrP);
+        writeln('  index     ',index);
+        write  ('  ptrBuf    '); PrHex(ord(ptrBuf)); PrBuff(ptrBuf);
+        writeln('  leftSib   ',leftSib);
+        writeln('  rightSib  ',rightSib);
+        write  ('  ptrStack  '); PrlnHex(ord(ptrStack));
+        writeln(chr(7)); readln;
+      end;
+{$ENDC}
+      rotPt := BAD;
+      rotPage := leftSib;
+      sibLock := FALSE;
+
+      if leftSib <> BAD then
+      begin
+        (* Fetch left node and compute rotate point *)
+        GetNode(ptrDCB, leftSib, TRUE {read}, ptrLftBuf, ecode);
+        if ecode > 0 then goto 1;
+        rotPt := RotatePoint(ptrLftBuf, ptrBuf, ptrBuf, size, index);
+        if rotPt < 0 then
+          FreeBuf(ptrLftBuf)
+        else
+        begin
+          ptrSibBuf := ptrLftBuf;
+          sibLock := TRUE;
+          ptrRgtBuf := ptrBuf;
+        end{if};
+      end{if};
+
+      if (rightSib <> BAD) and (rotPt < 0) then
+      begin
+        (* Fetch right node and compute rotate point *)
+        GetNode(ptrDCB, rightSib, TRUE {read}, ptrRgtBuf, ecode);
+        if ecode > 0 then goto 1;
+        rotPt := RotatePoint(ptrBuf, ptrRgtBuf, ptrBuf, size, index);
+        if rotPt < 0 then
+          FreeBuf(ptrRgtBuf)
+        else
+        begin
+          ptrSibBuf := ptrRgtBuf;
+          sibLock := TRUE;
+          ptrLftBuf := ptrBuf;
+          rotPage := rightSib;
+        end{if};
+      end{if};
+
+      if rotPt >= 0 then
+      begin
+        (******************************)
+        (*           Rotate           *)
+        (******************************)
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln;
+          writeln('LEFT NODE (BEFORE ROTATE)');
+          ShowNode(ptrLftBuf);
+          writeln('RIGHT NODE (BEFORE ROTATE)');
+          ShowNode(ptrRgtBuf);
+        end;
+{$ENDC}
+        if index <= rotPt then
+        begin
+          ptrRotBuf := ptrLftBuf;
+          rotPt := rotPt - 1;
+        end
+        else
+        begin
+          ptrRotBuf := ptrRgtBuf;
+          index := index - rotPt - 1;
+        end{if};
+
+        (* Dirties both buffers *)
+        ManyRotates(ptrLftBuf, ptrRgtBuf, rotPt, undoPt);
+
+        ptrBase := @ptrRotBuf^.Data;
+        ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+        {$R-}
+        insOffset := ptrOffst^[-index];
+        {$IFC DEBUG2} {$R+} {$ENDC}
+        insPage := ptrRotBuf^.page;
+        insIndex := index;
+        ptrPg := pointer(ord(ptrBase) + insOffset);
+
+        (*
+         *  Perform the insert operation that originally caused the rotation.
+         *  First make a hole in the target node.
+         *)
+        {$R-}
+        MoveRt(pointer(ord(ptrPg)),
+               pointer(ord(ptrPg) + size),
+               ptrOffst^[-ptrNode^.nkeys] - insOffset);
+        MovlOffsets(@ptrOffst^[-ptrNode^.nkeys],
+                    @ptrOffst^[-ptrNode^.nkeys - 1],
+                    ptrNode^.nkeys - index,
+                    size);
+        {$IFC DEBUG2} {$R+} {$ENDC}
+
+        (*
+         *  Copy the record into the target node and increment the key count.
+         *  Index records are accompanied by a page pointer.
+         *)
+        ptrNode^.nkeys := ptrNode^.nkeys + 1;
+        if ptrNode^.kind = nonleaf then
+        begin
+          MoveLt(ptrRec,
+                 pointer(ord(ptrPg) + sizeof(longint)),
+                 size - sizeof(longint));
+          ptrPg^ := ptrP^;
+        end
+        else
+          MoveLt(ptrRec,
+                 pointer(ord(ptrPg)),
+                 size);
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln;
+          writeln('LEFT NODE (AFTER ROTATE)');
+          ShowNode(ptrLftBuf);
+          writeln('RIGHT NODE (AFTER ROTATE)');
+          ShowNode(ptrRgtBuf);
+        end;
+{$ENDC}
+        FreeBuf(ptrLftBuf);
+        ptrBuf := ptrRgtBuf;
+        ptrSibBuf := ptrBuf;
+        result := key_rotate;  (* rotate was done *)
+      end
+      else
+      begin
+        (******************************)
+        (*           Split            *)
+        (******************************)
+        ptrBase := @ptrBuf^.Data;
+        ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+        {$R-}
+        used := ptrOffst^[-ptrNode^.nkeys];
+        insOffset := ptrOffst^[-index];
+        {$IFC DEBUG2} {$R+} {$ENDC}
+
+        (* Allocate the new node *)
+        AllocNode(ptrDCB, ptrSibBuf, ecode);
+        if ecode > 0 then goto 1;
+
+        ptrSibBase := @ptrSibBuf^.Data;
+        ptrSibNode := pointer(ord(ptrSibBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrSibOffst := pointer(ord(ptrSibNode) - sizeof(integer));
+
+        (*
+         *  Compute split point:  splitIndex is the highest record number
+         *  that will go in the left page, taking into account that an
+         *  insertion is happening.
+         *)
+        SplitPoint(ptrOffst, ptrNode^.nkeys, index, size, splitIndex);
+        ptrSibNode^.nkeys := ptrNode^.nkeys - splitIndex;
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln('NODE (BEFORE SPLIT)');
+          ShowNode(ptrBuf);
+        end;
+{$ENDC}
+        if index <= splitIndex then
+        begin
+          (*
+           *  New entry is inserted into original node
+           *)
+          insPage := ptrBuf^.page;
+          insIndex := index;
+          {$R-}
+          (* pointer to offset to first record copied out of original node *)
+          ptrCpyOffst := @ptrOffst^[-splitIndex];
+          {$IFC DEBUG2} {$R+} {$ENDC}
+
+          (* Copy right half of original node into new node *)
+          MoveLt(pointer(ord(ptrBase) + ptrCpyOffst^),
+                 ptrSibBase,
+                 used - ptrCpyOffst^);
+          (* Copy right half of offsets *)
+          MovrOffsets(@ptrCpyOffst^,
+                      ptrSibOffst,
+                      ptrSibNode^.nkeys,
+                      -ptrCpyOffst^);
+
+          (* Make a hole for the insertion record in the original node *)
+          MoveRt(pointer(ord(ptrBase) + insOffset),
+                 pointer(ord(ptrBase) + insOffset + size),
+                 ptrCpyOffst^ - insOffset);
+          {$R-}
+          MovlOffsets(@ptrCpyOffst^,
+                      @ptrOffst^[-splitIndex - 1],
+                      splitIndex - index,
+                      size);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+
+          (* Pointer to hole for insertion record *)
+          ptrHole := pointer(ord(ptrBase) + insOffset);
+        end
+        else
+        begin
+          (*
+           *  New entry is inserted into new node
+           *)
+          aftIndex := index - splitIndex;  (* number of records copied *)
+          insPage := ptrSibBuf^.page;
+          insIndex := aftIndex - 1;
+          {$R-}
+          (* Pointer to offset to first record copied out of original node *)
+          ptrCpyOffst := @ptrOffst^[-splitIndex - 1];
+          {$IFC DEBUG2} {$R+} {$ENDC}
+
+          (* Copy records (from original node) up to insertion point *)
+          MoveLt(pointer(ord(ptrBase) + ptrCpyOffst^),
+                 ptrSibBase,
+                 insOffset - ptrCpyOffst^);
+          MovrOffsets(@ptrCpyOffst^,
+                      ptrSibOffst,
+                      insIndex,
+                      -ptrCpyOffst^);
+
+          {$R-}
+          (* Copy records after insertion point *)
+          MovrOffsets(@ptrOffst^[-index],
+                      @ptrSibOffst^[-aftIndex],
+                      ptrSibNode^.nkeys - aftIndex,
+                      -ptrCpyOffst^ + size);
+          MoveLt(pointer(ord(ptrBase) + insOffset),
+                 pointer(ord(ptrSibBase) + ptrSibOffst^[-aftIndex]),
+                 used - insOffset);
+
+          ptrHole := pointer(ord(ptrSibBase) + ptrSibOffst^[-insIndex]);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+        end{if};
+
+        ptrNode^.nkeys := splitIndex + 1;
+
+        (* Copy in the insertion record *)
+        if ptrNode^.kind = nonleaf then
+        begin
+          MoveLt(ptrRec,
+                 pointer(ord(ptrHole) + sizeof(longint)),
+                 size - sizeof(longint));
+          ptrHole^ := ptrP^;
+        end
+        else
+          MoveLt(ptrRec,
+                 pointer(ord(ptrHole)),
+                 size);
+
+        if ptrNode^.kind = leaf then with ptrSibNode^ do
+        begin
+          next := ptrNode^.next;  (* next node is original node's right sibling *)
+          prior := ptrBuf^.page;  (* original node is prior node *)
+          kind := leaf;
+        end
+        else
+          ptrSibNode^.kind := nonleaf;
+
+        (* Write the new node to disk *)
+        Post(ptrSibBuf, ecode);
+        if ecode > 0 then
+        begin
+          (*
+           *  Unsplit (cross fingers).
+           *  First delete the inserted record.
+           *)
+          if index < ptrNode^.nkeys then
+            DeleteRec(ptrBase, ptrOffst, ptrNode, index)
+          else
+            DeleteRec(ptrSibBase, ptrSibOffst, ptrSibNode, index - ptrNode^.nkeys);
+          MergeNodes(ptrBuf, ptrSibBuf, done);
+          FreeNode(ptrSibBuf);
+          goto 1;
+        end{if};
+
+        ptrBuf^.dirty := TRUE;
+        TouchNode(ptrBuf);
+
+        (* Record the split on the node stack (in case we have to back out) *)
+        with ptrStack^ do
+        begin
+          leftSplit := ptrBuf^.page;
+          rightSplit := ptrSibBuf^.page;
+        end{with};
+
+        (* Patch prior and next node links *)
+        if ptrNode^.kind = leaf then
+        begin
+          if ptrNode^.next <> BAD then
+            UpdateLinks(ptrDCB, ptrNode^.next, ptrSibBuf^.page, 0, ecode);
+            (* Must patch backlink of original node's erstwhile right sibling *)
+          ptrNode^.next := ptrSibBuf^.page;
+        end{if};
+
+        result := node_split;  (* split was done *)
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+        begin
+          writeln;
+          writeln('LEFT NODE (AFTER SPLIT)');
+          ShowNode(ptrBuf);
+          writeln('RIGHT NODE (AFTER SPLIT)');
+          ShowNode(ptrSibBuf);
+        end;
+{$ENDC}
+      end{if};  (* split *)
+
+1:
+  if ecode > 0 then
+  begin
+    FreeBuf(ptrBuf);
+    if sibLock then FreeBuf(ptrSibBuf);
+    result := flame_out;  (* operation aborted *)
+  end{if};
+
+  end{proc Split_Rotate};
+
+
+
+
+
+  {$S fs7 }
+  function  RealDelete (     ptrDCB    : DCBptr;
+                             ptrBuf    : buffer_ptr;
+                             index     : integer;
+                             sibling   : longint;
+                         var ptrRgtBuf : buffer_ptr;
+                         var delPage   : longint;
+                         var delIndex  : integer ) : Transform;
+
+  var
+       ptrBase  : rec_ptr;
+       ptrNode  : node_ptr;
+       ptrOffst : offset_ptr;
+       halfNode : integer;
+       ecode    : integer;
+       ptrTmpBuf  : buffer_ptr;
+       ptrTmpNode : node_ptr;
+       ptrLftNode  : node_ptr;
+       ptrLftBuf   : buffer_ptr;
+       ptrLftBase  : rec_ptr;
+       ptrLftOffst : offset_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrRgtBase  : rec_ptr;
+       ptrRgtOffst : offset_ptr;
+       leftKeys    : integer;
+       result      : boolean;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('RealDelete');
+        write  ('  ptrBuf       '); PrHex(ord(ptrBuf)); PrBuff(ptrBuf);
+        writeln('  index        ',index);
+        writeln('  sibling      ',sibling);
+        writeln;
+      end;
+{$ENDC}
+      ecode := 0;
+      ptrRgtBuf := pointer(BAD);
+
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+
+      (* Delete the record at index *)
+      DeleteRec(ptrBase, ptrOffst, ptrNode, index);
+      TouchNode(ptrBuf);
+      ptrBuf^.dirty := TRUE;
+
+      halfNode := (NODE_SIZE - sizeof(NodeDesc)) div 2;
+
+      {$R-}
+      if ((ptrOffst^[-ptrNode^.nkeys] + ((ptrNode^.nkeys + 1) * sizeof(integer)))
+          < halfNode) and
+         (sibling <> BAD) then
+      begin
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          writeln('underflow:  sibling = ',sibling);
+{$ENDC}
+        (* Underflow, and deletion node has a sibling *)
+        if ptrNode^.next = sibling then
+        begin
+          (* Sibling is the right node, deletion node is the left *)
+          ptrLftBuf := ptrBuf;
+          GetNode(ptrDCB, sibling, TRUE {read}, ptrRgtBuf, ecode);
+        end
+        else
+        begin
+          (* Sibling is the left node, deletion node is the right *)
+          ptrRgtBuf := ptrBuf;
+          GetNode(ptrDCB, sibling, TRUE {read}, ptrLftBuf, ecode);
+        end{if};
+
+        if ecode > 0 then
+        begin
+          FreeBuf(ptrBuf);
+          exit(RealDelete);
+        end;
+
+        ptrLftBase := @ptrLftBuf^.Data;
+        ptrRgtBase := @ptrRgtBuf^.Data;
+        ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+        ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+        leftKeys := ptrLftNode^.nkeys;
+
+        (* Merge the sibling nodes into one node *)
+        MergeNodes(ptrLftBuf, ptrRgtBuf, result);
+        TouchNode(ptrLftBuf);
+        ptrLftBuf^.dirty := TRUE;
+        TouchNode(ptrRgtBuf);
+        ptrRgtBuf^.dirty := TRUE;
+        if result then
+        begin
+          (*
+           *  The merge worked.
+           *  Update next link in merged node.
+           *)
+          ptrLftNode^.next := ptrRgtNode^.next;
+          delPage := ptrLftBuf^.page;
+          if ptrBuf = ptrLftBuf then
+            delIndex := index
+          else
+            delIndex := index + leftKeys;
+          RealDelete := node_merge;  (* node merge was done *)
+
+          (* Patch backlink of new right sibling *)
+          if ptrRgtNode^.next <> BAD then
+            UpdateLinks(ptrDCB, ptrRgtNode^.next, ptrLftBuf^.page, 0, ecode);
+
+          (* The right node is deleted from the tree *)
+          FreeNode(ptrRgtBuf);
+          FreeBuf(ptrLftBuf);
+        end
+        else
+        begin
+{$IFC DIRBUG}
+          if trace(FS,DIRLEVEL) then
+            writeln('merge failed');
+{$ENDC}
+          (* Merge failed; must do a rotate instead *)
+          if ptrBuf = ptrLftBuf then
+          begin
+            (* Rotate right to left *)
+            delPage := ptrLftBuf^.page;
+            delIndex := index;
+            (* Copy the low key of the right node into the left node *)
+            OneRotate(ptrRgtBase, ptrRgtOffst, 0, ptrLftNode^.nkeys, ptrLftBuf);
+            (* Delete the low key in the right node *)
+            DeleteRec(ptrRgtBase, ptrRgtOffst, ptrRgtNode, 0);
+          end
+          else
+          begin
+            (* Rotate left to right *)
+            delPage := ptrRgtBuf^.page;
+            delIndex := index + 1;
+            (* Copy the high key of the left node into the right node *)
+            OneRotate(ptrLftBase, ptrLftOffst, leftKeys - 1, 0, ptrRgtBuf);
+            (* Delete the high key in the left node *)
+            DeleteRec(ptrLftBase, ptrLftOffst, ptrLftNode, leftKeys - 1);
+          end{if};
+
+          ptrLftBuf^.dirty := TRUE;
+          TouchNode(ptrLftBuf);
+          ptrRgtBuf^.dirty := TRUE;
+          TouchNode(ptrRgtBuf);
+          FreeBuf(ptrLftBuf);
+          (* Right buffer is left locked on a rotate *)
+          RealDelete := key_rotate;  (* rotate was done *)
+        end{if};
+      end
+      else if ptrNode^.nkeys <> 0 then
+      begin
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          writeln('no operation');
+{$ENDC}
+        RealDelete := no_operation;  (* nothing was done *)
+        delPage := ptrBuf^.page;
+        delIndex := index;
+        ptrBuf^.dirty := TRUE;
+        TouchNode(ptrBuf);
+        FreeBuf(ptrBuf);
+      end
+      else
+      begin
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          writeln('tree losing page = ',ptrBuf^.page);
+{$ENDC}
+        delPage := BAD;
+        if ptrBuf^.page = ptrDCB^.MDDFdata^.root_page then
+        begin
+          (* Root node was deleted *)
+          ptrDCB^.MDDFdata^.root_page := BAD;
+          ptrDCB^.MDDFdata^.tree_depth := 0;
+          ptrDCB^.MDDFdirty := TRUE;
+          RealDelete := tree_empty;  (* tree has become empty *)
+        end
+        else
+        begin
+          (* Patch links of neighbor nodes *)
+          if ptrNode^.prior <> BAD then
+            UpdateLinks(ptrDCB, ptrNode^.prior, 0, ptrLftNode^.next, ecode);
+          if (ptrNode^.next <> BAD) and (ecode <= 0) then
+            UpdateLinks(ptrDCB, ptrNode^.next, ptrLftNode^.prior, 0, ecode);
+          RealDelete := node_delete;  (* tree lost a node *)
+        end{if};
+
+        FreeNode(ptrBuf);
+      end{if};
+      {$IFC DEBUG2} {$R+} {$ENDC}
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        write  ('  ptrRgtBuf>   '); PrHex(ord(ptrRgtBuf));
+        if ord(ptrRgtBuf) <> BAD then PrBuff(ptrRgtBuf)
+                                 else writeln;
+        writeln('  delPage>     ',delPage);
+        writeln('  delIndex>    ',delIndex);
+        writeln;
+      end;
+{$ENDC}
+
+  end{proc RealDelete};
+
+
+
+
+
+  {$S fs7 }
+  procedure  DelAdjust (     ptrDCB    : DCBptr;
+                             state     : Transform;
+                             level     : integer;
+                             rightPage : longint;
+                             sibling   : longint;
+                             ptrRgtBuf : buffer_ptr;
+                         var ecode     : integer );
+
+  var
+       halfNode  : integer;
+       ptrStack  : stack_ptr;
+       ptrRec    : rec_ptr;
+       ptrParBuf   : buffer_ptr;
+       ptrParBase  : rec_ptr;
+       ptrParNode  : node_ptr;
+       ptrParOffst : offset_ptr;
+       newRoot     : longint;
+       ptrPg       : ^longint;
+       ptrSupBuf   : buffer_ptr;
+       ptrLftBuf   : buffer_ptr;
+       ptrLftBase  : rec_ptr;
+       ptrLftNode  : node_ptr;
+       ptrLftOffst : offset_ptr;
+       ptrRgtBase  : rec_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrRgtOffst : offset_ptr;
+       result      : boolean;
+       leftKeys    : integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('DelAdjust');
+        write  ('  state       '); PrState(state);
+        writeln('  level       ',level);
+        writeln('  rightPage   ',rightPage);
+        writeln('  sibling     ',sibling);
+        write  ('  ptrRgtBuf   '); PrHex(ord(ptrRgtBuf)); prBuff(ptrRgtBuf);
+        writeln;
+      end;
+{$ENDC}
+
+      ecode := 0;
+      halfNode := ((NODE_SIZE - sizeof(NodeDesc)) div 2) - sizeof(integer);
+
+      ptrStack := @NodeStack[level - 1];
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        PrStack(ptrStack);
+{$ENDC}
+      (* Pointer to low key in right node *)
+      if state = key_rotate then
+        if level = ptrDCB^.MDDFdata^.tree_depth then
+          ptrRec := @ptrRgtBuf^.Data  (* leaf *)
+        else
+          ptrRec := pointer(ord(@ptrRgtBuf^.Data) + sizeof(longint)); (* interior *)
+
+      (* Read parent node *)
+      GetNode(ptrDCB, ptrStack^.page, TRUE {read}, ptrParBuf, ecode);
+      if ecode > 0 then
+      begin
+        if state = key_rotate then  FreeBuf(ptrRgtBuf);
+        exit(DelAdjust);
+      end{if};
+
+      ptrParBase := @ptrParBuf^.Data;
+      ptrParNode := pointer(ord(ptrParBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrParOffst := pointer(ord(ptrParNode) - sizeof(integer));
+
+      repeat
+        if (state <> node_delete) and (sibling = rightPage) then
+          ptrStack^.index := ptrStack^.index + 1;
+
+        (* Changing the parent node *)
+        ptrParBuf^.dirty := TRUE;
+        TouchNode(ptrParBuf);
+
+        if state = key_rotate then
+        begin
+          {$R-}
+          (* Copy new low key of right page into parent node *)
+          MoveLt(ptrRec,
+                 pointer(ord(ptrParBase) + ptrParOffst^[-ptrStack^.index] +
+                         sizeof(longint)),
+                 KEY_SIZE);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+          FreeBuf(ptrParBuf);
+          FreeBuf(ptrRgtBuf);
+{$IFC DIRBUG}
+          if trace(FS,DIRLEVEL) then
+          begin
+            writeln('PARENT NODE');
+            ShowNode(ptrParBuf);
+          end;
+{$ENDC}
+          exit(DelAdjust);
+        end{if};
+
+        (*
+         *  Merge or node deletion at child level.
+         *  Delete the indexing record in the parent node.
+         *)
+        DeleteRec(ptrParBase, ptrParOffst, ptrParNode, ptrStack^.index);
+
+        (* Check for underflow in the parent *)
+        {$R-}
+        if level = 2 then
+        begin
+          (* Parent is at level 1 = the root *)
+          while (ptrParNode^.kind = nonleaf) and (ptrParNode^.nkeys = 1) do
+          begin
+            ptrPg := pointer(ord(ptrParBase));
+            newRoot := ptrPg^;  (* child node address in parent *)
+{$IFC DIRBUG}
+            if trace(FS,DIRLEVEL) then
+              writeln('tree loses root page = ',ptrParBuf^.page,
+                      '; new root = ',newRoot);
+{$ENDC}
+            FreeNode(ptrParBuf);
+
+            with ptrDCB^.MDDFdata^ do
+            begin
+              tree_depth := tree_depth - 1;  (* the tree loses a level *)
+              root_page := newRoot;
+              ptrDCB^.MDDFdirty := TRUE;
+            end{with};
+
+            (* Read the new root node *)
+            GetNode(ptrDCB, newRoot, TRUE {read}, ptrParBuf, ecode);
+            if ecode > 0 then exit(DelAdjust);
+
+            ptrParBase := @ptrParBuf^.Data;
+            ptrParNode := pointer(ord(ptrParbase) + (NODE_SIZE - sizeof(NodeDesc)));
+            ptrParOffst := pointer(ord(ptrparNode) - sizeof(integer));
+          end{while};
+
+          FreeBuf(ptrParBuf);
+          exit(DelAdjust);
+        end
+        else if halfNode <= (ptrParOffst^[-ptrParNode^.nkeys] +
+                             (ptrParNode^.nkeys * sizeof(integer))) then
+        begin
+          (* No underflow *)
+{$IFC DIRBUG}
+          if trace(FS,DIRLEVEL) then
+            writeln('no underflow');
+{$ENDC}
+          FreeBuf(ptrParBuf);
+          exit(DelAdjust);
+        end
+        else
+        begin
+          (* Underflow *)
+          level := level - 1;
+          ptrSupBuf := ptrParBuf;  (* save super parent *)
+          ptrStack := pointer(ord(ptrStack) - sizeof(StackRec));
+          if (ptrStack^.nkeys = 1) and (ptrParNode^.nkeys <> 0) then
+          begin
+{$IFC DIRBUG}
+            if trace(FS,DIRLEVEL) then
+              writeln('underflow:  no siblings, parent NOT empty');
+{$ENDC}
+            (* No siblings and parent is not empty *)
+            FreeBuf(ptrParBuf);
+            exit(DelAdjust);
+          end{if};
+
+          GetNode(ptrDCB, ptrStack^.page, TRUE {read}, ptrParBuf, ecode);
+          if ecode > 0 then exit(DelAdjust);
+
+          (* Find a sibling *)
+          ptrParBase := @ptrParBuf^.Data;
+          ptrParNode := pointer(ord(ptrParbase) + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrParOffst := pointer(ord(ptrparNode) - sizeof(integer));
+
+          if ptrStack^.nkeys = 1 then
+          begin
+            (* No siblings and parent is empty *)
+{$IFC DIRBUG}
+            if trace(FS,DIRLEVEL) then
+              writeln('underflow:  no siblings, parent empty');
+{$ENDC}
+            FreeNode(ptrParBuf);
+            state := node_delete;  (* tree loses a node *)
+          end
+          else
+          begin
+            (* Siblings exist *)
+            if ptrStack^.index = (ptrStack^.nkeys - 1) then
+            begin
+              ptrPg := pointer(ord(ptrParBase) + ptrParOffst^[-ptrStack^.index + 1]);
+              ptrRgtBuf := ptrSupBuf;
+              GetNode(ptrDCB, ptrPg^, TRUE {read}, ptrLftBuf, ecode);
+            end
+            else
+            begin
+              ptrPg := pointer(ord(ptrParBase) + ptrParOffst^[-ptrStack^.index - 1]);
+              ptrLftBuf := ptrSupBuf;
+              GetNode(ptrDCB, ptrPg^, TRUE {read}, ptrRgtBuf, ecode);
+            end{if};
+
+            sibling := ptrPg^;
+            if ecode > 0 then
+            begin
+              FreeBuf(ptrSupBuf);
+              FreeBuf(ptrParBuf);
+              exit(DelAdjust);
+            end{if};
+{$IFC DIRBUG}
+            if trace(FS,DIRLEVEL) then
+              writeln('underflow:  sibling = ',sibling);
+{$ENDC}
+            ptrLftBase := @ptrLftBuf^.Data;
+            ptrRgtBase := @ptrRgtBuf^.Data;
+            rightPage := ptrRgtBuf^.page;
+
+            (* Merge the index siblings into one node *)
+            MergeNodes(ptrLftBuf, ptrRgtBuf, result);
+            if result then
+            begin
+              FreeNode(ptrRgtBuf);
+              FreeBuf(ptrLftBuf);
+              state := node_merge;
+            end
+            else
+            begin
+{$IFC DIRBUG}
+              if trace(FS,DIRLEVEL) then
+                writeln('merge failed');
+{$ENDC}
+              (* Rotate *)
+              ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+              ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+              ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+              ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+
+              leftKeys := ptrLftNode^.nkeys;
+              if ptrLftBuf = ptrSupBuf then
+              begin
+                (* Rotate right to left *)
+                OneRotate(ptrRgtBase, ptrRgtOffst, 0, leftKeys, ptrLftBuf);
+                DeleteRec(ptrRgtBase, ptrRgtOffst, ptrRgtNode, 0);
+              end
+              else
+              begin
+                (* Rotate left to right *)
+                OneRotate(ptrLftBase, ptrLftOffst, leftKeys - 1, 0, ptrRgtBuf);
+                DeleteRec(ptrLftBase, ptrLftOffst, ptrLftNode, leftKeys - 1);
+              end{if};
+
+              ptrLftBuf^.dirty := TRUE;
+              TouchNode(ptrLftBuf);
+              ptrRgtBuf^.dirty := TRUE;
+              TouchNode(ptrRgtBuf);
+              ptrRec := pointer(ord(ptrRgtBase) + sizeof(longint));
+              FreeBuf(ptrLftBuf);
+              FreeBuf(ptrRgtBuf);
+              FreeBuf(ptrParBuf);
+
+              state := key_rotate;  (* rotate was done *)
+            end{if};
+          end{if};
+        end{if};
+        {$IFC DEBUG2} {$R+} {$ENDC}
+      until FALSE;  (* forever *)
+
+  end{proc DelAdjust};
+
+
+
+
+  {$S fs7}  (* or colder segment *)
+  procedure  UndoSplits ( ptrDCB    : DCBptr;
+                          stopLevel : integer );
+
+  var
+       ptrLftBuf   : buffer_ptr;
+       ptrLftBase  : rec_ptr;
+       ptrLftNode  : node_ptr;
+       ptrLftOffst : offset_ptr;
+       ptrRgtBuf   : buffer_ptr;
+       ptrRgtBase  : rec_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrRgtOffst : offset_ptr;
+       leftKeys    : integer;
+       result      : boolean;
+       ecode       : integer;
+       nextPage    : longint;
+       level       : integer;
+       ptrStack    : stack_ptr;
+       ptrTmpBuf   : buffer_ptr;
+       ptrTmpNode  : node_ptr;
+
+  begin
+      level := ptrDCB^.MDDFdata^.tree_depth;
+      ptrStack := @NodeStack[level];
+
+      repeat
+        (* Fetch left and right nodes that resulted from a split *)
+        GetNode(ptrDCB, ptrStack^.leftSplit, TRUE {read}, ptrLftBuf, ecode);
+        if ecode > 0 then exit(UndoSplits);
+        GetNode(ptrDCB, ptrStack^.rightSplit, TRUE {read}, ptrRgtBuf, ecode);
+        if ecode > 0 then
+        begin
+          FreeBuf(ptrLftBuf);
+          exit(UndoSplits);
+        end{if};
+        ptrLftBase := @ptrLftBuf^.Data;
+        ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+        ptrRgtBase := @ptrRgtBuf^.Data;
+        ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+        leftKeys := ptrLftNode^.nkeys;
+
+        (* Delete the inserted record that caused the split *)
+        if ptrStack^.index < leftKeys then
+          DeleteRec(ptrLftBase, ptrLftOffst, ptrLftNode, ptrStack^.index)
+        else
+          DeleteRec(ptrRgtBase, ptrRgtOffst, ptrRgtNode, ptrStack^.index - leftKeys);
+
+        (* Merge the left and right nodes back into one node *)
+        MergeNodes(ptrLftBuf, ptrRgtBuf, result);
+        nextPage := ptrRgtNode^.next;
+        ptrLftNode^.next := nextPage;
+        FreeNode(ptrRgtBuf);
+        FreeBuf(ptrLftBuf);
+
+        (* Update links in the merged node if it's a leaf node *)
+        if level = ptrDCB^.MDDFdata^.tree_depth then
+        begin
+          UpdateLinks(ptrDCB, ptrLftNode^.next, ptrLftBuf^.page, 0, ecode);
+          if ecode > 0 then exit(UndoSplits);
+        end{if};
+
+        level := level - 1;
+        ptrStack := pointer(ord(ptrStack) - sizeof(StackRec));
+      until level = stopLevel;
+
+      FreeBuf(ptrRgtBuf);
+
+  end{proc UndoSplits};
+
+
+
+
+  {$S fs7 }
+  procedure  InsertSplit (     ptrDCB    : DCBptr;
+                               level     : integer;
+                               ptrLftBuf : buffer_ptr;
+                               ptrRgtBuf : buffer_ptr;
+                           var ecode     : integer );
+
+  label   1;
+
+  var
+       insResult   : Transform;
+       ptrStack    : stack_ptr;
+       ptrParBuf   : buffer_ptr;
+       ptrParNode  : node_ptr;
+       ptrParBase  : rec_ptr;
+       ptrParOffst : offset_ptr;
+       ptrRgtBase  : rec_ptr;
+       ptrRgtNode  : node_ptr;
+       ptrRgtOffst : offset_ptr;
+       ptrLftBase  : rec_ptr;
+       ptrLftNode  : node_ptr;
+       ptrLftOffst : offset_ptr;
+       ptrNewBuf   : buffer_ptr;
+       ptr1RgtOffst : ^integer;
+       ptr1ParOffst : ^integer;
+       ptr2ParOffst : ^integer;
+       ptr1LftOffst : ^integer;
+       loclDepth   : integer;
+       page1       : longint;
+       page2       : longint;
+       dummyPage   : longint;
+       dummyIndex  : integer;
+       size        : integer;
+       result      : boolean;
+       rotPage     : longint;
+       ptrPg       : ^longint;
+       rightSib    : longint;
+       leftSib     : longint;
+       leftLock    : boolean;
+       rightLock   : boolean;
+       parentLock  : boolean;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('InsertSplit');
+        writeln('  level       ',level);
+        write  ('  ptrLftBuf   '); PrHex(ord(ptrLftBuf)); PrBuff(ptrLftBuf);
+        write  ('  ptrRgtBuf   '); PrHex(ord(ptrRgtBuf)); PrBuff(ptrRgtBuf);
+        writeln;
+      end;
+{$ENDC}
+      ecode := 0;
+      leftLock := TRUE;
+      rightLock := TRUE;
+      parentLock := FALSE;
+      page1 := ptrLftBuf^.page;
+      page2 := ptrRgtBuf^.page;
+
+      insResult := node_split;
+
+      ptrStack := @NodeStack[level];
+      loclDepth := ptrDCB^.MDDFdata^.tree_depth;
+
+      while insResult = node_split do
+      begin
+        ptrStack := pointer(ord(ptrStack) - sizeof(StackRec));
+        level := level - 1;
+
+        if level = 0 then
+          (* Create a new root node *)
+          AllocNode(ptrDCB, ptrParBuf, ecode)
+        else
+        begin
+          (* Fetch the next parent (index) node *)
+          FreeBuf(ptrLftBuf);
+          leftLock := FALSE;
+          GetNode(ptrDCB, ptrStack^.page, TRUE {read}, ptrParBuf, ecode);
+        end{if};
+
+        if ecode > 0 then goto 1;
+        parentLock := TRUE;
+
+        ptrRgtBase := @ptrRgtBuf^.Data;
+        ptrRgtNode := pointer(ord(ptrRgtBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrRgtOffst := pointer(ord(ptrRgtNode) - sizeof(integer));
+        ptr1RgtOffst := pointer(ord(ptrRgtOffst) - sizeof(integer));
+        ptrLftBase := @ptrLftBuf^.Data;
+        ptrLftNode := pointer(ord(ptrLftBase) + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrLftOffst := pointer(ord(ptrLftNode) - sizeof(integer));
+
+        if level = 0 then
+        begin
+          insResult := no_operation;  (* to exit loop *)
+          ptrParBase := @ptrParBuf^.Data;
+          ptrParNode := pointer(ord(ptrParBase) + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrParOffst := pointer(ord(ptrParNode) - sizeof(integer));
+          ptr1ParOffst := pointer(ord(ptrParOffst) - sizeof(integer));
+          ptr2ParOffst := pointer(ord(ptr1ParOffst) - sizeof(integer));
+
+          {$R-}
+          ptrParOffst^[0] := 0;
+          {$IFC DEBUG2} {$R+} {$ENDC}
+          if loclDepth = 1 then
+          begin
+            (* Split pages were leaves *)
+            size := KEY_SIZE + sizeof(longint);
+            (* if odd(size) then size := size + 1; *)
+            ptr1ParOffst^ := size;
+            ptr2ParOffst^ := ptr1ParOffst^ + size;
+          end
+          else
+          begin
+            (* Split pages were interior *)
+            ptr1LftOffst := pointer(ord(ptrLftOffst) - sizeof(integer));
+            ptr1ParOffst^ := ptr1LftOffst^;
+            ptr2ParOffst^ := ptr1ParOffst^ + ptr1RgtOffst^;
+            ptrLftBase := pointer(ord(ptrLftbase) + sizeof(longint));
+            ptrRgtBase := pointer(ord(ptrRgtBase) + sizeof(longint));
+          end{if};
+
+          (* Copy the low key from the left node into the new root node *)
+          MoveLt(ptrLftBase,
+                 pointer(ord(ptrParBase) + sizeof(longint)),
+                 KEY_SIZE);
+          ptrPg := pointer(ord(ptrParBase));
+          ptrPg^ := page1;
+
+          (* Copy the low key from the right node into the new root node *)
+          MoveLt(ptrRgtBase,
+                 pointer(ord(ptrParbase) + sizeof(longint) + ptr1ParOffst^),
+                 KEY_SIZE);
+          ptrPg := pointer(ord(ptrParBase) + ptr1ParOffst^);
+          ptrPg^ := page2;
+
+          (* Initialize the key count in the new root node *)
+          with ptrParNode^ do
+          begin
+            nkeys := 2;
+            kind := nonleaf;
+          end{with};
+
+          (*
+           *  Write the root node and update the volume MDDF to reference
+           *  the new root node.
+           *)
+          Post(ptrParBuf, ecode);
+          if ecode > 0 then goto 1;
+          loclDepth := loclDepth + 1;
+          with ptrDCB^.MDDFdata^ do
+          begin
+            tree_depth := loclDepth;
+            root_page := ptrParBuf^.page;
+            ptrDCB^.MDDFdirty := TRUE;
+          end{with};
+        end
+        else
+        begin
+          (* Promote the low key of the right page to the parent page *)
+          if level <> (loclDepth - 1) then
+            (* Split nodes were interior *)
+            ptrRgtBase := pointer(ord(ptrRgtBase) + sizeof(longint));
+
+          size := KEY_SIZE + sizeof(longint);
+          (* if odd(size) then size := size + 1; *)
+
+          ptrStack^.index := ptrStack^.index + 1;
+          insResult := no_operation;  (* to exit loop *)
+          SimpleInsert(ptrRgtBase, size, @page2, ptrParBuf, ptrStack^.index,
+                       result);
+          if not result then
+          begin
+            (* Split or rotate is necessary *)
+            Siblings(ptrDCB, level, rightSib, leftSib, ecode);
+            if ecode > 0 then goto 1;
+            Split_Rotate(ptrDCB, ptrRgtBase, size, @page2, ptrStack^.index,
+                         ptrParBuf, leftSib, rightSib, ptrStack, ptrNewBuf,
+                         dummyPage, dummyIndex, rotPage, insResult, ecode);
+            parentLock := FALSE;
+            if ecode > 0 then goto 1;
+
+            if insResult = node_split then
+            begin
+              ptrLftBuf := ptrParBuf;
+              leftLock := TRUE;
+              page1 := ptrStack^.page;
+              page2 := ptrNewBuf^.page;
+              FreeBuf(ptrRgtBuf);
+              ptrRgtBuf := ptrNewBuf;
+            end
+            else if insResult = key_rotate then
+            begin
+              FreeBuf(ptrRgtBuf);
+              ptrRgtBuf := ptrNewBuf;
+              DelAdjust(ptrDCB, key_rotate, level, ptrRgtBuf^.page, rotPage,
+                        ptrRgtBuf, ecode);
+              rightLock := FALSE;
+            end{if};
+          end{if};
+        end{if};
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) and parentLock then
+        begin
+          writeln('PARENT NODE');
+          ShowNode(ptrParBuf);
+        end;
+{$ENDC}
+      end{while};
+
+1:
+      if leftLock then FreeBuf(ptrLftBuf);
+      if rightLock then FreeBuf(ptrRgtBuf);
+      if parentLock then FreeBuf(ptrParBuf);
+
+      (* Potentially put the tree back together *)
+      if ecode > 0 then UndoSplits(ptrDCB, level);
+
+  end{proc InsertSplit};
+
+
+
+
+  {$S fs7 }
+  procedure  Search (*     ptrDCB : DCBptr;
+                           ptrKey : key_ptr;
+                       var ptrBuf : buffer_ptr;
+                       var found  : boolean;
+                       var ecode  : integer *);
+
+  var
+       ptrStack : stack_ptr;
+       ptrBase  : rec_ptr;
+       ptrOffst : offset_ptr;
+       ptrNode  : node_ptr;
+       ptrPg    : page_ptr;
+       index    : integer;
+       level    : integer;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Search');
+        write  ('  ptrKey   '); PrHex(ord(ptrKey)); PrKey(@ptrKey^);
+        writeln;
+      end;
+{$ENDC}
+
+      ecode := 0;
+      found := FALSE;
+      if ptrDCB^.MDDFdata^.root_page = BAD then
+      begin
+        ecode := E_TREE_EMPTY;
+        exit(Search);
+      end{if};
+
+      ptrStack := @NodeStack[1];
+      ptrStack^.page := ptrDCB^.MDDFdata^.root_page;
+
+      for level := 1 to ptrDCB^.MDDFdata^.tree_depth do
+      begin
+        GetNode(ptrDCB, ptrStack^.page, TRUE {read}, ptrBuf, ecode);
+        if ecode > 0 then exit(Search);
+
+        ptrBase := @ptrBuf^.Data;
+        ptrNode := pointer(ord(ptrBase) + (2048 - sizeof(NodeDesc)));
+        ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+        ptrStack^.nkeys := ptrNode^.nkeys;
+
+        if level < ptrDCB^.MDDFdata^.tree_depth then
+        begin
+          (* Interior Node *)
+          index := 0;
+          if ptrNode^.nkeys > 1 then
+          begin
+            (* Search this node for the key *)
+            SearchNode(pointer(ord(ptrBase) + sizeof(longint)),
+                       pointer(ord(ptrOffst) - sizeof(integer)),
+                       ptrNode^.nkeys - 1,
+                       ptrKey,
+                       KEY_SIZE,
+                       index,
+                       found );
+            if found then index := index + 1;
+          end{if};
+
+          ptrStack^.index := index;
+          {$R-}
+          ptrPg := pointer(ord(ptrBase) + ptrOffst^[-index]);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+          NodeStack[level + 1].page := ptrPg^;
+
+          FreeBuf(ptrBuf);
+        end
+        else
+          (* Leaf Node *)
+          SearchNode(ptrBase, ptrOffst, ptrNode^.nkeys, ptrKey, KEY_SIZE,
+                     ptrStack^.index, found);
+
+        (* Next stack frame *)
+        ptrStack := pointer(ord(ptrStack) + sizeof(StackRec));
+      end{for};
+
+      (* Exit with ptrBuf locked containing the desired node *)
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        PrStack(pointer(ord(ptrStack) - sizeof(StackRec)));
+{$ENDC}
+  end{proc Search};
+
+
+
+
+  {$S fs7}
+  procedure  E_Search (*     ptrDCB   : DCBptr;
+                             ptrKey   : key_ptr;
+                         var ptrBuf   : buffer_ptr;
+                         var ptrEntry : entry_ptr;
+                         var found    : boolean;
+                         var ecode    : integer *);
+
+  var
+       ptrStack : stack_ptr;
+       addrBase : longint;
+       ptrOffst : offset_ptr;
+
+  begin
+      (* Find the node containing the key *)
+      Search(ptrDCB, ptrKey, ptrBuf, found, ecode);
+      if ecode <= 0 then
+      begin
+        (* Compute and return a pointer to the record in the node *)
+        addrBase := ord(@ptrBuf^.Data);
+        ptrOffst := pointer(addrBase +
+                            (NODE_SIZE - sizeof(NodeDesc)) - sizeof(integer));
+        ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+        {$R-}
+        ptrEntry := pointer(addrBase + ptrOffst^[-ptrStack^.index]);
+        {$IFC DEBUG2} {$R+} {$ENDC}
+      end{if};
+  end{proc E_Search};
+
+
+
+
+  {$S fs7 }
+  procedure  SeqRec (*     ptrDCB : DCBptr;
+                       var ptrBuf : buffer_ptr;
+                       var index  : integer;
+                           ptrKey : rec_ptr;
+                       var ecode  : integer *);
+
+  var
+       ptrBase  : rec_ptr;
+       ptrNode  : node_ptr;
+       ptrOffst : offset_ptr;
+       nextPage : longint;
+       ptrRecOffst : ^integer;
+       ptrNxtOffst : ^integer;
+
+  begin
+      ecode := 0;
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+
+      index := index + 1;  (* next record in this leaf node *)
+      if index >= ptrNode^.nkeys then
+      begin
+        (* Record we want is in the next leaf node *)
+        nextPage := ptrNode^.next;
+        FreeBuf(ptrBuf);
+        if nextPage <> BAD then
+        begin
+          (* Fetch the next leaf node *)
+          GetNode(ptrDCB, nextPage, TRUE, ptrBuf, ecode);
+          if ecode > 0 then exit(SeqRec);
+          ptrBase := @ptrBuf^.Data;
+          ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+          index := 0;  (* first record in the node *)
+        end
+        else
+        begin
+          (* Last leaf node in the tree *)
+          ecode := E_EOF;
+          exit(SeqRec);
+        end{if};
+      end{if};
+
+      (* Copy the record out of the leaf node *)
+      {$R-}
+      ptrRecOffst := @ptrOffst^[-index];
+      {$IFC DEBUG2} {$R+} {$ENDC}
+      ptrNxtOffst := pointer(ord(ptrRecOffst) - sizeof(integer));
+      MoveLt(pointer(ord(ptrBase) + ptrRecOffst^),
+             ptrKey,
+             ptrNxtOffst^ - ptrRecOffst^);
+  end{proc SeqRec};
+
+
+
+
+  {$S fs7}
+  procedure  Position (     ptrDCB : DCBptr;
+                        var ptrBuf : buffer_ptr;
+                        var index  : integer;
+                            ptrRec : rec_ptr;
+                        var found  : boolean;
+                        var ecode  : integer );
+
+  var
+       ptrStack    : stack_ptr;
+       addrBase    : longint;
+       nextPage    : longint;
+       ptrRecOffst : ^integer;
+       ptrNxtOffst : ^integer;
+       ptrNode     : node_ptr;
+       ptrOffst    : offset_ptr;
+
+  begin
+      (* Find the node containing the key *)
+      Search(ptrDCB, pointer(ord(ptrRec)), ptrBuf, found, ecode);
+      if ecode <= 0 then
+      begin
+        (*
+         *  If the insertion point does not indicate a valid record,
+         *  move to the first record in the next sequential leaf node.
+         *)
+        addrBase := ord(@ptrBuf^.Data);
+        ptrNode := pointer(addrBase + (NODE_SIZE - sizeof(NodeDesc)));
+        ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+        index := ptrStack^.index;
+        if index >= ptrNode^.nkeys then
+          SeqRec(ptrDCB, ptrBuf, index, ptrRec, ecode)
+        else
+        begin
+          ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+          {$R-}
+          ptrRecOffst := @ptrOffst^[-index];
+          {$IFC DEBUG2} {$R+} {$ENDC}
+          ptrNxtOffst := pointer(ord(ptrRecOffst) - sizeof(integer));
+
+          (* Copy the record out of the leaf node *)
+          MoveLt(pointer(addrBase + ptrRecOffst^),
+                 ptrRec,
+                 ptrNxtOffst^ - ptrRecOffst^);
+        end{if};
+      end{if};
+  end{proc Position};
+
+
+  (*
+   *  This is a prime candidate for assembly language.
+   *)
+  {$S fs7 }
+  procedure  Gobble (* var path      : pathname;
+                       var index     : integer;
+                       var name      : e_name;
+                       var delimiter : char *);
+
+  var
+       c : char;
+       i : integer;
+       more : boolean;
+
+  begin
+      name := '';
+      delimiter := ' ';
+      if index > length(path) then exit(Gobble);
+
+      (* Peek at first character *)
+      i := 0;
+      c := path[index];
+      index := index + 1;
+      case c of
+        '-','+':   delimiter := c;
+        otherwise  begin
+                     (* not a delimiter char; copy to name *)
+                     name[1] := c;
+                     i := 1;
+                   end;
+      end{case};
+
+      more := (index <= length(path));
+      if more then c := path[index];
+
+      (* Collect characters until a delimiter is seen *)
+      while (c <> '-') and (c <> '+') and more do
+      begin
+        if i < MAX_ENAME then
+        begin
+          i := i + 1;
+          name[i] := path[index];
+        end{if};
+        index := index + 1;
+        more := (index <= length(path));
+        if more then c := path[index];
+      end{while};
+
+      name[0] := chr(ord(i));  (* stuff string length byte *)
+
+  end{proc Gobble};
+
+
+
+
+  {$S fs7 }
+  procedure  PathSearch (*     ptrDCB   : DCBptr;
+                               parID    : NodeIdent;
+                               path     : Pathname;
+                               ptrKey   : key_ptr;
+                           var ptrBuf   : buffer_ptr;
+                           var ptrEntry : entry_ptr;
+                           var found    : boolean;
+                           var ecode    : integer *);
+
+  label   1;
+
+  var
+       s         : integer;
+       ix        : integer;
+       ptrBase   : rec_ptr;
+       ptrNode   : node_ptr;
+       ptrOffst  : offset_ptr;
+       ptrStack  : stack_ptr;
+       name      : e_name;
+       nullName  : e_name;
+       lock      : boolean;
+       ptrSysloc : slocal_ptr;
+       delim     : char;
+       wasDir    : boolean;
+
+       (* State function  s = f(s,delim) *)
+       procedure  State;
+       begin
+           case delim of
+             ' ':  case s of
+                     0:    if length(name) > 0 then
+                             s := 2
+                           else
+                             s := 3;
+                     1:    s := 3;
+                     3:    s := 4;
+                     2,4:  s := 6;
+                     otherwise s := 5;
+                   end;
+             '+':  case s of
+                     0,1,2:  s := 1;
+                     otherwise s := 5;
+                   end;
+             '-':  case s of
+                     0,1,2:  s := 2;
+                     otherwise s := 5;
+                   end;
+           end;
+       end{proc State};
+
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,99) then
+        writeln('PathSearch   "',path,'"');
+{$ENDC}
+      ptrSysloc := pointer(b_syslocal_ptr);
+      lock := FALSE;
+      nullName := '';
+      ix := 1;
+      ecode := 0;
+      s := 0;
+      g_dirLevel := 0;
+      DirStack[0] := parID;  (* first directory visited *)
+      wasDir := TRUE;  (* since starting from working dir or root *)
+
+      repeat
+        Gobble(path, ix, name, delim);
+        State;
+
+        case s of
+          1,3:  begin
+                  if parID = ROOT_NID then
+                  begin
+                    ecode := E_PATH_SYNTAX;
+                    goto 1;
+                  end
+                  else
+                    (* Find thread record for directory *)
+                    MakeKey(parID, @nullName, ptrKey);
+                end;
+          2:    begin
+                  if length(name) = 0 then
+                  begin
+                    ecode := E_PATH_SYNTAX;
+                    goto 1;
+                  end;
+                  (* Find object record *)
+                  MakeKey(parID, @name, ptrKey);
+                end;
+          4:    (* Find directory object record *)
+                MakeKey(parID, @ptrEntry^.myName, ptrKey);
+          5:    begin
+                  ecode := E_PATH_SYNTAX;
+                  goto 1;
+                end;
+          6:    begin
+                  exit(PathSearch);  (* normal termination *)
+                end;
+        end{case};
+
+{$IFC DIRBUG}
+        if trace(FS,99) then
+          PrKey(ptrKey);
+{$ENDC}
+        if lock then FreeBuf(ptrBuf);
+        lock := FALSE;
+
+        if not wasDir then
+        begin
+          (* Pathname interior entry is not a directory *)
+          ecode := E_NOT_DIR;
+          exit(PathSearch);
+        end{if};
+
+        (* Find the next record *)
+        Search(ptrDCB, ptrKey, ptrBuf, found, ecode);
+        if ecode > 0 then exit(PathSearch);
+        lock := TRUE;
+        if not found then
+        begin
+          if not ((s = 2) and (ix > length(path))) then
+          begin
+            ecode := E_PATH_SYNTAX;
+            goto 1;
+          end;
+        end
+        else
+        begin
+          ptrBase := @ptrBuf^.Data;
+          ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+          ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+          {$R-}
+          ptrEntry := pointer(ord(ptrBase) + ptrOffst^[-ptrStack^.index]);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+
+          wasDir := FALSE;  (* assume the object is not a directory *)
+
+          case s of
+            1,3:  if ptrEntry^.eType = threadentry then
+                  begin
+                    wasDir := TRUE;
+                    parID := ptrEntry^.parID;
+                  end;
+            2,4:  if ptrEntry^.eType = direntry then
+                  begin
+                    wasDir := TRUE;
+                    parID := ptrEntry^.id;
+                  end;
+          end{case};
+
+          g_dirLevel := g_dirLevel + 1;
+          DirStack[g_dirLevel] := parID;  (* directory visited *)
+        end{if};
+
+      until FALSE;  (* forever *)
+  1:
+      if lock then FreeBuf(ptrBuf);
+
+{$IFC DIRBUG}
+      if trace(FS,99) then
+        writeln('PathSearch exit = ',ecode);
+{$ENDC}
+  end{proc PathSearch};
+
+
+
+
+  (*
+   *  Insert record into tree.
+   *  Assume protection by DCB.volSem.
+   *  if ptrBuf is non-nil then assume that
+   *  ptrBuf is locked, as the result of a previous Search/PathSearch.
+   *)
+  {$S fs7 }
+  procedure  Insert (*     ptrDCB  : DCBptr;
+                           ptrRec  : rec_ptr;
+                           size    : integer;
+                           ptrBuf  : buffer_ptr;
+                       var ecode   : integer *);
+
+  label   1;
+
+  var
+       ptrStack  : stack_ptr;
+       found     : boolean;
+       done      : boolean;
+       rightSib  : longint;
+       leftSib   : longint;
+       insPage   : longint;
+       insIndex  : integer;
+       rotPage   : longint;
+       ptrRgtBuf : buffer_ptr;
+       result    : Transform;
+       key       : RecKey;
+       ptrMDDF   : MDDFptr;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Insert');
+        write  ('  ptrRec   '); PrHex(ord(ptrRec)); PrKey(@ptrRec^);
+        writeln('  size     ',size);
+        writeln;
+      end;
+{$ENDC}
+      ecode := 0;
+      ptrMDDF := ptrDCB^.MDDFdata;
+      if ptrBuf = NIL then
+      begin
+        (* Find the node containing the key *)
+        Search(ptrDCB, @ptrRec^, ptrBuf, found, ecode);
+        if found then
+        begin
+          ecode := E_ENTRY_EXISTS;
+          FreeBuf(ptrBuf);
+        end{if};
+        if (ecode > 0) and (ecode <> E_TREE_EMPTY) then goto 1;
+      end{if};
+
+      ptrStack := @NodeStack[ptrMDDF^.tree_depth];
+      if ecode = E_TREE_EMPTY then
+        (* Insert the first record into the tree *)
+        FirstRec(ptrDCB, ptrRec, size, ecode)
+      else
+      begin
+        ptrStack := @NodeStack[ptrMDDF^.tree_depth];
+        SimpleInsert(ptrRec, size, NIL, ptrBuf, ptrStack^.index, done);
+        if not done then
+        begin
+          (* Simple insert failed *)
+          Siblings(ptrDCB, ptrDCB^.MDDFdata^.tree_depth, rightSib, leftSib, ecode);
+          if ecode > 0 then goto 1;
+          Split_Rotate(ptrDCB, ptrRec, size, NIL, ptrStack^.index, ptrBuf,
+                       leftSib, rightSib, ptrStack, ptrRgtBuf, insPage, insIndex,
+                       rotPage, result, ecode);
+          if ecode > 0 then goto 1;
+
+          if result = node_split then
+            (* Propogate splits up the tree *)
+            InsertSplit(ptrDCB, ptrMDDF^.tree_depth, ptrBuf, ptrRgtBuf, ecode)
+          else if result = key_rotate then
+            (* Adjust for keys leaving source node of rotate *)
+            DelAdjust(ptrDCB, key_rotate, ptrMDDF^.tree_depth, ptrRgtBuf^.page,
+                      rotPage, ptrRgtBuf, ecode);
+        end
+        else
+          FreeBuf(ptrBuf);
+{$IFC DIRBUG}
+        if trace(FS,DIRLEVEL) then
+          ShowNode(ptrBuf);
+{$ENDC}
+      end{if};
+1:
+
+  end{proc Insert};
+
+
+
+
+  (*
+   *  Delete record from tree.
+   *  Assume protection by DCB.volSem.
+   *  if ptrBuf is non-nil then assume that
+   *  ptrBuf is locked, as the result of a previous Search/PathSearch.
+   *  returns deleted record in ptrRec^.
+   *)
+  {$S fs7 }
+  procedure  Ddelete (*     ptrDCB : DCBptr;
+                            ptrRec : rec_ptr;
+                            ptrBuf : buffer_ptr;
+                        var size   : integer;
+                        var ecode  : integer *);
+
+  var
+       ptrStack  : stack_ptr;
+       found     : boolean;
+       done      : boolean;
+       loclDepth : integer;
+       ptrBase   : rec_ptr;
+       ptrNode   : node_ptr;
+       ptrOffst  : offset_ptr;
+       sibling   : longint;
+       rightNode : longint;
+       delPage   : longint;
+       delIndex  : integer;
+       ptrRgtBuf : buffer_ptr;
+       state     : Transform;
+       ptrMDDF   : MDDFptr;
+
+  begin
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+      begin
+        writeln;
+        writeln('Delete');
+        write  ('  ptrRec   '); PrHex(ord(ptrRec)); PrKey(@ptrRec^);
+        writeln;
+      end;
+{$ENDC}
+      ecode := 0;
+      ptrMDDF := ptrDCB^.MDDFdata;
+      if ptrBuf = NIL then
+      begin
+        (* Find the node containing the key *)
+        Search(ptrDCB, @ptrRec^, ptrBuf, found, ecode);
+        if ecode > 0 then exit(Ddelete);
+        if not found then
+        begin
+          ecode := E_NO_ENTRY;
+          FreeBuf(ptrBuf);
+          exit(Ddelete);
+        end{if};
+      end{if};
+
+      loclDepth := ptrMDDF^.tree_depth;
+      ptrStack := @NodeStack[loclDepth];
+      ptrBase := @ptrBuf^.Data;
+      ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+      ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+      {$R-}
+      size := ptrOffst^[-ptrStack^.index - 1] - ptrOffst^[-ptrStack^.index];
+      if ptrBuf <> NIL then
+        (* Return the record being deleted *)
+        MoveLt(pointer(ord(ptrBase) + ptrOffst^[-ptrStack^.index]),
+               ptrRec,
+               size);
+      {$IFC DEBUG2} {$R+} {$ENDC}
+      sibling := BAD;
+
+      (* Try to find a sibling *)
+      if loclDepth > 1 then
+      begin
+        with NodeStack[loclDepth - 1] do
+        begin
+          if nkeys > 1 then
+          begin
+            if index = nkeys - 1 then
+            begin
+              sibling := ptrNode^.prior;
+              rightNode := ptrBuf^.page;
+            end
+            else
+            begin
+              sibling := ptrNode^.next;
+              rightNode := sibling;
+            end{if};
+          end{if};
+        end{with};
+      end{if};
+
+      state := RealDelete(ptrDCB, ptrBuf, ptrStack^.index, sibling, ptrRgtBuf,
+                          delPage, delIndex);
+
+      if (state = node_merge)  or
+         (state = node_delete) or
+         (state = key_rotate) then
+        DelAdjust(ptrDCB, state, ptrMDDF^.tree_depth, rightNode, sibling,
+                  ptrRgtBuf, ecode);
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        ShowNode(ptrBuf);
+{$ENDC}
+
+  end{proc Ddelete};
+
+
+
+
+  {$S fs7 }
+  procedure  SetWorkingDir (*     ptrDCB : DCBptr;
+                                  parID  : NodeIdent;
+                                  path   : Pathname;
+                              var ecode  : integer *);
+
+  var
+       ptrBuf : buffer_ptr;
+       found  : boolean;
+       ptrSysloc : slocal_ptr;
+       ptrEntry  : entry_ptr;
+       key       : RecKey;
+
+  begin
+      ecode := 0;
+      ptrSysloc := pointer(b_syslocal_ptr);
+      if length(path) = 0 then
+      begin
+        (* Set working dir to root is special case *)
+        if (parID = ROOT_NID) then
+          ptrSysloc^.workDirID := ROOT_NID;
+        exit(SetWorkingDir);                 (* else set to current working dir *)
+      end{if};
+
+      (* Find new working dir *)
+      PathSearch(ptrDCB, parID, path, @key, ptrBuf, ptrEntry, found, ecode);
+      if ecode <= 0 then
+      begin
+        FreeBuf(ptrBuf);
+        if not found then
+          ecode := E_PATHNAME
+        else
+          (* Record ID of new working dir *)
+          ptrSysloc^.workDirID := DirStack[g_dirLevel];
+      end{if};
+  end{proc SetWorkingDir};
+
+
+
+  {$S fs7 }
+  procedure  GetDirPath (*     ptrDCB : DCBptr;
+                               id     : NodeIdent;
+                           var pathn  : Pathname;
+                           var ecode  : integer *);
+
+  var
+       found     : boolean;
+       ptrBuf    : buffer_ptr;
+       dirKey    : RecKey;
+       ptrBase   : rec_ptr;
+       ptrNode   : node_ptr;
+       ptrOffst  : offset_ptr;
+       ptrStack  : stack_ptr;
+       ptrEntry  : entry_ptr;
+       nullName  : e_name;
+
+  begin
+      ecode := 0;
+      nullName := '';
+      if (id = ROOT_NID) or (flat_catalog(ptrDCB^.dnum)) then
+        pathn := ''  (* root is special case *)
+      else
+      begin
+        MakeKey(id, @nullName, @dirKey);
+        pathn := '';
+
+        repeat
+          Search(ptrDCB, @dirKey, ptrBuf, found, ecode);
+          if ecode > 0 then exit(GetDirPath);
+          if not found then
+          begin
+            ecode := E_TREE_MUNCH;
+            FreeBuf(ptrBuf);
+            exit(GetDirPath);
+          end;
+
+          ptrBase := @ptrBuf^.Data;
+          ptrNode := pointer(ord(ptrBase) + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+          ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+          {$R-}
+          ptrEntry := pointer(ord(ptrBase) + ptrOffst^[-ptrStack^.index]);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+          FreeBuf(ptrBuf);
+
+          (*
+           *  Assumes the record is a thread!
+           *  There's no check here to see if the tree is damaged.
+           *)
+          MakeKey(ptrEntry^.parID, @nullName, @dirKey);
+          if pathn = '' then
+            pathn := concat('-', ptrEntry^.myName)
+          else
+            pathn := concat('-', ptrEntry^.myName, pathn);
+        until ptrEntry^.parID = ROOT_NID;  (* parent is root *)
+      end{if};
+
+      (* Tack on the device name *)
+      pathn := concat('-', configinfo[ptrDCB^.dnum]^.devname, pathn);
+  end{proc GetDirPath};
+
+
+
+
+  {$S fs7 }
+  procedure  GetWorkingDir (* var pathn : Pathname;
+                              var ecode : integer *);
+
+  var
+       ptrSysloc : slocal_ptr;
+       ptrDCB    : DCBptr;
+
+  begin
+      ptrSysloc := pointer(b_syslocal_ptr);
+      with ptrSysloc^ do
+      begin
+        ptrDCB := mounttable[working_dev];
+        (*
+         *  If the working device is found to be unmounted, the working
+         *  directory is reset to the root directory on the boot device.
+         *)
+        if ptrDCB = pointer(BADPTR1) then
+        begin
+          working_dev := bootdev;
+          workDirID := ROOT_NID;
+          ptrDCB := mounttable[bootdev];
+        end{if};
+        GetDirPath(ptrDCB, workDirID, pathn, ecode);
+      end{with};
+  end{proc GetWorkingDir};
+
+
+
+
+  {$S fs7 }
+  procedure  ResetDir (*     ptrDCB : DCBptr;
+                             parID  : NodeIdent;
+                         var pathn  : Pathname;
+                         var ecode  : integer *);
+
+  label   1;
+
+  var
+       key    : RecKey;
+       ptrBuf : buffer_ptr;
+       found  : boolean;
+       ptrBase  : rec_ptr;
+       ptrNode  : node_ptr;
+       ptrOffst : offset_ptr;
+       ptrStack : stack_ptr;
+       ptrEntry : entry_ptr;
+       nullName : e_name;
+       device   : integer;
+       ptrSysloc : slocal_ptr;
+       addrM    : longint;
+
+  begin
+      ecode := 0;
+
+      ptrSysloc := pointer(b_syslocal_ptr);
+
+      (* Reset process' topology counter *)
+      ptrSysloc^.topol := ptrDCB^.topol;
+
+      wait_sem(ptrDCB^.volSem, []);  (* acquire the tree *)
+
+      if ((length(pathn) = 0) and (parID = ROOT_NID)) then
+      begin
+        (* Reset working directory *)
+        ptrSysloc^.scanID := ROOT_NID;
+        ptrSysloc^.scanLevel := 0;
+      end
+      else
+      begin
+        (* Find the directory *)
+        PathSearch(ptrDCB, parID, pathn, @key, ptrBuf, ptrEntry, found, ecode);
+        if ecode > 0 then goto 1;
+        if not found then
+        begin
+          ecode := E_PATHNAME;
+          FreeBuf(ptrBuf);
+          goto 1;
+        end{if};
+
+        if ptrEntry^.eType <> direntry then
+        begin
+          ecode := 1121;  (* emulate RESET_CATALOG *)
+          FreeBuf(ptrBuf);
+          goto 1;
+        end{if};
+
+        ptrSysloc^.scanID := ptrEntry^.id;
+        ptrSysloc^.scanLevel := g_dirLevel;
+{$IFC DIRBUG}
+        writeln('scan id = ',ptrSysloc^.scanID);
+{$ENDC}
+        FreeBuf(ptrBuf);
+      end{if};
+
+      (* Find the thread record *)
+      nullName := '';
+      MakeKey(ptrSysloc^.scanID, @nullName, @key);
+      Search(ptrDCB, @key, ptrBuf, found, ecode);
+      if ecode > 0 then goto 1;
+
+      with ptrSysloc^ do
+      begin
+        ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+        scanPage := ptrStack^.page;
+        scanIndex := ptrStack^.index;
+        scanDevice := ptrDCB^.dnum;
+        scanMode := dirscan;
+        scanKey := key;
+        topol := ptrDCB^.topol;
+
+        (* Blast the last scan stack *)
+        while ptrScanStack <> pointer(BAD) do
+        begin
+          addrM := ord(ptrScanStack);
+          ptrScanStack := ptrScanStack^.link;
+          relspace(addrM, b_syslocal_ptr);
+        end{while};
+      end{with};
+
+      FreeBuf(ptrBuf);
+{$IFC DIRBUG}
+      writeln('page = ',ptrSysloc^.scanPage,'   index = ',ptrSysloc^.scanIndex);
+{$ENDC}
+
+  1:
+      signal_sem(ptrDCB^.volSem);
+
+  end{proc ResetDir};
+
+
+
+
+  {$S fs7 }
+  procedure  GetNextEntry (* var nextEntry : e_name;
+                             var NextRec   : ObjRec;
+                             var level     : integer;
+                             var ecode     : integer *);
+
+  label   1, 9;
+
+  var
+       parID     : NodeIdent;
+       seqKey    : RecKey;
+       threadKey : RecKey;
+       ptrBuf    : buffer_ptr;
+       ptrSysloc : slocal_ptr;
+       ptrDCB    : DCBptr;
+       addrM     : longint;
+       ptrM      : dirmrk_ptr;
+       nullName  : e_name;
+       found     : boolean;
+       ptrStack  : stack_ptr;
+       ptrRec    : entry_ptr;
+
+
+       procedure  Pop;
+       begin
+           (* Pop the scan stack *)
+           with ptrSysloc^ do
+           begin
+             with ptrScanStack^ do
+             begin
+               if topol <> ptrDCB^.topol then
+               begin
+                 (* Reestablish pointer into parent directory *)
+                 scanKey := saveKey;
+                 (* Force a call to Position *)
+                 ptrSysloc^.topol := ptrDCB^.topol + 1;
+               end{if};
+               scanPage := page;
+               scanIndex := index;
+               scanID := id;
+             end{with};
+             scanLevel := scanLevel - 1;
+
+             (* Unlink and release stack frame *)
+             addrM := ord(ptrScanStack);
+             ptrScanStack := ptrScanStack^.link;
+             relspace(addrM, b_syslocal_ptr);
+           end{with};
+       end{proc Pop};
+
+  begin
+      ecode := 0;
+      nullName := '';
+      ptrSysloc := pointer(b_syslocal_ptr);
+      ptrDCB := mounttable[ptrSysloc^.scanDevice];
+      nextEntry := '';
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        writeln('page = ',ptrSysloc^.scanPage,'   index = ',ptrSysloc^.scanIndex);
+{$ENDC}
+      if ptrSysloc^.scanPage = BAD then
+      begin
+        ecode := E_EOF;  (* reset dir has not been done yet *)
+        exit(GetNextEntry);
+      end{if};
+
+      wait_sem(ptrDCB^.volSem, []);  (* acquire the tree *)
+
+  9:  (* Try again *)
+
+      level := ptrSysloc^.scanLevel;
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        writeln('page = ',ptrSysloc^.scanPage:1,'   index = ',ptrSysloc^.scanIndex:1,
+                '   scanID = ',ptrSysloc^.scanID:1);
+{$ENDC}
+      if ptrSysloc^.topol <> ptrDCB^.topol then
+      begin
+        (* Tree has changed; reestablish scan location *)
+        NextRec.key := ptrSysloc^.scanKey;
+        Position(ptrDCB, ptrBuf, ptrSysloc^.scanIndex, @NextRec, found, ecode);
+        if ecode > 0 then goto 1;
+        if found then
+          SeqRec(ptrDCB, ptrBuf, ptrSysloc^.scanIndex, @NextRec, ecode);
+        ptrSysloc^.topol := ptrDCB^.topol;  (* back in sync *)
+      end
+      else
+      begin
+        GetNode(ptrDCB, ptrSysloc^.scanPage, TRUE {read}, ptrBuf, ecode);
+        if ecode > 0 then goto 1;
+
+        SeqRec(ptrDCB, ptrBuf, ptrSysloc^.scanIndex, @NextRec, ecode);
+      end{if};
+
+      if ecode = E_EOF then
+      begin
+        (* EOF on this directory *)
+        if ptrSysloc^.ptrScanStack <> pointer(BAD) then
+        begin
+          (* Resume scan in parent directory *)
+          Pop;
+          goto 9;
+        end{if};
+      end{if};
+      if ecode > 0 then goto 1;
+
+      (* Update the scan page in case a page boundary was crossed *)
+      ptrSysloc^.scanPage := ptrBuf^.page;
+      ptrSysloc^.scanKey := NextRec.key;
+      FreeBuf(ptrBuf);
+
+      DecompKey(@NextRec.key, @nextEntry, parID);
+
+{$IFC DIRBUG}
+      if trace(FS,DIRLEVEL) then
+        writeln('nextEntry = ',nextEntry,'  parID = ',parID);
+{$ENDC}
+
+      with ptrSysloc^ do
+      begin
+        if parID <> scanID then
+        begin
+          (* EOF on this directory *)
+          if ptrScanStack <> pointer(BAD) then
+          begin
+            (* Resume scan in parent directory *)
+            Pop;
+            goto 9;
+          end
+          else
+          begin
+            (* Final EOF on the directory/subtree *)
+            ecode := E_EOF;
+            ptrSysloc^.scanPage := BAD;
+            nextEntry := '';
+          end{if};
+        end
+        else
+        begin
+          (* Next object in directory *)
+          if scanMode = treescan then
+          begin
+            if NextRec.eType = direntry then
+            begin
+              (* Push location in current directory on scan stack *)
+              if not getspace(sizeof(DirMarker), b_syslocal_ptr, addrM) then
+              begin
+                ecode := E_SCANSTK_NOSPACE;
+                goto 1;
+              end{if};
+
+              ptrM := pointer(addrM);
+              ptrM^.link := ptrScanStack;
+              ptrScanStack := ptrM;
+
+              with ptrM^ do
+              begin
+                page := scanPage;
+                index := scanIndex;
+                id := scanID;
+                saveKey := scanKey;
+                topol := ptrDCB^.topol;
+              end{with};
+              scanLevel := scanLevel + 1;
+
+              (* Resume scan at first entry of subdirectory *)
+              scanID := NextRec.id;
+              MakeKey(NextRec.id, @nullName, @threadKey);
+              Search(ptrDCB, @threadKey, ptrBuf, found, ecode);
+              if ecode > 0 then goto 1;
+              FreeBuf(ptrBuf);
+              if not found then
+              begin
+                ecode := E_TREE_MUNCH;
+                goto 1;
+              end{if};
+
+              ptrStack := @NodeStack[ptrDCB^.MDDFdata^.tree_depth];
+              scanPage := ptrStack^.page;
+              scanIndex := ptrStack^.index;
+            end
+            else
+              (* Update the scan page in case page boundary was crossed *)
+              scanPage := ptrBuf^.page;
+          end{if};
+        end{if};
+      end{with};
+
+  1:
+      signal_sem(ptrDCB^.volSem);
+
+  end{proc GetNextEntry};
+
+
+END.
+
+ÿ

@@ -1,0 +1,667 @@
+(*
+$Exec
+PLibPr/PrBuf
+{no listing}
+LibPr/Temp
+GLibPr/Temp
+LibPr/PrBuf
+$EndExec
+*)
+{               NOTE: The above compiles this program.                   }
+{------------------------------------------------------------------------------------------}
+{                      Copyright 1983, 1984, Apple Computer Inc.                           }
+{------------------------------------------------------------------------------------------}
+UNIT PrBuf;
+INTRINSIC;
+
+{ ---------------------------------------------------------------------- }
+                              Interface
+{ ---------------------------------------------------------------------- }
+
+USES
+     {$U LibOS/SysCall      }  SysCall,
+     {$U LibPM/PMDecl       }  PMDecl,
+     {$U LibSM/UnitStd      }  UnitStd,
+     {$U LibSM/UnitHz       }  UnitHz,
+     {$U LibQD/Storage      }  Storage,
+     {$U LibQD/QuickDraw    }  QuickDraw,
+     {$U LibFM/FontMgr      }  FontMgr,
+     {$U LibPr/PrStdInfo    }  PrStdInfo;
+
+
+TYPE
+    TPbCmd = ( pbCmdText, pbCmdHRule, pbCmdVRule );
+
+    TPbCommand = RECORD
+        h: TC;                          {h coordinate for command}
+        v: TC;                          {v coordinate for command}
+        CASE pbCmd: TPbCmd OF
+            pbCmdText: (                {Text command}
+                cFont: TC;              {Font of the text string}
+                seteface: Style;        {Face for the text string}
+                cFirstChar: TC;         {Index into text buffer of first character}
+                cLength: TC);           {Length of text string in buffer}
+
+            pbCmdHRule: (               {Horizontal rule command}
+                cWidth: TC);            {Width of the horizontal rule}
+
+            pbCmdVRule: (               {vertical rule command}
+                cHeight: TC);           {Height of the horizontal rule}
+
+    END; {TPbCommand record}
+
+    TPbData  = PACKED ARRAY [0..32000] OF CHAR;
+    TPPbData = ^TPbData;
+    THPbData = ^TPPbData;
+
+    TPbProcs = ARRAY [TPbCmd] OF TProc; {Array of dump procs by cmd}
+
+    TPbInstall = RECORD                 {PrBuf caller installation}
+        chkProcs : TPbProcs;            {Check cmd procs for imaging}
+        dumpProcs: TPbProcs;            {Dump procs for imaging}
+        scanLine : TProc;               {Proc called at each scan line before dump}
+    END;
+
+
+Var
+    rPrBounds : Rect;                {Bounding box of images stored by PrBuf}
+    HOffSet,VOffSet : Integer;
+
+PROCEDURE PbClose;
+PROCEDURE PbDumpBand;
+PROCEDURE PbHRule( cLength: TC );
+PROCEDURE PbOffSet(HOff,VOff:Integer);
+PROCEDURE PbOpen( install: TPbInstall );
+PROCEDURE PbText( cCount: TC; p: TP );
+PROCEDURE PbVRule( cLength: TC );
+
+{ ---------------------------------------------------------------------- }
+                              IMPLEMENTATION
+{ ---------------------------------------------------------------------- }
+{$S Pr}
+
+{$IFC PrDeBug}
+   {$R+}
+{$ELSEC}
+   {$R-}
+{$ENDC}
+
+{$IFC PrSymbols}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+
+CONST
+    initData=100;       {Initial size for character and command structures}
+    initCmds=10;
+
+TYPE
+    TmpPbCommands  = ARRAY [0..1000] OF TPbCommand;
+    TPmpPbCommands = ^TmpPbCommands;
+    THmpPbCommands = ^TPmpPbCommands;
+
+    TPbSorted  = ARRAY [0..16000] OF TC;
+    TPPbSorted = ^TPbSorted;
+    THPbSorted = ^TPPbSorted;
+
+
+    TPrBuf = RECORD
+        pbInstall: TPbInstall;          {Instalation parameters}
+
+        hCommands    : THmpPbCommands;    {Handle to dynamic command array}
+        hPbData      : THPbData;          {Handle to dynamic character buffer}
+        cNumCommands : TC;                {Number of qm commands allocated}
+        cCommandsUsed: TC;                {Number of qm commands used from allocation}
+        cNumData     : TC;                {Number of characters allocated}
+        cDataUsed    : TC;                {Number of characters used from allocation}
+        iTextCurrent : TC;                {Index of current text command}
+        cFontCurrent : TC;                {current Font}
+        faceCurrent  : Style;             {Current font bold?}
+        hCurrent     : TC;                {Current h coordinate for text}
+        vCurrent     : TC;                {Current v coordinate for text}
+    END;
+    TPPrBuf = ^TPrBuf;
+    THPrBuf = ^TPPrBuf;
+
+VAR
+    hPrBuf: THPrBuf;
+
+{Directory of private procs}
+
+PROCEDURE PbDoHRule( hLoc, vLoc, dh: TC);                               FORWARD;
+PROCEDURE PbAlocChar( cChars: TC);                                      FORWARD;
+PROCEDURE PbAlocCmd;                                                    FORWARD;
+PROCEDURE PbDoText( hLoc, vLoc: TC; ch: CHAR );                         FORWARD;
+PROCEDURE PbLimit ( r: Rect );                                          FORWARD;
+PROCEDURE PbDoVRule( hLoc, vLoc, dv: TC);                               FORWARD;
+
+{Directory of external procs}
+
+FUNCTION  PbCallChkProc ( VAR cmd: TPbCommand; hPbData: THPbData; chkProc : TProc ): TF; EXTERNAL;
+PROCEDURE PbCallDumpProc( VAR cmd: TPbCommand; hPbData: THPbData; dumpProc: TProc );     EXTERNAL;
+PROCEDURE PbCallScanLine( v: TC; scanLine: TProc );                                      EXTERNAL;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbClose;
+Begin
+   With hPrBuf^^ do Begin
+     FreeH(TheHeap,POINTER(hPbData));
+     FreeH(TheHeap,POINTER(hCommands));
+   End;
+   FreeH(TheHeap,POINTER(hPrBuf));
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbDoHRule;
+   {    hLoc,
+        vLoc,
+        dh: TC}
+VAR
+    i: TC;
+    cmd: TPbCommand;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+{Stuff the new command}
+    WITH cmd DO BEGIN
+        pbCmd:=pbCmdHRule;
+        h:=hLoc;
+        v:=vLoc;
+        cWidth:=dh;
+    END;
+
+{See if command checks out}
+    IF
+        PbCallChkProc( cmd, hPrBuf^^.hPbData,
+                            hPrBuf^^.pbInstall.chkProcs[ pbCmdHRule ] )
+    THEN BEGIN
+        WITH hPrBuf^^ DO BEGIN
+{Try to add to an existing hrule using adjusted parameters from "cmd"}
+            FOR i:=0 TO cCommandsUsed-1 DO WITH hCommands^^[i] DO BEGIN
+                IF
+                    (pbCmd = pbCmdHRule) AND
+                    (v = cmd.v)
+                THEN BEGIN
+                    IF
+                        ( (h <= cmd.h) AND (h+cWidth >= cmd.h) ) OR
+                        ( (h <= cmd.h+cmd.cWidth) AND (h+cWidth >= cmd.h+cmd.cWidth) )
+                    THEN BEGIN
+                        cWidth:=CMAX( h+cWidth, cmd.h+cmd.cWidth );
+                        h:=CMIN( h, cmd.h );
+                        cWidth:=cWidth-h;
+                        EXIT(PbDoHRule);
+                    END;
+                END; {If hrule}
+            END; {for i:=0...}
+        END;{ with }
+
+{Insert new horizontal rule command at end; allocate a new command record}
+        PbAlocCmd;
+
+        WITH hPrBuf^^ DO BEGIN
+            hCommands^^[cCommandsUsed]:=cmd;
+            cCommandsUsed:=cCommandsUsed + 1;
+        END;
+    END; {if passes check}
+END; {proc}
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbAlocChar{    cChars: TC};
+VAR hPbData: THPbData;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Allocate space if needed. *)
+    IF (hPrBuf^^.cDataUsed+cChars>=hPrBuf^^.cNumData) THEN BEGIN
+       WITH hPrBuf^^ DO BEGIN
+            cNumData:=cNumData + CMAX( cChars, 200 );
+       END;
+       (* ----- Allocate in chunks of 200(or text length) to minimize size changing. *)
+       ChangeSizeH( TheHeap, POINTER(ORD( hPrBuf^^.hPbData )), hPrBuf^^.cNumData );
+    END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbAlocCmd;
+VAR hCommands: THmpPbCommands;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Allocate a new command. *)
+    IF hPrBuf^^.cCommandsUsed>=hPrBuf^^.cNumCommands THEN BEGIN
+      (* ----- Allocate in chunks of 25 to minimize size changing. *)
+      WITH hPrBuf^^ DO BEGIN
+          cNumCommands:=cNumCommands + 25;
+      END;
+      ChangeSizeH( TheHeap, POINTER(ORD( hPrBuf^^.hCommands )), hPrBuf^^.cNumCommands*SIZEOF(TPbCommand) );
+    END;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbDoText{ ( hLoc, vLoc: TC; ch: CHAR ) };
+VAR fTest: TF;
+    cmd: TPbCommand;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Add the character at the end. *)
+    PbAlocChar( 1 );
+    WITH hPrBuf^^ DO BEGIN
+        hPbData^^[ cDataUsed ]:=ch;
+        cDataUsed:=cDataUsed + 1;
+    END;
+
+    (* ----- Stuff a new text command for checkout. *)
+    WITH cmd, hPrBuf^^, ThePort^ DO BEGIN
+        pbCmd:=pbCmdText;
+        h:=hLoc;
+        v:=vLoc;
+        cFont:=txFont;
+        seteface:=txFace;
+        cFirstChar:=cDataUsed-1;
+        clength:=1;
+    END; {with stuff cmd}
+
+    IF PbCallChkProc( cmd, hPrBuf^^.hPbData, hPrBuf^^.pbInstall.chkProcs[ pbCmdText ] ) THEN BEGIN
+        (* ----- If this character stitches with the old ones, add on to existing cmd. *)
+        WITH hPrBuf^^, ThePort^ DO BEGIN
+            fTest:= (cFontCurrent = txFont) AND
+                    (faceCurrent = txFace)  AND
+                    (hCurrent = cmd.h)      AND
+                    (vCurrent = cmd.v)
+        END;
+        IF fTest THEN BEGIN
+            (* ----- Add to old text command at end. *)
+            WITH hPrBuf^^.hCommands^^[hPrBuf^^.iTextCurrent] DO BEGIN
+                clength:=clength + 1;
+            END; {with}
+        END
+        ELSE BEGIN
+            (* ----- Allocate a new command now that the string length has been set. *)
+            PbAlocCmd;
+            (* ----- Add a new text command at end. *)
+            WITH hPrBuf^^, ThePort^ DO BEGIN
+                hCommands^^[cCommandsUsed]:=cmd;
+                iTextCurrent:=cCommandsUsed;
+                cCommandsUsed:=cCommandsUsed + 1;
+            END;
+        END; {If text matches}
+
+        WITH hPrBuf^^, ThePort^ DO BEGIN
+            (* ----- Save the current location etc. for appending next text command. *)
+            cFontCurrent:=txFont;
+            faceCurrent:=txFace;
+            hCurrent:=cmd.h+CharWidth( ch );
+            vCurrent:=cmd.v;
+        END;
+    END; {If passes test}
+END; {proc}
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbDumpBand;
+VAR
+    v, i, j, cError: TC;
+    c: CHAR;
+    fBits: TF;
+    portTop, portBottom: TC;
+    hSorted: THPbSorted;
+    nSorted: TC;
+    cmd: TPbCommand;
+
+    PROCEDURE InsertEntry( left, right: TC );
+    VAR j, half: TC;
+    BEGIN
+        {$IFC fTracePR}    LogCall;     {$ENDC}
+        IF  (right-left < 1) THEN BEGIN
+            FOR j:=i DOWNTO right+1 DO BEGIN            {&&MoVE RIGHT}
+                hSorted^^[j]:=hSorted^^[j-1];
+            END;
+            hSorted^^[right]:=i;
+        END
+        ELSE WITH hPrBuf^^ DO BEGIN
+            half:=left + (right-left) DIV 2;
+            IF (hCommands^^[ hSorted^^[half] ].v < cmd.v) THEN BEGIN
+                InsertEntry( half+1 , right );
+            END
+            ELSE BEGIN
+                IF ( hCommands^^[ hSorted^^[half] ].v = cmd.v ) AND
+                   ( hCommands^^[ hSorted^^[half] ].h < cmd.h ) THEN BEGIN
+                     InsertEntry( half+1 , right );
+                END
+                ELSE BEGIN
+                    InsertEntry( left, half );
+                END;
+            END;
+        END; {else with...}
+    END;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Get top and bottom of port to dump. *)
+    WITH ThePort^.portRect DO BEGIN
+        portTop   :=top;
+        portBottom:=bottom;
+    END;
+
+    (* ----- Allocate the sorted list 2 bytes per command. *)
+    hSorted:=POINTER(ORD( HAllocate( TheHeap, hPrBuf^^.cCommandsUsed * 2 ) ));
+
+    (* ----- Do for every scan line in port rect. *)
+    FOR v:=portTop TO portBottom-1 DO WITH hPrBuf^^, pbInstall DO BEGIN
+        PbCallScanLine( v, scanLine );
+
+        (* ----- Scan the command list for a command at this v position. *)
+        nSorted:=0;
+        FOR i:=0 TO cCommandsUsed-1 DO BEGIN
+            (* ----- Remember the command and sort them. "i" is implied parameter to InsertEntry. *)
+            cmd:=hCommands^^[ i ];
+            IF cmd.v = v THEN BEGIN
+                InsertEntry( 0, nSorted );
+                nSorted:=nSorted+1;
+            END;
+        END; {for i}
+        FOR i:=0 TO nSorted-1 DO BEGIN
+            (* ----- Execute the command. *)
+            PbCallDumpProc( hCommands^^[ hSorted^^[i] ], hPrBuf^^.hPbData,
+                            dumpProcs[ hCommands^^[ hSorted^^[i] ].pbCmd ] );
+        END; {for i}
+    END;{for v..., with hPrBuf^^}
+
+    (* ----- Reset the commands and buffer counters. *)
+    WITH hPrBuf^^ DO BEGIN
+        cCommandsUsed:= 0;
+        cDataUsed:=0;
+    END;
+
+    (* ----- Give back the sorted list. *)
+    FreeH( TheHeap, POINTER(ORD(hSorted)) );
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbHRule;
+   {    cLength: TC}
+VAR
+   hLeft, hRight: TC;
+   rgnTest, rgnClip: RgnHandle;
+   rTest: Rect;
+
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    WITH ThePort^ DO BEGIN
+
+{Discard if not in clip rgn}
+        rgnTest:=NewRgn;
+        rgnClip:=NewRgn;
+
+        IF
+            cLength >= 0
+        THEN BEGIN
+            SetRect( rTest, 0, 0, clength, 1 );
+        END
+        ELSE BEGIN
+            SetRect( rTest, clength, 0, 0, 1 );
+        END;
+        OffsetRect( rTest, pnLoc.h, pnLoc.v );
+
+        RectRgn( rgnTest, rTest );
+        SectRgn( ThePort^.clipRgn, rgnTest, rgnTest );
+
+        {SectRgn( rgnTest, ThePort^.visRgn, rgnTest );}
+
+{Retrieve end points after clipping to the clip rgn and portRect}
+        WITH rgnTest^^.rgnBBox DO BEGIN
+            hLeft:= left;
+            hRight:=right;
+        END;
+        PbLimit( rgnTest^^.rgnBBox );
+
+        DisposeRgn( rgnTest );
+        DisposeRgn( rgnClip );
+{Discard if not in band h range}
+        IF
+            hLeft < hRight
+        THEN BEGIN
+
+            PbDoHRule( hLeft, pnLoc.v, hRight - hLeft );
+        END;
+    END;
+
+{Adjust the current position no matter what}
+    ThePort^.pnLoc.h:=ThePort^.pnLoc.h + cLength;
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbLimit{ ( r: Rect) };
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    IF (rPrBounds.left <> -32000) THEN BEGIN
+        UnionRect( rPrBounds, r, rPrBounds );
+    END
+    ELSE BEGIN
+        rPrBounds:=r;
+    END;
+END;
+{ ---------------------------------------------------------------------- }
+Procedure PbOffSet{Hoff,Voff:Integer};
+Begin
+  {$IFC fTracePR}    LogCall;     {$ENDC}
+  HOffSet{.PrBuf}:=Hoff;
+  VOffSet{.PrBuf}:=Voff;
+End;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbOpen{ ( install: TPbInstall ) };
+
+VAR cBitsDown: TC;
+    hDataTemp, hCmdTemp: TH;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Allocate the handles first. *)
+    hPrBuf:=POINTER(ORD( HAllocate( TheHeap, SIZEOF(TPrBuf) ) ));
+    hDataTemp:=HAllocate( TheHeap, initData );
+    hCmdTemp :=HAllocate( TheHeap, initCmds*SIZEOF(TPbCommand) );
+
+    WITH hPrBuf^^ DO BEGIN
+        pbInstall:=install;
+
+        cNumCommands:=initCmds;
+        cNumData:=initData;
+        cCommandsUsed:= 0;
+        cDataUsed:=0;
+        hPbData:=POINTER(ORD( hDataTemp ) );
+        hCommands:=POINTER(ORD( hCmdTemp ) );
+
+        hCurrent:=-9999;
+        vCurrent:=-9999;
+    END;
+
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbText {(cCount: TC;p: TP)};
+VAR
+    pChr    : TP;
+    i, cCharWidth, cRunWidth, newH: TC;
+    rgnClip, rgnTest, rgnResult: RgnHandle;
+    rtest: Rect;
+    finfo: FontInfo;
+    pTemp: TP;
+    cmd  : TPbCommand;
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    (* ----- Record the new value for the h location regardless of the outcome of the clipping.*)
+    cRunWidth:=TextWidth( POINTER(ORD(p)), 0, cCount );
+    newH:=ThePort^.pnLoc.h + cRunWidth;
+
+    (* ----- Get the font metrics.*)
+    GetFontInfo( finfo );
+
+    (* ----- Figure out the clip region = ClipRgn + sloppy portRect              *)
+    (* ----- Make clip region as large as characters for a particular scan line. *)
+    (*   -   +--------------------------------+  ascent Line
+         ^   !    !           !               !
+         !   !    !           !  !  ------    !
+         !   !    !           !  !/        \  !
+ Ascent  !   !    !           !  !          ! !
+         !   !    !           !  !          ! !
+         !   !     \ _______ /   \ _______ /  !
+         -   !------------------ ! -----------!  Base Line
+         ^   !                   !            !
+ Descent !   !                   !            !
+         !   !                   !            !
+         -   +--------------------------------+  desent line
+    *)
+    rgnClip:=NewRgn;
+    WITH ThePort^.portRect, finfo DO
+        SetRectRgn( rgnClip, left, top - ascent, right, bottom + descent );
+    SectRgn( rgnClip, ThePort^.clipRgn, rgnClip );
+
+    (* ----- See if any of the text intersects the clip rgn.*)
+    (* ----- rTest is the bounding box of the text.         *)
+    SetRect( rTest, 0, -finfo.ascent, cRunWidth, finfo.descent+finfo.leading );
+    WITH ThePort^.pnLoc DO OffsetRect( rTest, h, v );
+    IF SectRect( rTest, rgnClip^^.rgnBBox, rTest) THEN
+    WITH ThePort^ DO BEGIN
+        PbLimit( rTest );
+
+        (* ----- Get all the various regions.*)
+        rgnTest:=NewRgn;
+        rgnResult:=NewRgn;
+        (* ----- Enumerate each character and test individually. *)
+        FOR i:=0 TO cCount-1 DO BEGIN
+            cCharWidth:=TextWidth( POINTER(ORD(p)), i, 1);
+            SetRectRgn( rgnTest, 0, -finfo.ascent, cCharWidth, finfo.descent );
+            OffsetRgn( rgnTest, pnLoc.h, pnLoc.v );
+
+            (* ----- See if this character wholly hits the clip region.*)
+            SectRgn( rgnTest, rgnClip, rgnResult );
+            IF  EqualRgn( rgnTest, rgnResult ) THEN BEGIN
+                pTemp:=POINTER(ORD( p ) + i);
+                PbDoText( pnLoc.h, pnLoc.v, CHR(pTemp^) );
+            END; {If box wholly intersects cliprgn bbox}
+
+            (* ----- Bump up the test point by character width. *)
+            Move( cCharWidth, 0 );
+        END; {Do for each character}
+
+        (* ----- Get rid of character regions. *)
+        DisposeRgn( rgnTest );
+        DisposeRgn( rgnResult );
+
+    END; {if any text intersects}
+
+    (* ----- Get rid of clip rgn. *)
+    DisposeRgn( rgnClip );
+
+    (* ----- Set h location independent of clipping. *)
+    ThePort^.pnLoc.h:=newH;
+
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbDoVRule{ (hLoc, vLoc, dv: TC) } ;
+VAR
+    ptScale: Point;
+    i: TC;
+    cmd: TPbCommand;
+BEGIN
+{$IFC fTracePR}    LogCall;     {$ENDC}
+{Stuff the new command}
+    WITH cmd DO BEGIN
+        pbCmd:=pbCmdVRule;
+        h:=hLoc;
+        v:=vLoc;
+        cHeight:=dv;
+    END;
+
+{See if command checks out}
+    IF
+        PbCallChkProc( cmd, hPrBuf^^.hPbData,
+                            hPrBuf^^.pbInstall.chkProcs[ pbCmdVRule ] )
+    THEN BEGIN
+{Try to add to an existing vrule using adjusted parameters from "cmd"}
+        WITH hPrBuf^^ DO BEGIN
+            FOR i:=0 TO cCommandsUsed-1 DO WITH hCommands^^[i] DO BEGIN
+                IF
+                    (pbCmd = pbCmdVRule) AND
+                    (h = hLoc)
+                THEN BEGIN
+                    IF
+                        ( (v <= cmd.v) AND (v+cHeight >= cmd.v) ) OR
+                        ( (v <= cmd.v+cmd.cHeight) AND (v+cHeight >= cmd.v+cmd.cHeight) )
+                    THEN BEGIN
+                        cHeight:=CMAX( v+cHeight, cmd.v+cmd.cHeight );
+                        v:=CMIN( v, cmd.v );
+                        cHeight:=cHeight-v;
+                        EXIT(PbDoVRule);
+                    END;
+                END; {if rule intersect}
+            END; {for i:=0...}
+        END;{with}
+
+{Insert new vertical rule command at end; allocate a new command record}
+        PbAlocCmd;
+
+        WITH hPrBuf^^, pbInstall DO BEGIN
+            hCommands^^[cCommandsUsed]:=cmd;
+            cCommandsUsed:=cCommandsUsed + 1;
+        END;
+    END; {if passes check}
+END;
+{ ---------------------------------------------------------------------- }
+PROCEDURE PbVRule;
+   {    cLength: TC}
+
+VAR
+    vTop, vBottom, vTopCheck, vBotCheck: TC;
+    rgnTest, rgnClip: RgnHandle;
+    rTest: Rect;
+
+BEGIN
+    {$IFC fTracePR}    LogCall;     {$ENDC}
+    WITH ThePort^ DO BEGIN
+{Discard if not in clip rgn}
+        rgnTest:=NewRgn;
+        rgnClip:=NewRgn;
+
+        IF
+            cLength >= 0
+        THEN BEGIN
+            SetRect( rTest, 0, 0, 1, clength );
+        END
+        ELSE BEGIN
+            SetRect( rTest, 0, clength, 1, 0 );
+        END;
+        OffSetRect( rTest, pnLoc.h, pnLoc.v );
+        RectRgn( rgnTest, rTest );
+        SectRgn( ThePort^.clipRgn, rgnTest, rgnTest );
+
+        {SectRgn( ThePort^.visRgn, rgnTest, rgnTest );}
+{Retrieve end points after clipping to the clip rgn}
+        vTop:= rgnTest^^.rgnBBox.top;
+        vBottom:=rgnTest^^.rgnBBox.bottom;
+
+        PbLimit( rgnTest^^.rgnBBox );
+
+        DisposeRgn( rgnTest );
+        DisposeRgn( rgnClip );
+
+        IF
+            vTop < vBottom
+        THEN BEGIN
+{Clip v to band rect}
+            vTopCheck:=CMAX( vTop, CMAX(portRect.top, 0 ) );
+            vBotCheck:=CMIN( vBottom, portRect.bottom );
+
+{Record if still good, otherwise must be out of port rectangle}
+{ In order to do proper coalescing across band boundaries (in the daisy wheel printer for example),
+ the rejection for outside the print band is left to PbCallChkProc called by PbDoVRule.  }   {BH}
+(*            IF
+                vTopCheck < vBotCheck
+            THEN BEGIN    *)
+                PbDoVRule( pnLoc.h, vTop, vBottom - vTop );
+(*            END;        *)
+        END;
+    END;
+
+{Adjust the current v position no matter what}
+    ThePort^.pnLoc.v:=ThePort^.pnLoc.v + cLength;
+END;
+{ ---------------------------------------------------------------------- }
+END.
+
+{
+UNIT PrBuf CHANGE LOG:
+      2/17/84  BH:   Added PbVRule and PbHRule for Typewriter-like Printers
+      1/30/83  OD:   Nothing Yet!
+}
+
+
+
+
+ÿ

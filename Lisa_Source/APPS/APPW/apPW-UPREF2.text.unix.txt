@@ -1,0 +1,2356 @@
+CONST
+    unknownDevice = 0;
+
+VAR
+    bootVol:        pathname;
+    prExtWord:      TPrExtWord;
+
+    {pertaining to the SYSTEM.CDD file}
+    cddDescr:       cddHeader;
+    dirtyCDD:       boolean;
+    nameCDD:        pathname;
+    openCDD:        boolean;
+
+
+    {pertaining to the SYSTEM.PRD file}
+    prdDescr        : prdHeader;
+    dirtyPRD        : boolean;
+    namePRD         : pathname;
+    openPRD         : boolean;
+    refPRD          : integer;
+
+    cddClass:       TClass;
+    prdClass:       TClass;
+    unknownCdd:     TCddObject;
+    unknownPrd:     TPrdObject;
+
+    infoRec:        Q_info;
+
+{PRIVATE PROCEDURES and FUNCTIONS}
+PROCEDURE ParseName(namestring : e_name; var parsestring: e_name);                              FORWARD;
+FUNCTION  PMEntrySize(config: configdev): integer;                                              FORWARD;
+PROCEDURE GetCDDEntry(var error: integer; chRef: INTEGER; drvrname: e_name;
+                      var chObject: TChObject);                                                 FORWARD;
+PROCEDURE GetPRDEntry(var error: integer; dnRef: INTEGER; drvrname: e_name;
+                      var chObject: TChObject);                                                 FORWARD;
+FUNCTION  EqualBytes(source, dest: Ptr; nBytes: INTEGER): BOOLEAN; EXTERNAL;
+FUNCTION  EqualChar(source, dest: Ptr; nBytes: INTEGER): BOOLEAN; EXTERNAL;
+PROCEDURE XferLeft(source, dest: Ptr; nBytes: INTEGER); EXTERNAL;
+
+
+
+
+
+{*******************************************************************************************************}
+{       Methods of Classes                                                                              }
+{*******************************************************************************************************}
+
+FUNCTION MapAlert(alert: INTEGER): INTEGER;
+VAR
+    thisAlert:  INTEGER;
+BEGIN
+    thisAlert := alert;
+    IF onWorkShop THEN
+        CASE alert OF
+            CardHasUnKnownDevices:  thisAlert := wCardWithUnknown;
+            PmEntryButNoDriver:     thisAlert := wEntryButNoDriver;
+            32:                     thisAlert := 132;
+            cdMustRebuild:          thisAlert := wMustRebuild;
+            cdBootDiskFull:         thisAlert := wBootDiskFull;
+            cdCantCopyDriver:       thisAlert := wCantCopy;
+            cdBadVol:               thisAlert := wBadVol;
+            cantAttachDevice:       thisAlert := wCantAttach;
+            SlotInUseSoCantAttach:  thisAlert := wSlotInUse;
+            InUseSlot:              thisAlert := wInUseSlot;
+            ConnInUseSoCantAttach:  thisAlert := wConnInUse;
+            InUseConn:              thisAlert := wInUseConn;
+            errorDetaching:         thisAlert := wErrorDetaching;
+            deferedIsAttached:      thisAlert := wDeferedIsAttached;
+        END;
+    MapAlert := thisAlert;
+END;
+
+PROCEDURE PrefParamAlert(e_name1, e_name2: pE_name);
+VAR param1, param2:  TParamAlert;
+BEGIN
+    XferLeft(POINTER(ORD(e_name1)), @param1, ORD(e_name1^[0]) + 1);
+    XferLeft(POINTER(ORD(e_name2)), @param2, ORD(e_name2^[0]) + 1);
+    ParamAlert(param1, param2, '');
+END;
+
+{$S PrefCold}
+    FUNCTION  GetDescriptor(device: TDevice): TChObject;
+    VAR
+        chObject: TChObject;
+    BEGIN
+        IF device.typeDevice = printer THEN
+            chObject := TchObject(processList.HasId(device.printerID))
+        ELSE
+            chObject := TchObject(driverList.HasId(device.id));
+
+        GetDescriptor := chObject;
+        IF chObject = NIL THEN
+            IF device.typeDevice = printer THEN
+                GetDescriptor := unknownPrd
+            ELSE
+                GetDescriptor := unknownCdd;
+    END;
+
+    FUNCTION PosToConnector(pos: cd_position): TConnector;
+    VAR
+        i:          INTEGER;
+        connector:  TPrefPort;
+        card:       TCard;
+    BEGIN
+        connector := NIL;
+        CASE pos.slot OF
+         1,2,3:
+                IF pos.chan > 0 THEN
+                    BEGIN
+                    card := TCard(root.slots[pos.slot].connectedDevice);
+                    IF card.id <> unknownDevice THEN
+                        connector := TConnector(card.Connectors.elements[pos.chan]);
+                    END;
+            10:
+                IF pos.chan = 1 THEN
+                    connector := root.serialA
+                ELSE
+                    IF pos.chan = 2 THEN
+                        connector := root.serialB;
+            11:
+                connector := root.parallel;
+            END;
+
+        PosToConnector := TConnector(connector);
+    END;
+
+    PROCEDURE Detach(var error: integer; position: cd_position; shouldDefer: BOOLEAN);
+    VAR     ndxPM           : integer;
+            found           : boolean;
+            pmObject        : TpmObject;
+
+    BEGIN
+        IF configDbg THEN
+            WITH position DO
+                WRITELN('Entering Detach - posistion is ', slot:1, ' ', chan:1, ' ', dev:1);
+
+        {Get PM entry of position we are detaching}
+        ndxPM := 0;
+        repeat
+                ndxPM := ndxPM + 1;
+                pmObject := TPmObject(list_PM.At(ndxPM));
+                found := ((pmObject.config.pos.slot = position.slot) and
+                          (pmObject.config.pos.chan = position.chan) and
+                          (pmObject.config.pos.dev  = position.dev));
+        until found or (ndxpM = list_PM.Size);
+
+        IF NOT(found) THEN
+            EXIT(Detach);
+
+        {Attempt to detach the driver}
+        CDKILL(error, position);
+        IF error = 751 THEN
+            error := 0;
+        IF ((error = 752) OR (error = 753)) AND shouldDefer THEN
+            BEGIN
+            deferedList.InsLast(pmObject);
+            list_PM.DelAt(ndxpm, FALSE);
+            END;
+
+        IF error <= 0 THEN
+            list_PM.DelAt(ndxpm, TRUE);
+    END;
+
+    PROCEDURE BuildDevName(pos: cd_position; withDash: BOOLEAN; VAR devName: e_name);
+    VAR
+        count:  INTEGER;
+    BEGIN
+        IF configDbg THEN
+            WITH pos DO
+                WRITELN('Entering BuildDevName - the position is: ',slot,' ',chan,' ',dev);
+        count := 1;
+        IF withDash THEN
+            BEGIN
+            devName[count] := '-';
+            count := count + 1;
+            END;
+        devName[count] := '#';
+        WITH pos DO
+            BEGIN
+            IF slot >= 10 THEN
+                BEGIN
+                count := count + 1;
+                devName[count] := CHR(ORD('0') + slot div 10);
+                END;
+            count := count + 1;
+            devName[count] := CHR(ORD('0') + slot mod 10);
+            IF chan > 0 THEN
+                BEGIN
+                count := count + 1;
+                devName[count] := '#';
+                count := count + 1;
+                devName[count] := CHR(ORD('0') + chan);
+                END;
+            devName[0] := CHR(count);
+            END;
+        IF uprefDbg THEN
+            WRITELN('Leaving BuildDevName - devName is ',devName);
+    END;
+
+{-------------------------------------------------------------------------------------------}
+METHODS OF TpmObject
+{-------------------------------------------------------------------------------------------}
+    FUNCTION  TpmObject.Create(obj: TObject; itsHeap: THz): TpmObject;
+    BEGIN
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, ThisClass, SIZEOF(SELF));
+        SELF := TpmObject(obj);
+    END;
+
+    PROCEDURE TPmObject.SetDefault(isDefault: BOOLEAN);
+    VAR
+      dsp : dsProcParam;                                   {ff 6/8/84}
+    BEGIN
+        WITH SELF.config DO
+            BEGIN
+            prExtWord.extWord := extWords[1];
+            prExtWord.default_flag := isDefault;
+            extWords[1] := prExtWord.extWord;
+            IF isDefault THEN                              {ff 6/8/84}
+              BEGIN
+                dsp.proccode := dsPrintDev;
+                dsp.PrDevice := concat('-',DevName);
+          {$H-} DSPaslibCall(dsp); {$H+}
+              END;
+            END;
+    END;
+
+    FUNCTION TPmObject.isDefault: BOOLEAN;
+    BEGIN
+        prExtWord.extWord := SELF.config.extWords[1];
+        isDefault := prExtWord.default_flag;
+    END;
+
+{$IFC CFGDEBUG}
+    PROCEDURE TpmObject.Print;
+    BEGIN
+        WITH SELF.config DO
+            BEGIN
+            WRITE('ÆÆÆÆÆÆÆÆ PmObject ', devName);
+            IF SELF.printerId > 0 THEN
+                BEGIN
+                prExtWord.extWord := ExtWords[1];
+                WITH prExtWord DO
+                    WRITELN('is a printer with id ', prDeviceId:1,' and default flag is ',default_flag);
+                END;
+            WRITELN(' has id ',driverID:1);
+            WRITE('  and is at position ');
+            END;
+        WITH SELF.config.pos DO
+            WRITELN(slot:3,' ',chan:2,' ',dev:2);
+    END;
+{$ENDC}
+END;
+
+{$S PrefHot}
+{-------------------------------------------------------------------------------------------}
+METHODS OF TChList
+{-------------------------------------------------------------------------------------------}
+    FUNCTION  TChList.Create(obj: TObject; itsHeap: THz): TChList;
+    BEGIN
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, ThisClass, SIZEOF(SELF));
+        SELF := TChList(TIndexList.Create(obj, itsHeap));
+    END;
+
+    PROCEDURE TChList.DelNamedObject(name: pE_name; free: BOOLEAN);
+    VAR i:          INTEGER;
+        chObject:   TChObject;
+    BEGIN
+        FOR i := 1 TO SELF.size DO
+            BEGIN
+            chObject := TChObject(SELF.elements[i]);
+            IF EqualChar(@chObject.name, POINTER(ORD(name)), ORD(name^[0]) + 1) THEN
+                BEGIN
+                SELF.DelAt(i, free);
+                EXIT(DelNamedObject);
+                END;
+            END;
+    END;
+
+    FUNCTION  TChList.HasName(name: e_name): TChObject;
+    VAR i:          INTEGER;
+        chObject:   TChObject;
+    BEGIN
+        HasName := NIL;
+        FOR i := 1 TO SELF.size DO
+            BEGIN
+            chObject := TChObject(SELF.elements[i]);
+            IF EqualChar(@chObject.name, @name, LENGTH(name) + 1) THEN
+                HasName := chObject;
+            END;
+    END;
+
+    FUNCTION  TChList.HasTextAsName(name: TDynamicArray): BOOLEAN;   {*** should this, and others, call above **}
+    VAR i:          INTEGER;
+        chObject:   TChObject;
+    BEGIN
+        HasTextAsName := FALSE;
+        FOR i := 1 TO SELF.size DO
+            BEGIN
+            chObject := TChObject(SELF.elements[i]);
+            IF EqualChar(@chObject.name, @name.ch, name.size) THEN
+                HasTextAsName := TRUE;
+            END;
+    END;
+
+    FUNCTION  TChList.HasId(ID: LONGINT): TChObject;
+    VAR i:  INTEGER;
+    BEGIN
+        HasId := NIL;
+        FOR i := 1 TO SELF.size DO
+            IF id = TChObject(SELF.elements[i]).id THEN
+                BEGIN
+                HasId := TChObject(SELF.elements[i]);
+                EXIT(HasId);
+                END;
+    END;
+
+END;
+
+{$S PrefCold}
+{-------------------------------------------------------------------------------------------}
+METHODS OF TchObject
+{-------------------------------------------------------------------------------------------}
+    FUNCTION  TChObject.Create(obj: TObject; itsHeap: THz): TChObject;
+    BEGIN
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, ThisClass, SIZEOF(SELF));
+        SELF := TChObject(obj);
+        WITH SELF DO
+            BEGIN
+            active := 0;
+            END;
+    END;
+
+{$IFC CFGDEBUG}
+    PROCEDURE TchObject.Print;
+    BEGIN
+        WRITE('¥¥¥¥¥¥¥¥¥',SELF.name,'   ', SELF.id);
+        CASE SELF.typeDevice OF
+            disk:       WRITELN('  disk');
+            printer:    WRITELN('  printer');
+            process:    WRITELN('  process');
+            card:       WRITELN('  card');
+            OTHERWISE   WRITELN('  unkown');
+            END;
+        WRITELN('Is active ',SELF.active:1,' times');
+    END;
+{$ENDC}
+
+    FUNCTION TchObject.InUse: BOOLEAN;
+    BEGIN
+        InUse := SELF.active > 0;
+    END;
+
+
+    FUNCTION TchObject.Reveal: BOOLEAN;
+    BEGIN
+        Reveal := TRUE;
+    END;
+
+    PROCEDURE TChObject.PosDetach(var error: integer; position: cd_position);
+    { This routine detaches a driver from a position. }
+    VAR
+        devName:    e_name;
+    BEGIN
+        IF configDbg THEN
+            WITH position DO
+                WRITELN('Entering PosDetach - posistion is ', slot:1, ' ', chan:1, ' ', dev:1);
+
+        IF onWorkShop THEN
+            IF (SELF.typeDevice = disk) OR (SELF.typeDevice = printer) THEN
+                BEGIN
+                BuildDevName(position, FALSE, devName);
+                UnMount(error, devname);
+                END;
+
+        Detach(error, position, FALSE);
+        IF error <= 0 THEN
+            WITH SELF DO
+                active := active - 1;
+    END; {of PosDetach}
+END;
+
+{$S PrefInit}
+FUNCTION DummyCdd(itsHeap: THz): TcddObject;
+VAR obj:    TObject;
+    temp:   e_name;
+BEGIN
+    obj := NewObject(itsHeap, cddClass, SIZEOF(TCddObject));
+    DummyCdd := TCddObject(TChObject.Create(obj, itsHeap));
+
+    CreateStringFromText(sunknown, temp);
+
+    WITH DummyCdd DO
+        BEGIN
+        name := temp;
+        id := 0;
+        bootable := FALSE;
+        attachment := nilList;
+        typedevice := other;
+        connectors  := nilList;
+        END;
+END;
+
+FUNCTION DummyPrd(itsHeap: THz): TPrdObject;
+VAR obj:    TObject;
+    temp:   e_name;
+BEGIN
+    obj := NewObject(itsHeap, prdClass, SIZEOF(TPrdObject));
+    DummyPrd := TPrdObject(TChObject.Create(obj, itsHeap));
+
+    CreateStringFromText(sunknown, temp);
+    WITH DummyPrd DO
+        BEGIN
+        name := temp;
+        id := 0;
+        driver := nilList;
+        typedevice := process;
+        END;
+END;
+
+PROCEDURE MountDevice(newDevice: TPrefDevice);
+VAR
+    devName:    e_name;
+    dummy:      e_name;
+    pos:        cd_position;
+    error:      INTEGER;
+
+    PROCEDURE configPrinter;  {ff 9/13/83}
+    VAR
+        DevControl: DcType;
+        path:       pathname;
+        error:      INTEGER;
+    begin
+        with DevControl do
+          begin
+            path := concat('-',devName,'-x'); {OD}
+            dcversion := 2;
+            dccode := 17;   {auto LF }
+            dcdata[0] := 1;
+            Device_Control(error,path,DevControl);
+            IF newDevicd.position.slot = 10 { serial ports } THEN
+              BEGIN
+                dccode := 5;
+                dcdata[0] := 9600;
+                device_control(error,path,devcontrol); {baud rate}
+                dccode := 2;
+                device_control(error,path,devcontrol); {DTR}
+                dccode := 1;
+                dcdata[0] := 0;
+                device_control(error,path,devcontrol); {8-bit no-parity}
+                dccode := 12;
+                dcdata[0] := 60;
+                device_control(error,path,devcontrol); {time out}
+                dccode := 10;
+                dcdata[0] := 0;
+                dcdata[1] := -128;
+                device_control(error,path,devcontrol); {disconnect detect}
+              END;
+          end
+      end;
+
+BEGIN
+    IF (newDevice.typeDevice = disk) OR (newDevice.typeDevice = printer) THEN
+        BEGIN
+        BuildDevName(newDevice.position, FALSE, devName);
+        mount(error, dummy, dummy, devname);
+        IF error > 0 THEN
+            BEGIN
+            PrefParamAlert(@newDevice.name.ch, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cantMountDisk));
+            EXIT(MountDevice)
+            END;
+        IF TPrefDevice(newDevice).typeDevice = printer THEN ConfigPrinter;
+        END
+END;
+
+{-------------------------------------------------------------------------------------------}
+METHODS OF TcddObject
+{-------------------------------------------------------------------------------------------}
+{$S PrefCold}
+    FUNCTION TCddObject.Create(VAR error: INTEGER; obj: TObject; itsHeap: THz; itsName: e_name;
+                                                 chInfo: ch_info; fileRef: INTEGER): TcddObject;
+    LABEL 100;
+    VAR ename:      e_name;
+        actual:     LONGINT;
+        j:          INTEGER;
+        tempList:   TNamedList;
+        namedObject: TNamedObject;
+
+    BEGIN
+        IF configDbg THEN
+            WRITELN('Entering TCddObject.Create for cdd ',itsName);
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, cddClass, SIZEOF(SELF));
+        SELF := TCddObject(TChObject.Create(obj, itsHeap));
+
+        WITH SELF DO
+            BEGIN
+            version := chinfo.version;
+            name := itsName;
+            id := chinfo.driver_id;
+            bootable := chinfo.bootable;     {**** Use an Xfer to do this ****}
+            preload := chinfo.preload;      { XferLeft();}
+            permanent := chinfo.permanent;
+            deviceType := chinfo.deviceType;
+            size_exten := chinfo.size_exten;
+            removable := chinfo.removable;
+            ejectable := chinfo.ejectable;
+            fs_start_block := chinfo.fs_start_block;
+            start_block := chinfo.start_block;
+
+            FOR j := 1 to 3 do
+                def_cdinfo[j]   := chinfo.def_cdinfo[j];
+
+            END;
+
+        error := 0;
+        {get CDDObject.attachment}
+        IF chinfo.numAttach > 0 THEN
+            begin
+            tempList := TNamedList.Create(NIL, dynamicHeap);
+            SELF.attachment := tempList;
+            for j := 1 to chinfo.numAttach do
+                begin
+                READ_DATA(error, fileRef, ord4(@ename), sizeof(TypeConnect), actual, sequential, 0);
+                IF error > 0 THEN
+                    GOTO 100;
+                namedObject := TNamedObject.Create(NIL, dynamicHeap, CreateTextFromString(dynamicHeap, @ename), 0);
+                tempList.insLast(namedObject);
+                end;
+            end
+        ELSE
+            SELF.attachment := nilList;
+
+       WITH SELF DO
+            IF deviceType = diskDev THEN
+                typeDevice := disk
+            ELSE
+         {$H-}  IF attachment.HasName('lisaslot') <> NIL THEN {$H+}
+                    typeDevice := card
+                ELSE
+                    typedevice := other;
+
+        {get tempCDDObject.connectors}
+        if chinfo.numConnectors > 0 then
+            begin
+            tempList := TNamedList.Create(NIL, dynamicHeap);
+            SELF.connectors := tempList;
+            for j := 1 to chinfo.numConnectors do
+                begin
+                READ_DATA(error, fileRef, ord4(@ename), sizeof(TypeConnect), actual, sequential, 0);
+                IF error > 0 THEN
+                    GOTO 100;
+                namedObject := TNamedObject.Create(NIL, dynamicHeap, CreateTextFromString(dynamicHeap, @ename), 0);
+                tempList.insLast(namedObject);
+                end;
+            end
+        else
+            SELF.connectors := nilList;
+    100:
+        IF error > 0 THEN
+            BEGIN
+            obj.FreeObject;
+            SELF := NIL;
+            END;
+    END;
+
+{$IFC CFGDEBUG}
+    PROCEDURE TCddObject.Print;
+    VAR stringPtr:  ^Tsp;
+    BEGIN
+        SUPERSELF.Print;
+        WRITELN('Has attachments ');
+        SELF.attachment.Print;
+        WRITELN('And connectors');
+        SELF.connector.Print;
+    END;
+{$ENDC}
+
+    PROCEDURE TCddObject.Attach(VAR error: INTEGER; position: cd_position; itsPrinterId: INTEGER);
+
+    VAR
+            attributes      : cd_infobuf;
+            bytesUsed       : integer;
+            i               : integer;
+            ndxCDD          : integer;
+            parentPos       : cd_position;
+            pmEntry         : configDev;
+            pmObject        : TpmObject;
+
+    BEGIN
+        IF configDbg THEN
+            WITH position DO
+                BEGIN
+                WRITE('Entering Attach - posistion is ', slot:1, chan:1, dev:1,' object is ');
+                WRITELN(SELF.name);
+                END;
+
+        bytesUsed := 0;
+
+        {check if PM position is available for attaching}
+        for i := 1 to list_PM.Size do
+            begin
+            pmObject := TPmObject(list_PM.elements[i]);
+            bytesUsed := bytesUsed + PMEntrySize(pmObject.config);
+            if (pmObject.config.pos.slot = position.slot) then
+            if (pmObject.config.pos.chan = position.chan) then
+            if (pmObject.config.pos.dev  = position.dev)  then
+                BEGIN
+             {$IFC CFGDEBUG}
+                ABCBreak('Device already attached - removing it ',0);
+             {$ENDC}
+                SELF.PosDetach(error, position);
+                IF error > 0 THEN
+                    EXIT(Attach);
+                END;
+            END;
+
+        {Fill in new PM config entry}
+        pmEntry.pos := position;
+        pmEntry.driverid := SELF.id;
+        pmEntry.devName := SELF.name;
+        pmEntry.nExtwords := SELF.size_exten;
+        for i := 1 to 3 do
+            pmEntry.extwords[i] := SELF.def_cdinfo[i];
+
+        WITH prExtWord DO
+            BEGIN
+            IF ItsPrinterID > 0 THEN
+                BEGIN
+                IF pmEntry.nExtWords < 1THEN
+                    pmEntry.nExtWords := 1;
+                extWord := itsPrinterID;
+                printerChanged := TRUE;
+                printer_Flag := TRUE;
+                default_Flag := FALSE;
+                END
+            ELSE
+                IF pmEntry.nExtWords > 0 THEN
+                    printer_Flag := FALSE;
+
+            pmEntry.extWords[1] := extWord;
+            END;
+
+
+        if (bytesUsed + PMEntrySize(pmEntry) > pmmaxindex + 1) then
+            BEGIN
+            error := pmFull;
+            EXIT(Attach);
+            END;
+
+        pmObject := TpmObject.Create(NIL, dynamicHeap);
+        WITH pmObject DO
+            BEGIN
+            pmObject.printerId := itsPrinterId;
+            pmObject.config := pmEntry;
+            END;
+
+        {attach driver to PM position}
+        with attributes,SELF do
+                begin
+                cd_driverid    := id;
+                cd_start_block := start_block;
+                cd_fs_start    := fs_start_block;
+                cd_devt        := devicetype;
+                cd_drvrname    := name;
+                cd_perm        := permanent;
+                cd_ejectable   := ejectable;
+                cd_removable   := removable;
+                cd_preload     := preload;
+                end;
+
+        CDMAKE(error, position, attributes);
+        if error > 0 then
+                BEGIN
+              {$IFC CFGDEBUG}
+                ABCBreak('Error from CDMake in Attach', error);
+              {$ENDC}
+                EXIT(Attach);
+                END;
+
+
+        {Update PM and CDD lists}
+        list_PM.InsLast(pmObject);
+        SELF.active := SELF.active + 1;
+    END; {of Attach}
+
+    FUNCTION  TCddObject.AttachDevice(VAR error: INTEGER; connector: TPrefPort):TPrefPort ;
+    VAR newDevice:  TPrefDevice;
+        devName:    e_name;
+        dummy:      e_name;
+        pos:        cd_position;
+
+    BEGIN
+        SELF.Attach(error, connector.position, 0);
+        IF error > 0 THEN
+            EXIT(AttachDevice);
+
+        pos := connector.position;
+
+        IF SELF.typeDevice = card THEN
+            newDevice := TCard.Create(NIL, dynamicHeap, SELF, TSlot(connector), pos)
+        ELSE
+            newDevice := TDevice.Create(NIL, dynamicHeap, SELF, pos, SELF.id, 0);
+
+        attachDevice := newDevice;
+        connector.connectedDevice := newDevice;
+
+        IF onWorkShop THEN
+            MountDevice(newDevice)
+        ELSE
+            IF newDevice.typeDevice = disk THEN
+                NoteAlert(prefAlert, MapAlert(diskAttach));
+    END;
+
+    FUNCTION TCddObject.Reveal: BOOLEAN;
+    VAR error:      INTEGER;
+        filename:   pathname;
+    BEGIN
+        reveal := TRUE;
+        filename := Concat('-#Boot-','system.pr_', SELF.name);
+        Quick_LookUp(error, filename, infoRec);
+        IF error = 0 THEN
+            reveal := FALSE;
+    END;
+
+BEGIN
+    cddClass := THISCLASS;
+END;
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+METHODS OF TdcObject
+{-------------------------------------------------------------------------------------------}
+    FUNCTION TdcObject.Create(obj: TObject; itsHeap: THz; dChoice: DriverChoice): TdcObject;
+    BEGIN
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, ThisClass, SIZEOF(SELF));
+        SELF := TdcObject(obj);
+        SELF.connector := dChoice.connector;
+        SELF.cd_Driver := dChoice.cd_Driver;
+    END;
+
+{$IFC CFGDEBUG}
+    PROCEDURE TdcObject.Print;
+    BEGIN
+ {$H-}  WRITELN(SELF.cd_Driver,' on connector ',SELF.connector); {$H+}
+    END;
+{$ENDC}
+
+END;
+
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+METHODS OF TprdObject
+{-------------------------------------------------------------------------------------------}
+    FUNCTION TprdObject.Create(VAR error: INTEGER; obj: TObject; itsHeap: THz; itsName: e_name; dnInfo: dn_Info;
+                                                                        fileRef: INTEGER): TprdObject;
+    VAR dChoice:    driverChoice;
+        actual:     LONGINT;
+        j:          INTEGER;
+        tempList:   TIndexList;
+        dcObject:   TDcObject;
+    BEGIN
+        IF configDbg THEN
+            WRITELN('Entering TprdObject.Create for prd ',itsName);
+        IF obj = NIL THEN
+            obj := NewObject(itsHeap, ThisClass, SIZEOF(SELF));
+        SELF := TprdObject(TChObject.Create(obj, itsHeap));
+        WITH SELF DO
+            BEGIN
+            name := itsName;
+            id := dninfo.printer_id;
+            typeDevice := process;
+            END;
+
+        {get prdObject.driver}
+        if dninfo.numDrivers > 0 THEN
+            BEGIN
+            tempList := TIndexList.Create(NIL, dynamicHeap);
+            SELF.driver := tempList;
+            for j := 1 to dninfo.numDrivers do
+                BEGIN
+                READ_DATA(error, fileRef, ord4(@dChoice), sizeof(DriverChoice), actual, sequential, 0);
+                IF error > 0 THEN
+                    BEGIN
+                    obj.FreeObject;
+                    SELF := NIL;
+                    EXIT(Create);
+                    END;
+                dcObject := TdcObject.Create(NIL, dynamicHeap, dChoice);
+                tempList.insLast(dcObject);
+                END;
+            END
+        ELSE
+            SELF.driver := TIndexList(nilList);
+    END;
+
+    FUNCTION  TPrdObject.AttachDevice(VAR error: INTEGER; connector: TPrefPort):TPrefPort ;
+    VAR
+        newDevice:  TPrefDevice;
+        driver:     TCddObject;
+
+    BEGIN
+        error := 0;
+
+        driver := SELF.GetGoodDriver(connector.name, '');
+        IF driver = NIL THEN
+            BEGIN
+            PrefParamAlert(@connector.name.ch, @SELF.name);
+            NoteAlert(prefAlert, MapAlert(cdNoLowLevel));
+            EXIT(AttachDevice);
+            END;
+
+        driver.Attach(error, connector.position, SELF.id);
+        IF error > 0 THEN
+            EXIT(AttachDevice);
+
+        newDevice := TDevice.Create(NIL, dynamicHeap, SELF, connector.position, driver.id, SELF.id);
+
+        TDevice(newDevice).typeDevice := printer;
+        attachDevice := newDevice;
+        connector.connectedDevice := newDevice;
+
+        IF onWorkShop THEN
+            MountDevice(newDevice);
+
+        SELF.active := SELF.active + 1;
+    END;
+
+    FUNCTION TPrdObject.DiskHasDriver: BOOLEAN;
+    { Find a driver in searchList usable by this process independant of connector }
+    VAR i, j:  INTEGER;
+        thisDc: TdcObject;
+        driver: TCddObject;
+    BEGIN
+        DiskHasDriver := FALSE;
+        FOR i := 1 TO driverList.size DO
+            BEGIN
+            driver := TCddObject(driverList.elements[i]);
+            FOR j := 1 TO SELF.driver.size DO
+                BEGIN
+                thisDc := TdcObject(SELF.driver.elements[j]);
+                IF EqualChar(@thisDc.cd_driver, @driver.name, LENGTH(driver.name) +1) THEN
+                    BEGIN
+                    DiskHasDriver := TRUE;
+                    EXIT(DiskHasDriver);
+                    END;
+                END;
+            END;
+    END;
+
+    FUNCTION TPrdObject.GetGoodDriver(text: TDynamicArray; name: e_name): TCddObject;
+    { Find a driver usable by this process which can go on the connector passed in}
+    VAR i, j:  INTEGER;
+        thisDc: TdcObject;
+        driver: TCddObject;
+    BEGIN
+        IF text <> NIL THEN
+            CreateStringFromText(text, name);
+
+        GetGoodDriver := NIL;
+        FOR i := 1 TO SELF.driver.size DO
+            BEGIN
+            thisDc := TdcObject(SELF.driver.elements[i]);
+            IF EqualChar(@thisDc.connector, @name, LENGTH(name) + 1) THEN
+                FOR j := 1 TO driverList.size DO
+                    BEGIN
+                    driver := TCddObject(driverList.elements[j]);
+                    IF EqualChar(@thisDc.cd_driver, @driver.name, LENGTH(driver.name) +1) THEN
+                        IF driver.attachment.HasName(name) <> NIL THEN
+                            BEGIN
+                            GetGoodDriver := driver;
+                            EXIT(GetGoodDriver);
+                            END;
+                    END;
+            END;
+    END;
+
+{$IFC CFGDEBUG}
+    PROCEDURE TprdObject.Print;
+    BEGIN
+        SUPERSELF.Print;
+        WRITELN('has drivers');
+        SELF.driver.Print;
+    END;
+{$ENDC}
+
+BEGIN
+    prdClass := THISCLASS;
+END;
+
+
+
+
+{*******************************************************************************************************}
+{       Procedures and Functions                                                                        }
+{*******************************************************************************************************}
+PROCEDURE CdError(drvrName: e_name; alertNumber: INTEGER);
+BEGIN
+END;
+
+PROCEDURE InsertDriver(chObject: TChObject);
+BEGIN
+    IF chObject.typeDevice = card THEN
+        cardList.InsLast(chObject)
+    ELSE
+        deviceList.InsLast(chObject);
+    driverList.InsLast(chObject);
+END;
+
+{------------------------------------------------------------------------------}
+
+PROCEDURE InstallFromBoot;
+VAR error:          INTEGER;
+    menu:           TMenu;
+    totalDrivers:   INTEGER;
+    totalProcesses: INTEGER;
+BEGIN
+    ReadCdd(error, totalDrivers);
+
+    ReadPrd(error, totalProcesses);
+
+    IF (totalProcesses > 0) OR (totalDrivers > 0) THEN
+        NoteAlert(prefAlert, MapAlert(rcgnzdDrivers));
+END;
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE BuildCdd{var error: integer; VAR totalCdd: INTEGER};
+{-------------------------------------------------------------------------------------------}
+{       In the event that the Boot Volume's SYSTEM.CDD file is non-existant or damaged,     }
+{       this routine rebuilds the SYSTEM.CDD file.  The Boot Volume is searched for any     }
+{       SYSTEM.CH files and their corresponding SYSTEM.CD and optional SYSTEM.BT files.     }
+{       These are used to rebuild the SYSTEM.CDD file.                                      }
+{-------------------------------------------------------------------------------------------}
+VAR i:          INTEGER;
+BEGIN
+    IF configDbg THEN
+        WRITELN('Entering BuildCdd');
+    {Attempt to make SYSTEM.CDD file}
+    MAKE_FILE(error, nameCDD, 0);
+    IF (error > 0) and (error <> 890) then
+        EXIT(BuildCdd);
+
+    {Attempt to open SYSTEM.CDD file}
+    OPEN(error, nameCDD, refCDD, [dread,dwrite]);
+    if error > 0 then
+        EXIT(BuildCdd);
+
+    readCdd(error, totalCdd);
+    IF error > 0 THEN
+        EXIT(BuildCdd);
+
+    IF totalCdd > 0 THEN
+        NoteAlert(prefAlert, MapAlert(rcgnzdDrivers));
+
+    error := 0;
+    IF configDbg THEN
+        WRITELN('Exiting BuildCdd');
+END;
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE ReadCdd{var error: integer; VAR totalCdd: INTEGER};
+{-------------------------------------------------------------------------------------------}
+LABEL
+    100;
+
+CONST   cdPrefix        = '-SYSTEM.CD_';
+        btPrefix        = '-SYSTEM.BT_';
+
+VAR     btRef           : integer;
+        cdRef           : integer;
+        chRef           : integer;
+        chPrefix        : e_name;
+        drvrname        : e_name;
+        newEntry        : e_name;
+        filename        : pathname;
+        chObject        : TChObject;
+        driver:         TCddObject;
+        dummy:          INTEGER;
+BEGIN
+    IF uprefDbg THEN
+        WRITELN('Entering ReadCdd');
+    totalCDD := 0;
+    chPrefix := 'SYSTEM.CH_';
+
+
+    {Scan the boolVol for valid -SYSTEM.CD drivers, logging entries in list_CDD}
+    RESET_CATALOG(error,bootVol);
+
+    REPEAT
+        GET_NEXT_ENTRY(error, CHPrefix, newEntry);
+        if error <> 0 then
+            begin
+            IF error <> 848 THEN
+                EXIT(ReadCdd);
+            GOTO 100;
+            end;
+
+       {Parse off the drivername}
+        Parsename(newEntry, drvrname);
+
+      { If there is already an entry for this driver then delete it and continue }
+        driver := TCddObject(driverList.HasName(drvrname));
+        IF driver <> NIL THEN
+            BEGIN
+            IF driver.typeDevice = card THEN
+                cardList.DelNamedObject(@driver.name, FALSE)
+            ELSE
+                deviceList.DelNamedObject(@driver.name, FALSE);
+            driverList.DelNamedObject(@driver.name, TRUE);
+            END;
+
+        filename := CONCAT(bootVol, '-', chPrefix, drvrname);
+        OPEN(error, filename, chRef, [dread]);
+        if error > 0 then
+            GOTO 100;
+
+       {Read next SYSTEM.CH file and get a cddObject for it}
+        GetCDDEntry(error, chRef, drvrname, chObject);
+        if (error > 0) OR (chObject = NIL) then
+            GOTO 100;
+
+        {clean up}
+        CLOSE_OBJECT(dummy, chRef);
+
+       {Verify that SYSTEM.CD file exists}
+        filename := CONCAT(bootVol, cdPrefix, drvrname);
+        QUICK_LOOKUP(error, filename, infoRec);
+        if error = 948 then
+            begin
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdCDMissing));
+            chObject.Free;
+            GOTO 100;
+            end;
+
+       {Verify that optional SYSTEM.BT file exists}
+        if TCddObject(chObject).bootable then
+            BEGIN
+            filename := CONCAT(bootVol, btPrefix, drvrname);
+            QUICK_LOOKUP(error, filename, infoRec);
+            if error = 948 then
+                begin
+                PrefParamAlert(@drvrname, @emptyString);
+                NoteAlert(prefAlert, MapAlert(cdBTMissing));
+                GOTO 100;
+                end;
+            END;
+
+      { Add entry to list, update count, and set drity bit }
+        InsertDriver(chObject);
+        totalCDD := totalCDD + 1;
+        dirtyCDD := true;
+
+    100:
+       { Delete ch file }
+        filename := CONCAT(chPrefix, drvrname);
+        KILL_OBJECT(dummy, filename);
+    UNTIL error = 848;
+
+    error := 0;
+
+    IF uprefDbg THEN
+        WRITELN('Exiting ReadCdd');
+END; {of ReadCdd}
+
+
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE BuildPRD{var error: integer};
+{-------------------------------------------------------------------------------------------}
+{       In the event that the Boot Volume's SYSTEM.PRD file is non-existant or damaged,     }
+{       this routine rebuilds the SYSTEM.PRD file.  The Boot Volume is searched for any     }
+{       SYSTEM.DN files and their corresponding SYSTEM.PR files.  These are used to         }
+{       rebuild the SYSTEM.PRD file.                                                        }
+{-------------------------------------------------------------------------------------------}
+VAR totalPrd:   INTEGER;
+
+BEGIN
+    IF uprefDbg THEN
+        WRITELN('Entering BuildPrd');
+    {Attempt to make SYSTEM.PRD file}
+    MAKE_FILE(error, namePRD, 0);
+    if (error > 0) and (error <> 890) then {can't make SYSTEM.PRD file}
+        EXIT(BuildPRD);
+
+    {Attempt to open SYSTEM.PRD file}
+    OPEN(error, namePRD, refPRD, [dread,dwrite]);
+    if (error > 0) then {can't open SYSTEM.PRD file}
+        EXIT(BuildPRD);
+
+    ReadPrd(error, totalPrd);
+
+    IF totalPrd > 0 THEN
+        NoteAlert(prefAlert, MapAlert(rcgnzdDrivers));
+
+    IF uprefDbg THEN
+        WRITELN('Exiting BuildPrd');
+END;
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE ReadPrd{var error: integer; totalPrd: INTEGER};
+LABEL   100;
+CONST   prPrefix        = '-SYSTEM.PR_';
+
+VAR     dnRef           : integer;
+        prRef           : integer;
+        dnPrefix        : e_name;
+        drvrname        : e_name;
+        newEntry        : e_name;
+        filename        : pathName;
+        prdObject       : TPrdObject;
+        driver:         TCddObject;
+        dummy:          INTEGER;
+
+BEGIN
+    IF uprefDbg THEN
+        WRITELN('Entering ReadPrd');
+    totalPRD := 0;
+    dnPrefix := 'SYSTEM.DN_';
+
+
+    {Scan the boolVol for valid SYSTEM.PR drivers, logging entries in list_PRD}
+    RESET_CATALOG(error,bootVol);
+
+    REPEAT
+       {Look for next SYSTEM.DN entry}
+        GET_NEXT_ENTRY(error, DNPrefix, newEntry);
+        if error > 0 then
+            begin
+            IF error <> 848 THEN
+                EXIT(ReadPrd);
+            GOTO 100;
+            end;
+
+       {Parse off the drivername}
+        Parsename(newEntry, drvrname);
+
+      { If there is already an entry for this process then delete it and continue }
+        processList.DelNamedObject(@drvrname, TRUE);
+
+        filename := CONCAT(bootVol, '-', dnPrefix, drvrname);
+        OPEN(error, filename, dnRef, [dread]);
+        if error > 0 then
+            GOTO 100;
+
+       {Read next SYSTEM.DN file and get a prdObject for it}
+        GetPRDEntry(error, dnRef, drvrname, prdObject);
+        if error > 0 then GOTO 100;
+
+        {clean up}
+        CLOSE_OBJECT(dummy, dnRef);
+
+       {Verify that SYSTEM.PR file exists}
+        filename := CONCAT(bootVol, prPrefix, drvrname);
+        QUICK_LOOKUP(error, filename, infoRec);
+        if error = 948 then
+            begin
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdPRMissing));
+            GOTO 100;
+            end;
+
+        IF NOT prdObject.DiskHasDriver THEN
+            BEGIN
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdProcHasNoDriver));
+            END;
+
+       {Delete dn file and Add valid prd entry to list_PRD}
+        filename := CONCAT(DNPrefix, drvrname);
+        KILL_OBJECT(error, filename);
+
+        totalPRD := totalPRD + 1;
+        processList.InsLast(prdObject);
+
+100:
+    UNTIL error = 848;
+
+    error := 0;
+    dirtyPRD := true;
+
+    IF uprefDbg THEN
+        WRITELN('Exiting ReadPrd');
+END; {of ReadPrd}
+
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE GetCDDEntry{var error: integer; chRef: INTEGER; drvrname: e_name; var chObject: TChObject};
+{-------------------------------------------------------------------------------------------}
+{       This routine opens and reads the SYSTEM.CH file, returning a cddObject.             }
+{-------------------------------------------------------------------------------------------}
+LABEL   100;
+
+CONST   chPrefix        = '-SYSTEM.CH_';
+
+VAR     actual          : longint;
+        chFile          : pathname;
+        chinfo          : ch_info;
+        ename           : e_name;
+        i, j            : integer;
+        nObject         : TNamedObject;
+        CDDObject:      TcddObject;
+        connector:      TConnector;
+        newDevice:      TPrefPort;
+        dummy:          INTEGER;
+
+BEGIN
+    IF configDbg THEN
+        WRITELN('Enterin GetCddEntry');
+
+    CddObject := NIL;
+
+    {Read contents of SYSTEM.CH file}
+    READ_DATA(error, chRef, ord4(@chinfo), sizeof(ch_info), actual, sequential, 0);
+    if error > 0 then
+        GOTO 100;
+
+    {Stuff a cdd Object with the info}
+    CDDObject := TcddObject.Create(error, NIL, dynamicHeap, drvrname, chinfo, chRef);
+    IF error > 0 THEN
+        GOTO 100;
+
+    chObject := TChObject(CDDObject);
+
+100:
+    IF error > 0 THEN
+        BEGIN
+        PrefParamAlert(@drvrname, @emptyString);
+        NoteAlert(prefAlert, MapAlert(cdBadChFile));
+        KillDriver(@drvrname);
+        chObject := NIL;
+        END;
+
+    IF configDbg THEN
+        WRITELN('Enterin GetCddEntry');
+END; {of getCDDEntry}
+
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE GetPRDEntry{var error: integer; dnRef: INTEGER; drvrname: e_name; var chObject: TChObjecct};
+{-------------------------------------------------------------------------------------------}
+{       This routine opens and reads the named SYSTEM.DN file, returning a prdObject.       }
+{-------------------------------------------------------------------------------------------}
+LABEL   100;
+CONST   dnPrefix        = '-SYSTEM.DN_';
+
+VAR     actual          : longint;
+        dninfo          : dn_info;
+        dnFile          : pathname;
+        j               : integer;
+        dChoice         : DriverChoice;
+        dcObject        : TdcObject;
+        PRDObject       : TprdObject;
+        tempList        : TIndexList;
+        newDevice:      TPrefPort;
+        connector:      TConnector;
+        dummy:          INTEGER;
+BEGIN
+    IF configDbg THEN
+        WRITELN('Entering GetPRDEntry');
+
+    {Read contents of SYSTEM.DN file}
+    READ_DATA(error, dnRef, ord4(@dninfo), sizeof(dn_info), actual, sequential, 0);
+    if error > 0 then
+        GOTO 100;
+
+    {Stuff a prd object with the info}
+    PRDObject := TprdObject.Create(error, NIL, dynamicHeap, drvrName, dnInfo, dnRef);
+    IF error > 0 THEN
+        GOTO 100;
+
+100:
+    IF error > 0 THEN
+        BEGIN
+        PrefParamAlert(@drvrname, @emptyString);
+        NoteAlert(prefAlert, MapAlert(cdBadDnFile));
+        KillDriver(@drvrname);
+        END;
+
+    chObject := TChObject(PRDObject);
+    IF configDbg THEN
+        WRITELN('Exiting GetPRDEntry');
+END; {of GetPRDEntry}
+
+PROCEDURE BuildRootMenu;
+{ The button file already has the serial A and B buttons in the root menu.
+  Generate the other buttons as needed.}
+VAR startPoint:     POINT;
+    button:         TButton;
+    drvrButton:     TDriverButton;
+    looks:          TLooks;
+    i:              INTEGER;
+
+BEGIN
+    theRootMenu.btnArray.DelAll(FALSE);
+    startPoint.v := 5;
+    looks.fb := FALSE;
+
+  { Generate serialA }
+    startPoint.h := 0;
+    looks.buttonType := ckBox;
+    drvrButton := TDriverButton.Create(NIL, dynamicHeap, looks, sSerialA, startPoint, FALSE, root.serialA);
+    theRootMenu.InsLast(drvrButton);
+    startPoint.h := 200;
+    looks.buttonType := boxLabel;
+    button := TButton.Create(NIL, dynamicHeap, looks, NoText, startPoint, FALSE);
+    theRootMenu.InsLast(button);
+    startPoint.v := startPoint.v + 15;
+
+  { Generate serialB }
+    startPoint.h := 0;
+    looks.buttonType := ckBox;
+    drvrButton := TDriverButton.Create(NIL, dynamicHeap, looks, sSerialB, startPoint, FALSE, root.serialB);
+    theRootMenu.InsLast(drvrButton);
+    startPoint.h := 200;
+    looks.buttonType := boxLabel;
+    button := TButton.Create(NIL, dynamicHeap, looks, NoText, startPoint, FALSE);
+    theRootMenu.InsLast(button);
+    startPoint.v := startPoint.v + 15;
+
+    IF NOT isPepsi THEN
+        BEGIN
+        { Generate the parallel button }
+        startPoint.h := 0;
+        looks.buttonType := ckBox;
+        drvrButton := TDriverButton.Create(NIL, dynamicHeap, looks, sParallel, startPoint, FALSE, root.parallel);
+        theRootMenu.InsLast(drvrButton);
+        startPoint.h := 200;
+        looks.buttonType := boxLabel;
+        button := TButton.Create(NIL, dynamicHeap, looks, NoText, startPoint, FALSE);
+        theRootMenu.InsLast(button);
+        startPoint.v := startPoint.v + 15;
+        END;
+
+    FOR i := 1 TO 3 DO
+        BEGIN
+        { Generate the 3 slot buttons }
+        startPoint.h := 0;
+        looks.buttonType := ckBox;
+        drvrButton := TDriverButton.Create(NIL, dynamicHeap, looks, sSlots[i], startPoint, FALSE, root.slots[i]);
+        theRootMenu.InsLast(drvrButton);
+        startPoint.h := 200;
+        looks.buttonType := boxLabel;
+        button := TButton.Create(NIL, dynamicHeap, looks, NoText, startPoint, FALSE);
+        theRootMenu.InsLast(button);
+        startPoint.v := startPoint.v + 15;
+        END;
+END;
+
+{$S PrefInit}
+{-------------------------------------------------------------------------------------------}
+PROCEDURE InitCd(VAR error: INTEGER);
+{-------------------------------------------------------------------------------------------}
+{       This routine initializes my list of CDD entries, PRD entries and PMConfig entries.  }
+{       It should be called before preferences begins building its configuration data       }
+{       structures.  If the SYSTEM.CDD or SYSTEM.PRD files are bad, calls should then be    }
+{       made to BuildCDD or BuildPRD to rectify the problem.                                }
+{-------------------------------------------------------------------------------------------}
+LABEL   100,
+        150,
+        200,
+        250;
+
+VAR     i,j :           integer;
+        actual          : longint;
+        bootprefix      : e_name;
+        fileName:       Pathname;
+        cddObject       : TcddObject;
+        cddDescr        : cddHeader;
+        cddRec          : cddEntry;
+        config          : configDev;
+        dChoice         : DriverChoice;
+        dcObject        : TdcObject;
+        extraError:     integer;
+        ename           : e_name;
+        entryKey        : longint;
+        pmObject        : TpmObject;
+        prdObject       : TprdObject;
+        prdDescr        : prdHeader;
+        prdRec          : prdEntry;
+        stringObject    : TNamedObject;
+        tempList        : TNamedList;
+        temp2List       : TNamedList;
+        chInfo:         ch_Info;
+        totalCdd:       INTEGER;
+        cddError:       INTEGER;
+        prdError:       INTEGER;
+
+BEGIN
+{initialization}
+    nilList := TNamedList.Create(NIL, dynamicHeap);
+
+    driverList := TChList.Create(NIL, dynamicHeap);
+    processList := TChList.Create(NIL, dynamicHeap);
+    cardList := TChList.Create(NIL, dynamicHeap);
+    deviceList := TChList.Create(NIL, dynamicHeap);
+
+    unknownCdd := DummyCdd(dynamicHeap);
+    unknownPrd := DummyPrd(dynamicHeap);
+
+WITH nullPosition DO
+    BEGIN
+    slot := cNullSlot;
+    chan := cNullChan;
+    dev  := cNullDev;
+    END;
+
+    Mach_Info(error, thisMach_info); {Lisa, Pepsi, or sony?}
+
+    isPepsi := thisMachInfo.io_board = iob_pepsi;
+
+    dirtyCDD := false;
+    dirtyPRD := false;
+    OSBOOTVOL(error, bootprefix);
+    bootVol := CONCAT('-', bootprefix);
+    nameCDD := CONCAT(bootVol, '-SYSTEM.CDD');
+    namePRD := CONCAT(bootVol, '-SYSTEM.PRD');
+
+  { Allocate an empty defered list }
+    deferedList := TNamedList.Create(NIL, dynamicHeap);
+
+  { Allocate pm list and read it in }
+    entryKey := 0;
+    tempList   := TNamedList.Create(NIL, dynamicHeap);
+    PMREADCONFIG(error, entryKey, config);
+    REPEAT
+        IF (config.pos.slot < 14) THEN
+            IF (config.pos.slot <> 11) OR NOT isPepsi THEN
+                BEGIN
+                pmObject := TpmObject.Create(NIL, dynamicHeap);
+                pmObject.config := config;
+                WITH prExtWord DO
+                    BEGIN
+                    extWord := config.extWords[1];
+                    IF (prExtWord.printer_flag) AND (config.nExtWords > 0) THEN
+                        BEGIN
+                        default_flag := FALSE;
+                        printer_flag := FALSE;
+                        pmObject.printerID := extWord;
+                        END
+                    ELSE
+                        pmObject.printerID := 0;
+                    END;
+                tempList.InsLast(pmObject);
+                END;
+        PMREADCONFIG(error, entryKey, config);
+    UNTIL (error > 0);
+    list_PM := tempList;
+
+    {open the SYSTEM.CDD file}
+    OPEN(error, nameCDD, refCDD, [dread, dwrite]);
+    IF configDbg THEN
+        IF error > 0 THEN
+            WRITELN('Error trying to open system.cdd', error)
+        ELSE
+            WRITELN('system.cdd opened successfully, refnum is ', refcdd);
+
+    IF error > 0 THEN
+        BEGIN
+        StopAlert(prefAlert, cdMustRebuild);
+        cddError := cdNotOpened;
+        EXIT(initCd);
+        END;
+
+    cddError := 0;
+
+{read all cdd entries}
+     {read SYSTEM.CDD header}
+    READ_DATA(cddError, refCDD, ord4(@cddDescr), sizeof(cddHeader), actual,  sequential, 0);
+    IF (CddError > 0) or (actual <> sizeof(cddheader)) then
+        BEGIN
+        CddError := cdBadHeader; {SYSTEM.CDD has a bad header descriptor}
+        GOTO 100;
+        END;
+
+          {read SYSTEM.CDD entries}
+    IF (cddDescr.version <> cdd_version) or (cddDescr.cdcount < 0) then
+        BEGIN
+        CddError := cdBadFormat; {SYSTEM.CDD is in a bad format}
+        GOTO 100;
+        END;
+
+    FOR i := 1 to cddDescr.cdcount do
+        begin
+        READ_DATA(CddError, refCDD, ord4(@cddRec), sizeof(cddEntry), actual, sequential, 0);
+        if (CddError > 0) or (actual <> sizeof(cddEntry)) then
+            begin
+            CddError := cdBadEntry; {SYSTEM.CDD entry is bad}
+            GOTO 150;
+            end;
+
+        cddObject := TcddObject.Create(CddError, NIL, dynamicHeap, cddRec.drvr_name, cddRec.info,
+                                                                                refCdd);
+        IF CddError > 0 THEN
+            BEGIN
+            PrefParamAlert(@cddRec.drvr_name, @emptyString);
+            NoteAlert(prefAlert, MapAlert(abadDriver));
+            KillDriver(@cddRec.drvr_name);
+            cddObject.Free;
+            GOTO 100;
+            END;
+
+        filename := CONCAT('-#Boot-','SYSTEM.CD_', cddRec.drvr_name);
+        QUICK_LOOKUP(CddError, filename, infoRec);
+        IF CddError > 0 THEN
+            BEGIN
+            PrefParamAlert(@cddRec.drvr_name, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdCDMissing));
+            cddObject.Free;
+            cddError := 0;
+            GOTO 100;
+            END;
+
+        InsertDriver(cddObject);
+100:
+    END;
+150:
+
+    IF CddError > 0 THEN
+        BEGIN
+        Kill_Object(error, nameCdd);
+        BuildCdd(error, totalCdd);
+        IF (error > 0) OR (totalCdd = 0) THEN
+            BEGIN
+            StopAlert(prefAlert, cdMustRebuild);
+            EXIT(initCd);
+            END;
+        END;
+
+    {open the SYSTEM.PRD file}
+    OPEN(prdError, namePRD, refPRD, [dread, dwrite]);
+    IF prdError > 0 THEN
+        BEGIN
+        prdError := cdNotOpened;
+        GOTO 250;
+        END;
+
+     {read SYSTEM.PRD header}
+     READ_DATA(prdError, refPRD, ord4(@prdDescr), sizeof(prdHeader), actual,  sequential, 0);
+     if (prdError > 0) or (actual <> sizeof(prdheader)) then
+        BEGIN
+        prdError := cdBadHeader;
+        GOTO 250; {SYSTEM.PRD has a bad header descriptor}
+        END;
+
+    {read SYSTEM.PRD entries}
+    IF (prdDescr.version <> prd_version) or (prdDescr.prdcount < 0) THEN
+        begin
+        prdError := cdBadFormat;
+        GOTO 250; {SYSTEM.PRD is in a bad format}
+        END;
+
+    for i := 1 to prdDescr.prdcount do
+        begin
+        READ_DATA(prdError, refPRD, ord4(@prdRec), sizeof(prdEntry), actual, sequential, 0);
+        if (prdError > 0) or (actual <> sizeof(prdEntry)) then
+            begin {SYSTEM.PRD entry is bad}
+            prdError := cdBadEntry;
+            GOTO 250;
+            end;
+
+        prdObject := TprdObject.Create(prdError, NIL, dynamicHeap, prdRec.drvr_name, prdRec.Info, refPRD);
+
+        IF prdError > 0 THEN
+            BEGIN
+            PrefParamAlert(@prdRec.drvr_name, @emptyString);
+            NoteAlert(prefAlert, MapAlert(abadDriver));
+            KillDriver(@prdRec.drvr_name);
+            prdObject.Free;
+            GOTO 200;
+            END;
+
+        filename := CONCAT('-#Boot-','SYSTEM.PR_', prdRec.drvr_name);
+        QUICK_LOOKUP(prdError, filename, infoRec);
+        IF prdError > 0 THEN
+            BEGIN
+            PrefParamAlert(@prdRec.drvr_name, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdPRMissing));
+            KillDriver(@prdRec.drvr_name);
+            prdObject.Free;
+            GOTO 200;
+            END;
+
+        prdObject.entryLen := prdRec.entryLen;
+        processList.InsLast(prdObject);
+200:
+        END;
+250:
+    IF (prdError = cdBadHeader) OR (prdError = cdBadFormat) OR (prdError = cdNotOpened) THEN
+        BEGIN
+        Kill_Object(extraError, namePrd);
+        BuildPrd(extraError);
+        IF extraError > 0 THEN
+            BEGIN
+            NoteAlert(prefAlert, MapAlert(cdBadVol));
+            EXIT(initCd);
+            END;
+        END;
+
+  { Look for any new ch or dn files }
+    InstallFromBoot;
+
+ {$IFC CFGDEBUG}
+    IF configDbg THEN
+        BEGIN
+        IF Prompt('Print the driver list? ') THEN
+            BEGIN
+            WRITELN;
+            WRITELN;
+            WRITELN('***** Here is the driver list *****');
+            driverList.Print;
+            WRITELN;
+            END;
+        IF Prompt('Print the process list? ') THEN
+            BEGIN
+            WRITELN;
+            WRITELN;
+            WRITELN('***** Here is the process list *****');
+            processList.Print;
+            WRITELN;
+            END;
+        END;
+  {$ENDC}
+
+END; {of InitCd}
+
+
+{$S PrefCold}
+{-------------------------------------------------------------------------------------------}
+PROCEDURE CopyDriver{var error: integer; text: TDynamicArray; drvrname: pE_name};
+{-------------------------------------------------------------------------------------------}
+{       This routine copies all -SYSTEM. files associated with drvrname from the            }
+{       source microDisk to the destination bootVolume.  Any occurring I/O error will       }
+{       result in anger: the process will terminate and the error passed back to the        }
+{       caller.  If all goes well, when the copy is complete new entries will be added to   }
+{       the cdd and/or prd files.                                                           }
+{                                                                                           }
+{       Extensive error checking is not performed here.  It is assumed that bad version     }
+{       numbers, etc., were found during the what phase of the installation process.    }
+{-------------------------------------------------------------------------------------------}
+LABEL   100;
+CONST   ch_file         = 1;
+        dn_file         = 2;
+        cd_file         = 3;
+        bt_file         = 4;
+        pr_file         = 5;
+
+        ch_name         = '-SYSTEM.CH_';
+        cd_name         = '-SYSTEM.CD_';
+        bt_name         = '-SYSTEM.BT_';
+        dn_name         = '-SYSTEM.DN_';
+        pr_name         = '-SYSTEM.PR_';
+
+        srcVol          = '-#13';
+
+VAR     i               : integer;
+        bytesRead       : longint;
+        bytesWritten    : longint;
+        lastCDfile      : integer;
+        thisFile:       Pathname;
+        srcName         : pathname;
+        destName        : pathname;
+        chObject        : TChObject;
+        driverExists:   BOOLEAN;
+        dc:             TDcObject;
+        newDriver:      TCddObject;
+        newPrd:         TPrdObject;
+        found:          BOOLEAN;
+
+        buffer          : array [1..256] of integer;
+        fileName        : array [ch_file..pr_file] of pathname;
+        srcRef          : array [ch_file..pr_file] of integer;
+        srcOpened       : array [ch_file..pr_file] of boolean;
+        destRef         : array [ch_file..pr_file] of integer;
+        destOpened      : array [ch_file..pr_file] of boolean;
+
+
+BEGIN
+IF text <> NIL THEN
+    CreateStringFromText(text, drvrName^);
+
+IF configDbg THEN
+    WRITELN('Entering CopyDriver - Going to copy ', drvrname^);
+
+fileName[ch_file] := CONCAT(ch_name, drvrname^);
+fileName[cd_file] := CONCAT(cd_name, drvrname^);
+fileName[bt_file] := CONCAT(bt_name, drvrname^);
+fileName[dn_file] := CONCAT(dn_name, drvrname^);
+fileName[pr_file] := CONCAT(pr_name, drvrname^);
+
+
+{Open the five possible driver files on the microdisk}
+driverExists := FALSE;
+for i := ch_file to pr_file do
+    begin
+    srcName := CONCAT(srcVol, fileName[i]);
+    srcOpened[i] := FALSE;
+    OPEN(error, srcName, srcRef[i], [dread]);
+    IF error <= 0 THEN                          { should be srcOpened[i] := error <= 0 }
+        BEGIN
+        srcOpened[i] := TRUE;
+        driverExists := TRUE;
+        END
+    END;
+IF driverExits THEN
+    KillDriver(drvrname);
+
+{Create SYSTEM.CDD entry}
+if srcOpened[ch_file] then
+    BEGIN
+    dirtyCDD := TRUE;
+    GetCDDEntry(error, srcRef[ch_file], drvrname^, newDriver);
+    if error > 0 then
+        GOTO 100;
+
+    InsertDriver(newDriver);
+    end;
+
+
+{Create SYSTEM.PRD entry}
+if srcOpened[dn_file] then
+    BEGIN
+    dirtyPRD := true;
+    GetPRDEntry(error, srcRef[dn_file], drvrname^, newPrd);
+    if error > 0 then
+        GOTO 100;
+
+    found := FALSE;
+    FOR i := 1 TO newPrd.driver.size DO
+        BEGIN
+        dc := TDcObject(newPrd.driver.elements[i]);
+     { if this driver does not have the same name as the print process then copy it from sony }
+        IF NOT EqualChar(@dc.cd_driver, POINTER(ORD(drvrname)), ORD(drvrname^[0]) + 1) THEN
+            BEGIN
+            thisFile := CONCAT('-#13-SYSTEM.CH_',dc.cd_driver);
+            QUICK_LOOKUP(error, thisFile, infoRec);
+            IF error = 0 THEN
+                BEGIN
+                found := TRUE;
+                CopyDriver(error, NIL, @dc.cd_driver);
+                END;
+            END;
+        END;
+
+    IF not found THEN
+        IF NOT newPrd.DiskHasDriver THEN
+            BEGIN
+            PrefParamAlert(@newPrd.name, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdProcHasNoDriver));
+            error := 0;
+            GOTO 100;
+            END;
+
+    processList.InsLast(newPrd);
+    end;
+    PrefParamAlert(drvrname, @emptyString);
+    WaitAlert(prefAlert, MapAlert(cdCopyDriver));
+
+{copy the cd, bt, and pr files from microdisk to bootvol}
+    for i := cd_file to pr_file do
+        if srcOpened[i] then
+            begin
+            destName := CONCAT(bootVol, filename[i]);
+            MAKE_FILE(error, destName, 0);
+            if (error > 0) then
+                BEGIN
+                EndWaitAlert;
+                NoteAlert(PrefAlert, MapAlert(cdBadVol));
+                EXIT(CopyDriver);
+                END;
+
+            OPEN(error, destName, destRef[i], [dread,dwrite]);
+            if (error > 0) then
+                BEGIN
+                EndWaitAlert;
+                NoteAlert(PrefAlert, MapAlert(cdBadVol));
+                EXIT(CopyDriver);
+                END;
+
+            REPEAT
+                READ_DATA(error, srcRef[i], ord4(@buffer), 512, bytesRead, sequential, 0);
+                IF (error <= 0) and (BytesRead > 0) then
+                    WRITE_DATA(error, destRef[i], ord4(@buffer), bytesRead, bytesWritten, sequential, 0);
+            UNTIL (BytesRead = 0) or (BytesWritten = 0) or (error > 0);
+            if (error = 956) OR (error = 848) then error := 0;
+            if (error > 0) then
+                GOTO 100;
+
+            CLOSE_OBJECT(error, destRef[i]);
+            end;
+
+    EndWaitAlert;
+
+100:
+    IF error > 0 THEN
+        BEGIN
+        PrefParamAlert(@filename[i], @emptyString);
+        IF error = 848 THEN
+            NoteAlert(prefAlert, MapAlert(cdBootDiskFull))
+        ELSE
+            NoteAlert(prefAlert, MapAlert(cdCantCopy));
+        KillDriver(@filename[i]);
+        END;
+
+    for i := ch_file to pr_file do
+        if srcOpened[i] then
+            CLOSE_OBJECT(error, srcRef[i]);
+
+error := 0;
+END; {of CopyDriver}
+
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE KillDriver{drvrname: pE_name};
+{-------------------------------------------------------------------------------------------}
+{       This routine is used to remove the SYSTEM.files associated with drvrname, and to    }
+{       remove the cdd entry from list_CDD.  This action is only taken when attempting to   }
+{       install a new driver over an existing one.  If anything wierd happens when trying   }
+{       to delete a file, (ie: safety switch on), we return with the error.                 }
+{-------------------------------------------------------------------------------------------}
+VAR     filename        : pathname;
+        chObject        : TChObject;
+        i:              INTEGER;
+        error:          INTEGER;
+
+BEGIN
+
+{ Delete the driver from the lists }
+cardList.DelNamedObject(drvrname, FALSE);
+deviceList.DelNamedObject(drvrname, FALSE);
+driverList.DelNamedObject(drvrname, TRUE);
+
+processList.DelNamedObject(drvrname, TRUE);
+
+{delete the associated SYSTEM files}
+filename := CONCAT(bootVol, '-SYSTEM.CH_', drvrname^);
+KILL_OBJECT(error, filename);
+
+filename := CONCAT(bootVol, '-SYSTEM.CD_', drvrname^);
+KILL_OBJECT(error, filename);
+
+filename := CONCAT(bootVol, '-SYSTEM.BT_', drvrname^);
+KILL_OBJECT(error, filename);
+
+{delete the associated SYSTEM files}
+filename := CONCAT(bootVol, '-SYSTEM.DN_', drvrname^);
+KILL_OBJECT(error, filename);
+
+filename := CONCAT(bootVol, '-SYSTEM.PR_', drvrname^);
+KILL_OBJECT(error, filename);
+
+END; {of KillDriver}
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+FUNCTION  InstWhat{(var error: integer): TIndexList};
+{-------------------------------------------------------------------------------------------}
+{       This routine searches the microdisk for SYSTEM.CH and SYSTEM.DN files.              }
+{       For each that is finds, it insures that all necessary files are present before      }
+{       adding the driver to the list of those that can be installed.                       }
+{-------------------------------------------------------------------------------------------}
+LABEL
+        100,
+        300;
+
+CONST   prPrefix        = '-#13-SYSTEM.PR_';
+        btPrefix        = '-#13-SYSTEM.BT_';
+        cdPrefix        = '-#13-SYSTEM.CD_';
+
+VAR     i:              INTEGER;
+        actual          : longint;
+        chRef           : integer;
+        dnRef           : integer;
+        chPrefix        : e_name;
+        dnPrefix        : e_name;
+        drvrname        : e_name;
+        newEntry        : e_name;
+        filename        : pathname;
+        srcVol          : pathName;
+        stringObject    : TDynamicArray;
+        tempList        : TChList;
+        found:          BOOLEAN;
+        driver:         TCddObject;
+        chinfo:         ch_info;
+
+BEGIN
+    IF configDbg THEN
+        WRITELN('Entering InstWhat');
+
+    {Initialization}
+    srcVol   := '-#13';
+    chPrefix := 'SYSTEM.CH_';
+    dnPrefix := 'SYSTEM.DN_';
+
+    {Attempt to reset catalog on the microdisk}
+    RESET_CATALOG(error,srcVol);
+    IF error > 0 THEN
+        BEGIN
+        IF error = 1121 THEN
+            error := cdNoSony;
+        EXIT(InstWhat);
+        END;
+
+    WaitAlert(prefAlert, MapAlert(searchingSony));
+    tempList := TChList.Create(NIL, dynamicHeap);
+
+    {look for valid CD drivers on the microdisk}
+    REPEAT
+        GET_NEXT_ENTRY(error, CHPrefix, newEntry);
+        IF error = 848 THEN GOTO 100;
+        IF error > 0 THEN
+            EXIT(InstWhat);
+
+       {Parse off the drivername}
+        Parsename(newEntry, drvrname);
+
+    {--------- This was borrowed from GetCddEntry to avoid serveral more read datas and a cddobject creation --}
+        filename := CONCAT(srcVol, '-', chPrefix, drvrname);
+        OPEN(error, filename, chRef, [dread]);
+        IF error > 0 THEN
+            BEGIN
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdBadChFile));
+            GOTO 100;
+            END;
+
+        {Read contents of SYSTEM.CH file}
+        READ_DATA(error, chRef, ord4(@chinfo), sizeof(ch_info), actual, sequential, 0);
+        if (error > 0) or (actual <> SIZEOF(ch_info)) then
+            BEGIN
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdBadChFile));
+            GOTO 100;
+            END;
+
+        CLOSE_OBJECT(error, chRef);
+    {----------------------------------------------------------------------------------------------------------}
+
+       {Insure the SYSTEM.CD file exists}
+        filename := CONCAT(cdPrefix, drvrname);
+        QUICK_LOOKUP(error, filename, infoRec);
+        IF error > 0 THEN
+            BEGIN
+            PrefParamAlert(@drvrname, @emptyString);
+            NoteAlert(prefAlert, MapAlert(cdCDMissing));
+            GOTO 100;
+            END;
+
+       {Insure the optional SYSTEM.BT file exists}
+        IF chinfo.bootable THEN
+            BEGIN
+            filename := CONCAT(btPrefix, drvrname);
+            QUICK_LOOKUP(error, filename, infoRec);
+            IF error > 0 THEN
+                BEGIN
+                PrefParamAlert(@drvrname, @emptyString);
+                NoteAlert(prefAlert, MapAlert(cdBTMissing));
+                GOTO 100;
+                END;
+            END;
+
+       {add cd driver to the list of installable drivers}
+        stringObject := CreateTextFromString(dynamicHeap, @drvrname);
+
+        tempList.InsLast(stringObject);
+    100:
+    until error = 848;
+
+    IF configDbg THEN
+        BEGIN
+        WRITELN('after processing the drivers the list is');
+     {$IFC CFGDEBUG}
+        tempList.Print;
+     {$ENDC}
+        END;
+
+    {look for valid PR drivers on the microdisk}
+    RESET_CATALOG(error, srcVol);
+    REPEAT
+            GET_NEXT_ENTRY(error, DNPrefix, newEntry);
+            IF error = 848 THEN GOTO 300;
+            IF error > 0 THEN
+                EXIT(InstWhat);
+
+           {Parse off the drivername}
+            Parsename(newEntry, drvrname);
+            IF configDbg THEN
+                WRITELN('looking for process ',drvrname);
+
+            FOR i := 1 TO tempList.size DO
+                BEGIN
+                stringObject := TDynamicArray(tempList.elements[i]);
+                IF EqualChar(@stringObject.ch, @drvrname, stringObject.size) THEN
+                    tempList.DelAt(i, TRUE);
+                END;
+
+           {Insure the SYSTEM.PR file exists}
+            filename := CONCAT(prPrefix, drvrname);
+            QUICK_LOOKUP(error, filename, infoRec);
+            IF error > 0 THEN
+                BEGIN
+                PrefParamAlert(@drvrname, @emptyString);
+                NoteAlert(prefAlert, MapAlert(cdPRMissing));
+                GOTO 300;
+                END;
+
+
+           {add pr driver to the list of installable drivers}
+            stringObject := CreateTextFromString(dynamicHeap, @drvrname);
+
+            IF configDbg THEN
+                WRITELN('inserting in list');
+            tempList.InsLast(stringObject);
+    300:
+    until error = 848;
+
+    IF configDbg THEN
+        BEGIN
+        WRITELN('after processing the processes the list is');
+     {$IFC CFGDEBUG}
+        tempList.Print;
+     {$ENDC}
+        END;
+
+    IF tempList.size = 0 THEN
+        BEGIN
+        error := cdNoDrivers;
+        EXIT(InstWhat);
+        END;
+
+    error := 0;
+    InstWhat := tempList;
+    EndWaitAlert;
+END; {of InstWhat}
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE ParseName{(namestring : e_name; var parsestring : e_name)};
+{-------------------------------------------------------------------------------------------}
+{       Parse off the drivername.                                                           }
+{-------------------------------------------------------------------------------------------}
+VAR     i               : integer;
+        j               : integer;
+
+BEGIN
+i := 0;
+repeat i := i + 1 until namestring[i] = '_';
+j := 0;
+repeat
+        i := i + 1;
+        j := j + 1;
+        parsestring[j] := namestring[i];
+until   i = length(namestring);
+parseString[0] := chr(j);
+END; {of ParseName}
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+FUNCTION PMEntrySize{(config: configDev): integer};
+{-------------------------------------------------------------------------------------------}
+{       Returns the byte size of a pm entry.                                                }
+{-------------------------------------------------------------------------------------------}
+VAR     idsize:         integer;
+
+BEGIN with config do
+        begin
+        if (driverid <= pm_shortform) then idSize := 0 else idSize := 1;
+        PMEntrySize := 3 + idSize + 2 * nExtWords;
+        end;
+END; {of PMEntrySize}
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+FUNCTION PosActive{(position: cd_position): boolean};
+{-------------------------------------------------------------------------------------------}
+{       Returns whether PM has anything configured at a given position.                     }
+{-------------------------------------------------------------------------------------------}
+BEGIN
+PosActive := PosWhere(position, list_Pm) <> NIL;
+END; {of PosActive}
+
+
+{-------------------------------------------------------------------------------------------}
+FUNCTION  PosHasKids{(position: cd_position) : boolean};
+{-------------------------------------------------------------------------------------------}
+{       Returns whether anything is configured BENEATH a given position or if any device    }
+{       is deffered detached below that location.                                           }
+{-------------------------------------------------------------------------------------------}
+VAR
+    i:          integer;
+    pmObject:   TpmObject;
+
+BEGIN
+    PosHasKids := false;
+    if (position.dev <> cNullDev) then EXIT(PosHasKids);
+    for i := 1 to list_PM.Size do
+        begin
+        pmObject := TPmObject(list_PM.At(i));
+        if (position.slot = pmObject.config.pos.slot) then {slot matches}
+
+                if ((position.chan = cNullChan)  and
+                    (pmObject.config.pos.chan <> cNullChan))
+
+                or ((position.chan <> cNullChan) and
+                    (position.chan = pmObject.config.pos.chan) and
+                    (pmObject.config.pos.dev <> cNullDev)) then
+                                begin
+                                PosHasKids := true;
+                                EXIT(PosHasKids);
+                                end;
+        end;
+
+END; {of PosHasKids}
+
+
+
+
+{-------------------------------------------------------------------------------------------}
+FUNCTION  PosWhere(position: cd_position; searchList: TNamedList): TPmObject;
+{-------------------------------------------------------------------------------------------}
+{       Returns whether PM has anything configured at a given position.  If so, where       }
+{       returns an index in list_PMConfig where the match was found.                        }
+{-------------------------------------------------------------------------------------------}
+VAR     i               : integer;
+        pmObject        : TpmObject;
+
+BEGIN
+PosWhere := NIL;
+for i := 1 to searchList.Size do
+        begin
+        pmObject := TPmObject(searchList.elements[i]);
+        if (pmObject.config.pos.slot = position.slot) and
+           (pmObject.config.pos.chan = position.chan) and
+           (pmObject.config.pos.dev  = position.dev)  then
+                begin
+                PosWhere := pmObject;
+                EXIT(PosWhere);
+                end;
+        end;
+END; {of PosWhere}
+
+
+PROCEDURE ExitPref;
+VAR error:  INTEGER;
+BEGIN
+{Close the SYSTEM.CDD file}
+CLOSE_OBJECT(error, refCDD);
+
+{Close the SYSTEM.PRD file}
+CLOSE_OBJECT(error, refPRD);
+END;
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE ActvtPref;
+{-------------------------------------------------------------------------------------------}
+    PROCEDURE CheckAndDetach(connector: TPrefPort);
+    VAR
+        device:     TPrefPort;
+        error:      INTEGER;
+    BEGIN
+        device := connector.connectedDevice;
+        IF device <> NIL THEN
+            IF device.isDetached THEN
+                BEGIN
+                CdKill(error, connector.position);
+                IF (error = 0) OR (error = 751) THEN
+                    BEGIN
+                    connector.connectedDevice := NIL;
+                    device.Free;
+                    END;
+                END;
+    END;
+
+BEGIN
+    root.TraverseConnectors(CheckAndDetach)
+END;
+
+{-------------------------------------------------------------------------------------------}
+PROCEDURE DeactPref{var error: integer};
+{-------------------------------------------------------------------------------------------}
+{       This routine is called on a preferences deactivate to clean up my mess.  The        }
+{       SYSTEM.CDD and SYSTEM.PRD files are written, and the Parameter Memory is updated.   }
+{-------------------------------------------------------------------------------------------}
+VAR     actual          : longint;
+        config          : configDev;
+        dChoice         : DriverChoice;
+        dcObject        : TdcObject;
+        ename           : e_name;
+        entryKey        : longint;
+        i               : integer;
+        j               : integer;
+        cddRec          : cddEntry;
+        prdRec          : prdEntry;
+        pmObject        : TpmObject;
+        cddObject       : TcddObject;
+        prdObject       : TprdObject;
+        stringObject    : TNamedObject;
+
+BEGIN
+{Write out SYSTEM.CDD file}
+if dirtycdd then
+        begin
+        IF configDbg THEN
+            WRITELN('Writing out system.CDD');
+        {Write out header}
+        cddDescr.version := cdd_version;
+        cddDescr.cdcount := driverList.size;
+        IF configDbg THEN
+            WRITELN('Writing out system.CDD - version ',cdd_version:1,' size ',
+                                                            cddDescr.cdcount:1, ' refnum is ', refcdd);
+        WRITE_DATA(error, refCDD, ord4(@cddDescr), sizeof(cddheader), actual, absolute, 0);
+        if (error > 0) or (actual <> sizeof(cddheader) ) then
+                begin
+                NoteAlert(prefAlert, MapAlert(cdBadVol));
+                EXIT(DeactPref);
+                end;
+
+        {Write out entries}
+        for i := 1 to driverList.size do
+                begin
+                cddObject := TCddObject(driverList.elements[i]);
+                IF configDbg THEN
+                    WRITELN('Writing out entry for ',cddObject.name);
+                cddRec.info.version             := cddObject.version;
+                cddRec.drvr_name                := cddObject.name;
+                cddRec.active                   := cddObject.active;
+                cddRec.info.driver_id           := cddObject.id;
+                cddRec.info.bootable            := cddObject.bootable;
+                cddRec.info.preload             := cddObject.preload;
+                cddRec.info.permanent           := cddObject.permanent;
+                cddRec.info.devicetype          := cddObject.devicetype;
+                cddRec.info.size_exten          := cddObject.size_exten;
+                cddRec.info.removable           := cddObject.removable;
+                cddRec.info.ejectable           := cddObject.ejectable;
+                cddRec.info.fs_start_block      := cddObject.fs_start_block;
+                cddRec.info.start_block         := cddObject.start_block;
+                cddRec.info.numAttach           := cddObject.attachment.Size;
+                cddRec.info.numConnectors       := cddObject.connectors.Size;
+
+                for j := 1 to 3 do
+                cddRec.info.def_cdinfo[j]       := cddObject.def_cdinfo[j];
+
+                WRITE_DATA(error, refCDD, ord4(@cddRec), sizeof(cddentry), actual, sequential, 0);
+                if (error > 0) or (actual <> sizeof(cddentry) ) then
+                        EXIT(DeactPref);
+
+                if cddObject.attachment.Size > 0 then
+                for j := 1 to cddObject.attachment.Size do
+                        begin
+                        stringObject := TNamedObject(cddObject.attachment.At(j));
+                        CreateStringFromText(stringObject.name, ename);
+                        WRITE_DATA(error, refCDD, ord4(@ename), sizeof(TypeConnect), actual, sequential, 0);
+                        if (error > 0) or (actual <> sizeof(TypeConnect) ) then
+                                EXIT(DeactPref);
+                        end;
+
+                if cddObject.connectors.Size > 0 then
+                for j := 1 to cddObject.connectors.Size do
+                        begin
+                        stringObject := TNamedObject(cddObject.connectors.At(j));
+                        CreateStringFromText(stringObject.name, ename);
+                        WRITE_DATA(error, refCDD, ord4(@ename), sizeof(TypeConnect), actual, sequential, 0);
+                        if (error > 0) or (actual <> sizeof(TypeConnect) ) then
+                                EXIT(DeactPref);
+                        end;
+                end;
+
+        end;
+
+dirtyCdd := FALSE;
+
+{Write out SYSTEM.PRD file}
+if dirtyprd then
+        begin
+        {Write out header}
+        IF configDbg THEN
+            WRITELN('Writing out SYSTEM.PRD');
+        prdDescr.version := prd_version;
+        prdDescr.prdcount := processList.size;
+        WRITE_DATA(error, refPRD, ord4(@prdDescr), sizeof(prdheader), actual, absolute, 0);
+        if (error > 0) or (actual <> sizeof(prdheader)) then
+                EXIT(DeactPref);
+
+        {Write out entries}
+        for i := 1 to processList.size do
+                begin
+                prdObject := TPrdObject(processList.elements[i]);
+                IF configDbg THEN
+                    WRITELN('Writing out entry ',prdObject.name);
+                prdRec.entryLen                 := prdObject.entryLen;
+                prdRec.drvr_name                := prdObject.name;
+                prdRec.info.printer_id          := prdObject.id;
+                prdRec.info.numDrivers          := prdObject.driver.Size;
+
+                WRITE_DATA(error, refPRD, ord4(@prdRec), sizeof(prdentry), actual, sequential, 0);
+                if (error > 0) or (actual <> sizeof(prdentry) ) then
+                        EXIT(DeactPref);
+
+                if prdObject.driver.Size > 0 then
+                for j := 1 to prdObject.driver.Size do
+                        begin
+                        dcObject := TdcObject(prdObject.driver.At(j));
+                        dChoice.connector := dcObject.connector;
+                        dChoice.cd_driver := dcObject.cd_driver;
+                        WRITE_DATA(error, refPRD, ord4(@dChoice), sizeof(DriverChoice), actual, sequential, 0);
+                        if (error > 0) or (actual <> sizeof(DriverChoice) ) then
+                                EXIT(DeactPref);
+                        end;
+                end;
+
+        end;
+
+dirtyPrd := FALSE;
+
+IF configDbg THEN
+    WRITELN('Writing out PM');
+{write entire list_PM into PM}
+entryKey := 0;
+for i := 1 to list_PM.Size do
+        begin
+        pmObject := TPmObject(list_PM.elements[i]);
+        IF configDbg THEN
+            BEGIN
+        {$IFC CFGDEBUG}
+            WRITELN('Writing out entry ');
+            pmObject.print;
+        {$ENDC}
+            END;
+        config   := pmObject.config;
+        PMWRITECONFIG(error, entryKey, config);
+        end;
+
+
+
+
+{Write working copy to Parameter Memory}
+PMWRITE;
+END; {of QuitCDConfig}
+ÿ

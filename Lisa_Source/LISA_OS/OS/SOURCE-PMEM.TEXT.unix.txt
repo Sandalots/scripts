@@ -1,0 +1,504 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984,  Apple Computer Inc.                               *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT pm_interface;
+
+INTERFACE
+
+  USES
+    (*$U object/driverdefs.obj*)          driverdefs,
+    (*$U object/hwint.obj*)               hwint,
+    (*$U object/sysglobal.obj*)           globalda,
+    (*$U object/procprims.obj*)           proc_prims,
+    (*$U object/mmprim.obj*)              mmprimitives,
+    (*$U object/asynctr.obj*)             asynctr,
+    (*$U object/genio.obj*)               genio,
+    (*$U object/twiggy.obj*)              twiggy,
+    (*$U object/vmstuff.obj *)            vmstuff,
+    (*$U object/sfileio.obj *)            sfileio,
+    (*$U object/fsprim.obj *)             fs_primitives,
+    (*$U object/fsui.obj *)               fs_interface;
+
+TYPE
+   pmByte = -128..127;
+   pMemRec = array[0..63] of pmByte;
+
+ {The following defines the layout of PM in memory. The numbers to the right }
+ {indicate the byte offset of that field }
+ {         pm_Version:      integer;                               { 0 - 1 }
+ {         pm_TimeStamp:    integer;                               { 2 - 3 }
+ {         pm_BootVol:      TNibble;                               { 4       7-4 }
+ {         pm_NormCont:     TNibble;                               { 4       3-0 }
+ {         pm_DimCont:      TNibble;                               { 5       7-4 }
+ {         pm_BeepVol:      TNibble;                               { 5       3-0 }
+ {         pm_MouseOn:      boolean;                               { 6       7 }
+ {         pm_ExtendMem:    boolean;                               { 6       6 }
+ {         pm_ScaleMouse:   boolean;                               { 6       5 }
+ {         pm_Pad1:         boolean;                               { 6       4 }
+ {         pm_DoubleClick:  TNibble;                               { 6       3-0 }
+ {         pm_FadeDelay:    TNibble;                               { 7       7-4 }
+ {         pm_BeginRepeat:  TNibble;                               { 7       3-0 }
+ {         pm_SubRepeat:    TNibble;                               { 8       7-4 }
+ {         pm_pad2:         TNibble;                               { 8       3-0 }
+ {         pm_cdCount:      PMByte;                                { 9  }
+ {         pm_DevConfig:    packed array[1..50] of PMByte;         { 10 - 59 }
+ {         pm_MEM_LOSS:     integer;                               { 60 - 61 }
+ {         pm_Checksum:     integer;                               { 62 - 63 }
+ {       end;                                                                }
+
+   cd_position = record
+                   slot: pmbyte;      (*slot number*)
+                   chan: pmbyte;      (*channel number*)
+                   dev:  pmbyte;      (*device number*)
+                 end;
+
+   ConfigDev = record
+                 pos: cd_position;    (*device position*)
+                 nExtWords: pmbyte;   (*number of valid extension words*)
+                 ExtWords: array[1..3] of integer;   (*extension words*)
+                 DriverID: longint;   (*ID of driver controlling device*)
+                 DevName: e_name;     (*device name*)
+               end;
+
+procedure Write_PMem ( var errnum : integer; var my_pMem : pMemRec );
+
+procedure Read_PMem ( var errnum : integer; var my_pMem : pMemRec );
+
+procedure GetNxtConfig( var errnum: integer; var NextEntry: longint;
+                        var PMRec: PMemRec; var config: ConfigDev);
+
+procedure PutNxtConfig( var errnum: integer; var NextEntry: longint;
+                        var PMRec: PMemRec; var config: ConfigDev);
+
+IMPLEMENTATION
+
+(*$IFC NOT DEBUG2*)
+(*$R-*)
+(*$ENDC*)
+CONST
+  e_badentry= 796; (* invalid config entry *)
+  e_badnext = 797; (* bad value for NextEntry *)
+  e_noroom = 798;  (* no room for another config entry *)
+  e_nomore = 799;  (* no more config entries *)
+
+TYPE
+  c_ne = packed record          (*decoded NextEntry*)
+           case boolean of
+             true: ( PutLastOp: boolean;
+                     lastsize: pmbyte;
+                     offset: integer);
+             false:( l: longint);
+         end;
+
+  PMConfigEntry = record
+              pm_slot: 0..15;
+              pm_chan: 0..7;
+              pm_dev: 0..31;
+              pm_nExtWords: 0..3;
+              pm_IDsize: 0..1;
+              pm_driverID: longint;
+              pm_ExtWords: array[1..3] of integer;
+            end;
+
+procedure Pack_pm(var sparse: PMConfigEntry; dense_ptr: absptr); external;
+procedure Crak_pm(dense_ptr: absptr; var sparse: PMConfigEntry); external;
+
+
+(*$S fs4 *)
+procedure Write_PMem (* var errnum : integer; var my_pMem : pMemRec *);
+
+      (*************************************************************)
+      (*                                                           *)
+      (* Description:                                              *)
+      (*   System call procedure to write a new copy of paramter   *)
+      (*   memory.  The user supplied bytes are copied 1st to the  *)
+      (*   sysglobal copy of paramter memory, the timestamp and    *)
+      (*   checksum values are updated, and then it is written to  *)
+      (*   parameter memory and the snapshot of parameter memory   *)
+      (*   on the boot disk.                                       *)
+      (*                                                           *)
+      (* Input Parameters:                                         *)
+      (*   my_pMem : the user supplied bytes that are to be        *)
+      (*             written to parameter memory.                  *)
+      (*                                                           *)
+      (* Output Parameters:                                        *)
+      (*   errnum : the error return parameter for this system     *)
+      (*            call procedure.                                *)
+      (*                                                           *)
+      (* Side Effects:                                             *)
+      (*   None.                                                   *)
+      (*                                                           *)
+      (* Special Conditions of Use:                                *)
+      (*   This routine is intended to be called from the          *)
+      (*   privileged OS interface.                                *)
+      (*                                                           *)
+      (* Error Conditions:                                         *)
+      (*   None.                                                   *)
+      (*                                                           *)
+      (*************************************************************)
+  var
+    ptr1: ^pMemRec;
+
+  begin
+    with param_mem do
+      begin
+        ptr1:=@parm_mem;
+        ptr1^:=my_pMem;
+
+        parm_mem[2] := TimeStamp;
+        parm_mem[32] := 0;   { for checksum calculation }
+        Calc_Cksum (ord(@parm_mem), parm_mem[32])
+      end;
+
+    Paramem_Write;   { put it out to hardware registers }
+    PMSnapshot;      { put it out to disk }
+
+    pmem_state := PMg_SSg;
+    errnum := 0
+  end { Write_PMem };
+
+
+
+(*$S fs4 *)
+procedure Read_PMem (* var errnum : integer;  var my_pMem : pMemRec *);
+
+      (*************************************************************)
+      (*                                                           *)
+      (* Description:                                              *)
+      (*   System call procedure to read parameter memory and      *)
+      (*   return it to the user.  The sysglobal copy of           *)
+      (*   parameter memory is returned to the user along with     *)
+      (*   current status of parameter memory.  After the 1st      *)
+      (*   read of parameter memory, all others are considered to  *)
+      (*   return 'valid' parameter memory.  On the 1st read, the  *)
+      (*   status of parameter memory and its snapshot on the      *)
+      (*   boot disk is returned.                                  *)
+      (*                                                           *)
+      (*                                                           *)
+      (* Input Parameters:                                         *)
+      (*   None.                                                   *)
+      (*                                                           *)
+      (* Output Parameters:                                        *)
+      (*   errnum : the error return paramter for this system      *)
+      (*            call procedure.                                *)
+      (*                                                           *)
+      (*   my_pMem : the copy of paramter memory returned to the   *)
+      (*             user.                                         *)
+      (*                                                           *)
+      (* Side Effects:                                             *)
+      (*   None.                                                   *)
+      (*                                                           *)
+      (* Special Conditions of Use:                                *)
+      (*   This routine is intended to be called from the          *)
+      (*   privileged OS interface.                                *)
+      (*                                                           *)
+      (* Error Conditions:                                         *)
+      (*   None, although several warnings are returned to the     *)
+      (*   user indicating parameter memory status at boot time.   *)
+      (*                                                           *)
+      (*************************************************************)
+  var
+    ptr1: ^pMemRec;
+
+  begin
+    case pmem_state of
+      PMg_SSg : errnum := 0;
+      PMg_SSb : errnum := -620;
+      PMb_SSg : errnum := -621;
+      PMb_SSb : errnum := -622
+    end;
+
+    pmem_state := PMg_SSg;   { from now on, everything is valid }
+
+    with param_mem do
+      begin
+        ptr1:=@parm_mem;
+        my_pMem:=ptr1^;
+      end;
+
+  end { Read_PMem };
+
+
+
+procedure GetNxtConfig(* var errnum: integer; var NextEntry: longint;
+                        var PMRec: PMemRec; var config: ConfigDev *);
+  label 10, 100, 200;
+
+  var
+    cracked_ne: c_ne;
+    pm_entry: PMConfigEntry;
+    position: integer;
+    i: integer;
+
+  procedure BldName(data: integer; var p: integer);
+    var
+      q, r: integer;
+
+    begin
+      if data <> 0 then
+        with config do
+          begin
+            q:=data div 10;
+            r:=data mod 10;
+            devname:=concat(devname,'# ');
+            p:=p+2;
+            if q <> 0 then
+              begin
+                devname[p]:=chr(q + ord('0'));
+                devname:=concat(devname,' ');
+                p:=p+1;
+              end;
+            devname[p]:=chr(r + ord('0'));
+          end;
+    end;(*BldName*)
+
+  begin
+    cracked_ne.l:=NextEntry;
+    with cracked_ne, config do
+      if offset <= 8 then
+        begin (*return info on built-in devices*)
+          errnum:=0;
+10:       offset:=offset+1;
+          nExtWords:=0;
+          case offset of
+            1:  begin (*SCC*)
+                  with pos do
+                    begin
+                      slot:=10;
+                      chan:=0;
+                      dev:=0;
+                    end;
+                  devName:='#10';
+                  driverID:=0;
+                end;
+            2:  begin (*Widget if pepsi*)
+                  if iomodel <> 1
+                    then goto 10
+                    else begin
+                           with pos do
+                             begin
+                               slot:=12;
+                               chan:=0;
+                               dev:=0;
+                             end;
+                           devName:='#12';
+                           driverID:=35;
+                         end;
+                end;
+            3:  begin (*Sony if lisa-lite or pepsi*)
+                  if iomodel = 0
+                    then goto 10
+                    else begin
+                           with pos do
+                             begin
+                               slot:=13;
+                               chan:=0;
+                               dev:=0;
+                             end;
+                           devName:='#13';
+                           driverID:=36;
+                         end;
+                end;
+            4:  begin (*Upper Twiggy if Lisa 1*)
+                  if iomodel <> 0
+                    then goto 10
+                    else begin
+                           with pos do
+                             begin
+                               slot:=14;
+                               chan:=1;
+                               dev:=0;
+                             end;
+                           devName:='#14#1';
+                           driverID:=0;
+                         end;
+                end;
+            5:  begin (*Lower Twiggy if Lisa 1*)
+                  if iomodel <> 0
+                    then goto 10
+                    else begin
+                           with pos do
+                             begin
+                               slot:=14;
+                               chan:=2;
+                               dev:=0;
+                             end;
+                           devName:='#14#2';
+                           driverID:=0;
+                         end;
+                end;
+            6:  begin (*High-level pseudo-Console*)
+                  with pos do
+                    begin
+                      slot:=15;
+                      chan:=0;
+                      dev:=0;
+                    end;
+                  devName:='#15';
+                  driverID:=0;
+                end;
+            7:  begin (*Alternate Console*)
+                  with pos do
+                    begin
+                      slot:=15;
+                      chan:=1;
+                      dev:=0;
+                    end;
+                  devName:='#15#1';
+                  driverID:=40;
+                end;
+            8:  begin (*Main Console*)
+                  with pos do
+                    begin
+                      slot:=15;
+                      chan:=2;
+                      dev:=0;
+                    end;
+                  devName:='#15#2';
+                  driverID:=40;
+                end;
+            9:  begin (*move on to configurable devices*)
+                  offset:=10;
+                  goto 100;
+                end;
+          end;(*case*)
+        end
+       else
+        begin (*return info on configured devices*)
+          errnum:=e_badnext;
+          if offset > 59 then goto 200;
+          if not PutLastOp then offset:=offset+lastsize;
+          errnum:=e_nomore; (*cannot be any more*)
+          if offset > 57 then goto 200;
+100:      PutLastOp:=false;
+          CRAK_PM(ord(@PMRec[offset]),pm_entry);
+          with pm_entry do
+            begin
+              if pm_slot = 15 then
+                begin
+                  errnum:=e_nomore;
+                  lastsize:=0;
+                end
+               else
+                begin
+                  errnum:=0;
+                  lastsize:=3+pm_IDsize+2*pm_nExtWords;
+                  (*return the device information*)
+                  if pm_slot = 15 then pos.slot:=0
+                                  else pos.slot:=pm_slot+1;
+                  if pm_chan = 7  then pos.chan:=0
+                                  else pos.chan:=pm_chan+1;
+                  if pm_dev = 31 then pos.dev:=0
+                                 else pos.dev:=pm_dev+1;
+                  nExtWords:=pm_nExtWords;
+                  driverID:=pm_driverID;
+                  i:=1;
+                  repeat
+                    ExtWords[i]:=pm_ExtWords[i];
+                    i:=i+1;
+                  until i > 3;
+                  devName:='';
+                  position:=0;
+                  BldName(pos.slot,position);
+                  BldName(pos.chan,position);
+                  BldName(pos.dev,position);
+                end;
+            end;(*with pm_entry*)
+        end;
+200:NextEntry:=cracked_ne.l; (*return new NextEntry value*)
+  end;(*GetNxtConfig*)
+
+
+procedure PutNxtConfig(* var errnum: integer; var NextEntry: longint;
+                        var PMRec: PMemRec; var config: ConfigDev *);
+  label 10;
+
+  var
+    pm_entry: PMConfigEntry;
+    cracked_ne: c_ne;
+    i:integer;
+
+  begin
+    cracked_ne.l:=NextEntry;
+    with cracked_ne, config do
+      if offset = 0 then
+        begin (*starting to output a new configuration*)
+          errnum:=0;
+          PMRec[9]:=0; (*pm_cdcount*)
+          i:=10;
+          repeat       (*config area*)
+            PMRec[i]:=-1;
+            i:=i+1;
+          until i > 59;
+          offset:=10;
+          PutLastOp:=true;
+        end
+       else
+        begin (*storing a new configuration entry*)
+          with pm_entry do
+            begin
+              errnum:=0;
+              (*do not configure built-in devices*)
+              if (pos.slot>=12) or ((pos.slot=10) and (pos.chan=0)) then goto 10;
+              errnum:=e_badnext;
+              if (offset < 0) or (offset > 59) then goto 10;
+              if not PutLastOp then
+                begin (*Write after read can only alter extension words*)
+                  CRAK_PM(ord(@PMRec[offset]),pm_entry);
+                  errnum:=e_badentry;
+                  if nExtWords <> pm_nExtWords then goto 10;
+                  errnum:=0;
+                  i:=1;
+                  repeat
+                    pm_ExtWords[i]:=ExtWords[i];
+                    i:=i+1;
+                  until i > 3;
+                  PACK_PM(pm_entry,ord(@PMRec[offset]));
+                  PutLastOp:=true;
+                  offset:=offset+lastsize;
+                end
+               else
+                begin (*Write after write can store new config entry*)
+                  if driverID < 512 then pm_IDsize:=0
+                                    else pm_IDsize:=1;
+                  lastsize:=3+pm_IDsize+2*nExtWords;
+                  errnum:=e_noroom;
+                  if offset+lastsize > 59 then goto 10;
+                  errnum:=e_badentry;
+                  if (pos.slot < 0) or (pos.slot > 15) or
+                     (pos.chan < 0) or (pos.chan > 7) or
+                     (pos.dev  < 0) or (pos.dev  > 31) then goto 10;
+                  errnum:=0;
+                  if pos.slot = 0 then pm_slot:=15
+                                  else pm_slot:=pos.slot-1;
+                  if pos.chan = 0 then pm_chan:=7
+                                  else pm_chan:=pos.chan-1;
+                  if pos.dev = 0 then pm_dev:=31
+                                 else pm_dev:=pos.dev-1;
+                  pm_driverID:=DriverID;
+                  pm_nExtWords:=nExtWords;
+                  i:=1;
+                  repeat
+                    pm_ExtWords[i]:=ExtWords[i];
+                    i:=i+1;
+                  until i > 3;
+                  PACK_PM(pm_entry,ord(@PMRec[offset]));
+                  PMRec[9]:=PMRec[9]+1; (*bump pm_cdcount*)
+                  offset:=offset+lastsize;
+                  PutLastOP:=true;
+                end;
+            end;(*with pm_entry*)
+        end;
+10:   NextEntry:=cracked_ne.l;
+  end;(*PutNxtConfig*)
+
+END.
+
+
+
+
+
+ÿ

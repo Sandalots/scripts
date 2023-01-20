@@ -1,0 +1,775 @@
+{ Copyright 1983, 1984, Apple Computer Inc. }
+
+(*$S kr_prims *)
+
+procedure INIT_FREEPOOL(* fp_ptr: absptr; fp_size: int2 *);
+
+        (*********************************************************)
+        (*                                                       *)
+        (* Description:                                          *)
+        (*   Initializes the free pool area in a segment so that *)
+        (*   space can be dynamically allocated & deallocated in *)
+        (*   the segment.  This routine is used in particular by *)
+        (*   Make_Process to initialize the free pool in the     *)
+        (*   syslocal segment of a new process.  Note that it    *)
+        (*   be used, however, to initialize the free pool in    *)
+        (*   any segment.                                        *)
+        (*                                                       *)
+        (* Input Parameters:                                     *)
+        (*   fp_ptr: the address ordinal of where the free pool  *)
+        (*           is to start in the segment.                 *)
+        (*                                                       *)
+        (*   fp_size: the size of the new free pool in bytes.    *)
+        (*            Note that this is converted to a size in   *)
+        (*            words for use by Getspace & Relspace.      *)
+        (*                                                       *)
+        (*********************************************************)
+
+var
+  hdr_ptr: hdr_pool_ptr;
+  ent_ptr: ent_pool_ptr;
+
+begin
+  hdr_ptr:=pointer(fp_ptr);
+  with hdr_ptr^ do
+    begin
+      pool_size:=(fp_size - sizeof(hdr_freepool)) DIV 2;(* convert to # words *)
+      firstfree := sizeof(hdr_freepool);
+      freecount:=pool_size;(* available free space *)
+      ent_ptr:=pointer(fp_ptr+firstfree);
+      with ent_ptr^ do
+        begin
+          size:=pool_size;
+          next:=stopper;
+        end;
+    end;
+end; (*INIT_FREEPOOL*)
+
+
+procedure RELSPACE(* ordaddr: absptr; b_area: absptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The dynamic area at ordaddr will be released back   *)
+       (*    into the free space pool maintained in the data area*)
+       (*    defined by the base address b_area.                 *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    ordaddr: the address ordinal of the dynamic area    *)
+       (*             being released.  This is the same ordaddr  *)
+       (*             returned by GETSPACE.                      *)
+       (*    b_area:  the address ordinal of the base of the data*)
+       (*             area containing the free pool.             *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  x: ^absptr;
+  c_pool_ptr: hdr_pool_ptr;
+  newfree, leftfree, currfree: ent_pool_ptr;
+  int_level: intson_type;
+
+procedure L_R_MERGE(left,right: ent_pool_ptr);                        (*OS158*)
+  (* merge left free area and right free area *)                      (*OS158*)
+  (* if they are adjacent in free pool*)                              (*OS158*)
+  begin                                                               (*OS158*)
+    if (ord(left)+ord4(left^.size*2)) = ord(right) then               (*OS158*)
+      begin (*adjacent regions*)                                      (*OS158*)
+        left^.size:=left^.size+right^.size;                           (*OS158*)
+        left^.next:=right^.next;                                      (*OS158*)
+      end                                                             (*OS158*)
+     else                                                             (*OS158*)
+      begin (*nonadjacent regions*)                                   (*OS158*)
+        left^.next:=ord(right) - ord(c_pool_ptr);                     (*OS158*)
+      end;                                                            (*OS158*)
+  end;(*L_R_MERGE*)                                                   (*OS158*)
+
+begin
+  if b_area = b_sysglobal_ptr then b_area:=b_area-24575; (* adjust offset *)
+
+  (* determine the pointer to the free space pool *)
+  x:= pointer(b_area);  (* data area base *)
+  c_pool_ptr:=pointer(x^);
+
+  (*$IFC DEBUG*)
+  (* validate ordaddr and c_pool_ptr are in the same data space *)
+  if (ordaddr div maxmmusize) <> (ord(c_pool_ptr) div maxmmusize)
+    then SYSTEM_ERROR(e_badfreepool);
+  (*$ENDC*)
+
+  (* link space into free list *)
+  (* convert ordaddr to index within pool *)
+  newfree:=pointer(ordaddr-poolEnthdsize);
+
+  (*$IFC DEBUG*)
+  if newfree^.size >= 0 then SYSTEM_ERROR(e_badfreepool);
+  (*$ENDC*)
+
+  with c_pool_ptr^ do
+    begin
+      INTSOFF(clokints,int_level);
+
+      leftfree:=pointer(ord(c_pool_ptr));
+      currfree:=pointer(ord(c_pool_ptr)+firstfree);
+      while (ord(currfree) <> ord(c_pool_ptr)) and
+            (ord(currfree) <  ord(newfree)) do
+        begin
+          leftfree:=currfree;
+          currfree:=pointer(ord(c_pool_ptr)+currfree^.next);
+        end; (* while *)
+
+      with newfree^ do
+        begin
+          size:= -size;                                                (*OS158*)
+          freecount:=freecount + size;                                 (*OS158*)
+        end;(*with*)                                                   (*OS158*)
+      L_R_MERGE(newfree,currfree); (*merge new with region to right*)  (*OS158*)
+      L_R_MERGE(leftfree,newfree); (*merge new with region to left*)   (*OS158*)
+      INTSON(int_level);
+    end; (* with *)
+end; (* RELSPACE *)
+
+procedure NEWSPACE(* newaddr: absptr; deltasize: int2; b_area: absptr *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The free pool in b_area will be increased by the    *)
+       (*    block of space (size = deltasize bytes) at newaddr  *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    newaddr = the address of the new block              *)
+       (*    deltasize = the size of the new block in bytes      *)
+       (*    b_area = the address of the free pool base          *)
+       (*                                                        *)
+       (**********************************************************)
+
+  var
+    free_ptr: ent_pool_ptr;
+
+  begin
+    (* make new space look like used space and release it *)
+    free_ptr:=pointer(newaddr);
+    free_ptr^.size:=-(deltasize div 2); (* allocated space *)
+    RELSPACE(newaddr+poolEnthdsize,b_area);
+  end;(*NEWSPACE*)
+
+function GETSPACE(* amount: int2; b_area: absptr;
+                            var ordaddr: absptr ): boolean *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Dynamic space will be allocated from a free space   *)
+       (*    pool .                                              *)
+       (*    The dynamic space is allocated in an even number of *)
+       (*    bytes.  Each dynamic region allocated is preceeded  *)
+       (*    by a header of control information.                 *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    amount: the number of bytes of free space required  *)
+       (*    b_area: the base of the data area which contains the*)
+       (*            free space pool.  b_area^ contains a pointer*)
+       (*            to the free space pool header.              *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    GETSPACE= true if space was allocated               *)
+       (*              false if insufficient space in free pool  *)
+       (*    ordaddr: the address ordinal of the dynamic space   *)
+       (*             allocated.                                 *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10, 20;                                                              (*WH02*)
+
+var
+  x: ^absptr;
+  dummy: boolean;
+  c_pool_ptr: hdr_pool_ptr;
+  newsize, deltasize: int2;
+  currfree, leftfree, nextfree: ent_pool_ptr;
+  tries: int2;
+  int_level: intson_type;
+
+begin
+  (* determine ptr to appropriate pool area *)
+  if b_area = b_sysglobal_ptr then b_area:=b_area - 24575; (* adj offset *)
+
+  x:=pointer(b_area);    (* area base *)
+  c_pool_ptr:=pointer(x^);
+
+  (* compute size of free region needed *)
+  if (amount > 32764) or (amount <= 0) then                              (*WH02*)
+    begin                                                                (*WH02*)
+      getspace:=false;                                                   (*WH02*)
+      goto 20;                                                           (*WH02*)
+    end;                                                                 (*WH02*)
+
+  newsize:=(amount + poolEnthdsize + 1) div 2; (* size in words *)
+  (* allocate enough so it can always be freed *)
+  if newsize < minfreesize then newsize:=minfreesize;
+  tries:=0; (* initialize retry count *)
+
+10: (* start of loop for retry after expansion of free pool *)
+
+  with c_pool_ptr^ do
+    begin
+      (* find free entry which is big enough *)
+      leftfree:=pointer(ord(c_pool_ptr));
+
+      INTSOFF(clokints,int_level);
+
+      currfree:=pointer(ord(c_pool_ptr) + firstfree);
+      while (ord(currfree) <> ord(c_pool_ptr)) and
+            (currfree^.size < newsize) do
+        begin
+          (*$IFC DEBUG*)
+          if currfree^.size <= 0 then SYSTEM_ERROR(e_badfreepool);
+          (*$ENDC*)
+
+          leftfree:=currfree;                                         (*OS158*)
+          currfree:=pointer(ord(c_pool_ptr)+currfree^.next);          (*OS158*)
+        end; (* while *)
+
+      (* currfree either points to free area big enough or *)
+      (* no space is available                             *)
+
+      if ord(currfree) = ord(c_pool_ptr) then
+        begin  (* no free space available--must expand system pool *)
+          (* restore interrupts to their entry value *)
+          INTSON(int_level);
+          if (int_level = 0) and
+             (tries <= 4) then
+            begin (* interrupts are on so an expansion can be attempted *)
+              tries:=tries+1;
+              if EXP_POOLSPACE(newsize*2,b_area) then goto 10 (* retry *)
+            end;
+          getspace:=false; (*no go *)
+        end
+       else
+        begin  (* free space found *)
+          (* interrupts are still off *)
+
+          (* delink free entry *)
+          with currfree^ do
+            begin
+              (* check for excess free space *)
+              deltasize:=size - newsize;
+              if deltasize < minfreesize then
+                begin (* insufficient excess free space *)
+                  leftfree^.next:=next;
+                  freecount:=freecount - size;
+                  newsize:=size;
+                end
+               else
+                begin (* sufficient excess free space - return excess *)
+                  nextfree:=pointer(ord(currfree)+ord4(newsize)*2);
+                  nextfree^.next:=next;
+                  leftfree^.next:=ord(nextfree)-ord(c_pool_ptr);
+                  nextfree^.size:=deltasize;
+                  freecount:=freecount - newsize;
+                end;
+
+              (* allocate space *)
+              size:=-newsize;
+            end;(*with*)
+          INTSON(int_level);
+
+          (* try to avoid ever running out of space by expanding when *)
+          (* free count gets too low.                                 *)
+          if (freecount < 512) and   (* less than 1024 bytes left *)
+             (int_level = 0) then dummy:=EXP_POOLSPACE(512,b_area);
+
+          (* return pointer to dynamic space *)
+          ordaddr:=ord(currfree)+poolEnthdsize;
+          getspace:=true;
+        end;
+    end; (*with *)
+
+20: (*error exit*)                                                         (*WH02*)
+end; (*GETSPACE*)
+
+
+
+procedure SET_REFNUM_PARMS(refnum: int2; var base: absptr;
+                                         var p_refnum_rec: ptr_refnum_rec);
+   (* calculate free region base and ptr to refnum record for the input refnum *)
+
+var
+  c_syslocal_ptr: slocal_ptr;
+
+begin
+  if refnum <= max_glorefnum then
+    begin (* trying to find global refnum *)
+      base:=b_sysglobal_ptr;
+      p_refnum_rec:=@glo_refnum;
+    end
+   else
+    begin (* trying to find local refnum *)
+      base:=b_syslocal_ptr;
+      c_syslocal_ptr:=pointer(base);
+      p_refnum_rec:=@c_syslocal_ptr^.loc_refnum;
+    end;
+end; (*SET_REFNUM_PARMS*)
+
+
+function FIND_REFNCB_ENTRY(refnum: int2;
+                             var c_refncb_ptr: refncb_ptr):boolean;
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The list of refnum control blocks will be searched  *)
+       (*    to find the entry defining refnum.                  *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum = the target refnum value being searched for *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    c_refncb_ptr = the pointer to the refncb entry      *)
+       (*    FIND_REFNCB_ENTRY = true if the entry is found      *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  l_refncb_ptr: refncb_ptr;
+  base: absptr;
+  p_refnum_rec: ptr_refnum_rec;
+  found: boolean;
+
+begin
+  SET_REFNUM_PARMS(refnum,base,p_refnum_rec);
+
+  with p_refnum_rec^ do
+    begin
+      (* search for the refnum control block *)
+
+      l_refncb_ptr:=@hd_refnum_list.fwd_link;
+      c_refncb_ptr:=pointer(hd_refnum_list.fwd_link + base);
+      found:=false;
+      while (c_refncb_ptr <> l_refncb_ptr) and not found do
+        begin
+          if c_refncb_ptr^.refn = refnum
+            then found:=true
+            else c_refncb_ptr:=pointer(c_refncb_ptr^.refnum_list.fwd_link + base);
+        end; (* while *)
+      find_refncb_entry:=found;
+    end; (* with *)
+end; (* FIND_REFNCB_ENTRY *)
+
+
+function GET_REFNUM(* ordrefdbptr: absptr; global: boolean): int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    allocate a refnum                                   *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    ordrefdbptr = the ordinal address of the refdb entry*)
+       (*    to be associated with the new refnum value          *)
+       (*    global = the type of refnum desired                 *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    GET_REFNUM = the new refnum value                   *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    returns refnum = -1 if none can be found            *)
+       (*                                                        *)
+       (**********************************************************)
+
+ var
+   c_syslocal_ptr: slocal_ptr;
+   c_refncb_ptr, l_refncb_ptr: refncb_ptr;
+   ordrefncbptr: absptr;
+   base: absptr;
+   p_refnum_rec: ptr_refnum_rec;
+   beg_refnum, max_refnum, refnum: int2;
+
+ begin
+   if global then
+     begin (* want a global refnum *)
+       base:=b_sysglobal_ptr;
+       p_refnum_rec:=@glo_refnum;
+       beg_refnum:=beg_glorefnum;
+       max_refnum:=max_glorefnum;
+     end
+    else
+     begin (* want a process local refnum *)
+       base:=b_syslocal_ptr;
+       c_syslocal_ptr:=pointer(b_syslocal_ptr);
+       p_refnum_rec:=@c_syslocal_ptr^.loc_refnum;
+       beg_refnum:=beg_locrefnum;
+       max_refnum:=max_locrefnum;
+     end;
+
+   with p_refnum_rec^ do
+     begin
+       (* allocate space for refnum control block *)
+       if GETSPACE(SIZEOF(refncb),base,ordrefncb) then
+         begin (* allocated space *)
+           c_refncb_ptr:=pointer(ordrefncb);
+
+           (* allocate a refnum *)
+           if next_refnum < max_refnum then
+             begin (* normal case - refnum allocation has not rolled over *)
+               refnum:=next_refnum;
+               next_refnum:=next_refnum+1;
+               l_refncb_ptr:=pointer(hd_refnum_list.bkwd_link + base);
+             end
+            else
+             begin (* abnormal case - must search for free refnum *)
+               l_refncb_ptr:=pointer(hd_refnum_list.fwd_link + base);
+               refnum:=beg_refnum;
+               while l_refncb_ptr^.refn = refnum do
+                 begin
+                   refnum:=refnum+1;
+                   l_refncb_ptr:=pointer(l_refncb_ptr^.refnum_list.fwd_link + base);
+                 end;
+               l_refncb_ptr:=pointer(l_refncb_ptr^.refnum_list.bkwd_link + base);
+             end;
+
+           (* initialize refncb *)
+           with c_refncb_ptr^ do
+             begin
+               refn:=refnum;
+               refdb_addr:=pointer(ordrefdbptr);
+               hide:=false;
+             end; (* with *)
+
+           (* link refncb into list *)
+           ENQUEUE(c_refncb_ptr^.refnum_list,l_refncb_ptr^.refnum_list,base);
+         end
+        else
+         begin (* unable to allocate space *)
+           refnum:=-1; (* invalid refnum *)
+         end;
+     end; (* with *)
+   get_refnum:=refnum; (* return value *)
+ end; (* GET_REFNUM *)
+
+ procedure FREE_REFNUM(* refnum: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    release the refnum and its control block            *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum = the refnum to be released                  *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  l_refncb_ptr, c_refncb_ptr: refncb_ptr;
+  p_refnum_rec: ptr_refnum_rec;
+  base: absptr;
+
+begin
+  if FIND_REFNCB_ENTRY(refnum,c_refncb_ptr) then
+    begin  (* found the right entry *)
+      SET_REFNUM_PARMS(refnum,base,p_refnum_rec);
+
+      (* to avoid refnum rollover lower next_refnum if this is the last refnum *)
+      (* in the chain.                                                         *)
+      with p_refnum_rec^ do
+        begin
+          if (c_refncb_ptr^.refnum_list.fwd_link+base) =
+             ord(@hd_refnum_list.fwd_link) then
+            begin (* releasing last refncb in list *)
+              l_refncb_ptr:=pointer(c_refncb_ptr^.refnum_list.bkwd_link + base);
+              if ord(l_refncb_ptr) = ord(@hd_refnum_list.fwd_link) then
+                begin (* also releasing first refncb in list *)
+                  if refnum <= max_glorefnum then next_refnum:=beg_glorefnum
+                                             else next_refnum:=beg_locrefnum;
+                end
+               else
+                begin (* not releasing first in list *)
+                  next_refnum:=l_refncb_ptr^.refn+1;
+                end;
+            end;
+        end;
+
+      (* remove the entry from the refnum list and release its space *)
+      DEQUEUE(c_refncb_ptr^.refnum_list,base);
+      RELSPACE(ord(c_refncb_ptr),base);
+    end;
+end; (* FREE_REFNUM *)
+
+
+procedure CHK_REFNUM(* var errnum: int2; refnum: int2; c_type: refdbType;
+                        var ord_refdb_ptr: int4 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The refnum passed into the procedure is checked for *)
+       (*    validity.  Existence of a refnum descriptor block is*)
+       (*    verified and the descriptor block is of the proper  *)
+       (*    type.  The ord(pointer) to the descriptor is        *)
+       (*    returned if there are no errors.                    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum is the value to be validated.                *)
+       (*                                                        *)
+       (*    c_type is the type of refdb expected                *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    ord_refdb_ptr is the ord(pointer) to the valid      *)
+       (*    refdb record. It is undefined if errnum <> 0.       *)
+       (*                                                        *)
+       (*    errnum indicates the result of the validity check.  *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 refnum is valid                          *)
+       (*           = e_badrefnum if refnum is invalid           *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  c_refdb_ptr: refdb_ptr;
+  c_refncb_ptr: refncb_ptr;
+
+begin
+  errnum:=e_badrefnum;
+  if FIND_REFNCB_ENTRY(refnum,c_refncb_ptr) then
+    begin (* found refnum control block *)
+      (* check if refnum is of the proper type *)
+      c_refdb_ptr:=c_refncb_ptr^.refdb_addr;
+      if not c_refncb_ptr^.hide and
+         (c_refdb_ptr^.header.kind = c_type) then
+        begin (* refdb is of the proper type *)
+          errnum:=0;
+          ord_refdb_ptr:=ord(c_refdb_ptr);
+        end;
+    end;
+end; (* CHK_REFNUM *)
+
+
+procedure HIDE_REFNUM(* var errnum: int2; refnum: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Refnum will be hidden so that it cannot be seen by  *)
+       (*    CHK_REFNUM                                          *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum is the one to be hidden                      *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the result of the operation        *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 refnum is now hidden                     *)
+       (*           = e_badrefnum if refnum is invalid           *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  c_refncb_ptr: refncb_ptr;
+
+begin
+  errnum:=e_badrefnum;
+  if FIND_REFNCB_ENTRY(refnum,c_refncb_ptr) then
+    begin (* found refnum control block *)
+      c_refncb_ptr^.hide:=true;
+      errnum:=0;
+    end;
+end;(*HIDE_REFNUM*)
+
+
+procedure SHOW_REFNUM(* var errnum: int2; refnum: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Refnum will be made visible so it can be seen by    *)
+       (*    CHK_REFNUM                                          *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum is the one to be made visible                *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the result of the operation        *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 refnum is now visible                    *)
+       (*           = e_badrefnum if refnum is invalid           *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  c_refncb_ptr: refncb_ptr;
+
+begin
+  errnum:=e_badrefnum;
+  if FIND_REFNCB_ENTRY(refnum,c_refncb_ptr) then
+    begin (* found refnum control block *)
+      c_refncb_ptr^.hide:=false;
+      errnum:=0;
+    end;
+end;(*SHOW_REFNUM*)
+
+
+function SYS_CALLED (* : boolean *);  external;
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*   Assembly language function to determine whether the  *)
+       (*   system call procedure that called SYS_CALLED was     *)
+       (*   itself called from system code or from user code.    *)
+       (*   This is useful for those system call procedures      *)
+       (*   that allow access to system objects when called      *)
+       (*   from operating system code.                          *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*   None.                                                *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*   SYS_CALLED : returns true if the system call         *)
+       (*                routine was called from system code or  *)
+       (*                false if the routine was called from    *)
+       (*                user code.                              *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*   None.                                                *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*   SYS_CALLED assumes that it was called in a process   *)
+       (*   environment (i.e. not from the Supervisor's stack).  *)
+       (*   It can be called from anywhere in the system,        *)
+       (*   although it is really only useful in a system call   *)
+       (*   (i.e. interface) routine.                            *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*   None.                                                *)
+       (*                                                        *)
+       (**********************************************************)
+
+
+(*$S kr_fs *)   (* put it in segment where it is used *)
+
+  procedure GETID; (*var unid: uid*)
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  get unique id                               *)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  unique id                             *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  not re-entrant, so don't call *)
+       (*                from an interrupt handler.                 *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  begin
+    if prev_unid.b < 0 then
+    begin
+      prev_unid.b := prev_unid.b + $1000000; (*ignore overflow*)
+      if prev_unid.b >= 0 then (*get timestamp only once every 256 calls*)
+        prev_unid.a := TIMESTAMP
+    end
+    else
+      prev_unid.b := prev_unid.b + $1000000; (*ignore overflow*)
+    unid := prev_unid
+  end; (*getid*)
+
+(*$S init*)
+
+  procedure INITUID;
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  initialize unique id                        *)
+       (*                                                           *)
+       (* Input Parameters:  none                                   *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:                                             *)
+       (*                                                           *)
+       (* Special Conditions of Use:  none                          *)
+       (*                                                           *)
+       (* Error Conditions:  none                                   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  begin
+    prev_unid.a := TIMESTAMP;
+    prev_unid.b := serial_no (*only low 24 bits are serial number, high 8 change
+                             with every call to GETID*)
+  end; (*inituid*)
+
+
+(*$S init *)
+
+procedure POOL_INIT(* mb_sysglob, l_sysglob, mb_sgheap, l_sgheap,
+                mb_syslocal, l_syslocal : absptr *);
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Initialize the free pools within sysglobal and      *)
+       (*      syslocal, along with related global variables.    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    mb_sysglob - mapped address of the base (low memory *)
+       (*       side) of sysglobal.                              *)
+       (*    l_sys_global - the length of the same.              *)
+       (*    mb_sgheap - mapped version of b_sgheap.             *)
+       (*    l_sgheap - the length of the same.                  *)
+       (*    mb_sysloc - mapped address of the base (low memory  *)
+       (*       side) of syslocal                                *)
+       (*    l_syslocal - the length of the same.                *)
+       (*                                                        *)
+       (**********************************************************)
+var
+    c_hdr_pool_ptr : hdr_pool_ptr;
+    c_syslocal_ptr : slocal_ptr;
+
+begin
+
+   b_sysglobal_ptr := ord(@sg_free_pool_addr)+24575;     {gets mapped form free}
+   sg_free_pool_addr := mb_sgheap;
+   grow_sysglobal:=false;
+   size_sglobal := l_sysglob - (b_sysglobal_ptr - 24575 - mb_sysglob);
+   INIT_FREEPOOL(sg_free_pool_addr,l_sgheap);
+   c_hdr_pool_ptr := pointer(sg_free_pool_addr);
+   sysg_free := c_hdr_pool_ptr^.pool_size;
+
+   b_syslocal_ptr  := mb_syslocal;
+   c_syslocal_ptr := pointer(b_syslocal_ptr);
+   with c_syslocal_ptr^ do
+     begin
+        sl_free_pool_adr := b_syslocal_ptr + SIZEOF(syslocal);
+        size_slocal := l_syslocal;
+        INIT_FREEPOOL(sl_free_pool_adr,l_syslocal-sizeof(syslocal));
+        c_hdr_pool_ptr := pointer(sl_free_pool_adr);
+        sysl_free := c_hdr_pool_ptr^.pool_size;
+     end;
+end; { of pool_init}
+
+
+ÿ

@@ -1,0 +1,1247 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, 1984, Apple Computer Inc.                     }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+unit EventChn;          { Event Channel Management (memory based) }
+
+interface
+uses
+  (*$U object/driverdefs.obj*)          driverdefs,
+  (*$U object/hwint.obj*)               hwint,
+  (*$U object/sysglobal.obj*)           globalda,
+  (*$U object/procprims.obj *)          proc_prims,
+  (*$U object/mmprim.obj*)              mmprimitives,
+  (*$U object/asynctr.obj *)            asynctr,
+  (*$U object/genio.obj *)              genio,
+  (*$U object/twiggy.obj *)             twiggy,
+  (*$U object/vmstuff.obj *)            vmstuff,
+  (*$U object/sfileio.obj *)            sfileio,
+  (*$U object/fsprim.obj *)             fs_primitives,
+  (*$U object/fsui.obj *)               FS_Interface,
+  (*$U object/exceprim.obj*)            exceprim,
+  (*$U object/clock.obj *)              clock,
+  (*$U object/mm0.obj *)                MEMORYMANAGER,
+  (*$U object/ds0.obj *)                DATASEGS;
+
+
+  const
+    size_etext = 9;             (* event text size - 40 bytes *)
+    size_waitlist = 10;         (* size of wait list *)
+
+    user_event_type = 1;        (* type of event sent by user, system type of events
+                                   must have event_type other than this value *)
+    sys_son_term    = 2;        (* son process termination event sent by system *)
+
+  type
+    t_waitlist = record                          (* wait list *)
+                   length : integer;
+                   refnum : array [0..size_waitlist] of integer;
+                 end;
+
+    t_eheader = record                          (* event header *)
+                  send_pid : longint;           (* sender's process id *)
+                  event_type : longint;         (* type of event *)
+                end;
+    t_event_text = array [0..size_etext] of longint;
+
+    p_r_eventblk = ^r_eventblk;
+    r_eventblk = record
+                   event_header : t_eheader;
+                   event_text : t_event_text;
+                 end;
+
+    p_s_eventblk = ^s_eventblk;
+    s_eventblk = t_event_text;
+
+
+    chn_kind = (wait_ec, call_ec);
+    t_chn_sts = record                          (* channel status *)
+                  chn_type : chn_kind;          (* channel type *)
+                  num_events : integer;         (* number of events queued *)
+                  open_recv : integer;          (* number of opens for receiving *)
+                  open_send : integer;          (* number of opens for sending *)
+                  ec_name : pathname;           (* event channel name *)
+                end;
+
+    tm_event = record                           (* timed event block *)
+                 te_id : longint;               (* timed event id *)
+                 r_event : r_eventblk;          (* event to be received *)
+                 ec_name : pathname;            (* event channel name *)
+               end;
+
+
+
+  { Local Event Channel Data Structures }
+  ptr_QEvent = ^QEvent;
+
+  QEvent = record   { Local Event }
+             nextEvent_ptr : ptr_QEvent;         { ptr to next event in chan q }
+             theEvent      : r_eventblk          { the event - header & text }
+           end;
+
+  ptr_ECCB = ^ECCB;
+
+  ECCB = record   { Event Channel Control Block }
+           next_ptr      : ptr_ECCB;             { ptr to next ECCB in list }
+           receiver      : ptr_PCB;              { ptr to PCB of receiver }
+           waiting       : boolean;              { true if receiver is waiting }
+           localChan     : boolean;              { true if channel is local }
+           chnType       : chn_kind;             { type of channel }
+           numReceivers  : int2;                 { # receivers for channel }
+           numSenders    : int2;                 { # senders for channel }
+           numEvents     : int2;                 { # events in the queue }
+           eventList     : ptr_QEvent;           { ptr to 1st event in queue }
+
+           ex_occurred_f : boolean;
+           ex_state      : t_ex_state;
+           ex_name       : t_ex_name;
+           chnName       : ptr_pathname          { name of channel }
+         end;
+
+    ptr_ECrdb = ^EC_refdb;
+
+    EC_refdb = record     { Event Channel RefDB }
+                 header    : refdbHead;          { refdb header - link & type }
+                 eccb_ptr  : ptr_ECCB;           { pointer to ECCB for channel }
+                 ec_refnum : integer;            { refnum - for clean up }
+                 ds_refnum : integer;            { refnum for data seg w/channel }
+                 recv      : boolean             { true if refnum is for receive }
+               end;
+
+
+  procedure make_event_chn (var errnum : integer;
+                            var event_chn_name : pathname);
+
+  procedure kill_event_chn (var errnum : integer;
+                            var event_chn_name : pathname);
+
+  procedure open_event_chn (var errnum : integer;
+                            var event_chn_name : pathname;
+                            var refnum : integer;
+                            var excep_name : t_ex_name;
+                            receive : boolean);
+
+  procedure close_event_chn (var errnum : integer;
+                             refnum : integer);
+
+  procedure info_event_chn (var errnum : integer;
+                            refnum : integer;
+                            var chn_info : t_chn_sts);
+
+  procedure wait_event_chn (var errnum : integer;
+                            var wait_list : t_waitlist;
+                            var refnum : integer;
+                            event_ptr : p_r_eventblk);
+
+  procedure flush_event_chn (var errnum : integer;
+                             refnum : integer);
+
+  procedure send_event_chn (var errnum : integer;
+                            refnum : integer;
+                            event_ptr : p_s_eventblk;
+                            interval : timestmp_interval;
+                            clktime : time_rec);
+
+  procedure ec_setup (b_sloc_ptr : slocal_ptr);
+
+  procedure ec_cleanup;
+
+  function localEC (refnum : int2) : boolean;
+
+  procedure init_ec;
+
+  procedure tr_ex_ec (ec_refnum : integer;
+                      var ex_sts : t_ex_sts;
+                      ex_to_ec : boolean;
+                      set_ex_ocr : boolean);
+
+  function ecversion : integer;
+
+
+
+implementation
+
+  const
+    curversion = 10;
+
+    init_ECsize = 1024;         { initial size of an event channel data seg }
+    EC_ldsn = 0;                { LDSN for binding an event channel seg }
+
+    ecdef_size = 5;             (* ec default physical size in blocks - about 50
+                                   events *)
+
+    no_err           = 0;
+    e_inv_refnum     = 1;       (* invalid refnum *)
+    e_ec_base        = 400;     (* base for event channel error return *)
+    e_inv_name       = 401;     (* invalid ec name passed *)
+    e_no_sg_space    = 402;     (* no space in system global data area *)
+    e_no_rdb_space   = 403;     (* no space in system (local) data area for rdb *)
+    e_inv_device     = 404;     (* non-block structured device specified *)
+    e_catfull        = 405;     (* catalog is full in make or open_event_chn *)
+    e_no_ec          = 406;     (* no such ec exists in kill or open_event_chn *)
+
+    e_open_send_lec  = 410;     (* attempt to open a local ec to send *)
+    e_open_recv      = 411;     (* attempt to open to receive again - only one receiver
+                                   is allowed *)
+    e_open           = 413;     (* unexpected error from open, info, truncate *)
+    e_ecspace        = 416;     (* can't get enough disk space for ec in open *)
+    e_leftopen       = -412;    (* ec was left open and system crashed *)
+    e_scavenged      = -413;    (* ec was scavenged *)
+    e_close          = 417;     (* unexpected error from close_object *)
+
+    e_wait_nr_chn    = 420;     (* attempt to wait on a channel not opened to receive*)
+    e_req_fail       = 421;     (* asyn pipe request was not completed successfully *)
+    e_wait_e_call_chn= 422;     (* attempt to wait on an empty call channel *)
+                                (* these should not happen *)
+    e_ec_not_found   = 423;     (* cannot find the corresponding ec after blk_req *)
+    e_r_actual       = 424;     (* actual returned from read_data is not correct *)
+    e_empty_pipe_aw  = 425;     (* pipe empty after being unblocked *)
+    e_can_apipe      = 426;     (* bad reqptr error return from can_aread_pipe *)
+    e_waitlist       = 427;     (* wait_list has illegal length specified *)
+    e_senderclose    = 428;     (* waiter unblocked because last sender closed the ec *)
+    e_wait           = 429;     (* unexpected error from read_data *)
+
+    e_send_ns_chn    = 430;     (* attemp to send event to channel not opened to send*)
+    e_w_actual       = 431;     (* actual returned from write_data is not correct *)
+    e_recvclose      = 432;     (* sender unblocked because receiver closed the ec *)
+    e_write          = 433;     (* unexpected error from write_data *)
+
+    e_make           = 440;     (* unexpected error from make_entry *)
+    e_ec_exist       = 441;     (* ec entry already exists *)
+    e_kill           = 445;     (* unexpected error from kill_entry *)
+
+    e_flush          = 450;     (* unexpected error from truncate in flush_event_chn *)
+    e_ec_system      = 10400;   (* base for system errors in ec - should not
+                                         happen *)
+    e_ec_cleanup     = 10401;   (* error from close_event_chn in ec_cleanup *)
+    e_wt_actual      = 10402;   (* actual returned from write_data for timer event
+                                   is not correct - happen when disk is full - need
+                                   some recovery yet to be defined *)
+
+
+    ec_prim_level = 40;         (* trace level for primitive routines *)
+    ec_ui_level   = 90;         (* trace level for user level routines *)
+
+
+  var head_lec_refdb : linkage;    (* refdb list for local event channels *)
+      num_local_ec : longint;
+
+(*$S EventSeg*)
+
+  function ecversion (* : integer *);
+    begin
+      ecversion := curversion;
+    end;  (* funtion ecversion *)
+
+
+(*$S kr_prims*)
+
+  procedure tr_ex_ec (* ec_refnum : integer;
+                        var ex_sts : t_ex_sts;
+                        ex_to_ec : boolean;
+                        set_ex_ocr : boolean *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   transfer exception status between corresponding exception         *)
+    (*   control block and the call event channel control block.           *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   ec_refnum : event channel refnum.                                 *)
+    (*   ex_sts : exception status if to transfer to eccb.                 *)
+    (*   ex_to_ec : boolean flag to indicate the direction of transfer.    *)
+    (*   set_ex_ocr : boolean flag to set ex_occurred_f or not if ex_to_ec *)
+    (*                is true.                                             *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   ex_sts : exception status if to transfer to ecb.                  *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by ex_q_empty, setup_state, info_excep and flush_excep only*)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      a_ec_rdb_ptr : absptr;
+      c_ec_rdb_ptr : ptr_ECrdb;
+      c_eccb_ptr : ptr_ECCB;
+      errnum : integer;
+
+    begin
+      chk_refnum (errnum, ec_refnum, ecrefdb, a_ec_rdb_ptr);
+      c_ec_rdb_ptr := pointer (a_ec_rdb_ptr);
+      c_eccb_ptr := c_ec_rdb_ptr^.eccb_ptr;
+
+      with c_eccb_ptr^ do
+        if ex_to_ec then                        (* from caller to eccb *)
+          begin
+            if set_ex_ocr then
+              ex_occurred_f := ex_sts.ex_occurred_f;
+            ex_state := ex_sts.ex_state;
+          end
+        else                                    (* from eccb to caller *)
+          begin
+            ex_sts.ex_occurred_f := ex_occurred_f;
+            ex_sts.ex_state := ex_state;
+            ex_sts.num_excep := numEvents;             (* number of exceptions too *)
+          end;
+    end { tr_ex_ec };
+
+
+(*$S EventSeg*)
+
+  procedure Find_ECCB (var EC_name : pathname;  var eccb_ptr : ptr_ECCB);
+    { procedure to find the event channel control block for the specified
+      refnum, if one exists }
+
+    var
+      found : boolean;
+
+    begin
+      eccb_ptr := pointer(EC_list);  found := false;
+
+      while (eccb_ptr <> nil) and not found do
+        if not eccb_ptr^.localChan then
+          begin
+            if eccb_ptr^.chnName^ = EC_name then found := true
+              else eccb_ptr := eccb_ptr^.next_ptr
+          end
+        else
+          eccb_ptr := eccb_ptr^.next_ptr;
+
+      if not found then eccb_ptr := nil
+    end { Find_LCCB };
+
+
+  procedure Open_Event_Chn (* var errnum : int2;  var event_chn_name : pathname;
+                              var refnum : int2;  var excep_name : t_ex_name;
+                              receive : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      new_ptr : ptr_ECCB;                   { pointer to an ECCB }
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      seg_refnum : int2;                    { refnum for data segment }
+      b_area : absptr;                      { ptr to area containing refdb }
+      glob_ref : boolean;                   { true if global refnum needed }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+      sysloc_ptr : slocal_ptr;              { ptr to syslocal }
+      ecb_ptr : exctrb_ptr;
+      EC_name : pathname;                   { pathname for data seg of channel }
+
+    procedure Recover (error : int2);
+      { procedure used by Open_Event_Chn to recover from errors }
+
+      begin
+        errnum := error;
+        exit (Open_Event_Channel)
+      end { Recover };
+
+    begin
+      if event_chn_name = '' then
+        begin  { local channel }
+          b_area := b_sysglobal_ptr;   glob_ref := true;
+          EC_name := '';   seg_refnum := -1;
+          new_ptr := nil
+        end
+      else
+        begin
+          b_area := b_syslocal_ptr;   glob_ref := false;
+          EC_name := Concat (event_chn_name, '_EC');
+          (*Open_Dataseg (errnum, EC_name, seg_refnum, ord_ptr, EC_ldsn);
+          if errnum > 0 then Recover (errnum);
+          SetAccess_Dataseg (errnum, seg_refnum, false { read/write });
+          Unbind_Dataseg (errnum, seg_refnum);*)
+          seg_refnum := 0;  (* temp *)
+          Find_ECCB (event_chn_name, new_ptr)
+        end;
+
+      if new_ptr <> nil then
+        begin  { found ECCB }
+          with new_ptr^ do
+            if not receive then
+              numSenders := numSenders + 1
+            else if (receiver <> nil) and (ord(receiver) <> c_pcb_ptr) then
+              { attempt to open by a new receiver }
+              Recover (e_open_recv)
+            else
+              begin  { 1st receiver or subsequent open by receiver }
+                numReceivers := numReceivers + 1;
+                receiver := pointer(c_pcb_ptr)
+              end
+        end { found ECCB }
+      else if not GetSpace (Sizeof (ECCB) + Length (event_chn_name) + 1,
+                            b_sysglobal_ptr, ord_ptr) then
+        Recover (e_no_sg_space)
+      else
+        begin  { got ECCB space }
+          new_ptr := pointer(ord_ptr);
+
+          with new_ptr^ do
+            begin  { format the ECCB }
+              if receive then
+                begin
+                  receiver := pointer(c_pcb_ptr);
+                  numReceivers := 1;
+                  numSenders := 0
+                end
+              else
+                begin
+                  receiver := nil;
+                  numReceivers := 0;
+                  numSenders := 1
+                end;
+
+              waiting := false;
+              if event_chan_name = '' then localChan := true
+                else localChan := false;
+              chnType := wait_ec;
+              numEvents := 0;
+              eventList := nil;
+
+              if localChan then chnName := nil
+              else
+                begin
+                  chnName := pointer(ord(@chnName) + 4);
+                  MoveLeft (event_chn_name, chnName^, Length(event_chan_name)+1)
+                end
+            end { with new_ptr^ };
+
+          { add new ECCB to global list }
+          new_ptr^.next_ptr := pointer(EC_list);
+          EC_list := ord(new_ptr)
+        end { got ECCB space };
+
+      { set up refdb and refnum }
+      if not GetSpace (Sizeof(EC_refdb), b_area, ord_ptr) then
+        Recover (e_no_rdb_space);
+      ECrdb_ptr := pointer(ord_ptr);
+      refnum := Get_Refnum (ord_ptr, glob_ref);
+      if refnum = -1 then Recover (e_no_sg_space);
+
+      with ECrdb_ptr^ do
+        begin
+          eccb_ptr := new_ptr;
+          ec_refnum := refnum;
+          ds_refnum := seg_refnum;
+          recv := receive;
+          header.kind := ecrefdb;
+
+          if receive and (excep_name <> '') then
+            begin  { opening a call channel }
+              Set_EC_Refnum (errnum, excep_name, refnum, ecb_ptr);
+              if errnum > 0 then Recover (errnum);
+
+              with eccb_ptr^ do
+                begin
+                  chnType := call_ec;
+                  ex_name := excep_name;
+                  ex_occurred_f := false;
+                  ex_state := ecb_ptr^.ex_state;
+                  if numEvents > 0 then
+                    begin
+                      ex_occurred_f := true;
+                      if ex_state = enabled then raise_ex_pending (ecb_ptr)
+                    end
+                end
+            end { call channel };
+
+          if ds_refnum < 0 { local channel } then
+            Enqueue (header.refdb_list, head_lec_refdb, b_area)
+          else
+            begin
+              sysloc_ptr := pointer(b_syslocal_ptr);
+              Enqueue (header.refdb_list, sysloc_ptr^.head_ec_refdb, b_area)
+            end
+        end;
+
+      errnum := 0
+    end { Open_Event_Chn };
+
+
+  procedure Flush_Event_Chn (* var errnum : int2;  refnum : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      b_area : absptr;                      { ptr to area containing event queue }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+      event_ptr : ptr_QEvent;               { pointer to a queued event }
+
+    begin
+      Chk_Refnum (errnum, refnum, ecrefdb, ord_ptr);
+
+      if errnum = 0 then
+        begin  { refnum is valid }
+          ECrdb_ptr := pointer(ord_ptr);
+          with ECrdb_ptr^.eccb_ptr^ do
+            begin
+              if localChan then b_area := b_sysglobal_ptr
+              else
+                begin
+                  (*Bind_Dataseg (errnum, ECrdb_ptr^.ds_refnum);
+                  b_area := MMU_Base (maxsysldsnmmu)*)
+                  b_area := b_sysglobal_ptr
+                end;
+
+              while eventList <> nil do
+                begin
+                  event_ptr := eventList;
+                  eventList := event_ptr^.nextEvent_ptr;
+
+                  RelSpace (ord(event_ptr), b_area)
+                end;
+
+              numEvents := 0;
+
+              (*if not localChan then
+                Unbind_Dataseg (errnum, ECrdb_ptr^.ds_refnum)*)
+            end { with }
+        end { refnum is valid }
+    end { Flush_Event_Chn };
+
+
+  procedure Close_Event_Chn (* var errnum : int2;  refnum : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+      b_area : absptr;                      { base of area containing refdb }
+      prev_ptr : ptr_ECCB;                  { for finding previous ECCB in list }
+      ecb_ptr : exctrb_ptr;
+
+    begin
+      Chk_Refnum (errnum, refnum, ecrefdb, ord_ptr);
+
+      if errnum = 0 then
+        begin  { refnum is valid }
+          ECrdb_ptr := pointer(ord_ptr);
+          with ECrdb_ptr^ do
+            begin
+              with eccb_ptr^ do
+                begin
+                  { adjust fields in ECCB }
+                  if localChan then b_area := b_sysglobal_ptr
+                    else b_area := b_syslocal_ptr;
+
+                  if not recv then
+                    numSenders := numSenders - 1
+                  else
+                    begin  { receiver is closing channel }
+                      numReceivers := numReceivers - 1;
+                      if chnType = call_ec then
+                        { 'disassociate' event channel from its exception }
+                        { note that this can cause funny interaction w/ exceps }
+                        Set_EC_Refnum (errnum, ex_name, 0, ecb_ptr);
+                      if numReceivers = 0 then
+                        begin   { do an error check here!!! }
+                          receiver := nil;
+                          if localChan then
+                            begin
+                              Flush_Event_Chn (errnum, refnum);
+                              numSenders := 0   { so ECCB will be released }
+                            end
+                        end
+                    end;
+
+                  if numReceivers + numSenders = 0 then
+                    begin  { release the channel }
+                      (*if not localChan then Close_Dataseg (errnum, ds_refnum);*)
+
+                      { remove ECCB from the list }
+                      if EC_list = ord(eccb_ptr) then
+                        EC_list := ord(next_ptr)
+                      else
+                        begin
+                          prev_ptr := pointer(EC_list);
+                          while prev_ptr^.next_ptr <> eccb_ptr do
+                            prev_ptr := prev_ptr^.next_ptr;
+                          prev_ptr^.next_ptr := next_ptr
+                        end;
+
+                      RelSpace (ord(eccb_ptr), b_sysglobal_ptr)
+                    end { release channel }
+                end { with eccb_ptr^ };
+
+              { remove refdb from list }
+              Dequeue (header.refdb_list, b_area)
+            end { with ECrdb_ptr^ };
+
+          { release refdb and free the refnum }
+          RelSpace (ord(ECrdb_ptr), b_area);   { test later for local send close }
+          Free_Refnum (refnum)
+        end { refnum is valid }
+    end { Close_Event_Chn };
+
+
+(*$S kr_prims*)
+
+  procedure Send_Event_Chn (* var errnum : int2;  refnum : int2;
+                              event_ptr : p_s_eventblk;
+                              interval : timestmp_interval;
+                              clktime : time_rec *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+
+    procedure Recover (error : int2);
+      { procedure used by Send_Event_Chn to recover from errors }
+
+      begin
+        errnum := error;
+        exit (Send_Event_Chn)
+      end { Recover };
+
+    procedure Write_Event (eccb_ptr : ptr_ECCB);
+      { procedure used by Send_Event_Chn to write the event into the event queue }
+
+      var
+        pcb_ptr : ptr_PCB;                  { pointer to PCB of current process }
+        qEvent_ptr : ptr_QEvent;            { pointer to a queue event }
+        scan_ptr : ptr_QEvent;              { ptr for adding event to end of q }
+        b_area : absptr;                    { base of area containing event queue }
+
+      begin
+        with eccb_ptr^ do
+          begin
+            if localChan then b_area := b_sysglobal_ptr
+            else
+              begin
+                (*Bind_Dataseg (errnum, ECrdb_ptr^.ds_refnum);
+                b_area := MMU_Base (maxsysldsnmmu)*)
+                b_area := b_sysglobal_ptr
+              end;
+
+            if not GetSpace (Sizeof (QEvent), b_area, ord_ptr) then
+              Recover (e_no_sg_space);   (* fix this!!! *)
+
+            qEvent_ptr := pointer(ord_ptr);
+
+            { build header and copy user's event text }
+            with qEvent_ptr^.theEvent do
+              begin
+                with event_header do
+                  begin
+                    pcb_ptr := pointer(c_pcb_ptr);
+                    send_pid := pcb_ptr^.glob_id;
+                    if localChan then event_type := sys_son_term
+                      else event_type := user_event_type
+                  end;
+
+                event_text := event_ptr^
+              end;
+
+            { add the new event to the event channel queue }
+            if eventList = nil then
+              { adding to empty queue }
+              eventList := qEvent_ptr
+            else
+              begin  { adding to non-empty queue }
+                scan_ptr := eventList;
+                while scan_ptr^.nextEvent_ptr <> nil do
+                  scan_ptr := scan_ptr^.nextEvent_ptr;
+                scan_ptr^.nextEvent_ptr := qEvent_ptr
+              end { non-empty queue };
+
+            qEvent_ptr^.nextEvent_ptr := nil;
+
+            (*if not localChan then
+              Unbind_Dataseg (errnum, ECrdb_ptr^.ds_refnum);*)
+
+            numEvents := numEvents + 1;
+
+            if (receiver^.blk_state = [pipe_io]) and waiting then
+              Unblock_Process (receiver, [pipe_io]);
+          end { with eccb_ptr^ }
+      end { Write_Event };
+
+
+    begin  { Send_Event_Chn }
+      with interval do
+        if (sec <> 0) or (msec <> 0 ) then
+          Recover (1199);
+
+      Chk_Refnum (errnum, refnum, ecrefdb, ord_ptr);
+
+      if errnum = 0 then
+        begin  { refnum is valid }
+          ECrdb_ptr := pointer(ord_ptr);
+
+          with ECrdb_ptr^ do
+            begin
+              if recv and not eccb_ptr^.localChan then
+                Recover (e_send_ns_chan);
+
+              with eccb_ptr^ do
+                if chnType = wait_ec then
+                  Write_Event (eccb_ptr)
+                else
+                  begin  { call channel }
+                    ex_occurred_f := true;
+                    if ex_state <> ignored then Write_Event (eccb_ptr);
+                    if (ex_state = enabled) and (receiver <> nil) then
+                      with receiver^ do
+                        excep_pending := excep_pending + 1
+                  end
+            end { with ECrdb_ptr^ }
+        end { refnum is valid }
+    end { Send_Event_Chn };
+
+
+(*$S EventSeg*)
+
+  procedure Wait_Event_Chn (* var errnum : int2;  wait_list : t_waitlist;
+                              var refnum : int2;  var event_ptr : p_r_eventblk *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      pcb_ptr : ptr_PCB;                    { pointer to PCB of current process }
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      index : 0..size_waitlist;             { for scanning local list of ECCBs }
+
+      ECrdbPtrs : array[0..size_waitlist] of ptr_ECrdb;
+      eccbPtrs : array[0..size_waitlist] of ptr_ECCB;
+
+    procedure Recover (error : int2);
+      { procedure used by Wait_Event_Chn to recover from any errors that occur }
+
+      begin
+        errnum := error;
+        exit (Wait_Event_Chn)
+      end { Recover };
+
+    procedure Read_Event;
+      { procedure used by Wait_Event_Chn to get an event from a queue }
+
+      var
+        qEvent_ptr : ptr_qEvent;            { pointer to a queued event }
+        b_area : absptr;                    { base of area containing event queue }
+        index : 0..size_waitlist;           { for scanning ECCBs }
+
+      begin
+        for index := 0 to wait_list.length - 1 do
+          with eccbPtrs[index]^ do
+            if numEvents > 0 then
+              begin  { an event is available }
+                if localChan then b_area := b_sysglobal_ptr
+                else
+                  begin
+                    (*Bind_Dataseg (errnum, ECrdbPtrs[index]^.ds_refnum);
+                    b_area := MMU_Base (maxsysldsnmmu)*)
+                    b_area := b_sysglobal_ptr
+                  end;
+
+                qEvent_ptr := eventList;
+                eventList := eventList^.nextEvent_ptr;
+                numEvents := numEvents - 1;
+
+                { set user data, free event in queue, and return }
+                event_ptr^ := qEvent_ptr^.theEvent;
+
+                RelSpace (ord(qEvent_ptr), b_area);
+
+                (*if not localChan then
+                  Unbind_Dataseg (errnum, ECrdbPtrs[index]^.ds_refnum);*)
+
+                refnum := wait_list.refnum[index];
+                errnum := 0;
+                exit (Wait_Event_Chn)
+              end { event available }
+      end { Read_Event };
+
+    begin  { Wait_Event_Chn }
+      with wait_list do
+        begin
+          if (length <= 0) or (length > size_waitlist + 1) then
+            Recover (e_waitlist);
+
+          { verify all refnums in the wait list }
+          for index := 0 to length - 1 do
+            begin
+              Chk_Refnum (errnum, refnum[index], ecrefdb, ord_ptr);
+              if errnum <> 0 then Recover (errnum);
+
+              ECrdbPtrs[index] := pointer(ord_ptr);
+              if not ECrdbPtrs[index]^.recv then
+                Recover (e_wait_nr_chn);
+              eccbPtrs[index] := ECrdbPtrs[index]^.eccb_ptr;
+              with eccbPtrs[index]^ do
+                if (chnType = call_ec) and (numEvents = 0) then
+                  Recover (e_wait_e_call_chan)
+            end;
+
+          Read_Event;
+
+          { no events were found so wait for one }
+          for index := 0 to length - 1 do
+            eccbPtrs[index]^.waiting := true;
+
+          pcb_ptr := pointer(c_pcb_ptr);
+          Block_Process (pcb_ptr, [pipe_io]);
+
+          for index := 0 to length - 1 do
+            eccbPtrs[index]^.waiting := false;
+
+          Read_Event
+        end { with wait_list };
+
+      event_ptr := nil;
+      refnum := -1;
+      errnum := e_ec_not_found
+    end { Wait_Event_Chn };
+
+
+  procedure Info_Event_Chn (* var errnum : int2;  refnum : int2;
+                              var chn_info : t_chn_sts *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+
+    begin
+      Chk_Refnum (errnum, refnum, ecrefdb, ord_ptr);
+
+      if errnum = 0 then
+        begin  { refnum is valid }
+          ECrdb_ptr := pointer(ord_ptr);
+          with ECrdb_ptr^.eccb_ptr^, chn_info do
+            begin
+              chn_type := chnType;
+              num_events := numEvents;
+              if numReceivers > 0 then open_recv := 1
+                else open_recv := 0;
+              open_send := numSenders;
+
+              if chnName = nil then ec_name := ''
+              else
+                ec_name := Copy (chnName^, 1, Length(chnName^))
+            end
+        end { refnum is valid }
+    end { Info_Event_Chn };
+
+
+
+  procedure make_event_chn (* var errnum : integer;
+                              var event_chn_name : pathname *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   create an event channel of the specified name.  The channel to    *)
+    (*   be created can be global channel only.                            *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   event_chn_name : pathname of the event channel.                   *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : error returned.                                          *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    type
+      ptr_eqSeg = ^eqSeg;
+
+      eqSeg = record
+                eqSeg_freePtr : absptr;
+                eqSeg_size : int2
+              end;
+
+    var
+      ds_refnum : int2;                     { refnum for data segment }
+      seg_ptr : absptr;                     { ptr for Make_Dataseg call }
+      eqSeg_ptr : ptr_eqSeg;                { ptr to event queue segment }
+      EC_name : pathname;                   { 'special' pathname for channel }
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;
+          parms [1].addr := ord (@event_chn_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      (*$ENDC*)
+
+      EC_name := Concat (event_chn_name, '_EC');
+
+      (*Make_Dataseg (errnum, EC_name, init_ECsize, init_ECsize, ds_refnum,
+                    seg_ptr, EC_ldsn, ds_shared);
+      if errnum = 0 then
+        begin  { everything is ok }
+          { initialize segment as a system free pool }
+          eqSeg_ptr := pointer(seg_ptr);
+          with eqSeg_ptr^ do
+            begin
+              eqSeg_freePtr := seg_ptr + Sizeof (eqSeg);
+              eqSeg_size := init_ECsize;
+              Init_FreePool (eqSeg_freePtr, init_ECsize - Sizeof (eqSeg))
+            end;
+
+          Close_Dataseg (errnum, ds_refnum)
+        end
+      else
+        begin  { handle data seg error }
+          case errnum of
+            308 : errnum := e_ec_exist;
+            307 : errnum := e_inv_name;
+            311 : errnum := e_no_sg_space;
+            otherwise errnum := e_make
+          end
+        end*)
+    end { Make_Event_Chn };
+
+
+
+  procedure Kill_Event_Chn (* var errnum : integer;
+                              var event_chn_name : pathname *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   delete an event channel of the specified name. If the channel is  *)
+    (*   currently open, the deletion is delayed until all users finish    *)
+    (*   closing it.                                                       *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   event_chn_name : pathname of the event channel.                   *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   errnum : error returned.                                          *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   see output parameters.                                            *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      EC_name : pathname;                   { 'special' pathname for channel }
+      (*$IFC DEBUG2*)
+      parmarray : parmcheck;
+      (*$ENDC*)
+
+    begin
+      (*$IFC DEBUG2*)
+      with parmarray do
+        begin
+          numcheck := 1;
+          parms [1].addr := ord (@event_chn_name);
+          parms [1].readwrite := false;
+          if not valid_addr (errnum, parmarray) then goto 9;
+        end;
+      (*$ENDC*)
+
+      EC_name := Concat (event_chn_name, '_EC');
+
+      (*Kill_Dataseg (errnum, EC_name);*)
+      errnum := 0;
+
+      if errnum > 0 then
+        begin  { handle data seg error }
+          errnum := e_no_ec
+        end
+      (*else if channel_open then
+        Clear_Name   { so it could be re-used }*)
+    end { Kill_Event_Chn };
+
+
+  procedure EC_Setup (* b_sloc_ptr : slocal_ptr *);
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   set up event channel stuff when a process is created.             *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   b_sloc_ptr : pointer to the new process's syslocal.               *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   called by make_process   only.                                    *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    begin
+      with b_sloc_ptr^, head_ec_refdb do
+        begin
+          fwd_link := ord (@head_ec_refdb) - ord (b_sloc_ptr);
+          bkwd_link := fwd_link;
+        end;
+    end { EC_Setup };
+
+
+  procedure Init_EC;
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   Initialize the event channel's global variable - head_eccb.       *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   To be called at system startup only.                              *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    begin
+      EC_list := ord(nil);
+      with head_lec_refdb do
+        begin
+          fwd_link := ord (@fwd_link) - b_sysglobal_ptr;
+          bkwd_link := fwd_link
+        end
+    end { Init_EC };
+
+
+  procedure EC_Cleanup;
+
+    (***********************************************************************)
+    (*                                                                     *)
+    (* Description:                                                        *)
+    (*   event channel clean up for a terminating process. All event       *)
+    (*   channels opened by this process will be closed.                   *)
+    (*                                                                     *)
+    (* Input Parameters:                                                   *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Output Parameters:                                                  *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Side Effects:                                                       *)
+    (*   none.                                                             *)
+    (*                                                                     *)
+    (* Special Conditions of Use:                                          *)
+    (*   To be called by terminate_process only.                           *)
+    (*                                                                     *)
+    (* Error Conditions:                                                   *)
+    (*   system_error is called if error return from close_event_chn.      *)
+    (*                                                                     *)
+    (***********************************************************************)
+
+    var
+      error : int2;                         { error return }
+      sysloc_ptr : slocal_ptr;              { ptr to syslocal }
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+      nextrdb_ptr : ptr_ECrdb;              { ptr to next refdb in syslocal list }
+
+    begin
+      { clean up global channels }
+      sysloc_ptr := pointer (b_syslocal_ptr);
+      ECrdb_ptr := pointer(sysloc_ptr^.head_ec_refdb.fwd_link + b_syslocal_ptr);
+
+      while ECrdb_ptr <> @sysloc_ptr^.head_ec_refdb do
+        begin
+          with ECrdb_ptr^ do
+            begin
+              nextrdb_ptr := pointer(ECrdb_ptr^.header.refdb_list.fwd_link +
+                                       b_syslocal_ptr);
+
+              Close_Event_Chn (error, ec_refnum);
+              if error > 0 then
+                begin
+                end
+            end;
+
+          ECrdb_ptr := nextrdb_ptr
+        end { while };
+
+      { clean up local channels }
+      ECrdb_ptr := pointer(head_lec_refdb.fwd_link + b_sysglobal_ptr);
+
+      while ECrdb_ptr <> @head_lec_refdb do
+        with ECrdb_ptr^ do
+          if ord(eccb_ptr^.receiver) <> c_pcb_ptr then
+            { scan next refdb in list }
+            ECrdb_ptr := pointer(header.refdb_list.fwd_link + b_sysglobal_ptr)
+          else
+            begin  { found a channel belonging to process }
+              Close_Event_Chn (error, ec_refnum);
+              if error > 0 then
+                begin
+                end;
+
+              { start scan over again }
+              ECrdb_ptr := pointer(head_lec_refdb.fwd_link + b_sysglobal_ptr)
+            end { found channel }
+    end { EC_Cleanup };
+
+
+  function localEC (* refnum : int2) : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      ord_ptr : absptr;                     { general ordinal of a pointer }
+      ECrdb_ptr : ptr_ECrdb;                { ptr to refdb for channel }
+      errnum : integer;
+      eccb_ptr : ptr_ECCB;
+
+    begin
+      Chk_Refnum (errnum, refnum, ecrefdb, ord_ptr);
+      if errnum <> 0 then localEC := false
+      else
+        begin
+          ECrdb_ptr := pointer (ord_ptr);
+          eccb_ptr := ECrdb_ptr^.eccb_ptr;
+
+          localec := eccb_ptr^.localChan
+        end
+    end { localEC };
+
+end.
+ÿ

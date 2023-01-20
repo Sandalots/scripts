@@ -1,0 +1,1623 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE Undo Routines *)
+
+(* ********************************************************************* *)
+
+UNIT UOp;
+
+(* Segment CMD *)
+INTERFACE
+USES
+    (*$U UNITSTD*)     UnitStd,     (* interface dependency  *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/Syscall *)    Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)    Hdr,
+
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+    (*$U ApLd/DAT*)    Dat,         (* implementation units  *)
+    (*$U ApLd/SEL*)    Sel,
+    (*$U ApLd/UTL*)    Utl;
+
+CONST
+    (* directions to process oLst *)
+    iLDirFwd    = 1;
+    iLDirBwd    = 0;
+Var
+    sgnVrtFlag:  Boolean;
+
+    procedure SmoothFHnd(Var obj: TObjPtr);
+
+    (* Object Stream *)
+
+    function  CkObjTrfo(obj: TObjPtr): TObjPtr;
+    procedure RedoCmd;
+    procedure GetSlClr( selLst: TSelHnd;Var frgdClr, bkgdClr: TPByte );
+    Procedure SetGpClr(Var group: TObjPtr); {Get the color of curDoc.sLst and
+                                             assigns it to group.}
+    procedure UndoOLst;
+    procedure MakeSLst;
+    procedure GetNxtObj(dir: Integer; var obj: TObjPtr );
+    procedure ResetOLst( dir: Integer; var obj: TObjPtr );
+
+    (* grouping and placing *)
+    procedure UngpInPl(groupObj: TObjPtr); {Ungroup in place}
+    procedure InsertBh(obj, nextObj: TObjPtr);{inserts obj behind nextObj in
+                                               curDoc.oLst}
+    procedure InsertFt(obj, preObj: TObjPtr); {inserts obj in front of nextObj in
+                                                curDoc.oLst}
+
+    (* Sel *)
+    function  PtOnSelKnob (VAR pt: Point; var obj: TObjPtr;
+                          var knob: Integer): Integer;
+    function  PtOnObj(scrPt: Point; var obj: TObjPtr): boolean;
+    procedure GetSBBox(var sel: TSelHnd);
+    procedure GetSGBox(var sel: TSelHnd; VAR gBox: Rect);
+    procedure GetDwgGBox(VAR gBox: Rect);
+
+    (* LastOp *)
+    function  ObjLocked(obj: TObjPtr): Boolean;
+    procedure SetLastOp( lOp: Integer );
+    procedure CommitLastOp;
+    procedure UndoLastOp(VAR scrollFlag: Boolean);
+    procedure DumpLastOp;
+    procedure InitUOp;
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+
+
+(* ********************************************************************* *)
+
+VAR sCur:  Integer;
+    inSel: Boolean;
+    lFirst: Boolean;
+    smthSLst: TSelHnd;
+
+(* ************************************************************************* *)
+(*$S Reshape*)
+    procedure CompleteCLst(scrCLst: TCLstHnd ;Var dstCLst: TCLstHnd);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        {Fix up the rest of the data}
+        With dstCLst^^ do begin
+            beg2D := c2DLst[0];
+            crdKind := iObjPoly;
+            cClose := scrCLst^^.cClose;
+            {$R-}
+            c2DLst[crdCnt+1] := c2DLst[0]; {only need for closed curves}
+            c2DLst[crdCnt+2] := c2DLst[1];
+            {$IfC rangeOn} {$R+} {$EndC}
+        end;
+    end;{CompleteCLst}
+
+    (* ************************************************************************* *)
+(*$S Reshape*)
+    procedure GetKnots(Var cLst:TCLstHnd);
+    const
+        aMin = 50;          (* minimum triangle area *)
+        aMax = 200;         (* two * maximum triangle area *)
+    var i: Integer;
+        p1,p2,lastNode,begPt: Point;
+        aTot,a1,a2,a3: Integer;
+        newCLst: TCLstHnd;
+        done,noMorePts: Boolean;
+
+
+(* ********************************************************************* *)
+
+    procedure PutPoint(pt:Point);
+    Var pt2D: Point2D;
+    begin
+        With newCLst^^ do begin
+            crdCnt := crdCnt + 1;
+            ScrnToWld(pt,pt2D);
+            {$R-}
+            c2DLst[crdCnt] := pt2D;
+            {$IfC rangeOn} {$R+} {$EndC}
+        end;
+    end;{PutPoint}
+
+    (* ************************************************************* *)
+
+        procedure GetNxtP2;
+        begin
+    {$IFC sampcalls} ALogCall; {$ENDC}
+            With cLst^^ do begin
+                if i<=crdCnt then begin
+                    GetNode(cLst,i,p2);
+                    i := i+1;
+                end;
+                noMorePts := (i>crdCnt);
+            end;
+        end;
+
+    (* ************************************************************* *)
+
+    begin
+    {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then begin
+            DumpCLst(cLst);
+            writeln('GetKnots');
+        end;
+        (* reduces number of crdPts based on local curvature *)
+        With cLst^^ do begin
+            If crdCnt=2 then begin
+                {$R-}
+                crdLst[3].dh := 0;    {This crdLst has a limited existence and
+                                       there is room for two extra points.}
+                crdLst[3].dv := 0;
+                {$IfC rangeOn} {$R+} {$EndC}
+                crdCnt := 3;
+                crdMax := 3;
+            end;
+            If crdCnt>2 then begin
+                OpenCLst(HzFromH(Pointer(Ord(cLst))),newCLst,maxCrdCnt,
+                         iObjPoly);
+
+                With cLst^^ do begin
+                    {Initialize newCLst index}
+                    newCLst^^.crdCnt := -1;
+
+                    WldToScrn(beg2D,begPt);
+                    p1 := begPt;
+                    p2 := begPt;
+                    PutPoint(p1);
+                    i  := 1;
+                    GetNxtP2;
+                    a2   := 0;
+                    a3   := 0;
+                    repeat
+                        aTot := 0;
+                        lastNode := p1;
+                        repeat
+                            p1 := p2;
+                            GetNxtP2;
+
+                            (* get new area *)
+                            a1 := a2;
+                            a2 := a3;
+                            a3 := ((p1.h-lastNode.h)*(p2.v-lastNode.v)-
+                                   (p2.h-lastNode.h)*(p1.v-lastNode.v)) ;
+                            aTot := aTot+a3;
+
+                            (* check total area *)
+                            done := (ABS(aTot)>=aMax);
+
+                            (* check localized curvature *)
+                            if NOT done then
+                                done := (ABS(a3)>=ABS(a1+a2))
+                                    AND (ABS(aTot)>=aMin);
+
+
+                            if traceCmd then begin
+                                write('        ', (i-2):2,a1:6,a2:6,a3:6,aTot:6,
+                                      lastNode.h:6,',',lastNode.v:3,
+                                      p1.h:6,',',p1.v:3,p2.h:6,',',p2.v:3);
+                                if NOT done then writeln;
+                            end;
+                        until done OR noMorePts;
+                        if traceCmd then
+                            writeln(' PutNode(',(p1.h-lastNode.h):2,
+                                            ',',(p1.v-lastNode.v):2,')');
+                        PutPoint(p1);
+                    until noMorePts;
+                    PutPoint(p2);
+                    CompleteCLst(cLst, newCLst);
+
+                    {Switch to the new list}
+                    FreeCLst(cLst);
+                    cLst := newCLst;
+                    CloseCLst(cLst);  {Frees up extra memory}
+                end;
+            end;
+        end;
+    end; (* GetKnots *)
+
+    (* ********************************************************************* *)
+(*$S Reshape*)
+    procedure SmoothFHnd(*Var obj: TObjPtr*);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With obj^.oDat do begin
+            kind := iObjSPoly;
+            GetKnots(cLst);
+        end;
+    end;{SmoothFHnd}
+
+    (* ********************************************************************* *)
+(*$S Reshape*)
+    procedure UnSmthFHnd(Var obj: TObjPtr);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With obj^.oDat do begin
+            kind := iObjPoly;
+            GetKnots(cLst);
+        end;
+    end;{UnSmthFHnd}
+
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure SmoObj(Var obj: TObjPtr);
+    Var grpObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With obj^.oDat do begin
+            If kind=iObjGroup then begin
+                grpObj := grp.lBeg;
+                While grpObj<>NIL do begin
+                    SmoObj(grpObj);
+                    grpObj := grpObj^.fLink;
+                end;
+            end else if kind=iObjPoly then begin
+                kind := iObjSPoly;
+            end else if kind=iObjFHnd then begin
+                SmoothFHnd(obj);
+            end;
+        end;
+    end;{SmoObj}
+
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure UnSObj(Var obj: TObjPtr);
+    Var grpObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With obj^.oDat do begin
+            If kind=iObjGroup then begin
+                grpObj := grp.lBeg;
+                While grpObj<>NIL do begin
+                    UnSObj(grpObj);
+                    grpObj := grpObj^.fLink;
+                end;
+            end else if kind=iObjSPoly then begin
+                kind := iObjPoly;
+            end else if kind=iObjFHnd then begin
+                UnsmthFHnd(obj);
+            end;
+        end;
+    end;{UnSObj}
+
+(* ********************************************************************* *)
+(*$S BasicOps*)
+    procedure SwitchEnds(obj: TObjPtr); {When applied to iObjRLin or iObjSLin it
+                                         interchanges the end points.}
+    Var holdPoint: Point2D;
+        grpObj: TObjPtr;
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+
+        With obj^.oDat do begin
+            If kind=iObjGroup then begin
+                grpObj := grp.lBeg;
+                While grpObj <> NIL do begin
+                    SwitchEnds(grpObj);
+                    grpObj := grpObj^.fLink;
+                end;
+            end;
+            If (kind=iObjRLin) OR (kind=iObjSLin) then begin
+                holdPoint := p1;
+                p1        := p2;
+                p2        := holdPoint;
+            end;
+        end;
+    end;{SwitchEnds}
+
+
+(* ************************************************************************* *)
+(*$S Reshape*)
+    procedure AddSPDetail(thisObj:TObjPtr);
+    Var dummyPt2D: Point2D;
+        i,count: Integer;
+        newCLst: TCLstHnd;
+
+        (* ********************************************************************* *)
+
+        procedure PutPoint(alpha:Real; pt2D1,pt2D2:Point2D);
+        begin
+            With newCLst^^ do begin
+                crdCnt := crdCnt+1;
+                {$R-}
+                c2DLst[crdCnt].x := alpha*pt2D1.x + (1-alpha)*pt2D2.x;
+                c2DLst[crdCnt].y := alpha*pt2D1.y + (1-alpha)*pt2D2.y;
+                {$IfC rangeOn} {$R+} {$EndC}
+            end;
+        end;{PutPoint}
+
+        (* ********************************************************************* *)
+
+    begin{AddSPDetail}
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With thisObj^.oDat,cLst^^ do
+            {allocate room for newCLst}
+            OpenCLst(geHHz,newCLst,2*crdCnt+1,iObjPoly);
+        {$R-}
+        With prvVrtLst^^,thisObj^.oDat,cLst^^ do begin
+
+            {Initialize newCLst index}
+            newCLst^^.crdCnt := -1;
+
+            {Deal with first vertex and set up loop}
+            If cClose= iCLstUsr then begin
+                If vertex[0]=1 then begin
+                    PutPoint(0.25,c2DLst[crdCnt],c2DLst[0]);
+                    PutPoint(0.75,c2DLst[0],c2DLst[1]);
+                end else begin
+                    PutPoint(1.0,c2DLst[0],dummyPt2D);
+                end;
+                count := crdCnt;
+            end else begin
+                PutPoint(1.0,c2DLst[0],dummyPt2D);
+                count := crdCnt-1;
+                If vertex[0]=1 then vertex[1] := 1;
+                If vertex[crdCnt]=1 then vertex[crdCnt-1] := 1;
+                {Extend ends}
+                c2DLst[0].x := c2DLst[0].x + c2DLst[0].x - c2DLst[1].x;
+                c2DLst[0].y := c2DLst[0].y + c2DLst[0].y - c2DLst[1].y;
+                c2DLst[crdCnt].x := c2DLst[crdCnt].x + c2DLst[crdCnt].x
+                                    - c2DLst[crdCnt-1].x;
+                c2DLst[crdCnt].y := c2DLst[crdCnt].y + c2DLst[crdCnt].y
+                                    - c2DLst[crdCnt-1].y;
+            end;
+
+            {Do the general case}
+            For i := 1 to count do begin
+                If vertex[i] = 1 then begin
+                    PutPoint(0.25,c2DLst[i-1],c2DLst[i]);
+                    PutPoint(0.75,c2DLst[i],c2DLst[i+1]);
+                end else begin
+                    PutPoint(1.0,c2DLst[i],dummyPt2D);
+                end;
+            end;
+
+            {Do the end case}
+            If cClose=iCLstNil then begin
+                PutPoint(0.5,c2DLst[crdCnt],c2DLst[crdCnt-1]);
+            end;
+
+            {Fix up the rest of the data}
+            CompleteCLst(cLst, newCLst);
+
+            {Switch to the new list}
+            FreeCLst(cLst);
+            cLst := newCLst;
+            CloseCLst(cLst);  {Frees up extra memory}
+        end;
+        {$IfC rangeOn} {$R+} {$EndC}
+    end;{AddSPDetail}
+
+(* ************************************************************************* *)
+(*$S Reshape*)
+    procedure AddPDetail(thisObj:TObjPtr);
+    Var
+        i,count: Integer;
+        newCLst: TCLstHnd;
+
+    (* ********************************************************************* *)
+
+        procedure PutPoint;
+        begin
+            With newCLst^^,thisObj^.oDat do begin
+                crdCnt := crdCnt + 1;
+                {$R-}
+                c2DLst[crdCnt] := cLst^^.c2DLst[i];
+                {$IfC rangeOn} {$R+} {$EndC}
+            end;
+        end;{PutPoint}
+
+    (* ********************************************************************* *)
+
+        procedure AddPoint;
+        begin
+            With newCLst^^,thisObj^.oDat do begin
+                crdCnt := crdCnt + 1;
+                {$R-}
+                c2DLst[crdCnt].x := 0.5*cLst^^.c2DLst[i].x + 0.5*cLst^^.c2DLst[i+1].x;
+                c2DLst[crdCnt].y := 0.5*cLst^^.c2DLst[i].y + 0.5*cLst^^.c2DLst[i+1].y;
+                {$IfC rangeOn} {$R+} {$EndC}
+            end;
+        end;{AddPoint}
+
+    begin{AddPDetail}
+        {$IFC sampcalls} ALogCall; {$ENDC}
+
+        {allocate room for newCLst}
+        With thisObj^.oDat do
+        OpenCLst(HzFromH(Pointer(Ord(cLst))),
+                         newCLst,2*cLst^^.crdCnt+1,iObjPoly);
+
+        With prvVrtLst^^,thisObj^.oDat,cLst^^ do begin
+
+
+
+            {Initialize newCLst index}
+            newCLst^^.crdCnt := -1;
+
+            If cClose = iCLstUsr then begin
+                count := crdCnt;
+            end else begin
+                If vertex[crdCnt] = 1 then vertex[crdCnt-1] := 1;
+                count := crdCnt-1;
+            end;
+
+            {Each chosen vertex produces a new one half way to the next old vertex.}
+            For i := 0 to count do begin
+                PutPoint;
+                If vertex[i] = 1 then AddPoint;
+            end;
+
+            If cClose=iCLstNil then PutPoint;
+
+            CompleteCLst(cLst, newCLst);
+
+            {Switch to the new list}
+            FreeCLst(cLst);
+            cLst := newCLst;
+            CloseCLst(cLst);  {Frees up extra memory}
+        end;
+    end;{AddPDetail}
+
+(* ************************************************************************* *)
+(*$S Reshape*)
+    procedure AddDetail(obj:TObjPtr);
+    Var kind: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        kind := obj^.oDat.kind;
+        If kind=iObjPoly then begin
+            AddPDetail(obj);
+        end else if kind=iObjSPoly then begin
+            AddSPDetail(obj);
+        end;
+    end;{AddDetail}
+
+ (* ************************************************************************* *)
+(*$S Reshape*)
+    procedure SubDetail(thisObj:TObjPtr);
+    Var
+        i: Integer;
+        newCLst: TCLstHnd;
+
+    (* *********************************************************************** *)
+
+        procedure PutPoint;
+        begin
+            With newCLst^^ do begin
+                crdCnt := crdCnt + 1;
+                {$R-}
+                c2DLst[crdCnt] := thisObj^.oDat.cLst^^.c2DLst[i];
+                {$IfC rangeOn} {$R+} {$EndC}
+            end;
+        end;{PutPoint}
+
+    (* ************************************************************************* *)
+
+    begin{SubDetail}
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With thisObj^.oDat,cLst^^ do begin
+            If (kind=iObjPoly) OR (kind=iObjSPoly) then begin {this should be TRUE}
+
+                {allocate room for newCLst}
+                OpenCLst(geHHz,newCLst,crdCnt,iObjPoly);
+
+                With thisObj^.oDat,cLst^^,prvVrtLst^^ do begin
+                    {Initialize newCLst index}
+                    newCLst^^.crdCnt := -1;
+
+                    For i := 0 to vCnt do begin
+                        If vertex[i]=-1 then PutPoint;
+                    end;
+                    CompleteCLst(cLst, newCLst);
+
+                    {Switch to the new list}
+                    FreeCLst(cLst);
+                    cLst := newCLst;
+                    CloseCLst(cLst);  {Frees up extra memory}
+                end;
+            end;
+        end;
+    end;{SubDetail}
+
+
+    (* ********************************************************************* *)
+(*$S Arrange*)
+    procedure AddToGBg(obj: TObjPtr);
+    Var size,newSize: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('AddToGBg(',ord(obj):8,')');
+        {Check for room}
+        size := CbDataOfH(HzFromH(Pointer(Ord(groupBeg))),Pointer(Ord(groupBeg)));
+        newSize := SizeOf(TUndoLst) + (groupNum+1)*SizeOf(TObjPtr);
+        If size < newSize then
+            ChangeSizeH(HzFromH(Pointer(Ord(groupBeg))),Pointer(Ord(groupBeg)),
+            newSize + cSelGrow);
+        groupNum := groupNum + 1;
+        (*$R-*)
+        groupBeg^^[groupNum] := obj;
+        (*$IfC rangeOn *)(*$R+*)(*$EndC *)
+    end;{AddToGBg}
+
+    (* ***************************************************************** *)
+(*$S Arrange*)
+    procedure AddToGEd(obj: TObjPtr);
+    Var size,newSize: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('AddToGEd(',ord(obj):8,')');
+        {Check for room}
+        size := CbDataOfH(HzFromH(Pointer(Ord(groupEnd))),Pointer(Ord(groupEnd)));
+        newSize := SizeOf(TUndoLst) + (groupNum+1)*SizeOf(TObjPtr);
+        If size < newSize then
+            ChangeSizeH(HzFromH(Pointer(Ord(groupEnd))),Pointer(Ord(groupEnd)),
+            newSize + cSelGrow);
+        {groupNum := groupNum + 1; taken care of in AddToGBg}
+        (*$R-*)
+        groupEnd^^[groupNum] := obj;
+        (*$IfC rangeOn *)(*$R+*)(*$EndC *)
+    end;{AddToGEd}
+
+(* ********************************************************************* *)
+(*$S Arrange*)
+    procedure UngpInPl(*groupObj: TObjPtr*); {Ungroup in place}
+    Var groupie: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With groupObj^,oDat.grp do begin
+            {Set Flags}
+            groupie := lBeg;
+            While groupie<>NIL do begin
+                With groupie^ do begin
+                    cSel := iSelNml;
+                    pSel := iSelGpy;
+                    groupie := fLink;
+                end;
+            end;
+            AddToGBg(lBeg);
+            AddToGEd(lEnd);
+            lBeg^.bLink   := bLink;
+            lEnd^.fLink   := fLink;
+            If bLink <> NIL then bLink^.fLink  := lBeg;
+            If fLink <> NIL then fLink^.bLink  := lEnd;
+            If curDoc.oLst.oEnd = groupObj then   {groupObj cannot be text}
+               curDoc.oLst.oEnd := lEnd;
+            If curDoc.oLst.lst.lBeg = groupObj then
+               curDoc.oLst.lst.lBeg := lBeg;
+            If curDoc.oLst.lst.lEnd = groupObj then
+               curDoc.oLst.lst.lEnd := lEnd;
+            FreeP(curDoc.pHz,Pointer(Ord(groupObj)));
+            curDoc.oLst.lst.lCnt := curDoc.oLst.lst.lCnt + lCnt - 1;
+            curDoc.oLst.lst.lTot := curDoc.oLst.lst.lTot - 1;
+            curDoc.oLst.lst.lSiz := curDoc.oLst.lst.lSiz - SizeOf(TObjRec);
+        end;
+    end; {UngpInPl}
+
+(******************************************************************************)
+(*$S Ring2*)
+    procedure InsertBh(* obj, nextObj: TObjPtr *);{inserts obj behind nextObj in
+                                               curDoc.oLst}
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        {Must also see how oEnd and tBeg are affected}
+        With curDoc.oLst,lst do begin
+            lCnt := lCnt + 1;
+            lTot := lTot + CntOfObj(obj);
+            lSiz := lSiz + SizeOfObj(obj);
+            If nextObj <> NIL then begin
+                obj^.fLink            := nextObj;
+                obj^.bLink            := nextObj^.bLink;
+                If nextObj^.bLink <> NIL then
+                    nextObj^.bLink^.fLink := obj
+                else
+                    lBeg := obj;
+                nextObj^.bLink        := obj;
+            end else if lEnd <> NIL then begin
+                obj^.fLink  := NIL;
+                obj^.bLink  := lEnd;
+                lEnd^.fLink := obj;
+                lEnd        := obj;
+            end else begin
+                lBeg := obj;
+                lEnd := obj;
+                obj^.fLink := NIL;
+                obj^.bLink := NIL;
+            end;
+            If tBeg = nextObj then
+                If obj^.oDat.kind = iObjText then
+                    tBeg := obj
+                else oEnd := obj;
+            If (nextObj = NIL) and (obj^.oDat.kind <> iObjText) then oEnd := obj;
+        end;
+    end; {InsertBh}
+
+(********************************************************************************)
+(*$S Ring2*)
+    procedure InsertFt(* obj, preObj: TObjPtr *); {inserts obj in front of nextObj in
+                                                curDoc.oLst}
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        {Find the next obj and InsertBh it.  }
+        If preObj=NIL then
+            InsertBh(obj,curDoc.oLst.lst.lBeg)   {Put at the beginning}
+        else
+            InsertBh(obj,preObj^.fLink);
+    end; {InsertFt}
+
+(* ********************************************************************* *)
+
+    procedure GroupCmd;    {Inorder to effect forward references.}
+    External;
+
+    procedure UngroupCmd;
+    External;
+
+    procedure TopCmd;
+    External;
+
+    procedure BottomCmd;
+    External;
+
+    procedure CutCmd;
+    External;
+
+    procedure ClearCmd;
+    External;
+
+    procedure PasteCmd(item: Integer);
+    External;
+
+    procedure DupCmd;
+    External;
+
+    procedure CopyCmd;
+    External;
+
+    procedure HiLiteSel(sVal:Boolean);
+    External;
+
+
+(* ********************************************************************* *)
+(*$S Undo*)
+    procedure RedoCmd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        HiliteSel(ON);
+        case lastOp.oldOp of    {Must get op or oldOp straight, and the redrawing
+                              contained in these commands thought through.}
+
+            iOpGrp:  GroupCmd;
+            iOpUnG:  UngroupCmd;
+            iOpTop:  TopCmd;
+            iOpBot:  BottomCmd;
+            iOpCut:  CutCmd;
+            iOpClr:  ClearCmd;
+            iOpDup:  DupCmd;
+            iOpPstT: PasteCmd(1);
+            iOpPstF: PasteCmd(2);
+            iOpPstB: PasteCmd(3);
+            iOpCpy:  CopyCmd;
+        end;
+    end; {RedoCmd}
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    Procedure GetSlClr(* selLst: TSelHnd;Var frgdClr, bkgdClr: TPByte *);{Get
+                                                     the selections list's
+                                                     color, with iColorMix
+                                                     returned when the colors
+                                                     do not match.}
+    Var i: Integer;
+       fClr,bClr: TPByte;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With selLst^^ ,lastOp do begin
+            If curDoc.sLst^^.sState = iSStPrt then begin  {return proto colors if
+                                                           proto selected}
+                With curDoc do begin
+                    frgdClr := pnClr;
+                    bkgdClr := fillClr[proto];
+                end;
+            end else if sCnt = 0 then begin
+                frgdClr := iClrMix;
+                bkgdClr := iClrMix;
+            end else begin
+                (*$R-*)
+                With lst[1]^ do begin
+                (*$IfC rangeOn *) (*$R+*)(*$EndC *)
+                    fClr := oDat.inf.fgClr;
+                    bClr := oDat.inf.bgClr;
+                    If (pSel<>iSelNil)  and (op = iOpInf) then begin
+                        If rDat3 <> 0 then
+                            fClr := Round(rDat3);
+                        If rDat4 <> 0 then
+                            bClr := Round(rDat4);
+                    end;
+                end;
+                frgdClr := fClr;  {This and the next line could be eliminated at
+                                    the cost of clarity and consistency.}
+                bkgdClr := bClr;
+                If sCnt > 1 then begin
+                    For i := 2 to sCnt do begin
+                        (*$R-*)
+                        With lst[i]^ do begin
+                        (*$IfC rangeOn *) (*$R+*)(*$EndC *)
+                            fClr := oDat.inf.fgClr;
+                            bClr := oDat.inf.bgClr;
+                            If (pSel<>iSelNil) and (op = iOpInf) then begin
+                                If rDat3 <> 0 then
+                                    fClr := Round(rDat3);
+                                If rDat4 <> 0 then
+                                    bClr := Round(rDat4);
+                            end;
+                        end;
+                        If frgdClr <> fClr then frgdClr := iClrMix;
+                        If bkgdClr <> bClr then bkgdClr := iClrMix;
+                    end;
+                end;
+            end;
+        end;
+    end; { GetSlClr }
+
+
+(* ********************************************************************* *)
+(*$S Arrange*)
+    Procedure SetGpClr(* Var group: TObjPtr *); {Get the color of curDoc.sLst and
+                                             assigns it to group.}
+    Var frgdClr, bkgdClr: TPByte;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetSlClr(curDoc.sLst, frgdClr, bkgdClr);
+        group^.oDat.inf.fgClr := frgdClr;
+        group^.oDat.inf.bgClr := bkgdClr;
+    end; { SetGpClr }
+
+(* ********************************************************************* *)
+(*$S Undo*)
+    procedure Regroup;
+    Var i: Integer;
+        groupObj,thisObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (*$R-*)
+        For i := 1 to groupNum do begin
+            groupObj := NewObj(iObjGroup);
+            groupObj^.oDat.grp.lBeg := groupBeg^^[i];
+            groupObj^.oDat.grp.lEnd := groupEnd^^[i];
+            groupObj^.cSel := iSelNml;
+            thisObj := groupBeg^^[i];
+            With groupObj^.oDat.grp do begin
+                lCnt := 0;
+                lTot := 0;
+                lSiz := 0;
+                While thisObj <> lEnd^.fLink do begin
+                    lCnt := lCnt + 1;
+                    lTot := lTot + CntOfObj(thisObj);
+                    lSiz := lSiz + SizeOfObj(thisObj);
+                    SubFmOLst(curDoc.oLst,thisObj);
+                    thisObj^.pSel := iSelGpy;
+                    thisObj := thisObj^.fLink;
+                end;
+            end;
+            InsertBh(groupObj,groupEnd^^[i]^.fLink);
+            groupBeg^^[i]^.bLink := NIL;
+            groupEnd^^[i]^.fLink := NIL;
+
+            {Restore broken bLinks}
+            thisObj := groupBeg^^[i];
+            While thisObj<>NIL do begin
+                If thisObj^.fLink<>NIL then
+                        thisObj^.fLink^.bLink := thisObj;
+                thisObj := thisObj^.fLink;
+            end;
+            SetGpClr(groupObj);            {Set group color}
+            GetBBox(groupObj);
+        end;
+        (*$IfC rangeOn *)
+        (*$R+*)
+        (*$EndC *)
+    end;{Regroup}
+
+(******************************************************************************)
+(*$S Undo*)
+    procedure PutBack(dir: Integer);  {Rearranges curdoc.oLst so that objects
+                                       on prPstLst are put back into their
+                                        old positions}
+    Var i,j,lCnt: Integer;
+        obj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        lCnt := prPstLst^^.sCnt;
+        (*$R-*)
+        For i := lCnt downto 1 do begin
+            If dir=iLDirFwd then
+                j := lCnt+1-i
+            else
+                j := i;
+            obj := prPstLst^^.lst[j];
+            SubFmOLst( curDoc.oLst,obj);
+            InsertBh(obj,fallInBh^^[i]);
+        end;
+        (*$IfC rangeOn *)
+        (*$R+*)
+        (*$EndC *)
+    end; {PutBack}
+
+(* ********************************************************************* *)
+(*$S Ring2*)
+    procedure MakeSLst;
+          {Make selection list from curDoc.oLst and cSel or pSel flags}
+    Var thisObj: TObjPtr;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* put all objects that are selected into curSel *)
+        InitSLst(curDoc.sLst);
+        thisObj := curDoc.oLst.lst.lBeg;
+        While thisObj<>NIL do begin
+            If thisObj^.cSel<>iSelNil then
+                AddToSEnd(curDoc.sLst,thisObj);
+            thisObj := thisObj^.fLink;
+        end;
+        if traceCmd then begin
+            Writeln('end of MakeSLst');
+            GEDumpSel(curDoc.sLst);
+        end;
+    end;{MakeSLst}
+
+
+(* ********************************************************************* *)
+(*$S Undo*)
+    procedure UndoOLst;
+    Var i: Integer;
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With lastOp, curDoc do begin
+            case oldOp of
+                iOpDrw:
+                    begin
+                        op := iOpClr;
+                        MarkCSel(sLst,iSelNil);
+                        ResetSLst(sLst);
+                    end;
+                {iOpClr:  do nothing}
+                iOpGrp:
+                    begin
+                        UngpInPl(jstGpObj);
+                        PutBack(iLDirBwd);
+                    end;
+                iOpUnG:
+                    begin
+                        PutBack(iLDirFwd);
+                        Regroup;
+                    end;
+                iOpTop: PutBack(iLDirBwd);
+                iOpBot: PutBack(iLDirFwd);
+                {iOpCut: do nothing}
+                iOpDup,iOpPstT,iOpPstF,iOpPstB:
+                    begin
+                        For i := 1 to sLst^^.sCnt do
+                            SubFmOLst(oLst,CurSelObj(i));
+                        CopySLst(prPstLst,sLst);
+                        MarkCSel(sLst,iSelNml);
+                    end;
+              end;{cases}
+              If oldOp<>iOpDrw then begin
+                  MakeSLst;
+                  CopySLst(sLst,pSLst);
+                  MarkPSel(pSLst,iSelNml);
+              end;
+         end;{With}
+    end;{UndoOLst}
+
+
+(*****************************************************************************)
+(*$S Core2*)
+    procedure GetNxtObj(* dir: Integer; var obj: TObjPtr *);
+    var forwrd, goOn: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        forwrd := dir=iLDirFwd ;
+        With curDoc.oLst,lst do begin
+            If forwrd then
+                lCur := lCur^.fLink
+            else
+                lCur := lCur^.bLink;
+            If lCur = NIL then
+                obj := lCur
+            else begin
+                If (lastOp.op = iOpCut) OR (lastOp.op = iOpClr) then begin
+                    goOn := (lCur^.pSel<>iSelNil) AND (lCur^.oDat.locked=0);
+                    While goOn do begin
+                        If forwrd then
+                            lCur := lCur^.fLink
+                        else
+                            lCur := lCur^.bLink;
+                        If lCur = NIL then
+                            goOn := FALSE
+                        else
+                            goOn := (lCur^.pSel<>iSelNil) AND
+                                    (lCur^.oDat.locked=0);
+                    end;{While}
+                end;
+                obj := CkObjTrfo(lCur);  {This will transform a copy of previouly
+                                          selected objects by lastOp.op}
+            end;
+        end;{With}
+    end; {GetNxtObj}
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure ResetOLst(* dir: Integer; var obj: TObjPtr *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With curDoc.oLst,lst do begin
+            If dir=iLDirFwd then
+                lCur := lBeg
+            else
+                lCur := lEnd;
+            If (lCur<>NIL) then
+                If (lCur^.pSel<>iSelNil) AND (lCur^.oDat.locked=0) AND
+                    ((lastOp.op = iOpCut) OR (lastOp.op = iOpClr)) then
+                    GetNxtObj(dir,obj)
+                else
+                    obj := CkObjTrfo(lCur)
+            else
+                obj := NIL;
+        end;
+    end; {ResetOLst}
+
+(* ********************************************************************* *)
+
+(* Sel *)
+
+(* ********************************************************************* *)
+(*$S Core*)
+    function  PtOnObj(* scrPt: Point; var obj: TObjPtr): boolean *);
+    (* checks for objects within dhKnob of wld2D, returns topmost one *)
+    var nearObj: Boolean;
+        thisObj: TObjPtr;
+        hitRect: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('PtOnObj(',Ord(obj):6,') = ');
+
+        nearObj := FALSE;
+        ResetOLst(ilDirBwd,thisObj);
+        while (thisObj <> NIL) AND (not nearObj) do begin
+            if PtNearObj(scrPt,thisObj) then begin
+                obj := thisObj;
+                nearObj := TRUE;
+            end else
+                GetNxtObj(ilDirBwd,thisObj);
+        end;
+        if thisObj=trfoObj then
+            obj := trfoRef;
+        PtOnObj := nearObj;
+
+        if traceCmd then
+            writeln('PtOnObj=',nearObj);
+
+    end; (* PtOnObj *)
+
+(* ********************************************************************* *)
+(*$S Core*)
+    Function  PtOnSelKnob(* VAR pt: Point; var obj: TObjPtr;
+                          var knob: Integer ): Integer *);
+    var thisObj: TObjPtr;
+        selRect: Rect;
+        onKnob,i,sCnt: Integer;
+        knobSz: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* pt is in world coords *)
+        onKnob := iZoneCld;
+        GetSelRect(curDoc.sLst,selRect);
+        if PtInSelRect(pt,selRect) then begin
+            sCnt := curDoc.sLst^^.sCnt;
+            for i := 1 to sCnt do begin
+                thisObj := CkObjTrfo(CurSelObj(i));
+                onKnob := PtOnObjKnob(pt,thisObj,knob);
+                (* we can stop as soon as we are not cold *)
+                if onKnob<>iZoneCld then
+                    i := sCnt;
+            end;
+        end;
+        obj := thisObj;
+        if thisObj=trfoObj then
+            obj := trfoRef;
+        PtOnSelKnob := onKnob;
+    end; (* PtOnSelKnob *)
+
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure GetSBox(var sel: TSelHnd; gBoxFlag: Boolean; VAR sBox: Rect);
+    var thisObj: TObjPtr;
+        sState,i: Integer;
+        tBox: Rect;
+
+        bTime,tTime,eTime: LongInt;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceTrk then begin WrtTime('',tTime); eTime := tTime; end;
+        sBox := nilRect;
+        sState := sel^^.sState;
+        if (sState=iSStGrp) OR (sState>iObjNil) then
+            for i := 1 to sel^^.sCnt do begin
+                thisObj := CkObjTrfo(GetSelObj(sel,i));
+                if traceTrk then begin
+                    bTime := tTime;
+                    WrtTime('',tTime);
+                    eTime := tTime-bTime;
+                end;
+                if gBoxFlag then
+                    GetGBox(thisObj,tBox)
+                else
+                    tBox := thisObj^.bBox;
+                if i=1 then
+                    sBox := tBox;
+                UnionRect(tBox,sBox,sBox);
+            end;
+        if traceTrk then writeln('    GetSBox eTime=':20,eTime:8);
+    end; (* GetSBox *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure GetSBBox(* var sel: TSelHnd *);
+    var bBox: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetSBox(sel,FALSE,bBox);
+        sel^^.sBBox := bBox;
+    end; (* GetSBBox *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure GetSGBox(* var sel: TSelHnd; var gBox: Rect *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetSBox(sel,TRUE,gBox);
+    end; (* GetSGBox *)
+
+(* ********************************************************************* *)
+(*$S PageLayout*)
+    procedure GetDwgGBox(* VAR gBox: Rect *);
+    var thisObj: TObjPtr;
+        tBox: Rect;
+        startFlag: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        gBox := nilRect;
+        startFlag := TRUE;
+        ResetOLst(ilDirFwd,thisObj);
+        while thisObj<>NIL do begin
+            GetGBox(thisObj,tBox);
+            if startFlag then begin
+                gBox := tBox;
+                startFlag := FALSE;
+            end else
+                UnionRect(gBox,tBox,gBox);
+            GetNxtObj(ilDirFwd,thisObj);
+        end;
+        SetRect(gBox,CMax(0,gBox.left),CMax(0,gBox.top),
+                     CMin(cHDwgMax,gBox.right),CMin(cVDwgMax,gBox.bottom));
+    end; (* GetDwgGBox *)
+
+(* ********************************************************************* *)
+
+(* Last Op *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    function  ObjLocked(* obj: TObjPtr): Boolean *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with obj^,oDat do
+        if (pSel<>iSelNil) AND (lastOp.op in [iOpLck,iOpUnL]) then
+            ObjLocked := lastOp.op=iOpLck
+        else
+            ObjLocked := locked<>0;
+    end; (* ObjLocked *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure InitOp(var op: TOpRec; iOp: Integer; hScroll,vScroll: Integer);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with op do begin
+            op := iOp;
+            oldOp := iOpNil;
+            scrollPt.h := hScroll;
+            scrollPt.v := vScroll;
+            sVal := iSelNil;
+            InitSLst(pSLst);
+            nBox := nilRect;
+            iDat1  := 0;
+            iDat2  := 0;
+            rDat1  := 0;
+            rDat2  := 0;
+            rDat3  := 0;
+            rDat4  := 0;
+        end;
+    end; (* InitOp *)
+
+(* ********************************************************************* *)
+(*$S Ring2*)
+    procedure ScaleSLin(obj: TObjPtr; thisKnob: Integer; sx,sy: Real);
+    var this2D: Point2D;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        SetPt2D(this2D,sx,sy);
+        with obj^.oDat do
+            if thisKnob=1 then
+                p1 := this2D
+            else
+                p2 := this2D;
+        GetBBox(obj);
+    end; (* ScaleSLin *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    function  CkObjTrfo(* obj: TObjPtr): TObjPtr *);
+    var ctr2D: Point2D;
+
+    (* ***************************************************************** *)
+
+        procedure MkObjTrfo;
+
+            function TextInObj(obj: TObjPtr): Boolean;
+            var haveText: Boolean;
+                grpObj: TObjPtr;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                with obj^,oDat do
+                case kind of
+                    iObjText:
+                        haveText := TRUE;
+                    iObjGroup:
+                        if kind=iObjGroup then begin
+                            grpObj := grp.lBeg;
+                            while grpObj<>NIL do begin
+                                haveText := TextInObj(grpObj);
+                                if haveText then
+                                    grpObj := NIL
+                                else
+                                    grpObj := grpObj^.fLink;
+                            end;
+                        end;
+                    otherwise
+                        haveText := FALSE;
+                end;
+                TextInObj := haveText;
+            end;
+
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if traceUop then with obj^ do
+                writeln('    MkObjTrfo(',Ord(obj):8,')',cSel:4,pSel:4);
+
+            (* pSel objects get geometry trfo, show in trfoObj *)
+            (* iOpCut AND iOpUnd of ops that add to dwg return NIL *)
+            (* ops that change order of objects are picked out *)
+            (* in list sequencing routines *)
+
+            if trfoObj<>trfoRef then
+                FreeObj(trfoObj);
+            trfoRef := obj;
+            trfoObj := obj;
+            with lastOp do
+            if (op = iOpCut) OR (op = iOpClr) then
+                trfoObj := NIL
+            else begin
+                {XXX 6/8/83 try this...}
+                if op=iOpRnd then with obj^.oDat do begin
+                    (* only trfo iObjRndR *)
+                    if (kind=iObjRndR) OR ((iDat2=1) AND (kind=iObjRect)) then begin
+                        DupObj(obj,trfoObj);
+                        if kind=iObjRect then
+                            trfoObj^.oDat.kind := iObjRndR;
+                        SetObjRnd(trfoObj,iDat1);
+                    end;
+                end else if (op=iOpFmt) OR (op=iOpCase) then begin
+                    (* only trfo iObjText *)
+                    if TextInObj(obj) then begin
+                        DupObj(obj,trfoObj);
+                        if op=iOpFmt then
+                            SetObjFmt(trfoObj,iDat1,iDat2)
+                        else begin
+                            SetObjCase(trfoObj,iDat1);
+                            GetBBox(trfoObj);
+                        end;
+                    end;
+                end else if op in [iOpEdt,iOpStr,iOpSt1,iOpMov,iOpAlG,iOpAlO,
+                                   iOpInf,iOpRot,iOpSwt,iOpSmo,iOpUnS,
+                                   iOpAKnob,iOpSKnob] then begin
+                    DupObj(obj,trfoObj);
+                    SetPt2D(ctr2D,rDat3,rDat4);
+                    case op of
+                        iOpEdt: EditObj(trfoObj,iDat1,iDat2,rDat1,rDat2,rDat3,rDat4);
+                        iOpStr:
+                            begin
+                                ScaleObj(trfoObj,ctr2D,rDat1,rDat2);
+                                GetBBox(trfoObj);
+                            end;
+                        iOpSt1: ScaleSLin(trfoObj,iDat1,rDat1,rDat2);
+                        iOpMov: OffsetObj(trfoObj,rDat1,rDat2);
+                        iOpAlG: GridObj(trfoObj);
+                        iOpAlO: AlignObj(trfoObj,iDat1,rDat1,rDat2);
+                        iOpInf: SetObjInf(trfoObj,iDat1,iDat2,Round(rDat1),
+                            Round(rDat2),Round(rDat3),Round(rDat4));
+                        iOpRot: RotateObj(trfoObj,ctr2D,iDat1);
+                        iOpSwt: SwitchEnds(trfoObj);
+                        iOpSmo: SmoObj(trfoObj);
+                        iOpUnS: UnSObj(trfoObj);
+                        iOpAKnob: AddDetail(trfoObj);
+                        iOpSKnob: SubDetail(trfoObj);
+                        {
+                        iOpGrp  (* operation actually done *)
+                        iOpLck: (* taken care of in ObjLocked call *)
+                        iOpUnL: (* taken care of in ObjLocked call *)
+                        iOpDrw, (* operation actually done *)
+                        iOpPst, (* operation actually done *)
+                        iOpCpy, (* operation actually done *)
+                        iOpDup, (* operation actually done *)
+                        iOpUnd, (* operation actually done *)
+                        iOpUnG, (* operation actually done *)
+                        iOpTop, (* operation actually done *)
+                        iOpBot: (* operation actually done *)
+                        }
+                    end; (* case *)
+                end;
+            end;
+            CkObjTrfo := trfoObj;
+        end; (* MkObjTrfo *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        CkObjTrfo := obj;
+        if obj<>NIL then
+            if obj^.pSel<>iSelNil then
+                if lastOp.op<>iOpNil then
+                    if (obj^.oDat.locked=0) then
+                        {XXX 6/10/83 try this - reusing trfoObj}
+                        if obj<>trfoObj then
+                            MkObjTrfo;
+    end; (* CkObjTrfo *)
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure CommitLastOp;
+    var i: Integer;
+        (* iOpStr vars *)
+        ctr2D:   Point2D;
+        (* iOpCpy vars *)
+        nObj:    TObjPtr;
+        (* iOpUnG vars *)
+        gObj:    TObjPtr;
+        obj:     TObjPtr;
+
+    (* ***************************************************************** *)
+
+        procedure FreeUOpSLst(VAR sel: TSelHnd);
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            MarkPSel(sel,iSelNil);
+            InitSLst(sel);
+        end; (* FreeUOpSLst *)
+
+    (* ***************************************************************** *)
+
+        procedure DltSLst(sLst: TSelHnd);
+        var i: Integer;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                for i := 1 to sLst^^.sCnt do begin
+                obj := GetSelObj(sLst,i);
+                FreeObj(obj)
+            end;
+            InitSLst(sLst);
+        end; (* DltSLst *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd or traceUop then with lastOp do
+            writeln('CommitLastOp, ',op:4,iDat1:4,iDat2:4,rDat1:8:4,rDat2:8:4);
+
+        curDoc.dwgChgd := NOT (lastOp.op in [iOpNil,iOpNOP,iOpCpy])
+                          OR curDoc.dwgChgd;
+        MarkPSel(lastOp.pSLst,iSelNil);
+        with lastOp do
+        case op of
+            {iOpDrw,iOpPst,iOpDup:}
+            iOpEdt:
+                EditObj(GetSelObj(pSLst,1),iDat1,iDat2,rDat1,rDat2,rDat3,rDat4);
+            iOpCut,iOpClr:
+                begin
+                    (* transfer thisSel to scrap *)
+                    For i := 1 to pSLst^^.sCnt do begin
+                        obj := GetSelObj(pSLst,i);
+                        If obj^.oDat.locked=0 then begin
+                                SubFmOLst(curDoc.oLst,obj);
+                                If op=iOpClr then
+                                    FreeObj(obj);
+                        end;
+                    end;
+                end;
+            iOpSmo,iOpUnS,iOpAKnob,iOpSKnob,
+            iOpStr,iOpSt1,iOpMov,iOpTop,iOpGrp,iOpUnG,iOpAlG,iOpRnd,
+            iOpAlO,iOpLck,iOpUnL,iOpInf,iOpFmt,iOpCase,iOpRot,iOpSwt:
+                begin
+                    (* set up trfo *)
+                    SetPt2D(ctr2D,rDat3,rDat4);
+                    for i := 1 to pSLst^^.sCnt do begin
+                        obj := GetSelObj(pSLst,i);
+                        if obj^.oDat.locked=0 then
+                        case op of
+                            iOpSmo: SmoObj(obj);
+                            iOpUnS: UnSObj(obj);
+                            iOpAKnob: AddDetail(obj);
+                            iOpSKnob: SubDetail(obj);
+                            iOpSwt:
+                                SwitchEnds(obj);
+                            iOpStr:
+                                begin
+                                    ScaleObj(obj,ctr2D,rDat1,rDat2);
+                                    GetBBox(obj);
+                                end;
+                        end; (* case *)
+                        case op of
+                            iOpSt1: ScaleSLin(obj,iDat1,rDat1,rDat2);
+                            iOpMov: OffsetObj(obj,rDat1,rDat2);
+                            iOpAlG: GridObj(obj);
+                            iOpAlO: AlignObj(obj,iDat1,rDat1,rDat2);
+                            iOpLck: obj^.oDat.locked := 1;
+                            iOpUnL: obj^.oDat.locked := 0;
+                            iOpRnd:
+                                begin
+                                    if (iDat2=1) then with obj^.oDat do
+                                        if (kind=iObjRect) then
+                                            kind := iObjRndR;
+                                    SetObjRnd(obj,iDat1);
+                                end;
+                            iOpInf: SetObjInf(obj,iDat1,iDat2,Round(rDat1),
+                                Round(rDat2),Round(rDat3),Round(rDat4));
+                            iOpFmt: SetObjFmt(obj,iDat1,iDat2);
+                            iOpCase: begin
+                                         SetObjCase(obj,iDat1);
+                                         GetBBox(obj);
+                                     end;
+                            iOpRot: RotateObj(obj,ctr2D,iDat1);
+                        end; (* case *)
+                    end;
+
+                end;
+        end; (* case *)
+
+        (* free pSLst *)
+        InitSLst(lastOp.pSLst);
+
+        (* free prPstLst *)
+        InitSLst(prPstLst);
+
+        With lastOp.scrollPt do
+            InitOp(lastOp,iOpNil,h,v);
+        If trfoObj<>trfoRef then
+            FreeObj(trfoObj)
+        else
+            trfoObj := NIL;
+
+        trfoRef := NIL;
+    end; (* CommitLastOp *)
+
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure GetFldrCtr(VAR ctrPt: Point);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* assumes wrkOrigin is set *)
+        with curDoc.fldr^.portRect do
+        SetPt(ctrPt,(right+left) Div 2,(bottom+top) Div 2);
+    end; (* GetFldrCtr *)
+
+(* ********************************************************************* *)
+(*$S Reshape*)
+    procedure CopyVrtLst(srcVrtLst,dstVrtLst:THndVrtLst);
+    Var i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With srcVrtLst^^ do begin
+            dstVrtLst^^.vCnt := vCnt;
+            For i := 0 to vCnt do
+                {$R-}
+                dstVrtLst^^.vertex[i] := vertex[i];
+                {$IfC rangeOn} {$R+} {$EndC}
+        end;
+    end;{CopyVrtLst}
+
+(* ********************************************************************* *)
+(*$S Core2*)
+    procedure SetLastOp(* lOp: Integer *);
+    var thisRect: Rect;
+        sObj,tObj: TObjPtr;
+        tPt:  Point;
+        haveFHnd: Boolean;
+        i: Integer;
+
+        numBlks: Integer;
+
+        tTime: LongInt;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd or traceUop then
+            writeln('SetLastOp(',lOp:4);
+        if traceHeap then
+            if NOT FCheckHzOk(curDoc.hHz,numblks) then
+                Error('SetLastOp heap is bad...',numblks,NONFATAL);
+        if traceTrk then begin WrtTime('',tTime); WrtTime('SetLastOp',tTime); end;
+
+        (* reset curTPat on every op *)
+        curTPat := curDoc.fill[iObjText];
+
+        (* curSLst has not been changed to reflect newOp yet *)
+        if lOp in [iOpNIL,iOpNOP] then with curDoc.atr.scrollPt do
+            InitOp(lastOp,lOp,h,v)
+        else with curDoc,lastOp do begin
+            (* remember kind of current selection *)
+            sVal := iSelNml;
+            if sLst^^.sCnt>0 then begin
+                tObj := CurSelObj(1);
+                sVal := tObj^.cSel;
+            end;
+            If (edtState=iObjPoly) OR (edtState=iObjSPoly) then
+                CopyVrtLst(curVrtLst,prvVrtLst);
+
+            (* set rest of op data *)
+            GetFldrCtr(scrollPt);
+            op := lOp;
+            { MarkPSel(pSLst,iSelNil);}  {done in CommitLastOp before
+                                             objects are lost or marked iSelGpy
+                                             when put into groups}
+            CopySLst(sLst,pSLst);
+            MarkPSel(pSLst,sVal);
+            case op of
+                iOpCut,iOpClr:
+                    begin
+                        For i := 1 to sLst^^.sCnt do begin
+                            sObj := CurSelObj(i);
+                            With sObj^,oDat do
+                                If locked=0 then
+                                    cSel := iSelNil;
+                        end;
+                        MakeSLst;
+                    end;
+
+            end; (* case *)
+
+            GetSBBox(sLst);
+            lastOp.nBox := sLst^^.sBBox;
+        end;
+    end; (* SetLastOp *)
+
+(* ********************************************************************* *)
+
+ {   procedure CopyOp(src: TOpRec; VAR dst: TOpRec);
+    var tempOp: TOpRec;
+    begin
+        tempOp    := dst;
+        dst       := src;
+        dst.pSLst := tempOp.pSLst;
+        dst.nSLst := tempOp.nSLst;
+        CopySLst(src.pSLst,dst.pSLst);
+        CopySLst(src.nSLst,dst.nSLst);
+    end; (* CopyOp *)           } {I do not think that I will use this because
+                                   I have only one variable lastOp of TOpRec,
+                                   since I am not using undoOp }
+
+
+(* ********************************************************************* *)
+(*$S Undo*)
+    procedure UndoLastOp(* VAR scrollFlag: Boolean *);
+    var p: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetFldrCtr(p);
+        scrollFlag := NOT EqualPt(lastOp.scrollPt,p);
+
+        {XXX 6/13/83 try this to reuse trfoObj}
+        if trfoObj<>trfoRef then
+            FreeObj(trfoObj);
+        trfoObj := NIL;
+        trfoRef := NIL;
+
+        With lastOp,curDoc do begin
+            If op=iOpUnd then begin
+                If  (oldOp=iOpClr) OR (oldOp=iOpGrp) OR (oldOp=iOpTop) OR
+                    (oldOp=iOpBot) OR (oldOp=iOpCut) OR (oldOp=iOpPstT) OR
+                    (oldOp=iOpPstF) OR (oldOp=iOpPstB) OR
+                    (oldOp=iOpDup) OR (oldOp=iOpUnG) OR (oldOp=iOpCpy)  then
+                    op := iOpRdo
+                else
+                    op := oldOp;
+            end else begin
+                oldOp := op;
+                op    := iOpUnd;
+            end;
+            (* get rid of curDoc.sLst *)
+            MarkCSel(sLst,iSelNil);
+            (* restore curDoc.sLst to lastOp.pSLst *)
+            CopySLst(pSLst,sLst);
+            MarkCSel(sLst,iSelNml);
+            (* special case any needed ops *)
+            If (curDoc.edtState=iObjPoly) OR (curDoc.edtState=iObjSPoly)then
+                CopyVrtLst(prvVrtLst,curVrtLst);
+
+        end;
+    end; (* UndoLastOp *)
+
+(* ********************************************************************* *)
+(*$S DeBug*)
+
+    procedure DumpLastOp;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceOn then begin
+            writeln;
+            writeln('LastOp ---------------------------------------');
+            with lastOp do begin
+                writeln('    op=',op:4,', sVal=',sVal:2,', dat=',iDat1:4,iDat2:4,
+                                  Round(100*rDat1):6,Round(100*rDat2):6,
+                                  Round(100*rDat3):6,Round(100*rDat4):6);
+                GEDumpSel(pSLst);
+               { GEDumpSel(nSLst);}
+            end;
+        end;
+    end; (* DumpLastOp *)
+
+(* ********************************************************************* *)
+(*$S Init*)
+procedure InitFbBE; {Initialize fallInBh, groupBeg, and groupEnd}
+begin
+    fallInNm := 0;
+    groupNum := 0;
+    fallInBh := Pointer(Ord(HAllocate(geHHz,SizeOf(TUndoLst))));
+    groupBeg := Pointer(Ord(HAllocate(geHHz,SizeOf(TUndoLst))));
+    groupEnd := Pointer(Ord(HAllocate(geHHz,SizeOf(TUndoLst))));
+end;
+
+(* ********************************************************************* *)
+(*$S Init*)
+
+    procedure InitUOp;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        lastOp.pSLst := NewSLst(geHHz);
+        smthSLst     := NewSLst(geHHz);
+        InitOp(lastOp,iOpNil,0,0);
+        sCur  := 0;
+        inSel := FALSE;
+        trfoObj := NIL;
+        InitFbBE; {Initialize fallInBh, groupBeg, and groupEnd}
+    end; (* InitUOp *)
+
+END. (* unit *)
+
+ÿ

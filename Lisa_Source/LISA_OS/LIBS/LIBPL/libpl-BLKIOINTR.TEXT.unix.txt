@@ -1,0 +1,366 @@
+
+{-----------------------------------------------------------------------------}
+{                                                                             }
+{               Copyright 1983, Apple Computer Inc.                           }
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+
+      (* -------------------------------------------------------------- *)
+      (* File: blkiointr.text                                           *)
+      (*                                                                *)
+      (* Date: 01-Feb-82      Yu-Ying Chow                              *)
+      (*       24-Jun-82      Ron Johnston                              *)
+      (*       19-Oct-82      Yu-Ying Chow                              *)
+      (* The Non-Sharable block io support intrinsic unit.              *)
+      (* Each process has its own private data as defined in this unit. *)
+      (* This unit should be part of the intrinsic PASLIB.              *)
+      (* It is to be used by the shared blockio intrinsic unit          *)
+      (* -------------------------------------------------------------- *)
+
+UNIT blkiointr;
+INTRINSIC;
+
+{$%+}
+
+INTERFACE
+
+  USES
+    {$U libos/syscall.obj}    syscall,
+    {$U libpl/UClascal.obj}   UClascal;               {to get this unit initialized}
+
+
+
+{$SETC MONITOR  := false}    {A4 and beyond}
+{$SETC DEBUG    := false}    {A3 and beyond}
+{$SETC fRANGECK := TRUE}
+{$SETC fSYMBOL  := TRUE}
+
+
+  CONST
+    MMaxInt = $7fff;   (* Maximum integer *)
+    MaxUnit = 20;      (*MAXIMUM PHYSICAL UNIT # FOR UREAD*)
+    MaxDir = 77;       (*MAX NUMBER OF ENTRIES IN A DIRECTORY*)
+    MaxDir1 = 78;      (* one more than max number of entries in directory *)
+    VIDLeng = 7;       (*NUMBER OF CHARS IN A VOLUME ID*)
+    TIDLeng = 15;      (*NUMBER OF CHARS IN TITLE ID*)
+    MaxSeg = 15;       (*MAX CODE SEGMENT NUMBER*)
+    FBlkSize = 512;    (*STANDARD DISK BLOCK LENGTH*)
+    DirBlk = 2;        (*DISK ADDR OF DIRECTORY*)
+    NameLen = 23;      (*LENGTH OF CONCAT(VIDLENG,':',TIDLENG)*)
+    FillrLn = 11;      (*MAXIMUM # OF NULLS IN FILLER*)
+
+    SysUnit = 5;       (* system unit in monitor world *)
+                       (* system error for blockio *)
+
+    DirSize = 2048;    (* directory takes 4 blocks of 512 bytes each *)
+    DirNBlocks = 4;    (* directory size in blocks *)
+
+                {funit # for logical and physical devices, the order of # is
+                 relevant in %_finit, %_fclose, %_fget and %_pkeypress.}
+    unitScConsole  = 1;
+    unitScKeyboard = 2;
+    unitWiConsole  = 4;                 {window environment}
+    unitWiKeyboard = 5;
+    unitScPrinter  = 6;
+    unitWiPrinter  = 7;                 {window environment}
+    unitOSFile    = 10;                 {os files}
+
+  TYPE
+{$IFC MONITOR}
+    IORsltWd = (INoError,  IBadBlock, IBadUnit,   IBadMode,    ITimeOut,
+                ILostUnit, ILostFile, IBadTitle,  INoRoom,     INoUnit,
+                INoFile,   IDupFile,  INotClosed, INotOpen,    IBadFormat,
+                IStrgOvfl, IWrProt,   IDevError,  INoDirSpace);
+{$ELSEC}
+    IORsltWd = (INoError);
+{$ENDC}
+
+    DateRec = PACKED RECORD             (*ARCHIVAL INFO...THE DATE*)
+                Year: 0..100;           (*100 IS TEMP DISK FILE FLAG*)
+                Day: 0..31;             (*DAY OF MONTH*)
+                Month: 0..12;           (*0 IMPLIES DATE NOT MEANINGFUL*)
+              END (*DateRec*) ;
+
+    UnitNum = 0..MaxUnit;               (*VOLUME TABLES*)
+
+    VID = STRING[VIDLENG];
+
+    DirRange = 0..MaxDir;               (*DISK DIRECTORIES*)
+    dirrang1 = 0..MaxDir1;
+    TitleID = STRING[TIDLENG];
+    FullID = STRING[NAMELEN];
+
+    FileKind = (UNTYPEDFILE, XDSKFILE, CODEFILE, TEXTFILE,
+                INFOFILE,    DATAFILE, GRAFFILE, FOTOFILE, SECUREDIR);
+
+    DirEntry = PACKED RECORD    (* This record is used for OS file too, so that
+                                   FGET and FPUT can have the same code *)
+                                (* Fields used for OS files are indicated *)
+                 DFIRSTBLK: INTEGER;           (*FIRST PHYSICAL DISK ADDR*)
+                                               (* OS - always 0 *)
+                 DLASTBLK: INTEGER;            (*POINTS AT BLOCK FOLLOWING*)
+                                               (* OS - get it from info *)
+                 STATUS : BOOLEAN;             (*for FILER wildcards*)
+                 FILLER1 : 0..1024;            (*for downward compatibility*)
+                 CASE DFKIND: FILEKIND OF      (* For OS, only TEXTFILE and DATAFILE *)
+                   SECUREDIR,
+                   UNTYPEDFILE: (*ONLY IN DIR[0]...VOLUME INFO*)
+                      (DVID: VID;              (*NAME OF DISK VOLUME*)
+                       DEOVBLK: INTEGER;       (*LASTBLK OF VOLUME*)
+                       DNUMFILES: INTEGER;     (*NUM FILES IN DIR*)
+                       DLOADTIME: INTEGER;     (*TIME OF LAST ACCESS*)
+                       DLASTBOOT: DATEREC);    (*MOST RECENT DATE SETTING*)
+                   XDSKFILE, CODEFILE, TEXTFILE, INFOFILE,
+                   DATAFILE, GRAFFILE, FOTOFILE:
+                      (DTID: TitleID;          (*TITLE OF FILE*)
+                      { filler2 : 0..63;       (* so DLASTBYTE becomes integer *)}
+                       DLASTBYTE: integer{1..FBLKSIZE}; {NUM BYTES IN LAST BLOCK}
+                       CASE BOOLEAN OF         (* case on FIsOs *)
+                         TRUE : (DORefnum : integer;);  (* OS File refnum,
+                                                           org file *)
+                         FALSE : (DACCESS: DATEREC;);  (*LAST MODIFICATION DATE*)
+                      )
+               END (*DIRENTRY*) ;
+
+    DirP = ^Directory;
+
+    Directory = ARRAY [DirRange] OF DirEntry;
+
+                                   (*FILE INFORMATION*)
+
+    CloseType = (CNormal, CLock, CPurge, CCrunch);
+    CharArray = PACKED ARRAY [0..FBlkSize] OF CHAR;
+    WindowP = ^Window;
+    Window = CharArray;
+    FileState = (FJandW, FNeedChar, FGotChar);
+    FIBP = ^FIB;
+    FVIDrec =
+      record CASE BOOLEAN OF
+             TRUE : (FTrefnum : integer); (* OS - temp file refnum for rewrite,
+                                                  same as Orefnum for reset *)
+
+             FALSE : (FVID:     VID;);    (*VOLUME NAME*)
+      end;
+
+    (* --------------------- File Information Block (FIB) --------------------  *)
+    (*  Contains information about the type and state of a Pascal file.         *)
+    (*  Space reserved by compiler.  Originally designed to support UCSD file   *)
+    (*  system (the p-System Basic I/O Subsystem);  when a file is open, its    *)
+    (*  FIB includes the file's actual directory entry.  FIB also contains      *)
+    (*  information about the file that is duplicated or enlarged upon by the   *)
+    (*  OS file system's INFO call, but it omits other information that is      *)
+    (*  needed when running on the OS.                                          *)
+    (*                                                                          *)
+    (*  Therefore, in order to build a PASLIB that supports both UCSD and OS    *)
+    (*  files, we changed the FIB to be a variant record with a case for each.  *)
+    (*  The guidelines followed in changing the FIB were:                       *)
+    (*    o The size of the FIB could not be increased without changing the     *)
+    (*      compiler - something we wanted to avoid doing.  We don't know at    *)
+    (*      this point whether there is extra room reserved;  we should check.  *)
+    (*    o Invariant (head) part will be same as before so assembly language   *)
+    (*      routines checking for EOLN and EOF won't have to be changed.        *)
+    (*    o The UCSD variant will carry exactly the same information as before. *)
+    (*      In fact, its storage layout will be unchanged.                      *)
+    (*    o The OS variant will have only the information needed to supplement  *)
+    (*      information available from the OS INFO call.  It will not carry the *)
+    (*      file's directory entry like the UCSD variant does.                  *)
+    (*    o The OS part still needs Fmaxblk, Fnxtblk and some entries in        *)
+    (*      DirEntry, such as Dfirstblk, Dlastbyte, etc, so that FGET and FPUT  *)
+    (*      code can be exactly the same for OS text files as well.             *)
+    (* ------------------------------------------------------------------------ *)
+
+    FIB = RECORD       (* File Information Block - space allocated by compiler *)
+      FWindow: WindowP;        (*USER WINDOW...F^, USED BY GET-PUT*)
+      FEOLN,FEOF: BOOLEAN;
+      FIsOS: BOOLEAN;          (* TRUE if opened file is an OS file - HiByt1 *)
+      FState:     FileState;   (*State of the File*)
+      FRecSize:   INTEGER;     (*In Bytes..0=>BLOCKFILE,1=>CHARFILE, >1=>TYPEFILE*)
+      CASE FIsOpen: BOOLEAN OF (*Is File now open?*)
+        TRUE: (
+           FIsBlkd:  BOOLEAN;  (*FILE IS ON BLOCK DEVICE*)
+           FNewFile: BOOLEAN;  (*ASM LANG USES FUNIT AS A WORD, UCSD - HiByt2*)
+                               (* OS - Was this created by REWRITE *)
+           FUnit:    UnitNum;  (*PHYSICAL UNIT #*)
+                               (* OS - 1=console,2=keyboard,3=printer,else file*)
+           FVIDstuff: FVIDrec; (* VID, OS - others. *)
+           FMaxBlk,            (*MAX REL BLOCK ACCESSED, set in fopen, fclose only*)
+           FNxtBlk,            (*NEXT REL BLOCK TO IO*)
+           FReptCnt: INTEGER;  (* # TIMES F^ VALID W/O GET*)
+           HiByt3:   0..100;   (*ASM LANG USES FMODIFIED AS A WORD, used as openflag*)
+                               (* can not be bigger than a byte*)
+           FModified:BOOLEAN;  (*PLEASE SET NEW DATE IN CLOSE*)
+           FHeader:  DIRENTRY; (*COPY OF DISK DIR ENTRY*)
+                               (*OS - for ORefnum and others, see DIRENTRY *)
+           HiByt4:   0..100;   (*ASM LANG USES FSOFTBUF AS A WORD*)
+           CASE FSoftBuf: BOOLEAN OF  (*DISK GET-PUT STUFF*)
+             TRUE:  (
+                FMaxByte,FNxtByte: INTEGER;     (* Fmaxbyte set in fopen, fclose*)
+                HiByt5:  BOOLEAN;   (*ASM LANG USES FBUFCHNGD AS A WORD*)
+                FBufChngd: BOOLEAN;
+                FBuffer: CharArray
+                    )
+               )
+     END;  (*FIB*)
+
+{$IFC MONITOR}
+   UTBLENTRY = RECORD
+                 UVID: VID;            (*VOLUME ID FOR UNIT*)
+                 LOGGED: BOOLEAN;      (*VOLUME LOGGED IN*)
+                 lockdir : boolean;        (* volume directory locked *)
+                 CASE UISBLKD: BOOLEAN OF
+                   TRUE: (UEOVBLK: INTEGER)
+               END (*UNITABL*);
+{$ENDC}
+
+    envirRec = record                   {resident program's registers to restart}
+                 A6_init : longint;     {A6 at %_init}
+                 PC_2setup : longint;   {address of PC2Blockiosetup in %_init}
+                 PC_retinit : longint;  {return PC of %_init}
+                 SP_init : longint;     {sp in %_init}
+               end;
+
+    longaddr = ^longint;
+
+    Tstr255 = string [255];
+
+    TTerminal = SUBCLASS of NIL                 {only to get to USTDTERM unit}
+                                                {can not have any fields here}
+        FUNCTION  {TTerminal.}CREATE : TTerminal; Abstract;
+        PROCEDURE {TTerminal.}VWrite (VAR str : Tstr255); Abstract;
+        FUNCTION  {TTerminal.}VRead : CHAR; Abstract;
+        PROCEDURE {TTerminal.}VGotoxy (x, y : INTEGER); Abstract;
+        FUNCTION  {TTerminal.}VKeyPress : BOOLEAN; Abstract;
+        FUNCTION  {TTerminal.}VAbortKey : BOOLEAN; Abstract;
+        PROCEDURE {TTerminal.}VScreenCtr (contrfun : INTEGER); Abstract;
+        FUNCTION  {TTerminal.}OpenPrinter : INTEGER; Abstract;
+        FUNCTION  {TTerminal.}PrWrite (VAR str : Tstr255) : INTEGER; Abstract;
+        FUNCTION  {TTerminal.}ClosePrinter : INTEGER; Abstract;
+        PROCEDURE {TTerminal.}CleanUp; Abstract;
+                               {All Abstract since paslib will not have the code to
+                                implement the window stuff. They will be in unit
+                                UStdTerm that has the standard terminal (default)}
+        PROCEDURE {TTerminal.}SetupIOFile;
+                     {called by UStdTerm's creation block to set INPUT/OUTPUT file}
+        PROCEDURE {TTerminal.}InWindow (yesno : BOOLEAN);
+                     {called by UStdTerm and UVWGraph's capture procs to set env.}
+        {may have VOPEN to do dynamic recognition of virtual terminals}
+      END;
+
+
+
+  VAR
+    IORslt        : INTEGER;    {ioresult value, one per process}
+    PMyid         : longint;    {process id, save call to my_id}
+    PAbortKeyF    : boolean;    {abort key entered for the process}
+    PResProgram   : boolean;    {this process is resident or not}
+    PBeginEnv     : envirRec;   {process registers at %_init, used if resident}
+    PTrLisaChar   : Boolean;    {to translate lisa char to print on dmp or lqp}
+
+    PConsWindow   : BOOLEAN;    {console to window or to screen}
+    PInWindow     : INTEGER;    {for directing nested call to read/write to
+                                 altscreen in window environment, inc or dec in
+                                 UStdterm, and UVWGraph units when debug is on}
+    PInputfwindow : CHAR;       {we need a local fib for each process in window
+                                 env. so multiple processes can run.}
+    PInputfile    : FILE;       {we dont want to get the fbuffer space}
+    POutfwindow   : CHAR;       {Input/Output file pointer will always points to
+                                 local fibs even in the non-window env.}
+    POutputfile   : FILE;
+
+    PasTerm  : TTerminal;       {linkage to UStdTerm unit, set up in UStdTerm}
+    TermMptr : ^longint;        {master pointer of handle}
+    Termdata : RECORD classptr : longint; END;  {the self}
+                                                {can not use heap in paslib}
+
+
+
+{$IFC MONITOR}
+    gdirectory : PACKED ARRAY [1..dirsize] OF CHAR;
+                    (* directory space for fopen, fclose, one/process*)
+{$ENDC}
+
+
+
+  FUNCTION %_FIORESULT : INTEGER;
+
+  PROCEDURE %_Setiorslt (ior : integer);     {called by fplib and appastext only}
+  PROCEDURE %_Backupinput (var f : text);    {called by fplib only}
+
+
+
+
+
+IMPLEMENTATION
+
+{$IFC fRANGECK}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC fSYMBOL}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+
+{$S PASIOLIB}
+
+
+{ FIOResult ----------------------------------------------------------------- }
+FUNCTION %_FIORESULT {: INTEGER };
+
+  BEGIN  {%_FIORESULT }
+    %_FIORESULT := IORslt;
+  END;   { %_FIORESULT}
+
+
+
+PROCEDURE %_Setiorslt {(ior : integer)};     {called by fplib and appastext only}
+begin
+  IORslt := ior;
+end;  {%_Setiorslt}
+
+
+PROCEDURE %_Backupinput {(var f : text)};
+var fp : fibp;
+begin
+  fp := @f;
+  fp^.fstate := fgotchar;
+end;  {%_Backupinput}
+
+
+
+
+METHODS OF TTerminal;
+
+  PROCEDURE {TTerminal.}SetupIOFile;
+                     {called by UStdTerm's creation block to set INPUT/OUTPUT file}
+  VAR filename : pathname;
+      fp : fibp;
+  BEGIN
+      PConsWindow := TRUE;
+      fp := @PInputfile;
+      fp^.funit := unitWiConsole;     {for read from INPUT - from window}
+      fp := @POutputfile;
+      fp^.funit := unitWiConsole;     {for write to OUTPUT to window}
+                                   {shortcut to close and reopen INPUT/OUTPUT}
+  END;  {TTerminal.SetupIOFile}
+
+
+
+  PROCEDURE {TTerminal.}InWindow {(yesno : BOOLEAN)};
+                                {called by UVWGraph's capture procs to env.}
+  BEGIN
+      IF yesno THEN PInWindow := PInWindow + 1
+      ELSE PInWindow := PInWindow - 1;
+  END;  {TTerminal.InWindow}
+
+END;
+
+END.
+
+ÿ

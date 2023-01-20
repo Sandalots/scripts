@@ -1,0 +1,1544 @@
+{$S DBCPack}
+
+function VerifyNum (    dsp:ptrdata;
+                        dsplen:integer;
+                        isEdCheck:boolean;
+                        money:byte;
+                        decPoint:boolean;
+                    var ecinfo:checkinfo;
+                    var value:quadint;
+                    var errnum:integer):boolean;
+
+(*
+    Parse a sequence of characters (defined by dsp and dsplen) as a
+      number.  isEdCheck is true if the characters are for an edit
+      check and false if for an input value (in the latter case, only
+      actual digits are counted)
+    money is 0 if not monetary; 1 if units symbol optional; 2 if
+      units symbol required.
+    decPoint is true if '.' is preferred as the decimal character;
+      false if ',' is preferred
+    ecinfo is set to information about the number, if it parses:
+         ecinfo[1] = placement of sign (character position); zero if none
+         ecinfo[2] = if non-zero, the position and size of the units string:
+                        lower 5 bits: size of string
+                        next 10 bits: position of start of string (relative to 0)
+         ecinfo[3] = number of digits in integer part
+         ecinfo[4] = placement of decimal point (character position); zero
+                     if none
+         ecinfo[5] = number of digits after decimal point
+    value is the numeric value of the number
+    errnum is 0 (no error) or an error message:
+
+          7 - Unexpected space
+         13 - unknown component
+         14 - Illegal punctuation character
+         16 - extra characters at the end
+         17 - Letter L entered instead of number 1
+         18 - Letter o entered instead of number 0
+         25 - illegal comma
+         28 - too many signs
+         29 - sign positioned incorrectly
+         31 - illegal CR/DR
+         32 - CR/DR not allowed in number
+         34 - no digits for a numeric type
+         35 - asterisk not allowed after digit
+         37 - too many decimal points
+         42 - too many digits
+         43 - unmatched parenthesis
+         44 - unmatched angle bracket
+         47 - Check protection not allowed
+        200 - too many units symbols
+        201 - too many decimal commas
+        202 - currency symbol in wrong place
+        203 - $, ´, £ in number
+        204 - missing currency symbol
+        205 - period after decimal comma
+        209 - comma after decimal point
+        210 - illegal period
+        217 - units in wrong place
+
+    Globals used:
+      cSeparator, cFraction: characters to be used for digit separators
+        and fractions; either can be set to the global unknownChar, if
+        the parsing routines should figure out the right characters
+      unknownChar
+
+    Calls:
+      quadint routines
+
+*)
+
+type
+flags = (asterisk, sign,
+         digit,                         { anything that stands for a digit }
+         number,                        { '0'..'9','#' }
+         lParen, rParen,
+         lAngle, rAngle,
+         comma, period,
+         space,                         { significant spaces (within number) }
+         currency,                      { any currency symbol }
+         units,                         { any units, includes currency }
+         fract                          { fractional indicator }
+         );
+
+var
+x:integer;
+c:char;
+done:boolean;
+chDsp:ptrfstring;               { used to get characters out AS CHARs }
+nDsp:integer;                   { # dsp chars read so far }
+
+curChar:char;                   { char used for floating currency symbol }
+decChar:char;                   { char used for fraction marker }
+sepChar:char;                   { char used for digit separator }
+
+possFract:integer;              { position of a possible fraction mark;
+                                  used only if decChar and sepChar are both
+                                  unknown }
+DigCtr:integer;                 { if possFract is non-zero, the # digits seen
+                                  at time possFract was set; if the possFract
+                                  char actually is the fraction mark, this will
+                                  allow us to get the integer and fractional
+                                  digit counts right }
+seen:set of flags;
+LnDigits:integer;               { # digits to left of "decimal" }
+RnDigits:integer;               { # digits to right of "decimal" }
+LastDigit:integer;              { position of last digit place (1, 2, ...) }
+
+qe:boolean;                     { error flag for quadint routines }
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+
+chDsp:=pointer(ord(dsp));
+
+{ initialize checkinfo array }
+for x:=1 to 5 do
+  ecinfo[x]:=0;
+
+CLRQ(value);
+
+{ initialize from global variables }
+curChar:=unknownChar;              { no floating currency symbol yet }
+decChar:=cFraction;
+sepChar:=cSeparator;
+
+possFract:=0;
+LnDigits:=0;
+RnDigits:=0;
+
+{ set LastDigit to position (relative to 1) of last digit position }
+if dsplen=0
+then LastDigit:=0
+else begin
+  LastDigit:=dsplen;
+  repeat
+    LastDigit:=LastDigit-1;
+    c:=chDsp^[LastDigit];
+  until (c in ['0'..'9','*','$','#',sterling,yen]) or (LastDigit<=0);
+  LastDigit:=LastDigit+1;
+end;
+
+nDsp:=0;                        { # chars read so far }
+
+errnum:=0;
+
+seen:=[];
+
+while (errnum=0) and (nDsp<dsplen) do begin
+
+  c:=chDsp^[nDsp];
+  nDsp:=nDsp+1;
+  if dbcTest then
+    writeln(nDsp,'/',c,'/=', ord(c):1);
+
+  case c of
+
+    '0','1','2','3','4','5','6','7','8','9','#': begin
+
+    { increment # digits before (or after) "decimal" }
+      if isEdCheck or ((c>='0') and (c<='9')) then
+        if fract in seen
+        then RnDigits:=RnDigits+1
+        else LnDigits:=LnDigits+1;
+
+      if (c>='0') and (c<='9') then
+        begin
+        qe := MULQI(value,10);
+        qe := ADDQI(value,ord(c)-ord('0'));
+        end;
+
+      seen:=seen+[digit,number];
+    end; (* number case *)
+
+    '-','+': begin
+
+      if sign in seen
+      then errnum:=28 { too many signs }
+      else if (seen*[digit,period,comma]<>[]) and  { seen digit, period, comma }
+              (nDsp<=LastDigit)                    { not after all digits }
+      then errnum:=29 {sign positioned incorrectly }
+      else begin
+        ecinfo[1]:=nDsp;
+        seen:=seen+[sign];
+      end;
+    end; (* plus/minus case *)
+
+    '(','<': begin
+
+      if sign in seen
+      then errnum:=28 { too many signs }
+      else if (seen*[digit,period,comma]<>[])
+      then errnum:=29 { sign positioned incorrectly }
+      else begin
+        ecinfo[1]:=nDsp;
+        if c='(' then
+          seen:=seen+[sign,lParen]
+        else
+          seen:=seen+[sign,lAngle];
+      end;
+    end; (* left paren/angle case *)
+
+    ')': begin
+
+      if not (lParen in seen)
+      then errnum:=43 { unmatched paren }
+      else if (nDsp<=LastDigit)
+      then errnum:=29 {sign positioned incorrectly }
+      else seen:=seen+[rParen];
+    end; (* right paren case *)
+
+    '>': begin
+
+      if not (lAngle in seen)
+      then errnum:=44 { unmatched angle bracket }
+      else if (nDsp<=LastDigit)
+      then errnum:=29 {sign positioned incorrectly }
+      else seen:=seen+[rAngle];
+    end; (* right angle bracket case *)
+
+    '*': begin
+
+      if money=0
+      then errnum:=47 { check protection not allowed except in money }
+      else if number in seen
+      then errnum:=35 { asterisk not allowed after a number }
+      else begin
+        if isEdCheck then
+          if fract in seen
+          then RnDigits:=RnDigits+1
+          else LnDigits:=LnDigits+1;
+        seen:=seen+[digit,asterisk];
+      end;
+    end; (* asterisk case *)
+
+    '$',sterling,yen: begin
+      if money=0
+      then errnum:=203 { not a monetary value }
+      else if ([units,currency]*seen <> []) and (curChar<>c)
+      then errnum:=200 { too many units symbols }
+      else if (seen*[number,asterisk,fract]<>[])
+      then errnum:=202 { currency symbol in wrong place }
+      else begin
+        if (currency in seen) then      { multiple chars after 1st
+                                          stand for digits }
+            begin
+            if c <> curChar then
+                errnum := 200 { too many units symbols }
+            else
+                begin
+                if isEdCheck then
+                    if fract in seen then
+                        RnDigits:=RnDigits+1
+                    else
+                        LnDigits:=LnDigits+1;
+                seen:=seen+[digit];
+                end;
+            end
+        else
+            curChar:=c;
+
+        seen:=seen+[currency,units];
+      end;
+    end; (* dollar/yen/English pound sign case *)
+
+    '.', ',', ' ', reqSpace:
+        begin
+        { treat required space as a regular space }
+        if c = reqSpace then
+            c := ' ';
+
+      { only process period, comma, and SIGNIFICANT spaces }
+        if ((c<>' ')) or
+           ((digit in seen) and (nDsp<=LastDigit)) then
+            begin
+
+            if fract in seen then
+                begin
+                if dbcTest then
+                    writeln('fract in seen');
+
+                if c=sepChar then {separator after decimal char}
+                    case c of
+                        '.': errnum:=205; { period after decimal comma }
+                        ',': errnum:=209; { comma after decimal point }
+                        ' ': errnum:=7;   {&&&}{ unexpected space }
+                        end
+
+                else if c=decChar then {another decimal char}
+                    case c of
+                        '.': errnum:=37;  { too many decimal points }
+                        ',': errnum:=201; { too many decimal commas }
+                        ' ': errnum:=7;   { unexpected space--
+                                             should not occur, since decChar
+                                             cannot be space }
+                        end
+
+                else {neither the separator nor decimal char (after decimal)}
+                    case c of
+                        '.': errnum := 210;{illegal period}
+                        ',': errnum := 25; {illegal comma}
+                        ' ': errnum := 7;  {unexpected space}
+                        end;
+                end
+
+            else if c=sepChar then
+                begin
+                if not (digit in seen) then
+                    case c of
+                        '.': errnum:=210; { illegal period }
+                        ',': errnum:=25;  { illegal comma }
+                        ' ': errnum:=7;   { unexpected space--
+                                            should not occur, since we checked
+                                            for significant spaces at the start }
+                        end
+                end
+
+            else if c=decChar then
+                begin
+                ecinfo[4]:=nDsp;
+                seen:=seen+[fract];
+                end
+
+            else if (sepChar<>unknownChar) and (decChar<>unknownChar) then
+                begin
+                { c is neither a separator nor a fraction mark (before decimal) }
+                    case c of
+                        '.': errnum := 210;{illegal period}
+                        ',': errnum := 25; {illegal comma}
+                        ' ': errnum := 7;  {unexpected space}
+                        end;
+                end
+
+            else if (sepChar<>unknownChar) then
+                begin { make c the fraction mark }
+                if c=' ' then
+                    errnum:=7 { unexpected space }
+                else
+                    begin
+                    decChar:=c;
+                    seen:=seen+[fract];
+                    ecinfo[4]:=nDsp;
+                    end;
+                end
+
+            else if decChar<>unknownChar then
+                begin { make c the separator }
+                sepChar:=c;
+                end
+
+            else
+                begin { c could be either }
+
+            { NOTE: if both sepChar and decChar are "unknown", this is
+              the only possible case that will be executed; also this
+              case is never executed if either one is "known" }
+
+                if c=' ' then                    { spaces cannot be fraction markers }
+                    begin
+                    if possFract<>0 then
+                        errnum:=7 { unexpected space }
+                        {the problem: we found a punctuation earlier,
+                            which could be a separator or decimal char;
+                            but in either case, this space is illegal}
+                    else
+                        sepChar:=c;
+                    end
+                else if possFract=0 then         { this may be a fraction marker }
+                    begin
+                    possFract:=nDsp;
+                    DigCtr:=LnDigits;
+                    end
+                else if chDsp^[possFract-1]=c then { already seen one of these,
+                                                        so c must be a separator }
+                    begin
+                    possFract:=0;
+                    sepChar:=c;
+                    end
+                else                             { the previous thing we saw was
+                                                    really a separator, and this
+                                                    thing is the fraction marker }
+                    begin
+                    sepChar:=chDsp^[possFract-1];
+                    decChar:=c;
+                    ecinfo[4]:=nDsp;
+                    possFract:=0;
+                    seen:=seen+[fract];
+                    end;
+                end;
+
+            if c='.' then
+                seen:=seen+[period]
+            else if c=',' then
+                seen:=seen+[comma]
+            else
+                seen:=seen+[space];
+
+            end; (* processing of comma, period, and significant spaces *)
+
+        end; (* space, comma, period cases *)
+
+    otherwise
+        begin   { search for some strings }
+        nDsp := nDsp-1;         { need index of first char, rel. 0 }
+
+        { set x to length of cr/dr token }
+        if keyMatch(dsp,nDsp,dsplen-1,keyword[kwCR]) then
+            x := length(keyword[kwCR])
+        else if keyMatch(dsp,nDsp,dsplen-1,keyword[kwDR]) then
+            x := length(keyword[kwDR])
+        else
+            x := 0;
+
+        if (x <> 0) and (nDsp + x < dspLen) then
+            if ord(chDsp^[nDsp + x]) in alphaSet then
+                x := 0; {not really CR/DR because followed by alpha char}
+
+        if x<>0 then
+          begin
+          if sign in seen then
+            errnum:=31 { illegal CR/DR }
+          else if money=0 then
+            errnum:=32 { CR/DR not allowed in a number }
+          else if (nDsp<LastDigit) then
+            errnum:=29 { sign positioned incorrectly }
+          else
+            begin
+            ecinfo[1]:=nDsp+1;  { ecinfo[1] should be a char # relative to 1 }
+            nDsp := nDsp+x;     { skip over the token }
+            seen:=seen+[sign];
+            end;
+          end (* CR/DR case *)
+
+        else if NOT (units in seen) and
+                (ORD(chDsp^[nDsp]) in alphaSet) then { could be the units }
+            begin
+            ecinfo[2] := nDsp*32;   { save start pos }
+
+            done := false;
+            x := nDsp;
+            while not done AND (nDsp<dsplen) do
+                begin
+                if ORD(chDsp^[nDsp]) in alphaSet then
+                    nDsp := nDsp+1
+                else
+                    done := true;
+                end;
+
+            { also allow 1 period after the alpha chars }
+            if (nDsp<dsplen) and (chDsp^[nDsp]='.') then
+                nDsp := nDsp+1;
+
+            { units must be first or last thing }
+            if (seen*[digit,period,comma] <> []) and (nDsp < dsplen) then
+                begin   { user might have substituted one of these }
+                if (c='L') or (c='l') then
+                    errnum:=17 { letter 'L' instead of number '1' }
+                else if (c='O') or (c='o') then
+                    errnum:=18 { letter 'O' instead of number '0' }
+                else
+                    errnum := 217; { units in wrong place }
+                end
+            else
+                begin
+                seen := seen+[units];
+                ecinfo[2] := ecinfo[2]+(nDsp-x);
+                end;
+
+            end (* found units symbol *)
+
+    { at this point we have somthing that is not a digit, period, comma,
+            or space; it's not CR/DR; and it's not a units string
+            (either because we have already seen a units string  or
+            it's not an alpha character) }
+        else if (c='L') or (c='l') then
+          errnum:=17 { letter 'L' instead of number '1' }
+
+        else if (c='O') or (c='o') then
+          errnum:=18 { letter 'O' instead of number '0' }
+
+        else if ord(c) in alphaSet then
+          errnum:=200 { more than one units symbol }
+
+        else if ord(c) in spcl then
+          errnum:=14 { illegal punctuation character }
+
+        else
+          errnum:=13; { unknown component; catch all, probaly cannot occur }
+
+        end; (* looking for strings *)
+
+  end; (* case statement *)
+
+end; (* while: have more chDsp chars *)
+
+if possFract<>0
+then begin              { ambiguous case }
+  c:=chDsp^[possFract-1];
+  if ((c='.') and decPoint) or ((c=',') and not decPoint)
+  then begin            { assume that it was a fraction }
+    seen:=seen+[fract];
+    ecinfo[4]:=possFract;
+    RnDigits:=LnDigits-DigCtr;
+    LnDigits:=DigCtr;
+  end;
+
+end;
+
+if errnum=0
+then begin
+  if nDsp<dsplen
+  then errnum:=16 { extra characters at the end }
+  else if LnDigits+RnDigits>18
+  then errnum:=42 { too many digits }
+  else if LnDigits+RnDigits=0
+  then errnum:=34 { no digits for a numeric type }
+  else if (lParen in seen) and not (rParen in seen)
+  then errnum:=43 { unmatched paren }
+  else if (lAngle in seen) and not (rAngle in seen)
+  then errnum:=44 { unmatched angle bracket }
+  else if (money=2) and not (units in seen)
+  then errnum:=204; { missing units }
+end;
+
+if ecinfo[1]>0 then
+  begin
+  c:=chr(dsp^[ecinfo[1]-1]);
+  if (c<>'+') and
+     NOT keyMatch(dsp, ecinfo[1]-1, dsplen-1, keyword[kwDR]) then
+    qe:=NEGQ(value);
+  end;
+
+ecinfo[3]:=LnDigits;
+ecinfo[5]:=RnDigits;
+if errnum<>0 then
+  begin
+  VerifyNum:=false;
+  end
+else
+  VerifyNum:=true;
+if dbcTest then
+  writeln('VerifyNum returns error=',errnum:1);
+end; (* VerifyNum *)
+{errnum end search}
+
+{$S ECExcept}
+ procedure LegalEditCheck {ec:ecstr; fldtype:integer; var ecinfo:checkinfo;
+     var errnum:integer};
+
+{*****************************************************************************
+
+  Parse the edit check string and return edit check information if the string
+  is valid or errors if it is not.  An errnum of 0 is returned if no errors
+  were detected in the parse.  The array `ecinfo' is filled with edit check
+  information specific to the field type.  If the errnum is not 0, then
+  ecinfo[1] will have the number of the character that we stopped at
+  (relative to 1).
+
+  Assumes: The only edit check string which may be null is that for type lets;
+               in that case, the null string is equivalent to all types of
+               characters being allowed.
+
+  Errors:   see list for procedure called by this one, and
+              8 - wrong number of digits
+             10 - sign not allowed
+             39 - decimal point not allowed
+             42 - too many digits
+             52 - illegal character in zip
+             53 - illegal character in ss#
+             95 - text format too long
+            211 - missing double quote
+            213 - no characters in pattern
+            218 - illegal character in phone #
+
+  Calls: VerifyNum
+         ChrSet
+         TimeSet
+         DateSet
+         PhoneSet
+
+*****************************************************************************}
+
+ var x         : integer;
+     digCnt    : integer;
+     order     : integer;
+     pec       : ptrdata;
+     dsp       : ptrdata;
+     dsplen    : integer;
+     skipToStrt: integer;
+     q         : quadint;       { arg to VerifyNum }
+     dspCh     : ptrfstring;
+
+    PROCEDURE DateSet;
+
+    (**************************************************************************
+
+       Validate a date.  The date may have as the month section either
+       the number of the month,  the abbreviation of the month or the
+       full name of the month.  If the date validates, the routine returns:
+          ecinfo[1]  =  1st field (mm/dd/yy) encountered
+          ecinfo[2]  =  2nd field (mm/dd/yy) encountered
+          ecinfo[3]  =  3rd field (mm/dd/yy) encountered
+          ecinfo[4]  =  # digits in year field
+          ecinfo[5]  =  type of month (0 = numeric, 1 = abbr, 2 = full name )
+
+       For each of the field entries, the integer is divided as follows:
+           lower 3 bits:   field type (1=month, 2=day, 3=yr)
+           next    bit     1 if blank-filled; 0 if zero-filled
+           next  5 bits:   length of component
+           next  6 bits:   position of component (relative to 0)
+
+       Errors: 61 - portions of the editcheck are duplicated
+               63 - punctuation between components is required
+               75 - unknown date component
+               81 - too many year digits
+
+    *************************************************************************)
+
+    VAR done:       BOOLEAN;
+        x:          INTEGER;
+        stpos:      INTEGER;
+        dseen:      SET OF 1..3; {1=mon, 2=day, 3=yr }
+        kwi:        INTEGER;
+        thisComp:   INTEGER;
+        c:          CHAR;
+
+
+
+       function YearTest : boolean;
+
+       {******************************************************************
+
+       Checks for a valid year component and returns true if one is found.
+       Also sets up the ecinfo array as needed.
+
+       ******************************************************************}
+
+       var break : boolean;
+           lastY : integer;
+           eci   : integer;
+
+       begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+          ecInfo[4] := 0;
+          break := false;
+          lastY := -1;
+          eci := stPos;
+          while (eci <= skipToStrt + dspLen) and not break do
+              begin
+              if CompareChar(ec[eci], yearCH, CompVeryWeak) then
+                  lastY := eci
+              else if ec[eci]<>'0' then
+                  break := true;
+              eci := eci + 1;
+              end;
+
+          if lastY>=stPos then { found a 'y' }
+            ecinfo[4] := lastY - stPos + 1; { # of digits }
+          if dbcTest then
+            writeln('lastY=',lastY:1,' stPos=',stPos:1);
+
+          if lastY < 0 then { no 'y' found }
+              YearTest := false
+          else if ecInfo[4] = 0 then { no year digits entered }
+              YearTest := false
+          else if ecInfo[4] > 4 then { too many year digits entered }
+              begin
+              errNum := 81; { too many year digits }
+              YearTest := false;
+              end
+          else { 1-4 year digits entered }
+              begin
+              YearTest := true;
+                    (* record position info *)
+              ecinfo[order] := 512*(stPos-1) +
+                                16*ecinfo[4] +
+                                   3;
+              stPos := lastY + 1;
+              IF dbcTest THEN
+                WRITELN('done with year, stPos=', stPos:1);
+              end;
+       end; { of YearTest }
+
+
+    BEGIN { of DateSet }
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+    dseen := [];
+    order := 1;
+    stpos := skipToStrt + 1;
+
+    WHILE (stpos <= skipToStrt+dsplen) AND (errnum = 0) AND
+          (order <= 3) DO
+        BEGIN
+        IF dbcTest THEN
+            WRITELN('in DateSet stpos=', stpos:1,
+                    ' next char=', ec[stpos]);
+
+        { look for one of MM, 0M, DD, 0D }
+        kwi := dkwMM;
+        done := FALSE;
+        WHILE NOT done AND (kwi <= dkw0D) DO
+            IF keyMatch(POINTER(ORD(@ec)), stpos, dsplen, dateComps[kwi]) THEN
+                done := TRUE
+            ELSE
+                kwi := kwi+1;
+
+        IF done THEN {got a component: kwi is its number }
+            BEGIN
+            thisComp := (kwi+1) DIV 2; { what kind of component }
+            ecinfo[order] := 512*(stpos-1) +
+                              16*LENGTH(dateComps[kwi]) +
+                                 thisComp;
+            IF ODD(kwi) THEN { blank filled }
+                ecinfo[order] := ecinfo[order] + 8;
+
+            stpos := stpos + LENGTH(dateComps[kwi]);
+            END
+        ELSE { look for month name }
+            BEGIN
+            kwi := kwJanuary;
+            WHILE NOT done AND (kwi <= kwDecember) DO
+                BEGIN
+                IF keyMatch(POINTER(ORD(@ec)), stpos, dsplen,
+                            keyword[kwi]) THEN
+                    BEGIN
+                    x := LENGTH(keyword[kwi]);
+                    ecinfo[5] := 2; { full month }
+                    done := TRUE;
+                    END
+                ELSE IF keyMatch(POINTER(ORD(@ec)), stpos, dsplen,
+                                 monthAbbr[kwi]) THEN
+                    BEGIN
+                    x := LENGTH(monthAbbr[kwi]);
+                    ecinfo[5] := 1; { month abbr }
+                    done := TRUE;
+                    END
+                ELSE
+                    kwi := kwi + 1;
+                END;
+
+            IF done THEN { got a month, set up ecinfo entry }
+                BEGIN
+                thisComp := 1;
+                ecinfo[order] := 512*(stpos-1) +
+                                  16*x +
+                                     thisComp;
+
+                stpos := stpos + x;
+                END;
+            END;
+
+        IF NOT done THEN
+            BEGIN
+            IF YearTest THEN
+                { must look for a year last, in case letter used to designate
+                    a year is same as one used to start a month or another
+                    component }
+                thisComp := 3
+            ELSE IF errnum = 0 THEN
+                errnum := 75; { unknown component }
+            END;
+
+        IF errnum = 0 THEN
+            BEGIN
+            IF thisComp IN dseen THEN
+                errnum := 61 { duplicate date component }
+            ELSE
+                BEGIN
+                dseen := dseen + [thisComp];
+                order := order + 1;
+                END;
+
+            IF stpos <= skipToStrt+dsplen THEN { some chars left }
+                BEGIN
+                { make sure at least one punctuation is found }
+                x := stpos;
+                IF dbcTest THEN
+                    WRITELN('x=', x);
+                done := FALSE;
+                WHILE NOT done AND (stpos <= skipToStrt+dsplen) DO
+                    BEGIN
+                    c := ec[stpos];
+                    IF (ord(c) IN spcl) THEN
+                        stpos := stpos+1
+                    ELSE
+                        done := TRUE;
+                    END;
+                IF dbcTest THEN
+                    WRITELN('stpos=', stpos);
+                IF x = stpos THEN   { didn't move at all }
+                    errnum := 63;   { punctuation missing }
+                END;
+            END;
+        END; { while characters left to scan & no error & ... }
+
+    IF (errnum = 0) AND
+       (stpos <= skipToStrt+dsplen) THEN { still more characters }
+        errnum := 75;  { unknown date component }
+
+    END; { of DateSet }
+
+
+     procedure ChrSet;
+
+     {***********************************************************************
+
+      Validate a ZIP code, SS# or letters field.  We arrange the ecinfo array
+       such that
+                ecinfo[1] = maximum number of chars/line (120 right now)
+                ecinfo[2] = number of lines (1 right now)
+                ecinfo[3] = allowed letters:
+                        8 bit => special chars allowed
+                        4 bit => digits allowed
+                        2 bit => lower case alphabetics allowed
+                        1 bit => upper case alphabetics allowed
+
+     ***********************************************************************}
+
+     var spec, digs, locase, upcase: integer;
+         i: integer;
+         c: char;
+         dspCh: ptrfstring;
+
+     begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+     dspCh := pointer(ord(dsp));
+     ecinfo[1] := 1200;
+     ecinfo[2] := 1;
+     if dspLen > 0 then
+         begin
+         spec := 0;
+         digs := 0;
+         locase := 0;
+         upcase := 0;
+         for i := 0 to dspLen - 1 do
+            begin
+            c := dspCh^[i];
+            if c in ['0'..'9'] then digs := 4
+            else if ord(c) in LCalpha then locase := 2
+            else if ord(c) in UCalpha then upcase := 1
+            else spec := 8;
+            end;
+         ecinfo[3] := spec + digs + locase + upcase;
+         end
+     else { dspLen = 0 }
+         ecinfo[3] := 15;
+     end; { of ChrSet }
+
+
+     procedure CountBCDDigits (var count:integer);
+
+     {*********************************************************************
+
+     Counts digits in edit checks for social security numbers, phone numbers,
+     and zipcodes.  Checks for L's entered instead of 1's (error 17), o's
+     entered instead of 0's (error 18), and illegal alphabetic characters
+     (error 19).
+
+     *********************************************************************}
+
+     label 50;  { error exit }
+
+     var stPos: integer;
+         c    : char;
+         dspCh: ptrfstring;
+
+     begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+     dspCh := pointer(ord(dsp));
+     count := 0;
+     for stPos := 0 to dspLen - 1 do
+         begin
+         c := dspCh^[stPos];
+         if c in ['0'..'9'] then
+             count := count + 1
+         else if (c = 'L') or (c = 'l') then
+             begin
+             errNum := 17; { letter L entered instead of number 1 }
+             goto 50;
+             end
+         else if (c = 'o') or (c = 'O') then
+             begin
+             errNum := 18; { letter o entered instead of number 0 }
+             goto 50;
+             end
+         else if ord(c) in alphaSet then
+             begin
+             errNum := 19; { alphabetic character not allowed }
+             goto 50;
+             end;
+         end; { of loop through the edit check digits }
+     50: end; { of CountBCDDigits }
+
+
+    PROCEDURE TimeSet;
+
+    (**********************************************************************
+
+       Validate time edit check.  Returns
+          ecinfo[1] = 1st field type encountered (hh:mm:ss)
+          ecinfo[2] = 2nd field type encountered (hh:mm:ss)
+          ecinfo[3] = 3rd field type encountered (hh:mm:ss:am/pm)
+          ecinfo[4] = 4th field type encountered (am:pm)
+          ecinfo[5] = non - zero for 24 hour time (no am/pm)
+
+       For each of the field entries, the integer is divided as follows:
+           lower 3 bits:   field type (1=hr, 2=min, 3=sec, 4=am/pm)
+           next    bit     1 if blank-filled; 0 if zero-filled
+           next  5 bits:   length of component
+           next  6 bits:   position of component (relative to 0)
+
+       Errors: 16 - Extra characters
+               61 - duplicate component
+               62 - component in wrong place
+               64 - components must be hh, mm, ss, or pm
+               71 - too many components
+
+    **********************************************************************)
+
+    CONST   makeLower = 32;     { ord('a')-ord('A') }
+
+    VAR tseen:      SET OF 1..5; {1=hr, 2=min, 3=sec, 4=ampm, 5=time delim }
+        thisComp:   integer;
+        done:       boolean;
+        x:          integer;
+        kwi:        integer;
+        OKdelim:    keystr;
+        ch:         CHAR;
+    BEGIN
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+    tseen := [];        { components we have seen }
+    order := 1;         { number of next component }
+    x := skipToStrt+1;
+
+    WHILE (x <= skipToStrt+dsplen) AND (errnum = 0) DO
+        BEGIN
+        IF dbcTest THEN
+            WRITELN('in TimeSet x=',x:1);
+
+        { look for one of the keywords HH, 0H, MM, 0M, SS, 0S, AM, PM }
+        kwi := tkwHH;
+        done := FALSE;
+        WHILE NOT done AND (kwi <= tkwPM) DO
+            IF keyMatch(POINTER(ORD(@ec)), x, dsplen, timeComps[kwi]) THEN
+                done := TRUE
+            ELSE
+                kwi := kwi+1;
+
+        IF done THEN { got a component: kwi is its number }
+            BEGIN
+            IF order > 4 THEN
+                errnum := 71 { too many time components }
+            ELSE
+                BEGIN
+                { compute which component we have 1=HR, 2=MIN, 3=SEC, 4=AMPM }
+                thisComp := (kwi+1) DIV 2;
+
+                { compute allowed alpha delimiter }
+                IF thisComp <> 4 THEN
+                    OKdelim := timeDelims[thisComp]
+                ELSE
+                    OKdelim := '';
+
+                { store all info we need later }
+                ecinfo[order] := 512*(x-1) +
+                                  16*LENGTH(timeComps[kwi]) +
+                                     thisComp;
+                IF ODD(kwi) THEN { blank-filled }
+                    ecinfo[order] := ecinfo[order] + 8;
+
+                order := order+1;
+                x := x + LENGTH(timeComps[kwi]);
+                END;
+            END { if found a component }
+
+        ELSE IF keyMatch(POINTER(ORD(@ec)), x, dsplen,
+                         timeDelims[tkwTD]) THEN
+            BEGIN
+            IF 5 {time delim} IN tseen THEN
+                errnum := 214 { duplicate 'UHR'-like string }
+            ELSE
+                BEGIN
+                thisComp := 5 {time delim};
+                OKdelim := '';
+                x := x + LENGTH(timeDelims[tkwTD]);
+                END
+            END { if found Time Delimiter }
+
+        ELSE
+            errnum := 69; { unknown time component }
+
+        IF errnum = 0 THEN
+            BEGIN
+            IF thisComp IN tseen THEN
+                errnum := 61 { duplicate time component }
+
+            ELSE IF (thisComp < 4 {hr, min, sec}) AND
+                    (4 {ampm} in tseen) THEN
+                errnum := 62 { ampm in wrong place, must be after HR, MIN, SEC }
+
+            ELSE
+                BEGIN
+                IF dbcTest THEN
+                    WRITELN('got a component', order, thisComp);
+
+                tseen := tseen+[thisComp];
+                END;
+
+            (*  scan past delimiters *)
+            done := false;
+            WHILE (x<=skipToStrt+dsplen) AND (NOT done) AND
+                  (errnum=0) DO
+                BEGIN
+                ch := ec[x];
+                IF (ch=' ') OR (ch=reqSpace) THEN
+                    x := x+1
+
+                ELSE IF ord(ch) IN alphaSet THEN
+                    BEGIN
+                    IF (NOT keyMatch(POINTER(ORD(@ec)), x, dsplen,
+                                     Okdelim)) THEN
+                        done := true { must be next component }
+
+                    ELSE
+                        BEGIN
+                        x := x+LENGTH(OKdelim);
+                        OKdelim := '';  { only one allowed }
+                        END;
+                    END
+
+                ELSE IF ord(ch) in spcl {already tested for spaces above} THEN
+                    BEGIN
+                    x := x+1;
+                    OKdelim := '';  { no alpha delimiter after punctuation}
+                    END
+
+                ELSE { must be a digit or something }
+                    done := TRUE;
+
+                END; { while }
+
+            IF dbcTest THEN
+                writeln('done scan past delimiters, x=',x);
+            END; { if no error from reading component }
+        END; { while more chars to process }
+
+    IF (errnum=0) AND               { no error yet }
+       (x<=skipToStrt+dsplen) THEN  { and did not look at all characters }
+        errnum := 16; { extra characters at the end }
+
+    (* Set ecinfo[5] non zero if am/pm not given to indicate 24 hr time *)
+    IF NOT (4 {ampm} IN tseen) THEN
+        ecinfo[5] := 1;
+
+    IF dbcTest THEN
+        WRITELN('Exit TimeSet');
+    END; { of TimeSet }
+
+
+ begin { of LegalEditCheck }
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+ if dbctest then writeln ('Entering LegalEditCheck');
+    errnum := 0;
+    for x := 1 to 5 do ecinfo[x] := 0;
+    dsplen := length(ec);
+    dsp := pointer(ord(@ec) + 1);
+
+    { find the edit check string without its leading and trailing blanks }
+    while (dspLen > 0) and
+          ((chr(dsp^[dspLen - 1]) = ' ') or
+           (chr(dsp^[dspLen -1]) = reqSpace)) do
+        dspLen := dspLen - 1;
+    skipToStrt := 0;
+    while (dspLen > 0) and
+          ((chr(dsp^[skipToStrt]) = ' ') or
+           (chr(dsp^[skipToStrt]) = reqSpace)) do
+        begin
+        skipToStrt := skipToStrt + 1;
+        dspLen := dspLen - 1;
+        end;
+    dsp := pointer(ord(dsp) + skipToStrt);
+    if dbcTest then
+        writeln ('Skip to start: ', skipToStrt, ' Actual length; ', dspLen);
+
+    if (dsplen >= 1) or (fldtype = lets) then
+        case fldtype of
+            tick : if VerifyNum (dsp, dsplen, TRUE, 0,
+                                 prefPeriod, ecinfo,
+                                 q, errnum) then
+                       begin
+                       if (ecinfo[1] <> 0) then errnum := 10 { sign not
+                           allowed in ticket }
+                       else if (ecinfo[5] <> 0) then errnum := 39 { decimal
+                           point not allowed }
+                       else if ecInfo[3] > 14 then errNum := 42; { too many
+                           digits }
+                       end;
+
+            num  : if VerifyNum (dsp, dsplen, TRUE, 0,
+                                 prefPeriod, ecinfo,
+                                 q, errnum) then
+                      begin
+                      end;
+
+            dol  : if VerifyNum (dsp, dspLen, TRUE, 1,
+                                 prefPeriod, ecInfo,
+                                 q, errNum) then
+                       begin
+                       end;
+
+            zip  : begin
+                   { establish the checkInfo }
+                   ChrSet;
+                   { 5 or 9 digits are allowed }
+                   CountBCDDigits (digCnt);
+                   if errNum = 0 then
+                       if (ecinfo[3] <> 4) and (ecInfo[3] <> 12) then
+                           errNum := 52 { illegal character in zip code }
+                       else if digCnt <> 9 then
+                           begin
+                           if digCnt = 5 then
+                               { non-zero if only 5 digits are allowed }
+                               ecInfo[5] := 1
+                           else
+                               errNum := 8; { wrong number of digits }
+                           end;
+                   end;
+
+            ss   : begin
+                   ChrSet;
+                   CountBCDDigits (digCnt);
+                   if errNum = 0 then
+                       if digCnt <> 9 then
+                           errnum := 8 { wrong number of digits }
+                       else if (ecinfo[3]<>4) and (ecinfo[3]<>12) then
+                           errnum := 53;
+                               { illegal characters in social security number }
+                   end;
+
+            tim  : TimeSet;
+
+            dt   : DateSet;
+
+            ph   : begin
+                   ChrSet;
+                   { 7 or 10 digits are allowed }
+                   CountBCDDigits (digCnt);
+                   if errNum = 0 then
+                      if (ecinfo[3]<>4) and (ecinfo[3]<>12) then
+                           errnum := 218
+                      else if digCnt <> 10 then
+                           begin
+                           { ecinfo[5] = non-zero if no area code exists }
+                           if digCnt = 7 then
+                               ecinfo[5] := 1
+                           else
+                               errnum := 8; { wrong number of digits }
+                           end;
+                   end;
+
+            lets :
+              begin
+              ChrSet;
+              if (dsplen>=2) and (chr(dsp^[0])=openString) then
+                begin
+                dspCh:=pointer(ord(dsp));
+                digCnt := 0;    { this counts letter and numbers }
+                for x:=0 to dsplen-1 do
+                  if (ord(dspCh^[x]) in alphaSet) or
+                     (dspCh^[x] in ['0'..'9']) or
+                     (dspCh^[x]=wild1Char) or
+                     (dspCh^[x]=wild2Char) then
+                    digCnt := digCnt+1;
+                if digCnt=0 then
+                  errnum := 213 { no characters in pattern }
+                else if chr(dsp^[dsplen-1])<>openString then
+                  errnum := 211 { missing double quote }
+                else
+                  ecinfo[4] := digCnt;
+                end
+              else if dspLen>4 then
+                errnum := 95; {text format too long}
+              end;
+
+        end { of case }
+
+    else errnum := 15; { editcheck required }
+
+if dbcTest then
+  for x:=1 to 5 do
+    writeln('ecinfo[',x:1,']=',ecinfo[x]:1);
+if dbctest then writeln ('Exiting LegalEditCheck');
+
+end; { of LegalEditCheck }
+
+
+{$S ECExcept}
+procedure ReplaceEditCheck {curEcInfo:checkInfo; fldType:integer;
+              repType:integer; newEc:ecStr; var newEcInfo:checkInfo;
+              var errNum:integer};
+
+{*****************************************************************************
+
+Parse the new edit check string.  If it is valid, see if it can replace the
+current edit check string.  If so, return edit check information.  The only
+changes restricted are those which would increase the bucket size of numeric
+and dollar types.  Movement of the decimal point will change the magnitude of
+existing numeric and monetary data.
+
+Assumes: The only editcheck string which may be null is that for type lets;
+             in that case, the null string is equivalent to all types of
+             characters being allowed.
+
+Errors:  all those listed under LegalEditCheck plus:
+         101 - new edit check requires larger field size
+         102 - decimal point movement caused change of magnitude
+
+Calls:   LegalEditCheck
+
+*****************************************************************************}
+
+label 100; { error exit }
+
+var newDigits: integer;
+
+begin { of ReplaceEditCheck }
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbcTest then writeln ('Entering ReplaceEditCheck');
+
+{ first, see if the new edit check is legal and get the new checkInfo }
+LegalEditCheck (newEc, fldType, newEcInfo, errNum);
+if errNum <> 0 then goto 100;
+
+{ now make sure numeric and money changes are legal }
+if (fldType = dol) or (fldType = num) then
+    begin
+    newDigits := newEcInfo[3] + newEcInfo[5];
+    if ((repType = fTypInt1) and (newDigits > 2)) or
+        ((repType = fTypInt2) and (newDigits > 4)) or
+        ((repType = fTypInt4) and (newDigits > 9)) then
+        errNum := 101 { new edit check requires larger field size }
+    else
+        if curEcInfo[5] <> newEcInfo[5] then
+            errNum := 102; { decimal point movement caused change in magnitude }
+    end;
+
+100: if dbcTest then writeln ('Exiting ReplaceEditCheck');
+end; { of ReplaceEditCheck }
+
+
+
+procedure ConstructEditCheck{(fldtype:integer;
+                              VAR ecinfo: checkinfo;
+                              VAR ec: ecstr;
+                              VAR errnum: integer)};
+    { given a fldtype (ss..tick), AND an OLD ecinfo array,
+        this returns an editcheck string and NEW ecinfo array that
+        is compatible with the fldtype; errnum is set to the error
+        returned by LegalEditCheck on that editcheck string;
+
+        (the old editcheck array is used only to determine the correct
+            number of digits for money and number datatypes }
+VAR theDecChar: STRING[1];
+    theSepChar: STRING[1];
+    decchar : char;
+    i:          INTEGER;
+
+  (*****************************************************************************************)
+
+  function FindSeparator(decimal:char; fieldtype:integer) : char;
+  {pass in a char to designate what the decimal character is (space decimal comma) }
+  { and the fieldtype and return the separator which should be used                }
+
+  var edchk : ecstr;
+      edchklen : integer;
+      i : integer;
+      done : boolean;
+      ecchar : char;
+      separator : char;
+      newseparator : char;
+
+  begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+    done := FALSE;
+    newseparator := '?';
+    separator := '?';
+
+    {get the default edit check}
+    nulleditcheck(edchk,fieldtype);
+    edchklen := length(edchk) + 1;
+
+    {loop through edit check looking for delimiters}
+    i := 1;
+    while i <= edchklen do
+      begin
+      ecchar := edchk[i];
+      if (ecchar = ' ') or (ecchar = '.') or (ecchar = ',') then
+        if (separator = '?') then separator := ecchar
+        else begin
+             NewSeparator := separator;
+             i := edchklen;
+             end;
+      i := i+1;
+      end;
+
+    {if new separator was not determined}
+    if NewSeparator = '?' then
+      begin
+      {if no delimiter was found or the delimiter you found was the decimal, }
+      { then set NewSeparator to something different from decimal            }
+      if (separator = '?') or (separator = decimal) then
+        begin
+        if decimal = '.' then newseparator := ','
+        else newseparator := '.';
+        end
+      else newseparator := separator;
+      end;
+
+    FindSeparator := newseparator;
+
+  end;
+
+  (*****************************************************************************************)
+
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+    IF DBCTest THEN
+    WriteLn('ConstructEditCheck: fldtype=', fldtype:1);
+
+    IF (fldtype=dol) OR (fldtype=num) THEN
+        BEGIN
+        IF DBCTest THEN
+        WriteLn('ConstructEditCheck: given number/money', fldtype);
+
+        { determine reasonable values for the digit separator char
+                and decimal character }
+        theDecChar := ' ';
+        theSepChar := ' ';
+
+        IF cFraction <> '?' THEN
+            theDecChar[1] := cFraction
+        ELSE IF prefPeriod THEN
+            theDecChar[1] := '.'
+        ELSE
+            theDecChar[1] := ',';
+
+        IF cSeparator = '?' THEN
+            IF theDecChar[1] = '.' THEN
+                theSepChar[1] := ','
+            ELSE
+                begin
+                decchar := thedecchar[1];
+                theSepChar[1] := FindSeparator(DecChar,fldtype);
+                end
+        ELSE
+            theSepChar[1] := cSeparator;
+        IF DBCTest THEN
+        WriteLn('ConstructEditCheck: /sep/dec/=/', theSepChar, '/',
+                    theDecChar, '/');
+
+        { now construct the edit check ... }
+
+        { ... first the sign ... }
+        ec := '- ';
+
+        { ... now the integer part ... }
+        while ecinfo[3] > 0 do
+            begin
+            ec := CONCAT(ec, '9');
+            ecinfo[3] := ecinfo[3] - 1;
+            if (ecinfo[3] MOD 3 = 0) and (ecinfo[3] > 0) then
+                ec := CONCAT(ec, theSepChar);
+            end;
+        IF DBCTest THEN
+        WriteLn('ConstructEditCheck: after integer part, ec=/', ec, '/');
+
+        { ... finally the fraction part ... }
+        IF ecinfo[5] > 0 THEN
+            BEGIN
+            ec := CONCAT(ec, theDecChar);
+            for i := 1 TO ecinfo[5] DO
+                ec := CONCAT(ec, '9');
+            END;
+        IF DBCTest THEN
+        WriteLn('ConstructEditCheck: after third set of digits, ec=/', ec, '/');
+        END
+    ELSE
+        NullEditCheck(ec, fldtype);
+
+    IF DBCTest THEN
+    WriteLn('ConstructEditCheck: ec=/', ec, '/');
+
+    LegalEditCheck(ec, fldtype, ecinfo, errnum);
+
+    IF DBCTest THEN
+      BEGIN
+      WriteLn('ConstructEditCheck: errnum=', errnum:1);
+      for i:=1 to 5 do
+        writeln('ConstructEditCheck: ecinfo[',i:1,']=',ecinfo[i]);
+      END;
+end;
+
+
+{ ******************************************************************
+
+Changes and values stored in edit check array:
+
+Number/Money:
+o Handles use of comma as decimal character and blanks or period as digit
+  separator.  Possible to specify the characters to use as decimal character and
+  digit separator, or leave them unspecified (will be determined in context).
+  Also can specify the preferred decimal character, for disambiguating edit checks.
+
+o Handles yen and English pound symbols exactly like dollar signs.
+
+o More flexible with respect to placement of +, -, <>, CR, DR, and currency
+  symbols.
+
+o Use of '#' character to indicate non-padded digit position; the '9' character
+  means space-padded digit position in all contexts.
+
+o Allows a units string in number or money.
+
+1--character position of sign; zero if none
+2--position of units string or 0 if none:
+        lower 5 bits: size of string
+        next 10 bits: position of start of string (relative to 0)
+3--number of digits in integer part
+4--character position of decimal point; zero if none
+5--number of digits in fractional part
+
+   ambiguity: prefer period or comma as decimal char
+
+Date:
+o Month names and abbreviations are read from phrase file.
+
+o The strings used to represent mm, 0m, dd, 0d and the character used to represent
+  year ('y') are read from the phrase file.
+
+o More flexibility in entering date.  Month can be alphabetic or numeric regardless
+  of specification in edit check.
+
+1--first field (1=month, 2=day, 3=year)
+2--second field
+3--third field
+4--# year digits
+5--type of month (0=numeric, 1=abbr, 2=full name)
+
+For each field, the integer is coded as follows:
+           lower 3 bits:   field type
+           next    bit     1 if blank-filled; 0 if zero-filled
+           next  5 bits:   length of component
+           next  6 bits:   position of component (relative to 0)
+
+   ambiguity: order of components
+
+Time:
+o The strings used to represent hh, 0h, mm, 0m, ss, 0s, am, and pm are read
+  from the phrase file.
+
+o The phrase file can define alphabetic delimiters for hours, minute, and
+  seconds and for the time format as a whole.
+
+1--first field (1=hour, 2=minute, 3=second)
+2--second field
+3--third field (can be 4=am/pm)
+4--fourth field (only can be 4=am/pm)
+5--non-zero for 24-hour time
+
+For each field, the integer is coded as follows:
+           lower 3 bits:   field type
+           next    bit     1 if blank-filled; 0 if zero-filled
+           next  5 bits:   length of component
+           next  6 bits:   position of component (relative to 0)
+
+   ambiguity: order of components
+
+Zip:
+o can enter 5 or 9 digits, regardless of edit check; if 5 digits, the
+  other 4 are set to zero
+
+1--max number chars per line (120 currently)
+2--must be 1
+3--allowed characters:
+   8 bit => special chars allowed
+   4 bit => digits allowed
+   2 bit => lower case alphabetics allowed
+   1 bit => upper case alphabetics allowed
+   (for zip only digits and special chars are allowed)
+4--unused
+5--non-zero for 5-digit zip
+
+Social Security:
+1--max number chars per line (120 currently)
+2--must be 1
+3--allowed characters:
+   8 bit => special chars allowed
+   4 bit => digits allowed
+   2 bit => lower case alphabetics allowed
+   1 bit => upper case alphabetics allowed
+   (for zip only digits and special chars are allowed)
+4--unused
+5--unused
+
+Phone:
+o can enter 7 or 10 digits regardless of edit check; if 7 digits, area code
+  is made null and is output as blanks
+
+1--max number chars per line (120 currently)
+2--must be 1
+3--allowed characters:
+   8 bit => special chars allowed
+   4 bit => digits allowed
+   2 bit => lower case alphabetics allowed
+   1 bit => upper case alphabetics allowed
+   (for zip only digits and special chars are allowed)
+4--unused
+5--non-zero for no area code
+
+Text:
+o An edit check surrounded by double quotes indicates a pattern string.  Each
+  character in the pattern (excluding first and last double quotes) stands for
+  one character in output.  It is possible to classify each position as
+  alphabetic or numeric only, or both alphabetic and numeric.  All punctuation is
+  ignored in the input and the punctuation found in edit check is copied into
+  output.
+
+1--max number chars per line (120 currently)
+2--number of lines (1 currently)
+3--allowed characters:
+   8 bit => special chars allowed
+   4 bit => digits allowed
+   2 bit => lower case alphabetics allowed
+   1 bit => upper case alphabetics allowed
+4--** change: if zero, format specifies which character classes are allowed;
+   otherwise, format is a pattern and this is number of non-punctuation chars
+   in field **
+5--unused
+
+****************************************************************** }
+
+
+ÿ

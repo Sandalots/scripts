@@ -1,0 +1,1205 @@
+CONST
+    phPrompt = 1503;
+    phInpFr  = 1504;
+    phDiHeight = 1505;
+
+VAR
+    readBuffer:         TFileBuffer; {need this because we cannot guarantee that a TFileBlock object
+                                        does not cross a data segment boundary}
+    osErrs:             S255;        (* filename for OS error file: -vol-{Txx}OSerrs.Err *)
+    statusTypeStyle:    TTypestyle;
+
+PROCEDURE GetErrorText(err: INTEGER; msg: TPString);
+    VAR errRet: ErrTextRet;
+        num:    S255;
+        i:      INTEGER;
+BEGIN
+    SUGetErrText(osErrs, err, Pointer(Ord(msg)), errRet);
+    IF errRet <> SUOk THEN
+        BEGIN
+        process.GetAlert(phNoMsg, msg^);
+        i := Pos('#', msg^);
+        IF i > 0 THEN
+            BEGIN
+            Delete(msg^, i, 1);
+            SUIntToStr(err, @num);
+            Insert(num, msg^, i);
+            END;
+        END;
+END;
+
+METHODS OF TFileBlock;
+
+    FUNCTION TFileBlock.CREATE(object:TObject; heap: THeap; itsFirstLine: LONGINT): TFileBlock;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TFileBlock(object);
+        WITH SELF DO
+            BEGIN
+            numBytes := 0;
+            lineIndex := NIL;
+            firstLine := itsFirstLine;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TFileBlock.Free;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        Free(SELF.lineIndex);
+        TObject.FreeObject;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE TFileBlock.Fields(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        SUPERSELF.Fields(Field);
+        Field('numBytes:   INTEGER');
+        Field('firstLine:  LONGINT');
+        Field('lineIndex:  TArray');
+        Field('');
+    END;
+    {$ENDC}
+
+    FUNCTION TFileBlock.LineAt(idx: INTEGER; VAR leadingSp, chStart, nChars: INTEGER): BOOLEAN;
+        VAR ix:     INTEGER;
+            ok:     BOOLEAN;
+            nLines: LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        nLines := SELF.lineIndex.Size;
+
+        WITH SELF DO
+            IF (idx >= firstLine) AND (idx < firstLine + nLines) THEN
+                BEGIN
+                ok := TRUE;
+
+                {$H-}
+                ix := idx - firstLine + 1;
+
+                chStart := TpInteger(lineIndex.At(ix))^;
+
+                IF (ORD(data[chStart]) = DLE) AND (chStart < numBytes) THEN
+                    BEGIN
+                    leadingSp := ORD(data[chStart+1]) - 32;
+                    chStart := chStart + 2;
+                    END
+                ELSE
+                    leadingSp := 0;
+
+                IF ix < nLines THEN
+                    ix := TpInteger(lineIndex.At(ix+1))^
+                ELSE
+                    ix := numBytes;
+
+                REPEAT
+                    ix := ix - 1;
+                UNTIL ORD(data[ix]) = EOL;
+                nChars := ix - chStart
+                {$H+}
+                END
+            ELSE
+                ok := FALSE;
+
+        LineAt := ok;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TFileBlock.ReadFrom(fs: TFileScanner; VAR blockMaxLen: INTEGER);
+    VAR nBytes:     INTEGER;
+        numLines:   INTEGER;
+        lineIdx:    TArray;
+        byteIdx:    INTEGER;
+        ch:         INTEGER;
+        lineLen:    INTEGER;
+        currStart:  INTEGER;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        blockMaxLen := 0;
+
+        fs.XferSequential(xRead, @readBuffer, readUnit);
+        {$H-}
+        XferLeft(@readBuffer, @SELF.data, readUnit);
+        {$H+}
+
+        IF (fs.error <= 0) OR (fs.error = 848{EOF}) THEN
+            BEGIN
+            nBytes := fs.actual;
+
+            {find out how many lines there are}
+            numLines := 0;
+            byteIdx := 1;
+            WITH SELF DO
+                WHILE byteIdx <= nBytes DO
+                    BEGIN
+                    IF ORD(data[byteIdx]) = EOL THEN
+                        numLines := numLines + 1;
+                    byteIdx := byteIdx + 1;
+                    END;
+
+            lineIdx := TArray.CREATE(NIL, SELF.Heap, numLines, SIZEOF(INTEGER));
+            WITH SELF DO
+                BEGIN
+                lineIndex := lineIdx;
+                numBytes := nBytes;
+                END;
+
+            {construct the line index}
+            byteIdx := 1;
+            currStart := 1;
+            lineLen := 0;
+
+            WITH SELF DO
+                {$H-}
+                WHILE byteIdx <= nBytes DO
+                    BEGIN
+                    ch := ORD(SELF.data[byteIdx]);
+
+                    IF ch = DLE THEN
+                        BEGIN
+                        IF byteIdx < nBytes THEN
+                            BEGIN
+                            byteIdx := byteIdx + 1;
+                            lineLen := ORD(SELF.data[byteIdx]) - 32 - 2
+                                    {subtract an extra 2 for the DLE and space count};
+                            END;
+                        END
+
+                    ELSE IF ch = EOL THEN
+                        BEGIN
+                        lineIdx.InsLast(@currStart);
+
+                        blockMaxLen := Max(blockMaxLen, lineLen + byteIdx - currStart);
+
+                        {setup for next line}
+                        lineLen := 0;
+                        currStart := byteIdx + 1;
+
+                        IF ORD(SELF.data[currStart]) = 0 THEN
+                            BEGIN
+                                {skip to next 2-disk-block boundary}
+                            byteIdx := txtUnit * ((byteIdx DIV txtUnit) + 1);
+                            currStart := byteIdx + 1;
+                            END
+                        END;
+
+                    byteIdx := byteIdx + 1;
+                    END;
+                {$H+}
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TRdrProcess;
+
+
+    FUNCTION TRdrProcess.CREATE: TRdrProcess;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        SELF := TRdrProcess(TProcess.CREATE(NewObject(mainHeap, THISCLASS), mainHeap));
+
+        SUInit;
+        osErrs := Concat(toolVolume, toolPrefix, 'OSErrs.Err');
+        MakeTypestyle(famStatus, sizeStatus, [], statusTypeStyle);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TRdrProcess.CopyExternalDoc(VAR error: INTEGER; externalName, volumePrefix: TFilePath);
+        {External Name is the name of a .TEXT file}
+        CONST
+            bufSize = 16284;
+            chunkSize = bufSize;
+
+        VAR inFile:     TFile;
+            outFile:    TFile;
+            inScanner:  TFileScanner;
+            outScanner: TFileScanner;
+            buf:        ARRAY[1..bufSize] OF Byte;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        inFile := TFile.CREATE(NIL, mainHeap, externalName, '');
+        outFile := TFile.CREATE(NIL, mainHeap, volumePrefix, '');
+        inScanner := inFile.ScannerFrom(0, [fRead]);
+        {$IFC fDbgOK}
+        IF fExperimental THEN
+            BEGIN
+            ABCbreak('The output fileScanner will be created with no write access', 0);
+            outScanner := outFile.ScannerFrom(0, [fRead]); {this will cause an error on the write}
+            END
+        ELSE
+            outScanner := outFile.ScannerFrom(0, [fWrite]);
+        {$ELSEC}
+        outScanner := outFile.ScannerFrom(0, [fWrite]);
+        {$ENDC}
+
+        WHILE NOT (inScanner.atEnd OR (inScanner.error > 0) OR (outScanner.error > 0)) DO
+            BEGIN
+            SELF.AbortXferSequential(xRead, @buf, SIZEOF(buf), chunkSize, inScanner);
+            SELF.AbortXferSequential(xWrite, @buf, Min(SIZEOF(buf), inScanner.actual),
+                                            chunkSize, outScanner);
+            END;
+
+        error := inScanner.error;
+        LatestError(outScanner.error, error);
+        inScanner.Free;
+        outScanner.Free;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    FUNCTION TRdrProcess.NewDocManager(volumePrefix: TFilePath; openAsTool: BOOLEAN): TDocManager;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        NewDocManager := TRdrDocManager.CREATE(NIL, mainHeap, volumePrefix);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+
+METHODS OF TRdrDocManager;
+
+
+    FUNCTION TRdrDocManager.CREATE(object:TObject; heap: THeap; itsPathPrefix: TFilePath): TRdrDocManager;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TRdrDocManager(TDocManager.CREATE(object, heap, itsPathPrefix));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    FUNCTION TRdrDocManager.NewWindow(heap: THeap; wmgrID: TWindowID):TWindow;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        NewWindow := TRdrWindow.CREATE(NIL, heap, wmgrID);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TRdrWindow;
+
+
+    FUNCTION TRdrWindow.CREATE(object:TObject; heap: THeap; itsWmgrID: TWindowID): TRdrWindow;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TRdrWindow(TWindow.CREATE(object, heap, itsWmgrID, TRUE));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE TRdrWindow.Fields(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        SUPERSELF.Fields(Field);
+        Field('filePanel: TPanel');
+        Field('statusPanel: TPanel');
+        Field('dialogWindow: TDialogWindow');
+        Field('fileDialog: TFileDialog');
+        Field('');
+    END;
+    {$ENDC}
+
+    PROCEDURE TRdrWindow.Activate;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        SUPERSELF.Activate;
+
+        IF NOT TRdrView(SELF.filePanel.view).HasFile AND (SELF.dialogBox = NIL) THEN
+            SELF.DoCommand(uReadFile);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TRdrWindow.BlankStationery;
+        VAR panel:          TPanel;
+            rdrView:        TRdrView;
+            statusView:     TStatusView;
+            dialogWindow:   TDialogWindow;
+            fileDialog:     TFileDialog;
+            s:              S255;
+            diHeight:       INTEGER;
+            cv:             TConvResult;
+
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        panel := TPanel.CREATE(NIL, SELF.Heap, SELF, 30, 20,
+                                [aBar, aScroll, aSplit], [aBar, aScroll, aSplit]);
+        rdrView := TRdrView.CREATE(NIL, SELF.Heap, panel);
+        SELF.filePanel := panel;
+        WITH rdrView.typestyle.font DO
+            BEGIN
+            fontFamily := famModern;
+            fontSize := size15Pitch;
+            END;
+        rdrView.FontChanged;
+
+        panel := panel.Divide(v, statusHeight, pixelsFromEdge, [], statusHeight, [aBar], []);
+        statusView := TStatusView.CREATE(NIL, SELF.Heap, panel);
+        SELF.statusPanel := panel;
+
+        process.GetAlert(phDiHeight, s);
+        StrToInt(@s, diHeight, cv);
+        IF cv <> cvValid THEN
+            diHeight := 125;
+
+        dialogWindow := NewStdDialogWindow(SELF.Heap, diHeight, diAccept, diAccept, diDismissDialogBox);
+        fileDialog := TFileDialog.CREATE(NIL, SELF.Heap, dialogWindow.dialogView, rdrView);
+        dialogWindow.dialogView.AddDialog(fileDialog);
+        SELF.dialogWindow := dialogWindow;
+        SELF.fileDialog := fileDialog;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    FUNCTION TRdrWindow.CanDoCommand(cmdNumber: TCmdNumber; VAR checkIt: BOOLEAN): BOOLEAN;
+        VAR rdrView:    TRdrView;
+            famCmd:     TCmdNumber;
+            sizeCmd:    TCmdNumber;
+            hasFile:    BOOLEAN;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        rdrView := TRdrView(SELF.filePanel.view);
+
+        hasFile := rdrView.HasFile;
+        WITH rdrView.typestyle.font DO
+            BEGIN
+            famCmd := fontFamily + famOffset;
+            sizeCmd := fontSize + sizeOffset;
+            END;
+
+        CASE cmdNumber OF
+            uModern, uClassic,
+            u20Pitch, u15Pitch, u12Pitch, u10Pitch:
+                BEGIN
+                CanDoCommand := hasFile;
+                checkIt := (famCmd = cmdNumber) OR (sizeCmd = cmdNumber);
+                END;
+
+            uClear, uLisaWrite:
+                CanDoCommand := hasFile;
+
+            uReadIcons:
+                CanDoCommand := clipboard.hasIcon;
+
+            uReadFile:
+                CanDoCommand := SELF.dialogBox = NIL;
+
+            OTHERWISE
+                CanDoCommand := SUPERSELF.CanDoCommand(cmdNumber, checkIt);
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    FUNCTION TRdrWindow.NewCommand(cmdNumber: TCmdNumber): TCommand;
+        VAR rdrView:        TRdrView;
+            diView:         TDialogView;
+            inputFrame:     TInputFrame;
+            diTextSel:      TFrameSelection;
+            oldManBreaks:   TArray;
+            newManBreaks:   TArray;
+            i:              INTEGER;
+            ln:             LONGINT;
+            LCd:            LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        NewCommand := NIL;
+        rdrView := TRdrView(SELF.filePanel.view);
+
+        CASE cmdNumber OF
+            uModern, uClassic,
+            u20Pitch, u15Pitch, u12Pitch, u10Pitch:
+                BEGIN
+                WITH rdrView.typeStyle.font DO
+                    IF (cmdNumber = uModern) OR (cmdNumber = uClassic) THEN
+                        fontFamily := cmdNumber - famOffset
+                    ELSE
+                        fontSize := cmdNumber - sizeOffset;
+                rdrView.FontChanged;
+
+                {reset manual breaks on the same lines as before}
+                TRdrPrintManager(rdrView.printManager).RemakeManualBreaks;
+                SELF.selectPanel.selection.MarkChanged;
+                END;
+
+            uReadFile:
+                IF SELF.dialogBox = NIL THEN
+                    BEGIN
+                    SELF.fileDialog.SelectInputFrame(SELF.fileDialog.inputFrame);
+                    SELF.PutUpDialogBox(SELF.dialogWindow);
+                    END;
+
+            uClear:
+                BEGIN
+                rdrView.fBlockList.DelAll(TRUE);
+                rdrView.fBlockList.Free;
+                WITH rdrView DO
+                    BEGIN
+                    fBlockList := NIL;
+                    filePath := '';
+                    fileDate := 0;
+                    maxLineLen := 0;
+                    nLines := 0;
+                    END;
+                rdrView.SetExtent;
+                SELF.statusPanel.Invalidate;
+                SELF.selectPanel.selection.MarkChanged;
+                END;
+
+            uLisaWrite:
+                NewCommand := TCopyToLisaWrite.CREATE(NIL, SELF.Heap, cmdNumber, rdrView);
+
+            uReadIcons:
+                NewCommand := TRdrPasteIcons.CREATE(NIL, SELF.Heap, cmdNumber, rdrView);
+
+            OTHERWISE
+                NewCommand := SUPERSELF.NewCommand(cmdNumber);
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TRdrPrintManager;
+
+    FUNCTION TRdrPrintManager.CREATE(object:TObject; heap: THeap): TRdrPrintManager;
+        VAR dynamicArray:   TArray;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TRdrPrintManager(TStdPrintManager.CREATE(object, heap));
+
+        dynamicArray := TArray.CREATE(NIL, heap, 0, 4);
+        SELF.manBreaks := dynamicArray;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE TRdrPrintManager.Fields(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        SUPERSELF.Fields(Field);
+        Field('manBreaks:  TArray');
+        Field('');
+    END;
+    {$ENDC}
+
+    PROCEDURE TRdrPrintManager.ClearPageBreaks(automatic: BOOLEAN);
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        IF NOT automatic THEN
+            SELF.manBreaks.DelAll;
+        SUPERSELF.ClearPageBreaks(automatic);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrPrintManager.Init(itsMainView: TView; itsDfltMargins: LRect);
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        SUPERSELF.Init(itsMainView, itsDfltMargins);
+        SELF.pageRiseDirection := v;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrPrintManager.RemakeManualBreaks;
+        VAR rdrView:    TRdrView;
+            manBreaks:  TArray;
+            i:          INTEGER;
+            ln:         LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        {clear old manual page breaks, but call superclass so we don't wipe out our
+                list of manual breaks}
+        SUPERSELF.ClearPageBreaks(FALSE);
+
+        rdrView := TRdrView(SELF.view);
+        manBreaks := SELF.manBreaks;
+
+        FOR i := 1 TO manBreaks.Size DO
+            BEGIN
+            ln := TpInteger(manBreaks.At(i))^;
+            SUPERSELF.SetBreak(h, rdrView.LocateLine(ln), FALSE); {again, call superclass so we don't
+                                                        insert anything into our list of breaks}
+            END;
+
+        SELF.RedoBreaks;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrPrintManager.SetBreak(vhs: VHSelect; where: LONGINT; isAutomatic: BOOLEAN);
+        VAR ln:         LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        IF NOT isAutomatic AND (vhs = h) THEN
+            BEGIN
+            ln := TRdrView(SELF.view).LocateLCd(where);
+            SELF.manBreaks.InsLast(@ln);
+            END;
+        SUPERSELF.SetBreak(vhs, where, isAutomatic);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrPrintManager.SetDfltHeadings;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        SUPERSELF.SetDfltHeadings;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TRdrView;
+
+    FUNCTION TRdrView.CREATE(object:TObject; heap: THeap; itsPanel: TPanel): TRdrView;
+        VAR margins:        LRect;
+            dummyExtent:    LRect;
+    BEGIN
+        {$IFC fTrace}BP(11);{$ENDC}
+        SetLRect(dummyExtent, 0, 0, hMargin, vMargin);
+        WITH screenRes DO
+            SetLRect(margins, h, v, h, v);
+
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TRdrView(object);
+
+        WITH SELF DO {some of these fields are needed ultimately by TView.CREATE}
+            BEGIN
+            filePath := '';
+            fileDate := 0;
+            fBlockList := NIL;
+            maxLineLen := 0;
+            nLines := 0;
+            typeStyle := sysTypestyle;
+            fntDescent := 0;
+            charSize := zeroPt;
+            END;
+
+        SELF := TRdrView(itsPanel.NewView(object, dummyExtent,
+                                            TRdrPrintManager.CREATE(NIL, heap), margins, TRUE));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE TRdrView.Fields(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        SUPERSELF.Fields(Field);
+        Field('filePath:   STRING[255]');
+        Field('fileDate:   LONGINT');
+        Field('fBlockList: TList');
+        Field('maxLineLen: INTEGER');
+        Field('nLines:     LONGINT');
+        Field('typeStyle:  RECORD onFaces:Byte; pad: Byte; fontFamily: Byte; fontSize: Byte; END');
+        Field('');
+        Field('fntDescent: INTEGER');
+        Field('charSize:   Point');
+        Field('');
+    END;
+    {$ENDC}
+
+    PROCEDURE TRdrView.Draw;
+        LABEL
+            10;
+
+        VAR numLines:   LONGINT;
+            spWidth:    INTEGER;
+            start:      LONGINT;
+            finish:     LONGINT;
+            height:     INTEGER;
+            lCd:        LONGINT;
+            ln:         LONGINT;
+            s:          TListScanner;
+            leadingSp:  INTEGER;
+            chStart:    INTEGER;
+            nChars:     INTEGER;
+            aBlock:     TFileBlock;
+            ix:         INTEGER;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        numLines := SELF.nLines;
+
+        IF numLines > 0 THEN
+            BEGIN
+            SetQDTypeStyle(SELF.typeStyle);
+            spWidth := CharWidth(' ');
+
+            WITH thePad.visLRect, SELF.charSize DO
+                BEGIN
+                height := v;
+                start := top - v;
+                finish := bottom + v;
+                END;
+
+            WITH SELF.extentLRect DO
+                {$H-}
+                BEGIN
+                start := Max(start, top);
+                finish := Min(finish, bottom);
+                END;
+                {$H+}
+
+            start := SELF.LocateLCd(start);
+            finish := SELF.LocateLCd(finish);
+
+            lCd := SELF.LocateLine(start);
+
+            s := SELF.fBlockList.Scanner;
+            ln := start;
+
+            WHILE s.Scan(aBlock) DO
+                IF aBlock.firstLine > finish THEN
+                    s.Done
+
+                ELSE IF aBlock.LineAt(ln, leadingSp, chStart, nChars) THEN
+                    REPEAT
+                        MoveToL(hMargin + (leadingSp * spWidth), lCd);
+                        DrawText(@aBlock.data, chStart-1, nChars);
+
+                        ln := ln + 1;
+                        lCd := lCd + height;
+
+                        IF ln > finish THEN
+                            GOTO 10; {break from repeat}
+                    UNTIL NOT aBlock.LineAt(ln, leadingSp, chStart, nChars);
+10:
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrView.FontChanged;
+        VAR fInfo:  FontInfo;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        PushFocus;
+        SELF.panel.window.Focus;
+        SetQDTypeStyle(SELF.typeStyle);
+        GetFontInfo(fInfo);
+        PopFocus;
+
+        WITH SELF, fInfo DO
+            BEGIN
+            fntDescent := descent;
+            {$H-}
+            SetPt(charSize, widMax, ascent + descent + leading);
+            {$H+}
+            stdScroll.v := charSize.v;
+            END;
+
+        SELF.SetExtent;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    FUNCTION TRdrView.ForceBreakAt(vhs: VHSelect; precedingLocation: LONGINT;
+                                            proposedLocation: LONGINT): LONGINT;
+        VAR ln:         LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        IF vhs = h THEN
+            BEGIN
+            ln := SELF.LocateLCd(proposedLocation);
+            ForceBreakAt := SELF.LocateLine(ln) + SELF.fntDescent - SELF.charSize.v;
+            END
+        ELSE
+            ForceBreakAt := SUPERSELF.ForceBreakAt(vhs, precedingLocation, proposedLocation);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    { 1 <= LocateLCd <= number of lines; if number of lines = 0 then returns 0 }
+
+    FUNCTION TRdrView.LocateLCd(lCd: LONGINT): LONGINT;
+        VAR ln:     LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        ln := ((lCd - vMargin) DIV (SELF.charSize.v)) + 1;
+        IF ln < 1 THEN
+            ln := 1
+        ELSE IF ln > SELF.nLines THEN
+            ln := SELF.nLines;
+        LocateLCd := ln;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    FUNCTION TRdrView.HasFile: BOOLEAN;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        HasFile := SELF.nLines > 0;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    FUNCTION TRdrView.LocateLine(ln: LONGINT): LONGINT;
+        VAR lCd:    LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        IF ln <= 0 THEN
+            LocateLine := 0
+        ELSE
+            BEGIN
+            lCd := (SELF.charSize.v * ln) + vMargin - SELF.fntDescent;
+            IF lCd = SELF.extentLRect.bottom THEN
+                lCd := SELF.extentLRect.bottom;
+            LocateLine := lCd;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrView.ReadFile(VAR filePath: TFilePath);
+        LABEL
+            100;
+
+        TYPE
+            TpEName     =   ^E_Name;
+            TpPathname  =   ^Pathname;
+
+        VAR error:          INTEGER;
+            catalog:        TFilePath;
+            pCatalog:       TpEName;
+            filePart:       TFilePath;
+            attr:           fs_info;
+            vName:          e_name;
+            password:       e_name;
+            aFile:          TFile;
+            str:            S255;
+            aList:          TList;
+            vol:            S255;
+            maxLen:         INTEGER;
+            blockMaxLen:    INTEGER;
+            heap:           THeap;
+            fs:             TFileScanner;
+            fSize:          LONGINT;
+            ixLine:         LONGINT;
+            aFileBlock:     TFileBlock;
+            pct:            INTEGER;
+{$IFC TimeRead}
+            i:              INTEGER;
+            timeVal:        LONGINT;
+{$ENDC}
+
+        PROCEDURE DoAbort;
+        BEGIN
+            process.BeginWait(phAborting);
+            aList.DelAll(TRUE);
+            maxLen := 0;
+            ixLine := 1;
+            process.Stop(phTerminated);
+            GOTO 100;
+        END;
+
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        SplitFilePath(filePath, catalog, filePart);
+
+        IF catalog <> '' THEN
+            BEGIN
+            catalog := Copy(catalog, 2, Length(catalog)-2); {delete the '-'s}
+            pCatalog := @catalog;
+
+            Lookup(error, TpPathname(pCatalog)^, attr);
+            IF error > 0 THEN
+                BEGIN
+                password := '';
+                Mount(error, vname, password, pCatalog^);
+                END;
+            END;
+
+        heap := SELF.Heap;
+
+        aFile := TFile.CREATE(NIL, heap, filePath, '');
+        fs := aFile.ScannerFrom(0, [fRead]);
+
+        IF fs.error > 0 THEN
+            BEGIN
+            process.ArgAlert(1, filePath);
+            GetErrorText(error, @str);
+            process.ArgAlert(2, str);
+            process.Stop(phCantOpen);
+            END
+        ELSE
+            BEGIN
+            aList := SELF.fBlockList;
+            SELF.filePath := filePath;
+      {$H-} SELF.fileDate := aFile.WhenModified(error); {$H+}
+
+            IF aList <> NIL THEN
+                BEGIN
+                aList.DelAll(TRUE);
+                aList.Free;
+                END;
+
+            { skip first 2 blocks }
+            fs.Seek(txtUnit);
+
+            fSize := aFile.size;
+            maxLen := 0;
+
+            aList := TList.CREATE(NIL, heap, (fSize - txtUnit + readUnit - 1) DIV readUnit);
+            SELF.fBlockList := aList;
+
+            ixLine := 1;    {number of next line to read}
+
+            pct := 0;
+            process.ArgAlert(1, filePath);
+            process.BeginWait(phReadingFile);
+            process.CountAlert(phCtrReading, (100 * fs.position) DIV fSize);
+
+{$IFC TimeRead}
+            timeVal := GetTime;
+{$ENDC}
+            WHILE (fs.position < fSize) AND (fs.error <= 0) DO
+                BEGIN
+                IF process.AbortRequest THEN
+                    DoAbort;
+
+                aFileBlock := TFileBlock.CREATE(NIL, heap, ixLine);
+                aList.InsLast(aFileBlock); {insert in list, so that if a read error it will be freed}
+                aFileBlock.ReadFrom(fs, blockMaxLen);
+                maxLen := Max(maxLen, blockMaxLen);
+
+                IF (fs.error > 0) AND (fs.error <> 848 {EOF}) THEN
+                    BEGIN
+                    IF error = erAborted THEN
+                        DoAbort
+                    ELSE
+                        BEGIN
+                        aList.DelAll(TRUE);
+                        GetErrorText(fs.error, @str);
+                        process.ArgAlert(1, str);
+                        process.Stop(phReadError);
+                        END;
+                    maxLen := 0;
+                    ixLine := 1;
+                    END
+                ELSE
+                    ixLine := ixLine + aFileBlock.lineIndex.Size;
+
+                process.CountAlert(phCtrReading, (100 * fs.position) DIV fSize);
+                END; {while still blocks in the file}
+
+{$IFC TimeRead}
+            timeVal := GetTime - timeVal;
+            SULIntToStr(timeVal, @str);
+            FOR i := Length(str) + 1 TO 3 DO
+                Insert('0', str, 1);
+            Insert('.', str, Length(str)-1);
+            process.ArgAlert(1, str);
+            process.Note(phTimer);
+{$ENDC}
+
+100:        {wrap up}
+            fs.Free;
+            WITH SELF DO
+                BEGIN
+                maxLineLen := maxLen;
+                nLines := ixLine - 1;
+                END;
+            process.EndWait;
+
+            SELF.SetExtent;
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrView.SetExtent;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        SELF.panel.currentView.ReactToPrinterChange;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    PROCEDURE TRdrView.SetMinViewSize(VAR minLRect: LRect);
+        VAR len:        LONGINT;
+            wid:        LONGINT;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        IF SELF.nLines > 0 THEN
+            BEGIN
+            WITH SELF.charSize DO
+                {$H-}
+                BEGIN
+                len := 2 * vMargin +
+                       ORD4(SELF.nLines) * v;
+                wid := 2 * hMargin +
+                       ORD4(SELF.maxLineLen) * h;
+                END;
+                {$H+}
+            SetLRect(minLRect, 0, 0, wid, len);
+            END
+        ELSE
+            minLRect := zeroLRect;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TStatusView;
+
+    FUNCTION TStatusView.CREATE(object:TObject; heap: THeap; itsPanel: TPanel): TStatusView;
+        VAR itsExtent:  LRect;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        SetLRect(itsExtent, 0, 0, 1000, statusHeight);
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TStatusView(itsPanel.NewStatusView(object, itsExtent));
+        SELF.scrollPastEnd := zeroPt;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TStatusView.Draw;
+        CONST   hMargin = 3;
+
+        VAR fInfo:  FontInfo;
+            base:           LONGINT;
+            str:            S255;
+            pStr:           TPString;
+            overflow:       BOOLEAN;
+            rdrWindow:      TRdrWindow;
+            rdrView:        TRdrView;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        TextFont(fIDSystem); {system font}
+        TextFace([]);
+        GetFontInfo(fInfo);
+        WITH fInfo DO
+            base := ascent + (statusHeight - ascent - descent) DIV 2;
+        MoveToL(hMargin, base);
+
+        process.GetAlert(phCurFile, str);
+        SUAddCh(@str, ' ', 255, overflow);
+        DrawString(str);
+
+        rdrWindow := TRdrWindow(SELF.panel.window);
+        rdrView := TRdrView(rdrWindow.filePanel.view);
+
+        IF rdrView.HasFile THEN
+            BEGIN
+            SetQDTypestyle(statusTypestyle);
+            pStr := @rdrView.filePath;
+            END
+        ELSE
+            BEGIN
+            process.GetAlert(phNoName, str);
+            pStr := @str;
+            END;
+
+        DrawString(pStr^);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TFileDialog;
+
+    FUNCTION TFileDialog.CREATE(object:TObject; heap: THeap; itsDiView: TView;
+                                        itsRdrView: TRdrView): TFileDialog;
+        VAR itsExtentLRect: LRect;
+            inLoc:          LPoint;
+            prLoc:          LPoint;
+            fInfo:  FontInfo;
+            inpExtent:      LRect;
+            itsInputFrame:  TInputFrame;
+            legend:         TLegend;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TFileDialog(TDialog.CREATE(object, heap, 'FILE', itsDiView));
+
+        SELF.AddOKButton(noCmdNumber);
+        SELF.AddCancelButton(noCmdNumber);
+
+        SELF.SetDefaultButton(TButton(SELF.ObjWithID(cancelString)));
+
+        legend := SELF.NewLegend(phPrompt, sysTypeStyle);
+
+        itsInputFrame := SELF.NewInputFrame(phInpFr, statusTypeStyle, zeroPt,
+                            statusTypeStyle, 66, zeroRect, TRUE, FALSE);
+
+        WITH SELF DO
+            BEGIN
+            rdrView := itsRdrView;
+            inputFrame := itsInputFrame;
+            lastInput := '';
+            END;
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE TFileDialog.Fields(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        SUPERSELF.Fields(Field);
+        Field('rdrView: TRdrView');
+        Field('inputFrame: TInputFrame');
+        Field('lastInput: STRING[255]');
+        Field('');
+    END;
+    {$ENDC}
+
+    PROCEDURE TFileDialog.ButtonPushed(button: TButton);
+        VAR userInput:  S255;
+            overflow:   BOOLEAN;
+            rdrWindow:  TRdrWindow;
+            filePanel:  TPanel;
+            vhs:        VHSelect;
+            firstBand:  BOOLEAN;
+            wholePanel: Rect;
+            s:          TListScanner;
+            band:       TBand;
+            scroller:   TScroller;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        SUPERSELF.ButtonPushed(button);
+        currentWindow.Update(TRUE);
+
+        IF button.HasID('OK') THEN
+            BEGIN
+            SELF.inputFrame.GetContents(userInput);
+            SELF.lastInput := userInput;
+            SUAddExtension(@userInput, '.TEXT', 255, overflow);
+            SELF.rdrView.ReadFile(TFilePath(userInput));
+
+            rdrWindow := TRdrWindow(SELF.rdrView.panel.window);
+
+            filePanel := rdrWindow.filePanel;
+            filePanel.selection.MarkChanged;
+            filePanel.view.printManager.ClearPageBreaks(FALSE); {clear manual pagebreaks}
+
+            {size of the first (and soon to be only) band}
+            wholePanel := filePanel.innerRect;
+            InsetRect(wholePanel, -1, -1);
+
+            {delete all splits and associated bands; scroll to top of document}
+            FOR vhs := v TO h DO
+                BEGIN
+                firstBand := TRUE;
+                s := filePanel.bands[vhs].Scanner;
+
+                {have to be careful because TPanel.ResizeBand can delete the band from the list}
+                WHILE s.Scan(band) DO
+                    BEGIN
+                    scroller := band.scroller;
+
+                    IF firstBand THEN
+                        BEGIN
+                        scroller.SetSize(wholePanel);
+                        firstBand := FALSE;
+                        END
+                    ELSE
+                        BEGIN
+                        s.Delete(FALSE); {remove from the list now so list scanner can fix itself;
+                                            ResizeBand will still free it}
+                        scroller.SetSize(zeroRect);
+                        END;
+
+                    filePanel.ResizeBand(vhs, band, 0, FALSE);
+                    END;
+                END;
+
+            {invalidate whole window}
+            PushFocus;
+            rdrWindow.Focus;
+            noPad.InvalRect(rdrWindow.outerRect);
+            PopFocus;
+            END
+        ELSE
+            SELF.inputFrame.SupplantContents(SELF.lastInput);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+
+
+METHODS OF TCopyToLisaWrite;
+
+    FUNCTION  TCopyToLisaWrite.CREATE(object: TObject; heap: THeap; itsCmdNumber: TCmdNumber;
+                                        itsRdrView: TRdrView): TCopyToLisaWrite;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TCopyToLisaWrite(TCopyIconRefCommand.CREATE(object, heap,
+                                    itsCmdNumber, itsRdrView, revealNone));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TCopyToLisaWrite.EachIconRef(PROCEDURE CopyIcon(iconKind: TIconKind;
+                                                toolNumber: LONGINT;
+                                                iconName: TIconName;
+                                                externalName: S255));
+        VAR rdrView:    TRdrView;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        rdrView := TRdrView(SELF.image);
+        CopyIcon(iDocument, idLisaWrite, 'a Text File', rdrView.filePath);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+END;
+
+
+METHODS OF TRdrPasteIcons;
+
+    FUNCTION  TRdrPasteIcons.CREATE(object: TObject; heap: THeap; itsCmdNumber: TCmdNumber;
+                                        itsRdrView: TRdrView): TRdrPasteIcons;
+    BEGIN
+        {$IFC fTrace}BP(10);{$ENDC}
+        IF object = NIL THEN
+            object := NewObject(heap, THISCLASS);
+        SELF := TRdrPasteIcons(TPasteIconRefCmd.CREATE(object, heap,
+                                    itsCmdNumber, itsRdrView, revealNone));
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TRdrPasteIcons.BeginPaste;
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        WriteLn('Begin pasting Icons');
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TRdrPasteIcons.PasteIcon(iconKind: TIconKind;
+                                         toolNumber: LONGINT;
+                                         VAR iconName: TIconName;
+                                         VAR prefix: TFilePath;
+                                         VAR password: TPassword);
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        WriteLn('Another Icon:');
+        WriteLn('  kind=', ORD(iconKind):1);
+        WriteLn('  tool number=', toolNumber:1);
+        WriteLn('  icon name="', iconName, '"');
+        WriteLn('  prefix="', prefix, '"');
+        WriteLn('  password="', password, '"');
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+
+    PROCEDURE TRdrPasteIcons.EndPaste(error: INTEGER);
+    BEGIN
+        {$IFC fTrace}BP(12);{$ENDC}
+        WriteLn('End Pasting Icons, error=', error:1);
+        {$IFC fTrace}EP;{$ENDC}
+    END;
+
+END;
+ÿ

@@ -1,0 +1,872 @@
+
+        .INCLUDE libqd/GRAFTYPES.TEXT
+;------------------------------------------------------------------
+;
+;  -->  RGNBLT.TEXT
+;
+;  Low level block transfer clipped to an arbitrary region.
+;
+
+
+        .PROC RGNBLT,9
+        .REF BITBLT,RSECT,SHIELDCURSOR,SHOWCURSOR
+        .REF INITRGN,SEEKRGN,PATEXPAND,ColorMap
+;--------------------------------------------------------------
+;
+;  PROCEDURE RgnBlt(srcBits,dstBits: BitMap;
+;                   srcRect,dstRect: Rect;
+;                   mode: INTEGER; pat: Pattern;
+;                   rgnA,rgnB,rgnC: RgnHandle);
+;
+;  TRANSFERS A RECTANGULAR BLOCK OF BITS CLIPPED TO THE DESTINATION
+;  BITMAP'S BOUNDS AND TO THE INTERSECTION OF THREE REGIONS.
+;  MODE SPECIFIES THE TRANSFER MODE AND WHETHER THE SOURCE SHOULD COME
+;  FROM THE SOURCE BITMAP OR FROM A REPEATING PATTERN.
+;
+;  COPYRIGHT APPLE COMPUTER INC.
+;  DESIGNED AND WRITTEN BY BILL ATKINSON
+;
+;  THIS CODE IS POSITION INDEPENDENT, RE-ENTRANT, AND READ-ONLY.
+;  CLOBBERS ONLY A0.
+;
+;  MODES:      0 SRC         --> DST
+;              1 SRC OR  DST --> DST
+;              2 SRC XOR DST --> DST
+;              3 SRC BIC DST --> DST
+;
+;              4 (NOT SRC)         --> DST
+;              5 (NOT SRC) OR  DST --> DST
+;              6 (NOT SRC) XOR DST --> DST
+;              7 (NOT SRC) BIC DST --> DST
+;
+;              8 PATTERN         --> DST
+;              9 PATTERN OR  DST --> DST
+;             10 PATTERN XOR DST --> DST
+;             11 PATTERN BIC DST --> DST
+;
+;             12 (NOT PATTERN)         --> DST
+;             13 (NOT PATTERN) OR  DST --> DST
+;             14 (NOT PATTERN) XOR DST --> DST
+;             15 (NOT PATTERN) BIC DST --> DST
+;
+;
+
+
+;----------------------------------------------------
+;
+;  A6 OFFSETS OF PARAMETERS AFTER LINK:
+;
+PARAMSIZE       .EQU    34                      ;SIZE OF PARAMETERS
+SRCBITS         .EQU    PARAMSIZE+8-4           ;LONG, ADDR OF BITMAP
+DSTBITS         .EQU    SRCBITS-4               ;LONG, ADDR OF BITMAP
+SRCRECT         .EQU    DSTBITS-4               ;LONG, ADDR OF RECT
+DSTRECT         .EQU    SRCRECT-4               ;LONG, ADDR OF RECT
+MODE            .EQU    DSTRECT-2               ;WORD
+PAT             .EQU    MODE-4                  ;LONG, ADDR OF PATTERN
+RGNA            .EQU    PAT-4                   ;LONG, RGNHANDLE
+RGNB            .EQU    RGNA-4                  ;LONG, RGNHANDLE
+RGNC            .EQU    RGNB-4                  ;LONG, RGNHANDLE
+
+
+;-------------------------------------------------
+;
+;  A6 OFFSETS OF LOCAL VARIABLES AFTER LINK:
+;
+EXPAT           .EQU    -64                     ;16 LONGS
+STATEA          .EQU    EXPAT-RGNREC            ;RGN STATE RECORD
+STATEB          .EQU    STATEA-RGNREC           ;RGN STATE RECORD
+STATEC          .EQU    STATEB-RGNREC           ;RGN STATE RECORD
+SAVESTK         .EQU    STATEC-4                ;LONG
+MINRECT         .EQU    SAVESTK-8               ;RECTANGLE
+RECTFLAG        .EQU    MINRECT-2               ;WORD
+MASKBUF         .EQU    RECTFLAG-4              ;LONG
+MASKADDR        .EQU    MASKBUF-4               ;LONG
+BUFLEFT         .EQU    MASKADDR-2              ;WORD
+BUFSIZE         .EQU    BUFLEFT-2               ;WORD
+DSTADDR         .EQU    BUFSIZE-4               ;LONG
+SRCADDR         .EQU    DSTADDR-4               ;LONG
+FIRSTV          .EQU    SRCADDR-2               ;WORD
+LASTV           .EQU    FIRSTV-2                ;WORD
+VBUMP           .EQU    LASTV-2                 ;WORD
+HBUMP           .EQU    VBUMP-2                 ;WORD
+SRCROW          .EQU    HBUMP-4                 ;LONG
+DSTROW          .EQU    SRCROW-4                ;LONG
+VERT            .EQU    DSTROW-2                ;WORD
+MODECASE        .EQU    VERT-4                  ;LONG
+SRCRECT2        .EQU    MODECASE-8              ;RECT
+SAVEA5          .EQU    SRCRECT2-4              ;LONG
+NOCHANGE        .EQU    SAVEA5-2                ;WORD
+VARSIZE         .EQU    NOCHANGE                ;SIZE OF LOCAL VARIABLES
+
+
+
+;--------------------------------------------------
+;
+;  ENTER HERE. RGNBLT TAKES CARE OF CURSOR.
+;
+        CHECKSTACK VARSIZE
+        LINK    A6,#VARSIZE                     ;ALLOCATE LOCAL VARIABLES
+        MOVEM.L D0-D7/A1-A5,-(SP)               ;SAVE REGS
+        MOVE.L  SP,SAVESTK(A6)                  ;REMEMBER STACK FOR LATER
+        MOVE.L  A5,SAVEA5(A6)                   ;REMEMBER GLOBAL PTR
+
+
+;----------------------------------------------------------------
+;
+;  ADJUST MODE AND PAT IF THECOLOR DOESNT MATCH THEFILTER.
+;
+        MOVE    MODE(A6),-(SP)                  ;PUSH INPUT MODE
+        MOVE.L  PAT(A6),-(SP)                   ;PUSH ADDR OF INPUT PATTERN
+        JSR     COLORMAP                        ;ALTER BY THECOLOR, THEFILTER
+        MOVE.L  (SP)+,PAT(A6)                   ;GET (ALTERED) PATTERN
+        MOVE    (SP)+,MODE(A6)                  ;GET (ALTERED) MODE
+
+
+;------------------------------------------------------
+;
+;  GET THREE REGION HANDLES AND DE-REFERENCE THEM.
+;
+        MOVE.L  RGNA(A6),A1                     ;GET RGNHANDLE
+        MOVE.L  (A1),A1                         ;DE-REFERENCE IT
+        MOVE.L  RGNB(A6),A2                     ;GET RGNHANDLE
+        MOVE.L  (A2),A2                         ;DE-REFERENCE IT
+        MOVE.L  RGNC(A6),A3                     ;GET RGNHANDLE
+        MOVE.L  (A3),A3                         ;DE-REFERENCE IT
+
+
+;------------------------------------------------------
+;
+;  POINT TO DSTRECT AND DSTBITS
+;
+        MOVE.L  DSTRECT(A6),A4                  ;A4 POINTS TO DSTRECT
+        MOVE.L  DSTBITS(A6),A5                  ;A5 POINTS TO DSTBITS
+
+
+;-------------------------------------------------------------------
+;
+;  CALC MINRECT, THE INTERSECTION OF DSTRECT, DSTBITS.BOUNDS,
+;  AND 3 REGION BOUNDING BOXES.  QUIT IF THE INTERSECTION IS EMPTY.
+;
+        MOVE.L  A4,-(SP)                        ;PUSH DSTRECT
+        PEA     BOUNDS(A5)                      ;PUSH DSTBITS.BOUNDS
+        PEA     RGNBBOX(A1)                     ;PUSH RGNA BBOX
+        PEA     RGNBBOX(A2)                     ;PUSH RGNB BBOX
+        PEA     RGNBBOX(A3)                     ;PUSH RGNC BBOX
+        MOVE    #5,-(SP)                        ;PUSH NRECTS=5
+        PEA     MINRECT(A6)                     ;PUSH WHERE TO PUT RESULT
+        JSR     RSECT                           ;CALC INTERSECTION
+        BEQ     GOHOME                          ;QUIT IF EMPTY
+
+
+;----------------------------------------------------
+;
+;  HIDE THE CURSOR IF IT INTERSECTS MINRECT
+;
+        PEA     MINRECT(A6)                     ;PUSH SHIELD RECT
+        MOVE.L  BOUNDS+TOPLEFT(A5),-(SP)        ;PUSH DELTA TO CONVERT TO GLOBAL
+        MOVE.L  SAVEA5(A6),A5                   ;GET GLOBAL POINTER
+        JSR     SHIELDCURSOR                    ;REMOVE CURSOR IF INTERSECT
+        MOVE.L  DSTBITS(A6),A5                  ;RECOVER A5 POINTS TO DSTBITS
+
+
+;----------------------------------------------------
+;
+;  ARE ALL THREE REGIONS RECTANGULAR ?
+;
+        MOVE    #30,D0
+        SUB     RGNSIZE(A1),D0
+        SUB     RGNSIZE(A2),D0
+        SUB     RGNSIZE(A3),D0
+        BNE.S   NOTRECT                         ;NO, CAN'T USE BITBLT
+
+
+;--------------------------------------------------------------
+;
+;  SINCE ALL THREE REGIONS ARE RECTANGULAR, WE WILL USE BITBLT.
+;  FIRST CLIP SRCRECT TO MATCH MINRECT.  (COPY SRCRECT SINCE IT'S NOT VAR)
+;
+        MOVE.L  SRCRECT(A6),A2                  ;POINT TO SRC RECT
+        LEA     SRCRECT2(A6),A0                 ;POINT TO LOCAL COPY OF SRCRECT
+
+        MOVE    MINRECT+TOP(A6),D0              ;GET MINRECT TOP
+        SUB     TOP(A4),D0                      ;CONVERT FROM DST COORDS
+        ADD     TOP(A2),D0                      ;TO SRC COORDS
+        MOVE    D0,TOP(A0)                      ;PUT CLIPPED SRC TOP INTO COPY
+
+        MOVE    MINRECT+LEFT(A6),D0             ;GET MINRECT LEFT
+        SUB     LEFT(A4),D0                     ;CONVERT FROM DST COORDS
+        ADD     LEFT(A2),D0                     ;TO SRC COORDS
+        MOVE    D0,LEFT(A0)                     ;PUT CLIPPED SRC LEFT INTO COPY
+
+
+;----------------------------------------------------
+;
+;  PUSH PARAMETERS AND CALL BITBLT
+;
+        MOVE.L  SRCBITS(A6),-(SP)               ;PUSH SRCBITS
+        MOVE.L  A5,-(SP)                        ;PUSH DSTBITS
+        MOVE.L  A0,-(SP)                        ;PUSH SRCRECT COPY
+        PEA     MINRECT(A6)                     ;PUSH DST = MINRECT
+        MOVE    MODE(A6),-(SP)                  ;PUSH MODE
+        MOVE.L  PAT(A6),-(SP)                   ;PUSH PATTERN
+        MOVE.L  SAVEA5(A6),A5                   ;RESTORE GLOBAL POINTER
+        JSR     BITBLT                          ;CALL BITBLT
+        BRA     DONE                            ;RESTORE CURSOR AND QUIT
+
+
+;-----------------------------------
+;
+;  CALC BUFLEFT AND BUFSIZE
+;
+NOTRECT MOVE    MINRECT+LEFT(A6),D1             ;GET MINRECT LEFT
+        SUB     BOUNDS+LEFT(A5),D1              ;CONVERT TO GLOBAL COORDS
+        AND     #$FFF0,D1                       ;TRUNC TO MULT OF 16
+        ADD     BOUNDS+LEFT(A5),D1              ;CONVERT BACK TO LOCAL
+        MOVE    D1,BUFLEFT(A6)                  ;SAVE AS BUFLEFT
+
+        MOVE    MINRECT+RIGHT(A6),D0            ;GET MINRECT RIGHT
+        SUB     D1,D0                           ;CALC WIDTH IN DOTS
+        LSR     #5,D0                           ;DIV BY 32 FOR LONGS
+        MOVE    D0,BUFSIZE(A6)                  ;BUFSIZE = # LONGS -1
+
+
+;---------------------------------------------
+;
+;  EXPAND STACK IF NECESSARY
+;
+        .IF     FORMAC=0
+        LSL     #2,D0                           ;QUAD FOR BYTECOUNT
+        NEG     D0                              ;MAKE OFFSET NEGATIVE
+        TST.W   0(SP,D0)                        ;EXPAND STACK
+        MOVE    BUFSIZE(A6),D0                  ;RESTORE BUFSIZE
+        .ENDC
+
+
+;-----------------------------------------------------------------------
+;
+;  ALLOCATE AND CLEAR A SCANLINE BUFFER FOR THE COMPOSITE MASK.
+;
+CLRMASK CLR.L   -(SP)                           ;ALLOCATE AND CLEAR
+        DBRA    D0,CLRMASK                      ;LOOP TILL DONE
+        MOVE.L  SP,MASKBUF(A6);                 ;REMEMBER WHERE MASKBUF IS
+
+
+;-------------------------------------------------------------------
+;
+;  INIT ALL THREE STATE RECORDS VERT0 AND VERT1 IN CASE RECTANGULAR
+;
+        MOVE    #-32767,STATEA+THISV(A6);
+        MOVE    #-32767,STATEB+THISV(A6);
+        MOVE    #-32767,STATEC+THISV(A6);
+
+        MOVE    #32767,STATEA+NEXTV(A6);
+        MOVE    #32767,STATEB+NEXTV(A6);
+        MOVE    #32767,STATEC+NEXTV(A6);
+
+
+;----------------------------------------------------------------------
+;
+;  ALLOCATE BUFFERS AND INIT STATE RECORDS FOR EACH NON-RECT REGION
+;
+        CLR     RECTFLAG(A6)                    ;INIT ALL RGNS RECT
+        CMP     #10,RGNSIZE(A1)                 ;IS RGNA RECTANGULAR ?
+        BEQ.S   ARECT                           ;YES, SKIP IT
+        ADD     #2,RECTFLAG(A6)
+        MOVE.L  A1,A0                           ;POINT TO RGNA
+        LEA     STATEA(A6),A1                   ;POINT TO STATE RECORD A
+        MOVE    MINRECT+LEFT(A6),D0             ;GET MINH
+        MOVE    MINRECT+RIGHT(A6),D1            ;GET MAXH
+        MOVE    BUFLEFT(A6),D2                  ;GET BUFLEFT
+        JSR     INITRGN                         ;INIT STATE, ALLOC BUFFER
+
+ARECT   CMP     #10,RGNSIZE(A2)                 ;IS RGNB RECTANGULAR ?
+        BEQ.S   BRECT                           ;YES, SKIP IT
+        ADD     #4,RECTFLAG(A6)
+        MOVE.L  A2,A0                           ;POINT TO RGNB
+        LEA     STATEB(A6),A1                   ;POINT TO STATE RECORD B
+        MOVE    MINRECT+LEFT(A6),D0             ;GET MINH
+        MOVE    MINRECT+RIGHT(A6),D1            ;GET MAXH
+        MOVE    BUFLEFT(A6),D2                  ;GET BUFLEFT
+        JSR     INITRGN                         ;INIT STATE, ALLOC BUFFER
+
+
+BRECT   CMP     #10,RGNSIZE(A3)                 ;IS RGNC RECTANGULAR ?
+        BEQ.S   CRECT                           ;YES, SKIP IT
+        ADD     #8,RECTFLAG(A6)
+        MOVE.L  A3,A0                           ;POINT TO RGNC
+        LEA     STATEC(A6),A1                   ;POINT TO STATE RECORD C
+        MOVE    MINRECT+LEFT(A6),D0             ;GET MINH
+        MOVE    MINRECT+RIGHT(A6),D1            ;GET MAXH
+        MOVE    BUFLEFT(A6),D2                  ;GET BUFLEFT
+        JSR     INITRGN                         ;INIT STATE, ALLOC BUFFER
+
+
+CRECT
+
+
+;---------------------------------------------------------------------
+;
+;  IF ONLY ONE REGION IS NON-RECTANGULAR, PLAY IT BACK DIRECTLY
+;  INTO THE MASK BUFFER.
+;
+        CMP     #2,RECTFLAG(A6)                 ;IS RGNA THE ONLY NON-RECT ?
+        BNE.S   AOK                             ;NO, CONTINUE
+        MOVE.L  MASKBUF(A6),STATEA+SCANBUF(A6)  ;YES, PLAY DIRECTLY INTO MASK
+        BRA.S   COK
+
+AOK     CMP     #4,RECTFLAG(A6)                 ;SAME FOR RGNB
+        BNE.S   BOK
+        MOVE.L  MASKBUF(A6),STATEB+SCANBUF(A6)
+        BRA.S   COK
+
+BOK     CMP     #8,RECTFLAG(A6)                 ;SAME FOR RGNC
+        BNE.S   COK
+        MOVE.L  MASKBUF(A6),STATEC+SCANBUF(A6)
+COK
+
+
+;----------------------------------------------------------
+;
+;  ASSUME WE WILL BE DRAWING DOWNWARD AND TO RIGHT.
+;
+        MOVE    MINRECT+TOP(A6),FIRSTV(A6)      ;FIRSTV:=MINRECT TOP
+        MOVE    MINRECT+BOTTOM(A6),LASTV(A6)    ;LASTV:=MINRECT BOTTOM
+        MOVE    #1,VBUMP(A6)                    ;VBUMP:=+1 SCAN LINE
+        MOVE    #4,HBUMP(A6)                    ;HBUMP:=+4 BYTES
+        MOVE    ROWBYTES(A5),D0
+        EXT.L   D0
+        MOVE.L  D0,DSTROW(A6)                   ;DSTROW:=+ROWBYTES
+        MOVE.L  MASKBUF(A6),MASKADDR(A6)        ;MASKADDR:=MASKBUF
+
+
+;---------------------------------------
+;
+;  SET UP INVERT FLAG IN D7 TO REFLECT MODE BIT 2
+;
+        CLR.L   D7                              ;SAY NOT INVERTED
+        MOVE    MODE(A6),D2                     ;GET TRANSFER MODE
+        BMI     DONE                            ;QUIT IF MODE NEGATIVE
+        BCLR    #2,D2                           ;TEST AND CLR INVERT BIT
+        BEQ.S   SETMODE                         ;SKIP IF NOT INVERTED
+        NOT.L   D7                              ;INVERTED; D7 GETS ALL 1'S
+
+
+;--------------------------------------------------
+;
+;  CALCULATE CASE JUMP FOR DIFFERENT TRANSFER MODES
+;
+SETMODE AND     #$F,D2                          ;TREAT MODE MOD 16
+        MOVEQ   #3,D0
+        AND     D2,D0                           ;GET BOTTOM 2 BITS OF MODE
+        ADD     D0,D2                           ;MODIFY MODE FOR INDEX
+        LEA     MODETAB,A0                      ;POINT TO MODE TABLE
+        ADD     0(A0,D2),A0                     ;GET CASE JUMP ADDRESS
+        MOVE.L  A0,MODECASE(A6)                 ;SAVE FOR LATER
+
+        BTST    #3,D2                           ;WILL PATTERN BE USED ?
+        BEQ.S   USESRC                          ;NO, USE SOURCE INSTEAD
+
+
+;------------------------------------------------------------------
+;
+;  PATTERN WILL BE USED.  EXPAND 8 BYTE PATTERN TO 16 LONGS
+;
+        MOVE    BOUNDS+LEFT(A5),D2              ;GET GLOBAL-LOCAL OFFSET
+        MOVE.L  PAT(A6),A0                      ;POINT TO BYTE WIDE PATTERN
+        LEA     EXPAT(A6),A1                    ;POINT TO EXPANDED PATTERN
+        MOVE.L  SAVEA5(A6),A5                   ;GET GLOBAL POINTER
+        JSR     PATEXPAND                       ;EXPAND 8 BYTES TO 16 LONGS
+        MOVE.L  DSTBITS(A6),A5                  ;RECOVER A5 POINTS TO DSTBITS
+
+
+;-------------------------------------------------
+;
+;  SET UP (VERT * 4) MOD 64 AS PATTERN SELECTOR
+;
+        MOVEQ   #$F,D7                          ;TREAT COORD MOD 16
+        AND     MINRECT+TOP(A6),D7              ;GET TOP VERT COORD
+        LSL     #2,D7                           ;QUAD FOR 4 BYTE PATTERNS
+        MOVE.L  EXPAT(A6,D7),D6                 ;GET FIRST PATTERN DATA
+        BRA     GETDST                           ;SKIP OVER SRC STUFF
+
+
+;--------------------------------------------------------------
+;
+;  SRC WILL BE USED.  CHECK FOR OVERLAP AND CHOOSE DIRECTION SO
+;  THAT SRC WONT GET CLOBBERED BEFORE IT IS USED.
+;
+USESRC  MOVE.L  SRCRECT(A6),A2                  ;POINT TO SRC RECT
+        MOVE.L  SRCBITS(A6),A3                  ;POINT TO SRCBITS
+        MOVE    ROWBYTES(A3),D0
+        EXT.L   D0
+        MOVE.L  D0,SRCROW(A6)                   ;SRCROW:=+ROWBYTES
+        MOVE.L  BASEADDR(A3),D0                 ;GET SRC BASEADDR
+        CMP.L   BASEADDR(A5),D0                 ;ARE SRC AND DST SAME BITMAP ?
+        BNE.S   SRCOK                           ;NO, DON'T WORRY ABOUT OVERLAP
+
+        MOVE    TOP(A4),D0                      ;GET DST TOP
+        SUB     BOUNDS+TOP(A5),D0               ;CONVERT TO GLOBAL
+        MOVE    TOP(A2),D1                      ;GET SRC TOP
+        SUB     BOUNDS+TOP(A5),D1               ;CONVERT TO GLOBAL
+        SUB     D1,D0                           ;CALC DV:=DSTTOP-SRCTOP
+        BLT.S   SRCOK                           ;EVERYTHING FINE IF SCROLLING UP
+        BGT.S   UPSIDE                          ;UPSIDE DOWN IF SCROLLING DOWN
+
+
+;------------------------------------------------------------
+;
+;  DV=0. IF DH > 0 THEN WE MUST TRANSFER BACKWARDS FROM RIGHT.
+;
+        MOVE    LEFT(A4),D0                     ;GET DST LEFT
+        SUB     BOUNDS+LEFT(A5),D0              ;CONVERT TO GLOBAL
+        MOVE    LEFT(A2),D1                     ;GET SRC LEFT
+        SUB     BOUNDS+LEFT(A3),D1              ;CONVERT TO GLOBAL
+        SUB     D1,D0                           ;DH:=DSTLEFT-SRCLEFT
+        BLE.S   SRCOK                           ;IF DH <= 0, WE'RE FINE
+        NEG     HBUMP(A6)                       ;ELSE BUMP TOWARD LEFT
+        BRA.S   SRCOK                           ;CONTINUE
+
+
+;------------------------------------------------------------
+;
+;  DV IS POSITIVE, WE MUST TRANSFER UPSIDE-DOWN FROM BOTTOM.
+;
+UPSIDE  NEG     VBUMP(A6)                       ;VBUMP:=-1, BUMP UPWARD
+        NEG.L   SRCROW(A6)                      ;SRCROW:=-SRC ROWBYTES
+        NEG.L   DSTROW(A6)                      ;DSTROW:=-DST ROWBYTES
+        MOVE    MINRECT+BOTTOM(A6),FIRSTV(A6)
+        SUB     #1,FIRSTV(A6)                   ;FIRSTV:=BOTTOM-1
+        MOVE    MINRECT+TOP(A6),LASTV(A6)
+        SUB     #1,LASTV(A6)                    ;LASTV:=TOP-1
+
+
+;----------------------------------------------
+;
+;  CALC SHIFTCNT
+;
+SRCOK   MOVE    LEFT(A4),D6                     ;GET DST LEFT LOCAL COORDS
+        SUB     BOUNDS+LEFT(A5),D6              ;CONVERT TO GLOBAL
+        MOVE    LEFT(A2),D1                     ;GET SRC LEFT LOCAL COORDS
+        SUB     BOUNDS+LEFT(A3),D1              ;CONVERT TO GLOBAL
+        SUB     D1,D6                           ;CALC DELTA HORIZ GLOBAL
+        AND     #$F,D6                          ;MOD 16 FOR SHIFTCNT
+
+
+;------------------------------------
+;
+;  CALC STARTING SRCADDR
+;
+        MOVE    FIRSTV(A6),D0                   ;GET FIRST DST VERTICAL
+        SUB     TOP(A4),D0                      ;SUBTRACT DSTRECT TOP
+        ADD     TOP(A2),D0                      ;ADD SRCRECT TOP
+        SUB     BOUNDS+TOP(A3),D0               ;CONVERT SRCV TO GLOBAL
+        MULU    ROWBYTES(A3),D0                 ;MULT BY SRC ROWBYTES
+        MOVE.L  BASEADDR(A3),A0                 ;GET START OF BITMAP
+        ADD.L   D0,A0                           ;ADD OFFSET TO BASEADDR
+
+        MOVE    MINRECT+LEFT(A6),D0             ;GET DST LEFT
+        SUB     LEFT(A4),D0                     ;CONVERT FROM DST COORDS
+        ADD     LEFT(A2),D0                     ;TO SRC COORDS
+        SUB     BOUNDS+LEFT(A3),D0              ;CONVERT TO GLOBAL SRC
+        ADD     D6,D0                           ;ADD SHIFTCNT
+        LSR     #4,D0                           ;CONVERT DOTS TO WORDS
+        ADD     D0,D0                           ;DOUBLE FOR BYTES
+        ADD     D0,A0                           ;ADD HORIZ OFFSET
+        MOVE.L  A0,SRCADDR(A6)                  ;SAVE AS SRCADDR
+
+
+;------------------------------------
+;
+;  CALC STARTING DSTADDR
+;
+GETDST  MOVE    FIRSTV(A6),D0                   ;GET FIRST DST VERT
+        SUB     BOUNDS+TOP(A5),D0               ;CONVERT TO GLOBAL
+        MULU    ROWBYTES(A5),D0                 ;MULT BY ROWBYTES
+        MOVE.L  BASEADDR(A5),A0                 ;GET START OF BITMAP
+        ADD.L   D0,A0                           ;ADD VERTICAL OFFSET
+
+        MOVE    MINRECT+LEFT(A6),D0             ;GET DST LEFT
+        SUB     BOUNDS+LEFT(A5),D0              ;CONVERT TO GLOBAL
+        LSR     #4,D0                           ;CONVERT DOTS TO WORDS
+        ADD     D0,D0                           ;DOUBLE FOR BYTES
+        ADD     D0,A0                           ;ADD HORIZ OFFSET
+        MOVE.L  A0,DSTADDR(A6)                  ;SAVE AS DSTADDR
+
+
+
+;------------------------------------------------------------------------
+;
+;  ADJUST SRCADDR,DSTADDR,MASKADDR IF WE ARE BUMPING BACKWARDS FROM RIGHT
+;
+        TST     HBUMP(A6)                       ;BUMPING BACKWARD ?
+        BPL.S   HBUMPOK                         ;NO, CONTINUE
+        MOVE    BUFSIZE(A6),D0                  ;GET BUFFER SIZE
+        ASL     #2,D0                           ;QUAD FOR # BYTES
+        EXT.L   D0                              ;CLEAR HI WORD
+        ADD.L   D0,DSTADDR(A6)                  ;ADJUST DSTADDR
+        ADD.L   D0,SRCADDR(A6)                  ;ADJUST SRCADDR
+        ADD.L   D0,MASKADDR(A6)                 ;ADJUST MASKADDR
+HBUMPOK
+
+
+        MOVE    FIRSTV(A6),VERT(A6)             ;INIT CURRENT VERTICAL
+;-------------------------------------------------------
+;
+;  MAKE MASK BUFFER CURRENT FOR THIS VERTICAL.
+;  THEN SET UP AND DRAW CURRENT SCANLINE.
+;
+NXTMASK JSR     SEEKMASK                        ;MAKE MASK BUFFER CURRENT
+        MOVE.L  SRCADDR(A6),A3                  ;INIT SRCPTR
+        MOVE.L  DSTADDR(A6),A5                  ;INIT DSTPTR FOR ROW
+        MOVE.L  MASKADDR(A6),A4                 ;INIT MASKPTR FOR ROW
+        MOVE    BUFSIZE(A6),D2                  ;INIT COUNT OF LONGS
+        MOVE.L  MODECASE(A6),A2                 ;GET MODE CASE JUMP
+        JMP     (A2)                            ;TAKE MODE JUMP
+
+NEXTSRC MOVE.L  SRCROW(A6),D0                   ;GET SRC ROWBYTES
+        ADD.L   D0,SRCADDR(A6)                  ;BUMP SRC TO NEXT ROW
+        BRA.S   BUMPV                           ;CONTINUE WITH NEXT ROW
+
+NEXTPAT ADD     #4,D7                           ;BUMP PATTERN SELECTOR
+        AND     #$3F,D7                         ;MOD 64 FOR 16 LONG REPEAT
+        MOVE.L  EXPAT(A6,D7),D6                 ;GET PATTERN FOR NEXT ROW
+
+
+;-----------------------------------------------------
+;
+;  BUMP DESTINATION VERTICALLY AND LOOP FOR ALL ROWS
+;
+BUMPV   MOVE.L  DSTROW(A6),D0                   ;GET DST ROWBYTES
+        ADD.L   D0,DSTADDR(A6)                  ;BUMP DST TO NEXT ROW
+NODRAW  MOVE    VERT(A6),D0                     ;GET CURRENT VERT
+        ADD     VBUMP(A6),D0                    ;BUMP UP OR DOWN A SCAN LINE
+        MOVE    D0,VERT(A6)                     ;UPDATE CURRENT VERT
+        CMP     LASTV(A6),D0                    ;ARE WE AT THE LAST SCAN LINE ?
+        BNE     NXTMASK                         ;NO, LOOP FOR ALL SCAN LINES
+
+
+;-----------------------------------------------------------------
+;
+;  ENTIRE RGNBLT COMPLETE. RESTORE REGS AND STACK AND GO HOME.
+;
+DONE    MOVE.L  SAVEA5(A6),A5                   ;GET GLOBAL POINTER
+        JSR     SHOWCURSOR                      ;RESTORE CURSOR
+GOHOME  MOVE.L  SAVESTK(A6),SP                  ;STRIP VARIABLE SIZED BUFFER
+        MOVEM.L (SP)+,D0-D7/A1-A5               ;RESTORE REGISTERS
+        UNLINK  PARAMSIZE,'RGNBLT  '
+
+
+;-----------------------------------------------------------
+;
+;  ROUTINE TO UPDATE MASK BUFFER TO CURRENT VERTICAL COORD.
+;
+SEEKMASK MOVE   RECTFLAG(A6),D0
+         MOVE   RECTJMP(D0),D0
+         JMP    RECTJMP(D0)
+RECTJMP .WORD   GOHOME-RECTJMP                  ;CAN'T HAPPEN
+        .WORD   A-RECTJMP
+        .WORD   B-RECTJMP
+        .WORD   AB-RECTJMP
+        .WORD   C-RECTJMP
+        .WORD   AC-RECTJMP
+        .WORD   BC-RECTJMP
+        .WORD   ABC-RECTJMP
+
+
+;--------------------------------------------------------------------
+;
+;  ONLY REGION A IS NON RECTANGULAR.  UPDATE IT AND USE IT AS THE MASK
+;
+A       MOVE    VERT(A6),D0
+        LEA     STATEA(A6),A1
+        JSR     SEEKRGN
+        RTS
+
+
+;--------------------------------------------------------------------
+;
+;  ONLY REGION B IS NON RECTANGULAR.  UPDATE IT AND USE IT AS THE MASK
+;
+B       MOVE    VERT(A6),D0
+        LEA     STATEB(A6),A1
+        JSR     SEEKRGN
+        RTS
+
+
+;--------------------------------------------------------------------
+;
+;  ONLY REGION C IS NON RECTANGULAR.  UPDATE IT AND USE IT AS THE MASK
+;
+C       MOVE    VERT(A6),D0
+        LEA     STATEC(A6),A1
+        JSR     SEEKRGN
+        RTS
+
+
+;-------------------------------------------------------------------
+;
+;  REGIONS A AND B ARE NON-RECTANGULAR. UPDATE EACH,
+;  THEN FORM INTERSECTION IN THE MASK BUFFER.
+;
+AB      MOVE    VERT(A6),D0
+        LEA     STATEA(A6),A1
+        JSR     SEEKRGN
+        MOVE    D1,NOCHANGE(A6)                 ;REMEMBER IF RGN CHANGED
+        LEA     STATEB(A6),A1
+        JSR     SEEKRGN
+        OR      D1,NOCHANGE(A6)                 ;HAS EITHER RGN CHANGED ?
+        BEQ.S   ABDONE                          ;NO, WE'RE DONE
+        MOVE.L  STATEA+SCANBUF(A6),A0
+        MOVE.L  STATEB+SCANBUF(A6),A1
+        MOVE.L  MASKBUF(A6),A2
+        MOVE    BUFSIZE(A6),D1
+ABLOOP  MOVE.L  (A0)+,D0
+        AND.L   (A1)+,D0
+        MOVE.L  D0,(A2)+
+        DBRA    D1,ABLOOP
+ABDONE  RTS
+
+
+;-------------------------------------------------------------------
+;
+;  REGIONS A AND C ARE NON-RECTANGULAR. UPDATE EACH,
+;  THEN FORM INTERSECTION IN THE MASK BUFFER.
+;
+AC      MOVE    VERT(A6),D0
+        LEA     STATEA(A6),A1
+        JSR     SEEKRGN
+        MOVE    D1,NOCHANGE(A6)                 ;REMEMBER IF RGN CHANGED
+        LEA     STATEC(A6),A1
+        JSR     SEEKRGN
+        OR      D1,NOCHANGE(A6)                 ;HAS EITHER RGN CHANGED ?
+        BEQ.S   ACDONE                          ;NO, WE'RE DONE
+        MOVE.L  STATEA+SCANBUF(A6),A0
+        MOVE.L  STATEC+SCANBUF(A6),A1
+        MOVE.L  MASKBUF(A6),A2
+        MOVE    BUFSIZE(A6),D1
+ACLOOP  MOVE.L  (A0)+,D0
+        AND.L   (A1)+,D0
+        MOVE.L  D0,(A2)+
+        DBRA    D1,ACLOOP
+ACDONE  RTS
+
+
+;-------------------------------------------------------------------
+;
+;  REGIONS B AND C ARE NON-RECTANGULAR. UPDATE EACH,
+;  THEN FORM INTERSECTION IN THE MASK BUFFER.
+;
+BC      MOVE    VERT(A6),D0
+        LEA     STATEB(A6),A1
+        JSR     SEEKRGN
+        MOVE    D1,NOCHANGE(A6)                 ;REMEMBER IF RGN CHANGED
+        LEA     STATEC(A6),A1
+        JSR     SEEKRGN
+        OR      D1,NOCHANGE(A6)                 ;HAS EITHER RGN CHANGED ?
+        BEQ.S   BCDONE                          ;NO, WE'RE DONE
+        MOVE.L  STATEB+SCANBUF(A6),A0
+        MOVE.L  STATEC+SCANBUF(A6),A1
+        MOVE.L  MASKBUF(A6),A2
+        MOVE    BUFSIZE(A6),D1
+BCLOOP  MOVE.L  (A0)+,D0
+        AND.L   (A1)+,D0
+        MOVE.L  D0,(A2)+
+        DBRA    D1,BCLOOP
+BCDONE  RTS
+
+
+;-------------------------------------------------------------------
+;
+;  REGIONS A, B AND C ARE ALL NON-RECTANGULAR. UPDATE EACH,
+;  THEN FORM INTERSECTION IN THE MASK BUFFER.
+;
+ABC     MOVE    VERT(A6),D0
+        LEA     STATEA(A6),A1
+        JSR     SEEKRGN
+        MOVE    D1,NOCHANGE(A6)                 ;REMEMBER IF RGN CHANGED
+        LEA     STATEB(A6),A1
+        JSR     SEEKRGN
+        OR      D1,NOCHANGE(A6)                 ;REMEMBER IF RGN CHANGED
+        LEA     STATEC(A6),A1
+        JSR     SEEKRGN
+        OR      D1,NOCHANGE(A6)                 ;HAS ANY OF THE THREE CHANGED ?
+        BEQ.S   ABCDONE                         ;NO, WE'RE DONE
+        MOVE.L  STATEA+SCANBUF(A6),A0
+        MOVE.L  STATEB+SCANBUF(A6),A1
+        MOVE.L  STATEC+SCANBUF(A6),A2
+        MOVE.L  MASKBUF(A6),A3
+        MOVE    BUFSIZE(A6),D1
+ABCLOOP MOVE.L  (A0)+,D0
+        AND.L   (A1)+,D0
+        AND.L   (A2)+,D0
+        MOVE.L  D0,(A3)+
+        DBRA    D1,ABCLOOP
+ABCDONE RTS
+
+
+
+;---------------------------------------------------------------;
+;                                                               ;
+;  INTERFACE TO EACH OF THE RGNBLT SCANLINE LOOPS:              ;
+;                                                               ;
+;  REGISTERS:   A0:                     D0:                     ;
+;               A1:                     D1:                     ;
+;               A2:                     D2: LONGCNT             ;
+;               A3: SRCPTR              D3:                     ;
+;               A4: MASKPTR             D4:                     ;
+;               A5: DSTPTR              D5:                     ;
+;               A6:                     D6: SHIFTCNT OR PATTERN ;
+;               A7:                     D7: INVERT OR PAT-SEL   ;
+;                                                               ;
+;---------------------------------------------------------------;
+
+MODETAB .WORD    MASK0-MODETAB
+        .WORD    MASK1-MODETAB
+        .WORD    MASK2-MODETAB
+        .WORD    MASK3-MODETAB
+        .WORD    MASK8-MODETAB
+        .WORD    MASK9-MODETAB
+        .WORD    MASK10-MODETAB
+        .WORD    MASK11-MODETAB
+
+
+;-------------------------------------------------------
+;
+;  MODE 0 OR 4: SRC --> DST
+;
+MASK0   MOVE.L  -2(A3),D0       ;GET SRC FROM BITMAP
+        LSR.L   D6,D0           ;ALIGN TO DST
+        SWAP    D0              ;PUT INTO HI HALF OF D0
+        MOVE.L  (A3),D1         ;GET SRC FROM BITMAP
+        ADD     HBUMP(A6),A3    ;BUMP 4 BYTES RIGHT OR LEFT
+        LSR.L   D6,D1           ;ALIGN TO DST
+        MOVE    D1,D0           ;ASSEMBLE ONE LONG
+        EOR.L   D7,D0           ;INVERT SRC IF MODE BIT 2 SET
+        MOVE.L  (A4),D1         ;GET MASK
+        ADD     HBUMP(A6),A4    ;BUMP 4 BYTES RIGHT OR LEFT
+        AND.L   D1,D0           ;MASK SRC
+        NOT.L   D1              ;FORM NOTMASK
+        AND.L   (A5),D1         ;GET DST DATA
+        OR.L    D1,D0           ;MERGE WITH SRC DATA
+        MOVE.L  D0,(A5)         ;PUT RESULT IN DST
+        ADD     HBUMP(A6),A5    ;BUMP 4 BYTES RIGHT OR LEFT
+        DBRA    D2,MASK0        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTSRC         ;GO FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 1 OR 5: SRC OR DST --> DST
+;
+MASK1   MOVE.L  -2(A3),D0       ;GET SRC FROM BITMAP
+        LSR.L   D6,D0           ;ALIGN TO DST
+        SWAP    D0              ;PUT INTO HI HALF OF D0
+        MOVE.L  (A3),D1         ;GET SRC FROM BITMAP
+        ADD     HBUMP(A6),A3    ;BUMP 4 BYTES RIGHT OR LEFT
+        LSR.L   D6,D1           ;ALIGN TO DST
+        MOVE    D1,D0           ;ASSEMBLE ONE LONG
+        EOR.L   D7,D0           ;INVERT SRC IF MODE BIT 2 SET
+        AND.L   (A4),D0         ;AND WITH MASK
+        ADD     HBUMP(A6),A4    ;BUMP 4 BYTES RIGHT OR LEFT
+        OR.L    D0,(A5)         ;OR RESULT INTO DST
+        ADD     HBUMP(A6),A5    ;BUMP 4 BYTES RIGHT OR LEFT
+        DBRA    D2,MASK1        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTSRC         ;LOOP FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 2 OR 6: SRC XOR DST --> DST
+;
+MASK2   MOVE.L  -2(A3),D0       ;GET SRC FROM BITMAP
+        LSR.L   D6,D0           ;ALIGN TO DST
+        SWAP    D0              ;PUT INTO HI HALF OF D0
+        MOVE.L  (A3),D1         ;GET SRC FROM BITMAP
+        ADD     HBUMP(A6),A3    ;BUMP 4 BYTES RIGHT OR LEFT
+        LSR.L   D6,D1           ;ALIGN TO DST
+        MOVE    D1,D0           ;ASSEMBLE ONE LONG
+        EOR.L   D7,D0           ;INVERT SRC IF MODE BIT 2 SET
+        AND.L   (A4),D0         ;AND WITH MASK
+        ADD     HBUMP(A6),A4    ;BUMP 4 BYTES RIGHT OR LEFT
+        EOR.L   D0,(A5)         ;XOR RESULT INTO DST
+        ADD     HBUMP(A6),A5    ;BUMP 4 BYTES RIGHT OR LEFT
+        DBRA    D2,MASK2        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTSRC         ;LOOP FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 3 OR 7: SRC BIC DST --> DST
+;
+MASK3   MOVE.L  -2(A3),D0       ;GET SRC FROM BITMAP
+        LSR.L   D6,D0           ;ALIGN TO DST
+        SWAP    D0              ;PUT INTO HI HALF OF D0
+        MOVE.L  (A3),D1         ;GET SRC FROM BITMAP
+        ADD     HBUMP(A6),A3    ;BUMP 4 BYTES RIGHT OR LEFT
+        LSR.L   D6,D1           ;ALIGN TO DST
+        MOVE    D1,D0           ;ASSEMBLE ONE LONG
+        EOR.L   D7,D0           ;INVERT SRC IF MODE BIT 2 SET
+        AND.L   (A4),D0         ;AND WITH MASK
+        ADD     HBUMP(A6),A4    ;BUMP 4 BYTES RIGHT OR LEFT
+        NOT.L   D0              ;INVERT FOR BIC
+        AND.L   D0,(A5)         ;BIC RESULT INTO DST
+        ADD     HBUMP(A6),A5    ;BUMP 4 BYTES RIGHT OR LEFT
+        DBRA    D2,MASK3        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTSRC         ;LOOP FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 8 OR 12: PATTERN --> DST (FILLING AREAS, DRAWING LINES)
+;
+MASK8   MOVE.L  D6,D0           ;GET PATTERN DATA
+        MOVE.L  (A4)+,D1        ;GET MASK
+        AND.L   D1,D0           ;MASK PATTERN DATA
+        NOT.L   D1              ;MAKE NOTMASK
+        AND.L   (A5),D1         ;GET DST DATA
+        OR.L    D1,D0           ;MERGE WITH PAT DATA
+        MOVE.L  D0,(A5)+        ;PUT RESULT TO DST
+        DBRA    D2,MASK8        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTPAT         ;LOOP BACK FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 9 OR 13: PATTERN OR DST --> DST
+;
+MASK9   MOVE.L  D6,D0           ;GET PATTERN DATA
+        AND.L   (A4)+,D0        ;MASK PATTERN DATA
+        OR.L    D0,(A5)+        ;OR RESULT INTO DST
+        DBRA    D2,MASK9        ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTPAT         ;LOOP BACK FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 10 OR 14: PATTERN XOR DST --> DST (INVERTING AREAS, XOR LINES)
+;
+MASK10  MOVE.L  D6,D0           ;GET PATTERN DATA
+        AND.L   (A4)+,D0        ;MASK PATTERN DATA
+        EOR.L   D0,(A5)+        ;XOR RESULT INTO DST
+        DBRA    D2,MASK10       ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTPAT         ;LOOP BACK FOR NEXT ROW
+
+
+;-------------------------------------------------------
+;
+;  MODE 11 OR 15: PATTERN BIC DST --> DST
+;
+MASK11  MOVE.L  D6,D0           ;GET PATTERN DATA
+        AND.L   (A4)+,D0        ;MASK PATTERN DATA
+        NOT.L   D0              ;INVERT FOR BIC
+        AND.L   D0,(A5)+        ;BIC RESULT INTO DST
+        DBRA    D2,MASK11       ;LOOP ALL LONGS THIS ROW
+        BRA     NEXTPAT         ;LOOP BACK FOR NEXT ROW
+
+
+
+
+        .END
+
+
+ÿ

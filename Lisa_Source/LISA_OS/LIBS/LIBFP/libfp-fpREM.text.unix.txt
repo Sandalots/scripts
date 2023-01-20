@@ -1,0 +1,175 @@
+;-----------------------------------------------------------
+; 07JUL82: WRITTEN BY JEROME COONEN
+; 12AUG82: TIDIED UP. (JTC)
+; 12OCT82: RETURN QUO TO D0 FIXED. (JTC)
+; 12DEC82: ONLY PLACE WHERE D0.W MODIFIED (JTC)
+; 05AUG83: FIX BUG IN QUOTIENT WHEN SIGN MUST BE ADJUSTED (JTC)
+;
+; ******** IMPORTANT STACK DEPENDENCY -- SEE BELOW ********
+;
+; THE REMAINDER OPERATION DIVIDES DST/SRC TO GET ----ALL---
+; QUOTIENT BITS (POSSIBLY THOUSANDS OF THEM) AND THEN
+; RETURNS THE RESULTING REMAINDER, REDUCED TO LESS THAN OR
+; EQUAL TO  (1/2)*DVR.  IT ALSO RETURNS THE SIGN AND LOW
+; SEVEN INTEGER QUOTIENT BITS IN REGISTER D0.W AS A
+; TWO'S-COMPLEMENT INTEGER.  THIS KLUGE IS
+; EXTREMELY USEFUL FOR ELEMENTARY FUNCTION EVALUATION
+; WHERE, SAY, REMAINDER BY (PI/4) IS NOT USEFUL WITHOUT
+; AN INDICATION OF THE OCTANT (GIVEN BY THE QUOTIENT) AS
+; WELL AS THE REMAINDER.
+;
+; TO GET THE PROPERLY REDUCED QUOTIENT, IT IS EASIEST TO
+; DIVIDE ALL THE WAY THROUGH THE FIRST FRACTION QUOTIENT
+; BIT, AND THEN PATCH UP.  IF THE QUOTIENT TURNS OUT TO BE
+; ZERO, ITS SIGN IS ARBITRARILY SET TO THAT OF THE DST.
+;
+; MUST BE CAREFUL IN CALLING THE RESTORING DIVISION
+; ALGORITHM.  IN THE WORST CASE OF EXTENDED OPERANDS:
+;       HUGE / DENORMALIZED
+; THE EXPONENT DIFFERENCE IN D0 WILL BE OF THE FORM:
+;       7FFF - NEGATIVE > 8000
+; IN MAGNITUDE, WHICH SAYS THE EXPONENT DIFFERENCE,
+; WHEN VIEWED AS A WORD, MUST BE TAKEN AS A
+; MAGNITUDE.
+;
+; ASSUME THE MASK: DO-ARITHMETIC, WITH D7=0 FOR THE
+; CCR AND ROUND INFO.
+;
+; SOME ASSUMPTIONS ABOUT THE STACK ARE NECESSARY.
+; WHEN THE REGISTERS WERE SAVED WITH MOVEM.L, D0 WAS
+; LEFT NEAREST THE TOP OF THE STACK.  ALL THAT IS ABOVE
+; IT NOW IS THE RETURN ADDRESS, "PREPACK:" IN FPCONTROL.
+; THUS DO.W, WHICH GETS THE INTEGER QUOTIENT, IS AT 6(SP).
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; DO SOME BOOKKEEPING FIRST.  PLACE DEFAULT 0 QUO IN D0.
+; ASSUME THE RESULT WILL HAVE DST SIGN, AND NOTE THAT QUO
+; SIGN IS MOVED TO BIT #6 OF D6.
+; AND STORE ERROR CODE IN D0 IN CASE OF INVALID.
+;
+; P754 REQUIRES THAT THE PRECISION CONTROL BE DISABLED HERE.
+;-----------------------------------------------------------
+REMTOP:
+        CLR.W   6(SP)           ; QUO SET TO 0
+
+        ADD.B   D6,D6           ; ALIGN DST SIGN, MOVING QUO
+        MOVEQ   #nanREM,D0      ; ASSUME THE WORST...
+
+        ANDI.L  #$3FFFFFFF,D6  ; SET DST TO EXT'D
+
+        .IF PCOK
+        MOVE.W  REMCASE(PC,D3),D3
+        JMP     REMTOP(PC,D3)
+        .ELSE
+        MOVE.W  REMCASE(D3),D3
+        JMP     REMTOP(D3)
+        .ENDC
+
+REMCASE:                                ; DST / SRC
+        .WORD   REMNUM    - REMTOP      ; NUM / NUM
+        .WORD   INVALIDOP - REMTOP      ; NUM / 0
+        .WORD   REMDST    - REMTOP      ; NUM / INF
+
+        .WORD   RDST      - REMTOP      ;   0 / NUM
+        .WORD   INVALIDOP - REMTOP      ;   0 /   0
+        .WORD   RDST      - REMTOP      ;   0 / INF
+
+        .WORD   INVALIDOP - REMTOP      ; INF / NUM
+        .WORD   INVALIDOP - REMTOP      ; INF / 0
+        .WORD   INVALIDOP - REMTOP      ; INF / INF
+
+;-----------------------------------------------------------
+; DEXP - SEXP + 1 = NUMBER OF INTEGER QUO BITS.  GET ONE
+; MORE TO AID IN ROUNDING.  CASES ON (DEXP - SEXP + 2):
+;       > 0 -- RUN RESTORE TO GET THOSE BITS
+;      <= 0 -- DST IS ALREADY LESS THAN HALF SRC, SO JUST
+;              COERCE (AND QUO = 0).
+;-----------------------------------------------------------
+REMNUM:
+        MOVE.L  A3,D0           ; DST EXP
+        ADDQ.L  #2,D0
+        SUB.L   A4,D0           ; DEXP - SEXP + 2
+        BGT.S   REMDIV          ; MUST DO IT ALL...
+REMDST:
+        MOVE.L  A1,D4           ; RESULT IS DST
+        MOVE.L  A2,D5
+        MOVEA.L A3,A4
+        BRA.S   REMFIN
+
+;-----------------------------------------------------------
+; SET TENTATIVE REM EXP TO SEXP-1, SINCE REM WILL BE REDUCED
+; TO AT MOST HALF OF SRC.  THEN OFF TO RESTORE WITH ITS
+; REGISTER MASK:
+;       D0: MAGNITUDE COUNT     D1,D2: DIVIDEND
+;       D4,D5: QUOTIENT         D3,A2: DIVISOR
+;-----------------------------------------------------------
+REMDIV:
+        SUBQ.L  #1,A4
+        MOVE.L  A1,D1           ; DST IS DIVIDEND
+        MOVE.L  A2,D2
+        MOVE.L  D4,D3           ; SRC IS DIVISOR
+        MOVEA.L D5,A2
+        BSR.S   RESTORE
+
+;-----------------------------------------------------------
+; AFTER ALL QUOTIENT BITS AND FIRST FRACTION BIT HAVE BEEN
+; EVALUATED INTO D4,5 (LEADING BITS ARE LOST OFF THE LEFT)
+; THERE ARE THREE CASES ("REM" IS RESULT OF DIV LOOP):
+;
+;       LOW QUO BIT = 0 --> REM < HALF DVR, ALL DONE
+;
+;       LOW QUO BIT = 1 AND REM = 0 --> HALF-WAY CASE, WHERE
+;               SIGN OF REM (= HALF DIVISOR) IS DETERMINED
+;               SO LOW INT QUO BIT WILL BE 0
+;
+;       LOW QUO BIT = 1 AND REM > 0 --> TRUE REM > HALF DVR,
+;               SO FLIP SIGN AND SUBTACT.  THIS IS TRICKY
+;               AND RATHER NONINTUITIVE.  THE POINT IS THAT
+;               DIVIDING THROUGH TO THE FIRST FRAC QUO BIT
+;               REDUCES THE EXP OF REM TO DVR-1; BUT THE
+;               DIV ALGORITHM DOES NOT SHIFT ON THE LAST
+;               STEP, SO THE REM LINES UP PROPERLY WITH
+;               THE DVR FOR THE SUBTRACTION (THOUGH THEIR
+;               EXPONENTS SEEM TO DIFFER BY ONE).  AND THE
+;               DIV ALGORITHM GUARANTEES THAT THE REM IT
+;               LEAVES IS LESS THAN THE DVR, SO THERE CAN
+;               BE NO CARRY OUT.
+;-----------------------------------------------------------
+        BTST    #0,D5           ; LOW QUO BIT
+        BEQ.S   REMQUO          ; 0 --> JUST STUFF QUO
+        TST.L   D1
+        BNE.S   @3              ; CASE 3
+        TST.L   D2
+        BNE.S   @3              ; CASE 3
+
+        BTST    #1,D5           ; CASE 2 DECIDED ON LO INT
+        BEQ.S   @5              ; IF EVEN, LEAVE QUO BUT SET REM
+@3:
+        BCHG    #7,D6           ; FLIP REM SIGN
+        ADDQ.W  #2,D5           ; INCREMENT QUO BY 1 (IN SECOND BIT)
+@5:
+        EXG     D2,A2           ; SWAP DVR AND REM
+        EXG     D1,D3
+        SUB.L   A2,D2           ; DVR - REM
+        SUBX.L  D3,D1
+
+;-----------------------------------------------------------
+; NOW EXTRACT LOW 7 INTEGER BITS (REMEMBER GOT FIRST FRAC),
+; NEGATE IF NECESSARY, EXTEND TO WORD, AND STORE.
+;-----------------------------------------------------------
+REMQUO:
+        LSR.B   #1,D5           ; KILL FRAC BIT
+        BTST    #6,D6           ; TEST QUO SIGN
+        BEQ.S   @9
+        NEG.B   D5
+@9:
+        EXT.W   D5              ; EXTEND SIGNED BYTE TO WORD
+        MOVE.W  D5,6(SP)        ; STORE IN SAVED D0.W
+
+        MOVE.L  D1,D4           ; STUFF REM BITS
+        MOVE.L  D2,D5
+REMFIN:
+        BRA     ZNORMCOERCE     ; STORE THE RESULT
+
+ÿ

@@ -1,0 +1,825 @@
+(*
+$Exec
+{PLibPr/PrBtn}
+{no listing}
+{Temp}
+{GTemp}
+{LibPr/PrBtn}
+L?
++W
+-NewDisk-intrinsic.lib
+
+LibPr/PrBtn
+-NewDisk-IOsPasLib
+-NewDisk-SULib
+-NewDisk-Sys1Lib
+-NewDisk-PrLib
+
+
+-newdisk-PrBtn
+$EndExec
+*)
+{               NOTE: The above compiles this program.                   }
+{ ---------------------------------------------------------------------- }
+{                Copyright 1983, Apple Computer Inc.                     }
+{ An OS-only program that makes the Print Manager DataSeg     L. Daniels }
+
+PROGRAM PrBtn;
+{$SETC ForOS=TRUE}
+{$SETC fBtnRead=FALSE}
+USES
+     {$U StdUnit    }  StdUnit,
+     {$U LibSM/UnitStd    } UnitStd,
+     {$U LIbOS/SysCall    } SysCall,
+     {$U LibOS/PSysCall   } PSysCall,
+     {$U LibPM/PMDecl     } PMDecl,
+     {$U LibSM/UnitHz     } UnitHz,
+     {$U LibQD/Storage    } Storage,
+     {$U LibQD/QuickDraw  } QuickDraw,
+     {$U LibQD/GrafUtil   } GrafUtil,
+     {$U LibFM/FontMgr    } FontMgr,
+     {$U LibFM/FmgrUtil   } FmgrUtil,
+     {$U LibWM/Events     } Events,
+     {$U LibWM/Menus      } Menus,
+     {$U LibWM/Windows    } Windows,
+     {$U LibWM/Folders    } Folders,
+     {$U LibAM/AlertMgr   } AlertMgr,
+
+     {$U LibPr/PrStdInfo  } PrStdInfo,
+     {$U LibPr/PrStdProcs } PrStdProcs,
+     {$U LibPr/Queues     } Queues,
+     {$U LibPr/PrEvents   } PrEvents,
+     {$U LibPr/PrDlgMgr   } PrDlgMgr,
+     {$U LibPr/PrMgr      } PrMgr;
+
+{ ---------------------------------------------------------------------- }
+
+CONST
+
+   cbMyHzMax   = 32000;
+   slabel      = 'L';
+
+   templdsn    = 7;
+   cultimate   = 50000;
+
+TYPE  {--The following types are held over from the old previous versions of PrMgr
+         just so that PrBtn will work.  The previously shared dataseg for checkforms
+         is now a temporary dataseg exclusively for this version of this program.}
+
+   TPrMgrDS = RECORD
+      hzPM     : THz;
+      hckfmPrf : THckfm;
+      hckfmIns : THckfm;
+      hckfmArb : THckfm;
+      hckfmBgd : THckfm;
+   END;
+   TPPrMgrDS = ^TPrMgrDS;
+
+   Tsp90    = STRING[91];
+
+VAR
+
+   cPmRefNum   : TC;                 {--retained from the old days in PrMgr}
+
+   cDLRefNum   : TC;                 {Data seg refnum for dialog check form segment}
+
+   fDbg        : TF;
+   MyPort      : GrafPort;
+   cMyRefNum   : TC;
+   pPrDS       : TPPrMgrDS;
+   rBtnLst     : Rect;                {BtnRead's last bounding box.}
+
+   sckfmFile   : STR255;
+   sASMFile    : STR255;
+   svol,sBaseName,sext   : STR255;
+   ckfmFile    : TEXT;
+   ASMFile     : TEXT;
+   fhzck       : TF;
+   fdummy      : TF;
+
+   lcurptr     : TL;
+   ghsp        : THsp;
+   ghmu        : THmu;
+   ghckfm      : THckfm;
+
+   pckfmseg    : ^TckfmSeg;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE CheckHz(pin:STR255;hz:THz);
+VAR
+   xcbk  : TC;
+BEGIN
+IF NOT FCheckHzOk(hz,xcbk) THEN WRITELN('Zone Problems in ',pin,': ',ORD4(hz));
+END;
+
+{ ---------------------------------------------------------------------- }
+{                      Btn Parsing Code                                  }
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE Bump(VAR x:TL;num:TC);
+BEGIN
+x:=x+num+(num mod 2);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION  DLGAlloc(hs:TH;clength:TC):TH;
+VAR
+   htemp : TH;
+BEGIN
+htemp:=POINTER(lcurptr);
+Bump(lcurptr,SIZEOF(THsp));
+htemp^:=POINTER(lcurptr);
+MoveLeft(hs^^,htemp^^,clength);
+Bump(lcurptr,clength);
+DLGAlloc:=htemp;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION  HspAlloc (hz: THz; sp: TSp{TSp}; cChMax: TC): THsp;
+VAR hsp  : THsp;
+    xcbk : TC;
+BEGIN
+   cChMax := CMAX (cChMax, LENGTH(sp));
+   IF (cChMax=0) AND (hspNil<>NIL) THEN BEGIN
+      HspAlloc := hspNil;
+      ghsp:=POINTER(DLGAlloc(POINTER(hspNil),1));
+   END
+   ELSE BEGIN
+      hsp := Pointer(ORD4( HAllocate(hz, cChMax+1) ));
+      MoveLeft(sp, hsp^^, LENGTH(sp)+1);
+      HspAlloc := hsp;
+      ghsp:=POINTER(DLGAlloc(POINTER(hsp),cbDataofH(hz,POINTER(hsp))));
+   END;
+   IF fhzck THEN CheckHz('HspAlloc',hz);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE HspFree (hz: THz; VAR hsp: THsp);
+BEGIN
+   IF hsp<>hspNil THEN FreeH (hz, POINTER(ORD4(hsp)) );
+   hsp := hspNil;
+   IF fhzck THEN CheckHz('HspFree',hz);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnRead (hz: THz; VAR ckFile: Text; VAR btn: TBtn);
+{Format: hhh vvv dhh dvv R fam BIQAT Label}
+VAR sp:  TSp{TSp};
+    hsp: THsp;
+    lx:  TLx;
+    r:   Rect;
+    h, v, dh, dv, fam, cChSp, iconCode, maskCode: TC;
+    chRel, chB, chI, chQd, chAct, chTyp, ch: CHAR;
+   PROCEDURE BtnError;
+   BEGIN
+      WRITELN ('BtnRead Error: Current Line:');
+      WRITELN (' fam=', fam:1, ',', chRel:1, chB:1, chI:1, chQd:1, chAct:1, chTyp:1,
+               '[h=', h:1, ' v=', v:1, ' dh=', dh:1, ' dv=', dv:1, '],sp=', sp );
+      WRITELN ('Next Line:');
+      READLN  (ckFile, sp);
+      WRITELN (sp);
+      HALT;
+   END;
+BEGIN
+   IF fDbg THEN WRITE ('BtnRead:');
+
+   READ (ckFile, h, v, dh, dv, ch, chRel, fam, ch, chB, chI, chQd, chAct, chTyp, ch);
+{/ convention: If preceeded by blank, then spacer; else a parameter string to be written to later.}
+
+   lx.fam  := fam;
+   lx.fB   := (chB   ='B'); {Use 'b' for not bold, etc.}
+   lx.fI   := (chI   ='I');
+   CASE chAct OF            {Use upper case only here.}
+      'I': lx.eact := eactIn;
+      'C': lx.eact := eactCk;
+      'N': lx.eact := eactNr;
+      'S': lx.eact := eactSp;
+      'K': lx.eact := eactIc;
+      OTHERWISE BtnError;
+   END;
+
+   IF chAct = 'K' THEN BEGIN
+      READLN(ckFile,iconCode,maskCode);
+      sp[0]:=CHR(1);
+      sp[1]:=CHR(iconCode);
+      lx.mask:=CHR(maskCode);
+   END
+   ELSE BEGIN
+      READLN(ckFile,sp);
+      cChSp:=LENGTH(sp);
+      IF (sp[cChSp] = '/') AND (sp[cChSp-1] = ' ') THEN sp[0]:=CHR(cChSp-1);
+   END;
+
+   CASE chAct OF
+      'I','C': hsp := HspAlloc (hz, sp, 0{LENGTH(sp)});
+      'N': hsp := HspAlloc (hz, sp, cChNrMax);
+      'S': hsp := HspAlloc (hz, sp, cChSpMax);
+      'K': hsp := HspAlloc (hz, sp, LENGTH(sp));
+   END;
+   IF (hsp <> hspNil) THEN BEGIN  {!BH: 1/19/84}
+      lx.smax:=CbDataOfH(hz,POINTER(hsp));
+   END
+   ELSE BEGIN
+      lx.smax:=2;
+   END;
+
+   IF fhzck THEN CheckHz('BtnRead after CASE on achAct',hz);
+
+   IF (sp[LENGTH(sp)] = '/') THEN IF chAct <> 'K' THEN hsp^^[0] := CHR(0);
+
+   IF fDbg THEN
+      WRITE   (' fam=', fam:1, ',', chRel:1, chB:1, chI:1, chQd:1, chAct:1, chTyp:1);
+
+   CASE chQd OF
+      {'L': lx.eqd := eqdLO;}
+      'l': lx.eqd := eqdLI;
+      'c': lx.eqd := eqdCI;
+      'r': lx.eqd := eqdRI;
+      'R': lx.eqd := eqdRO; {Note: Should only be a eactCk box.}
+      OTHERWISE BtnError;
+   END;
+   CASE chTyp OF
+      's': BEGIN lx.ebtn := ebtnSq; lx.enib := enibSm; END;
+      'S': BEGIN lx.ebtn := ebtnSq; lx.enib := enibLg; END;
+      'r': BEGIN lx.ebtn := ebtnRR; lx.enib := enibSm; END;
+      'R': BEGIN lx.ebtn := ebtnRR; lx.enib := enibLg; END;
+      'o': BEGIN lx.ebtn := ebtnOv; lx.enib := enibSm; END;
+      'O': BEGIN lx.ebtn := ebtnOv; lx.enib := enibLg; END;
+      OTHERWISE BtnError;
+   END;
+
+   BtnBind (lx);
+{If negative, use 100-ths of an inch.}
+   IF h<0  THEN h  := ( -h*9) DIV 10;  {Neg: hundredths}
+   IF v<0  THEN v  := ( -v*6) DIV 10;
+   IF dh<0 THEN dh := (-dh*9) DIV 10;
+   IF dv<0 THEN dv := (-dv*6) DIV 10;
+
+{dh: adjust for "ck boxes" or dh=0 => string width.}
+   IF lx.eqd = eqdRO THEN dh := dh + StringWidth (hsp^^) + dhSpToCk;
+   IF dh=0 THEN BEGIN {Note: ^=>eqd is "inside"}
+      CASE lx.eact OF
+         eactCk, eactIn, eactIc: dh := StringWidth (hsp^^);    {!DC 2/7/84}
+         eactNr: dh := cChNrMax*finfoLx.widMax;
+         eactSp: dh := cChSpMax*finfoLx.widMax;
+      END;
+      IF NOT(lx.eact IN [eactIn, eactIc]) THEN                     {!DC 2/7/84}
+         dh := dh + 2*dhSpToR + 2*rgnib[lx.enib].h;
+   END;
+
+{dv: dv=0 => string height.}
+   IF dv=0 THEN BEGIN
+      dv := finfoLx.ascent + finfoLx.descent;
+      IF NOT(lx.eact IN [eactIn, eactIc]) THEN                     {!DC 2/7/84}
+         dv := dv + 2*dvSpToR + 2*rgnib[lx.enib].v;
+   END;
+
+   h := h + dhCkfmMarg; v := v + dvCkfmMarg;
+{"relative mode"=> h/v relative to last rect.}
+   CASE chRel OF
+      'L': h := rBtnLst.left - dh - h + rgnib[lx.enib].h - dhCkfmMarg;
+      'R': h := rBtnLst.right    +  h - rgnib[lx.enib].h - dhCkfmMarg;
+      'T': v := rBtnLst.top  - dv - v + rgnib[lx.enib].v - dvCkfmMarg;
+      'B': v := rBtnLst.bottom   +  v - rgnib[lx.enib].v - dvCkfmMarg;
+      '=': ;
+      OTHERWISE BtnError;
+   END;
+
+{v/h=0 and "relative mode"=> center on last rect.}
+   CASE chRel OF
+      'L','R': IF v=dvCkfmMarg THEN v:=(rBtnLst.top+rBtnLst.bottom-dv) DIV 2;
+      'T','B': IF h=dhCkfmMarg THEN h:=(rBtnLst.right+rBtnLst.left-dh) DIV 2;
+   END;
+
+   btn.hsp   := hsp;
+   btn.lx    := lx;
+   SetRect (btn.r, h, v, h+dh, v+dv);
+   rBtnLst := btn.r;
+   IF lx.eqd=eqdRO THEN WHILE (sp[LENGTH (sp)] = ' ') DO BEGIN {**}{**OK for 0 lng?**}
+      rBtnLst.right := rBtnLst.right - CharWidth (' ');
+      sp[0] := CHR( LENGTH(sp)-1 );
+   END;
+   IF fDbg THEN
+      WRITELN ('[h=',     h:1,
+               ' v=',     v:1,
+               ' dh=',    dh:1,
+               ' dv=',    dv:1,
+               '],sp=',    sp );
+END;
+
+{ ---------------------------------------------------------------------- }
+
+
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION HMuRead (hz: THz; VAR ckFile: Text): THmu;
+{Format: muID  cBtn dhh dvv}
+VAR i, idMu, cBtn, iBtnUsr: TC;
+    hmu:   THmu;
+    {btn:   TBtn;}
+    spComment: Str255;
+    ibytes  : TC;
+BEGIN
+   IF fDbg THEN WRITE ('HMuRead:');
+
+   READLN (ckFile, idMu, cBtn, iBtnUsr, spComment);
+   ibytes:=SizeOf(TMu)-(cBtnMax-cBtn)*SIZEOF(TBtn);
+   hmu := Pointer(ORD4( HAllocate(hz,ibytes)));
+   IF fhzck THEN CheckHz('HMuRead after HAllocate',hz);
+
+   IF fDbg THEN BEGIN
+      WRITELN (' idMu=',    idMu:1,
+               ',cBtn=',    cBtn:1,
+               ',iBtnUsr=', iBtnUsr:1,
+               ',hmu=',     ORD4(hmu):1,
+               ',size=',    CbDataOfH(hz, POINTER(ORD4(hmu))):1);
+      IF fhzck THEN CheckHz('HmuRead after CbDataOfH',hz);
+   END;
+
+   hmu^^.idMu   := idMu;
+   hmu^^.iBtnOn := iBtnNil;
+   hmu^^.iBtnUsr:= iBtnUsr;
+   hmu^^.cBtn   := cBtn;
+   hmu^^.fMuVis := FALSE;
+   hmu^^.fMuActv:= TRUE {idMu=0??};
+
+   ghmu:=POINTER(DLGAlloc(POINTER(hmu),ibytes));
+
+   FOR i := 0 TO hmu^^.cBtn DO BEGIN
+      BtnRead (hz, ckFile, hmu^^.rgbtn[i]);
+      WITH hmu^^,rgbtn[i] DO IF i=0 THEN rBB := r ELSE UnionRect(rBB,r,rBB);
+      ghmu^^.rgbtn[i]:=hmu^^.rgbtn[i];{!BH}
+      ghmu^^.rgbtn[i].hsp:=ghsp;{!BH}
+      ghmu^^.rBB:=hmu^^.rBB;{!BH}
+   END;
+   READLN (ckFile, spComment);
+
+   HMuRead := hmu;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION HCkfmRead (hz: THz; VAR ckFile: Text): THckfm;
+VAR i, cMu: TC;
+    hmu: THmu;
+    hckfm: THckfm;
+    rBB: Rect;
+    spComment: Str255;
+    ibytes  : TC;
+BEGIN
+   IF fDbg THEN WRITE ('HCkfmRead Start:');
+
+   READLN (ckFile, cMu, spComment);
+   ibytes:=SIZEOF(TCkfm)-(cMuMax-cMu)*SIZEOF(THmu);
+   hckfm := POINTER(ORD4( HAllocate(hz,ibytes)));
+   IF fhzck THEN CheckHz('HCkfmRead after  ',hz);
+
+   IF fDbg THEN BEGIN
+      WRITELN (' cMu=', cMu:1,
+               ',hckfm=', ORD4(hckfm):1,
+               ',size=', CbDataOfH(hz, POINTER(ORD4(hckfm))):1);
+      IF fhzck THEN CheckHz('HCkfmRead after CbDataOfH',hz);
+   END;
+
+   ghckfm:=POINTER(DLGAlloc(POINTER(hckfm),ibytes));
+
+   FOR i := 0 TO cMu DO BEGIN
+      hmu := HMuRead(hz, ckFile);
+      hckfm^^.rghmu[i] := hmu;
+      IF i=0 THEN rBB := hmu^^.rBB ELSE UnionRect(rBB,hmu^^.rBB, rBB);
+      ghckfm^^.rghmu[i]:=ghmu;{!BH}
+   END;
+   rBB.right   := rBB.right  + dhCkfmMarg;
+   rBB.bottom  := rBB.bottom + dvCkfmMarg;
+
+   hckfm^^.cMu       := cMu;
+   hckfm^^.rBB       := rBB;
+   hckfm^^.iMuKey    := iMuNil;
+   hckfm^^.iBtnKey   := iBtnNil;
+
+   ghckfm^^.cMu       := cMu;{!BH}
+   ghckfm^^.rBB       := rBB;{!BH}
+   ghckfm^^.iMuKey    := iMuNil;{!BH}
+   ghckfm^^.iBtnKey   := iBtnNil;{!BH}
+
+   HCkfmRead     := hckfm;
+
+   IF fDbg
+   THEN WRITELN ('HCkfmRead End:',
+                 ' rBB=[',    hckfm^^.rBB.left:1,
+                 ',',         hckfm^^.rBB.top:1,
+                 ',',         hckfm^^.rBB.right:1,
+                 ',',         hckfm^^.rBB.bottom:1, ']');
+END;
+
+{ ---------------------------------------------------------------------- }
+{                     PrMgr DataSeg Code                                 }
+{ ---------------------------------------------------------------------- }
+
+
+PROCEDURE PrMgrDSMake (cbPmHzFst, cpPmHzFst: TC; cbMoreProc: TProc);
+VAR   pStart, pLimit: TP;
+      cErr, cBk:TC;
+      lSegptr:  LONGINT;
+      lDLGptr:  LONGINT;
+      sSegname: PathName;
+      sDLGName: PathName;
+      hz:       THz;
+      fileMu:   Text;
+      DSInfo:   DSInfoRec;
+      cckfms,J: TC;
+      lnewmem,lnewdisk: TL;
+      ltemp:    TL;
+BEGIN
+   IF fDbg THEN WRITELN ('PrMgrDSMake');
+
+   sSegname := 'PrBtnSeg';
+   KILL_DATASEG(cErr, sSegName);
+   IF (cErr <> 0) AND (cErr <> 313) THEN  WRITELN('PrMgrDSMake: KILL_DATASEG err=', cErr);
+   MAKE_DATASEG(cErr, sSegName, cbPmHzFst, cbPmHzFst,
+                cPmRefNum, lSegPtr, templdsn, DS_Shared);
+
+   IF cErr <> 0 THEN BEGIN
+      WRITELN('PrMgrDSMake: MAKE_DATASEG err=', cErr);
+      WRITELN('     sSegName=',  sSegName,
+              ' cbPmHzFst=',     cbPmHzFst:1,
+              ' templdsn=',     templdsn:1
+              );
+      IF cErr>0 THEN HALT;
+   END;
+   INFO_DATASEG(cErr, cPmRefNum, DSInfo);
+
+   pPrDS    := POINTER(lSegPtr);
+   pStart   := POINTER(lSegPtr+SIZEOF(TPrMgrDS) );
+   pLimit   := POINTER(lSegPtr+DSInfo.mem_size);
+   hz       := HzInit (pStart, pLimit, pStart,
+                       cpPmHzFst, 0, cbMoreProc,
+                       POINTER(procNIL), POINTER(procNIL), POINTER(procNIL));
+   IF fhzck THEN CheckHz('PrMgrDSMake after HzInit',hz);
+
+   WITH hz^ DO BEGIN
+      IF fhzck THEN BEGIN
+         fScramble:=TRUE;
+         fCheck   :=TRUE;
+      END
+      ELSE BEGIN
+         fScramble:=FALSE;
+         fCheck   :=FALSE;
+      END;
+   END;
+
+   {--Make the permanent data segment for the dialog checkforms}
+   sDLGName:=CONCAT(sBaseName,'Data');
+   KILL_DATASEG(cErr,sDLGName);
+   MAKE_DATASEG(cErr,sDLGName,cultimate,cultimate,cDLRefNum,lDLGPtr,ldsnDialog,DS_Shared);
+
+   READLN(ckfmfile,cckfms);  {--read number of checkforms to read}
+   pckfmSeg:=POINTER(lDLGPtr);
+   FOR J:=0 TO ckfmMax DO pckfmSeg^.ckfm[J]:=NIL;
+   lcurptr:=lDLGPtr+SIZEOF(TckfmSeg);
+
+   WITH pPrDS^ DO BEGIN
+      hzPM       := hz;
+
+      FOR J:=0 TO cckfms DO BEGIN
+         hckfmPrf   := HCkFmRead (hz, ckfmfile{fileMu});
+         IF fhzck THEN CheckHz('PrMgrDSMake after hckfmPrf',hz);
+         IF NOT FCheckHzOK(hz, cbk) THEN WRITELN ('Hz Probs after hckfmPrf');
+         pckfmSeg^.ckfm[J]:=ghckfm;{!BH}
+   (*
+         hckfmIns   := HCkFmRead (hz, fileMu);
+         IF fhzck THEN CheckHz('PrMgrDSMake after hckfmIns',hz);
+         hckfmArb   := HCkFmRead (hz, fileMu);
+         IF fhzck THEN CheckHz('PrMgrDSMake after hckfmArb',hz);
+         hckfmBgd   := HCkFmRead (hz, fileMu);
+         IF fhzck THEN CheckHz('PrMgrDSMake after hckfmBgd',hz);
+
+         IF NOT FCheckHzOK(hz, cbk) THEN WRITELN ('Hz Probs after hckfmBgd');
+      {Last hckfmBgd btn is the "Not Printing" String:}
+         WITH hckfmBgd^^.rghmu[0{muBgd}]^^ DO cBtn := cBtn-1;
+   *)
+         END;
+   END;
+
+   INFO_DATASEG(cErr, cPmRefNum, DSInfo);
+   WRITELN ('PrMgr Hz: cb=', (CbOfHz(hz)):1,
+            ' cbk=', cbk:1,
+            ' DataSeg: cb=', DSInfo.mem_size:1,
+            ' pStrt=', ORD4(pPrDS):1,
+            ' pEnd=', (ORD4(pPrDS)+DSInfo.mem_size):1 );
+
+   {--Should not be used if it is desired that the dataseg remain around.}
+   {--Segment is not actually killed until CLOSE_DATASEG is called.}
+   KILL_DATASEG(cErr,sSegName);
+
+   INFO_DATASEG(cErr,cDLRefNum,DSInfo);
+   ltemp:=(lcurptr-lDLGptr)-DSInfo.mem_size;
+   WRITE(sDLGName,' dataseg: cb= ',DSInfo.mem_size:1,' deltasize= ',ltemp:1);
+   SIZE_DATASEG(cErr,cDLRefNum,ltemp,lnewmem,ltemp,lnewdisk);
+   WRITELN(' newactual= ',lnewmem:1);
+   CLOSE_DATASEG(cErr,cDLRefNum);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION CbMyHzMore (hz: Thz; cbNeeded: TC): TC;
+VAR lNewMem, lNewDisk: TL;
+    cErr: TC;
+    DSInfo: DSInfoRec;
+BEGIN
+   WRITE ('EXPANDING theHeap, cbNeeded=', cbNeeded:4);
+   INFO_DATASEG(cErr, cMyRefNum, DSInfo);
+   SIZE_DATASEG(cErr, cMyRefNum, cbNeeded, lNewMem, 0, lNewDisk);
+   IF cErr > 0 THEN BEGIN
+      WRITELN('CbMyHzMore: SIZE_DATASEG error=', cErr);
+      HALT;
+   END;
+   WRITELN (', cbNewMem=', lNewMem:6, ', cbAdded=', (lNewMem-DSInfo.mem_size):4);
+   CbMyHzMore := lNewMem - DSInfo.mem_size;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+FUNCTION CbPrMgrMore (hz: Thz; cbNeeded: TC): TC;
+VAR lNewMem, lNewDisk: TL;
+    cErr: TC;
+    DSInfo: DSInfoRec;
+BEGIN
+   WRITE ('EXPANDING PrMgr heap, cbNeeded=', cbNeeded:4);
+   INFO_DATASEG(cErr, cPmRefNum, DSInfo);
+   SIZE_DATASEG(cErr, cPmRefNum, cbNeeded, lNewMem, cbNeeded, lNewDisk);
+   IF cErr > 0 THEN BEGIN
+      WRITELN('CbPrMgrMore: SIZE_DATASEG error=', cErr);
+      HALT;
+   END;
+   WRITELN (', cbNewMem=', lNewMem:6, ', cbAdded=', (lNewMem-DSInfo.mem_size):4);
+   CbPrMgrMore := lNewMem - DSInfo.mem_size;
+{   IF fhzck THEN CheckHz('CbPrMgrMore',hz);}
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnCounts (hckfm: THckfm; VAR cBk, cSp, cbBk, cbSp: TC);
+VAR iMu, iBtn: TB;
+    hz: THz;
+BEGIN
+   {IF fDbg THEN WRITELN ('BtnCounts');}
+   cSp := 0;  cbSp := 0; cBk := 0;  cbBk := 0;
+   IF hckfm<>NIL THEN BEGIN
+      hz  := HzFromH ( POINTER(ORD4(hckfm)) );
+      IF fhzck THEN CheckHz('BtnCounts after HzFromH',hz);
+      cBk := 1;  cbBk := CbDataOfH(hz, POINTER(ORD4(hckfm)));
+      IF fhzck THEN CheckHz('BtnCounts after CbDataOfH',hz);
+
+      FOR iMu := 0 TO hckfm^^.cMu DO BEGIN
+         cbBk := cbBk + CbDataOfH(hz, POINTER(ORD4(hckfm^^.rghmu[iMu])));
+         IF fhzck THEN CheckHz('BtnCounts after CbDataOfH2',hz);
+         cBk  := cBk  + 1;
+         FOR iBtn := 0 TO hckfm^^.rghmu[iMu]^^.cBtn DO BEGIN
+            IF hckfm^^.rghmu[iMu]^^.rgbtn[iBtn].hsp <> hspNil THEN BEGIN
+               cbSp := cbSp + CbDataOfH(hz, POINTER(ORD4(hckfm^^.rghmu[iMu]^^.rgbtn[iBtn].hsp)));
+               IF fhzck THEN CheckHz('BtnCounts after CbDataOfH3',hz);
+               cSp  := cSp  + 1;
+            END;
+         END;
+      END;
+   END;
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE CkfmSummary (sp: TSp{TSp});
+VAR cBk, cSp, cbBk, cbSp, cBkTot, cSpTot, cbBkTot, cbSpTot: TC;
+   J     : TC;
+BEGIN
+WITH pPrDS^ DO BEGIN
+   {PrMgrDSBind; No! might double bind! User must handle. }
+
+   WRITELN (sp);
+   cBkTot := 0; cSpTot := 0; cbBkTot := 0; cbSpTot := 0;
+
+(*
+   BtnCounts (hckfmPrf, cBk, cSp, cbBk, cbSp);
+   WRITELN ('Prf:   cBk=',cBk:4,',cSp=',cSp:4,',cbBk=',cbBk:4,',cbSp=',cbSp:4,
+            ',cBoth=', (cBk+cSp):4, ',cbBoth=', (cbBk+cbSp):4 );
+   cBkTot  := cBkTot +cBk;  cSpTot  := cSpTot +cSp;
+   cbBkTot := cbBkTot+cbBk; cbSpTot := cbSpTot+cbSp;
+
+   BtnCounts (hckfmIns, cBk, cSp, cbBk, cbSp);
+   WRITELN ('Ins:   cBk=',cBk:4,',cSp=',cSp:4,',cbBk=',cbBk:4,',cbSp=',cbSp:4,
+            ',cBoth=', (cBk+cSp):4, ',cbBoth=', (cbBk+cbSp):4 );
+   cBkTot  := cBkTot +cBk;  cSpTot  := cSpTot +cSp;
+   cbBkTot := cbBkTot+cbBk; cbSpTot := cbSpTot+cbSp;
+
+   BtnCounts (hckfmArb, cBk, cSp, cbBk, cbSp);
+   WRITELN ('Arb:   cBk=',cBk:4,',cSp=',cSp:4,',cbBk=',cbBk:4,',cbSp=',cbSp:4,
+            ',cBoth=', (cBk+cSp):4, ',cbBoth=', (cbBk+cbSp):4 );
+   cBkTot  := cBkTot +cBk;  cSpTot  := cSpTot +cSp;
+   cbBkTot := cbBkTot+cbBk; cbSpTot := cbSpTot+cbSp;
+
+   BtnCounts (hckfmBgd, cBk, cSp, cbBk, cbSp);
+   WRITELN ('Bgd:   cBk=',cBk:4,',cSp=',cSp:4,',cbBk=',cbBk:4,',cbSp=',cbSp:4,
+            ',cBoth=', (cBk+cSp):4, ',cbBoth=', (cbBk+cbSp):4 );
+   cBkTot  := cBkTot +cBk;  cSpTot  := cSpTot +cSp;
+   cbBkTot := cbBkTot+cbBk; cbSpTot := cbSpTot+cbSp;
+
+   WRITELN ('Total: cBk=',cBkTot:4,',cSp=',cSpTot:4,',cbBk=',cbBkTot:4,',cbSp=',cbSpTot:4,
+            ',cBoth=', (cBkTot+cSpTot):4, ',cbBoth=', (cbBkTot+cbSpTot):4 );
+*)
+END;
+END;
+
+{ ---------------------------------------------------------------------- }
+{                     Local Hz & Graf Code                               }
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnGrafError(cErr: TC);
+BEGIN
+   WRITELN('Graf Err from Btn; cErr=', cErr:1);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE MyHeapMake;
+CONST cbMyHzFst   = 16000;
+      ldsnMyHz    = 5;
+VAR   pStart, pLimit: TP;
+      cErr:       TC;
+      lSegptr:    LONGINT;
+      sSegname:   PathName;
+      DSInfo:   DSInfoRec;
+BEGIN
+   IF fDbg THEN WRITELN ('MyHeapMake');
+
+   sSegname := 'HeapData';
+   MAKE_DATASEG(cErr, sSegName, cbMyHzFst, 0{Resident},
+                cMyRefNum, lSegPtr, ldsnMyHz, DS_Private);
+
+   IF cErr <> 0 THEN BEGIN
+      WRITELN('MyHeapMake: MAKE_DATASEG error=', cErr);
+      IF cErr > 0 THEN HALT;
+   END;
+   INFO_DATASEG(cErr, cMyRefNum, DSInfo);
+
+   pStart   := POINTER(lSegPtr);
+   pLimit   := POINTER(lSegPtr+DSInfo.mem_size);
+   InitHeap(pStart, pLimit, POINTER(procNIL){@CbMyHzMore});
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnCkAlert {};
+BEGIN
+   IF alertError <> 0 THEN BEGIN
+      WRITELN ('BtnCkAlert: alertError=', alertError:1);
+   (*   TellFiler (alertError, initFailed, internalError); *)
+      IF alertError > 0 THEN HALT;
+   END;
+END;
+
+{ ---------------------------------------------------------------------- }
+{                             Main Code                                  }
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnInit;
+CONST fInitDbg = TRUE;
+VAR pStart, pLimit: TP;
+    hzForPm: THz;
+    cErr: TC;
+    ch: CHAR;
+BEGIN
+
+   ghsp  := NIL;
+
+   fDbg      := FALSE;
+   WITH rBtnLst DO BEGIN
+      right := 0;
+      left  := 0;
+      top   := 0;
+      bottom:= 0;
+   END;
+
+IF fInitDbg THEN WRITELN ('Btn: Initing Standard Unit');
+   SUInit;
+
+IF fInitDbg THEN WRITELN ('Btn: Initing My Heap');
+   MyHeapMake;
+
+
+IF fInitDbg THEN WRITELN ('Btn: InitGraf');
+   InitGraf (@thePort);
+   OpenPort (@MyPort);
+
+
+IF fInitDbg THEN WRITELN ('Btn: FMInit');
+   FMInit (cErr);
+   IF cErr<>0 THEN WRITELN ('Btn: FMInit Error=', cErr:1);
+
+
+IF fInitDbg THEN WRITELN ('Btn: PrGlobalInit');
+   PrGlobalInit;
+
+
+IF fInitDbg THEN WRITELN ('Btn: DlgMgrInit');
+   DlgMgrInit;
+
+
+IF fInitDbg THEN WRITELN ('Btn: InitAlerts');
+   InitAlerts (5, 2500, theHeap, NIL, @BtnCkAlert);
+   IF cErr<>0 THEN WRITELN ('Btn: alertError=', alertError:1);
+
+IF fInitDbg THEN WRITELN ('Btn: Sizes:',
+                           ',Ckfm=',    SizeOf(TCkfm):1,
+                           ',Rghmu=',   SizeOf(TRghmu):1,
+                           ',Mu=',      SizeOf(TMu):1,
+                           ',Rgbtn=',   SizeOf(TRgbtn):1,
+                           ' Btn=',     SizeOf(TBtn):1,
+                           ' PrMgrDS=', SizeOf(TPrMgrDS):1
+                         );
+
+END;
+
+{ ---------------------------------------------------------------------- }
+
+PROCEDURE BtnMain;
+VAR cbPmHzFst, cpPmHzFst: TC;
+    cErr: TC;
+    ch: CHAR;
+    cbMoreProc: TProc;
+    CurrentDir, SrcDir, DstDir : PathName;
+BEGIN
+   WRITELN; WRITELN; WRITELN ('<< Button Reader Here >>'); WRITELN;
+
+   WRITE('Input file name: [.Text] ');
+   READLN(sckfmfile);
+   SUAddExtension(@sckfmfile,'.Text',SIZEOF(sckfmfile),fdummy);
+
+   RESET(ckfmFile,sckfmFile);
+   IF (IOResult <> 0) THEN BEGIN
+      WRITE('Can''t find: ', sckfmFile);
+      {IF (LENGTH(SrcDir) > 0) THEN WRITELN(' on volume ',SrcDir) ELSE} WRITELN;
+      HALT;
+   END;
+
+   sBaseName:=COPY(sckfmfile,1,LENGTH(sckfmfile)-LENGTH('.Text'));
+   WRITE('Output data file name: [',sBaseName,'][Data] ');
+   READLN(sBaseName);
+   IF (LENGTH(sBaseName) = 0) THEN BEGIN
+      sBaseName:=COPY(sckfmfile,1,LENGTH(sckfmfile)-LENGTH('.Text'));
+   END;
+
+   fhzck:=FALSE;
+
+   cbPmHzFst:=3000;
+   cpPmHzFst:=300;
+   cbMoreProc:=@CbPrMgrMore;
+   fDbg:=FALSE;
+
+   WRITE ('Initial DS bytes=');     {READLN (cbPmHzFst);} WRITELN(cbPmHzFst:1);
+   WRITE ('Initial Hz Pointers=');  {READLN (cpPmHzFst);} WRITELN(cpPmHzFst:1);
+{
+   WRITE ('Nil for cbMoreProc?[n] ');   READ (ch); WRITELN;
+   IF ch='y' THEN cbMoreProc := POINTER(ProcNIL) ELSE cbMoreProc := @CbPrMgrMore;
+   WRITE ('DeBugging On?[n] ');         READ (ch); WRITELN;
+   fDbg := ch='y';
+}
+
+   WRITELN ('..Making Data Seg');
+   PrMgrDSMake(cbPmHzFst, cpPmHzFst, cbMoreProc);
+
+   WRITELN ('..Calling PrCkfmCounts');
+   CkfmSummary ('PrMgr Data Counts:');
+
+   WRITELN ('..Closing the data seg:');
+   CLOSE_DATASEG (cErr, cPmRefNum);
+
+   CLOSE(ckfmFile);
+   SET_WORKING_DIR(cErr,CurrentDir);
+END;
+
+{ ---------------------------------------------------------------------- }
+
+BEGIN
+   BtnInit;
+   BtnMain;
+END.
+
+{ ---------------------------------------------------------------------- }
+(* Oops: add bind flag!!
+   WRITELN ('..Calling PrMgrInit');
+   PrMgrInit;
+
+{$IFC fPrDbgOk }
+   WRITELN ('..Calling PrCkfmCounts');
+   PrCkfmCounts ('PrMgr Data Counts:');
+{$ENDC }
+*)
+
+
+ÿ

@@ -1,0 +1,746 @@
+(* Copyright 1983, 1984, Apple Computer, Inc. *)
+(* DS3 *)
+
+
+procedure SIZE_DATASEG(* var errnum: integer; refnum: integer;
+                         deltamemsize: longint; var newmemsize: longint;
+                         deltadiscsize: longint; var newdiscsize: longint *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The memory size of the data seg will be changed by  *)
+       (*    deltamemsize bytes.  The disc size of the data seg  *)
+       (*    will be changed by deltadiscsize bytes.  Both sizes *)
+       (*    will be changed in multiples of mempgsize bytes.    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum specifies the desired segment.               *)
+       (*                                                        *)
+       (*    deltamemsize and deltadiscsize are signed integers  *)
+       (*    of bytes to add (positive) or subtract (negative)   *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    newmemsize and newdiscsize are the new seg sizes    *)
+       (*    after the operation.                                *)
+       (*                                                        *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful operation.                    *)
+       (*           = e_dsbase +                                 *)
+       (*              e_badrefnum  -- invalid refnum            *)
+       (*              e_dstoobig  -- expansion makes seg too big*)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+const
+  setnds = true;
+
+var
+  c_sdb_ptr: sdb_ptr;
+  c_ptr_ds_refdb: ptr_ds_refdb;
+  ordrefdbptr: absptr;
+  attributes: fs_info;
+  blkcnt, actcnt: int4;
+  n_length, n_dlength: int4;
+  new_no_ldsn: int2;
+  c_mmrb: mmrb_ptr;
+  semT: boolean;
+  fcbptr: sfcb_ptr;                                                          (*P*)
+
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+begin
+  semT:=false;
+
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' size_dataseg called ');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  with parmarr do
+    begin
+      numcheck:=2;
+      parms[1].addr:=ord(@newmemsize);
+      parms[1].readwrite:=true;
+      parms[2].addr:=ord(@newdiscsize);
+      parms[2].readwrite:=true;
+    end;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum <> 0 then goto 10; (* take error exit*)
+
+  c_ptr_ds_refdb:=pointer(ordrefdbptr);
+  c_sdb_ptr:=c_ptr_ds_refdb^.a_sdb_ptr;
+
+  c_mmrb:=pointer(mmrb_addr);
+  WAIT_SEM(c_mmrb^.sds_sem,[]);   (* get sds semaphore *)                     (*P*)
+  semT:=true;  (* have semaphore *)
+
+  with c_sdb_ptr^ do
+    begin
+      (* calculate new memory size in bytes *)
+      if newlength <> 0
+        then n_length:=ord4(newlength)*mempgsize
+        else n_length:=length;
+      n_length:=FULLPAGES(n_length+deltamemsize);
+
+      (* calculate new disc size in bytes *)
+      n_dlength:=FULLPAGES(disclength+deltadiscsize);
+      if n_dlength < 0 then n_dlength:=0;
+
+      with c_ptr_ds_refdb^ do
+        begin
+          if (n_length < 512) or
+             ((privateF) and (n_length > p_maxDsSize)) or
+             ((not privateF) and (n_length > s_maxDsSize)) or
+             (n_dlength < 0) then
+            begin
+              errnum:=e_dsbase + e_invalidsize;
+              goto 10;
+            end;
+
+          (* check if additional ldsns are required and that they are free *)
+          new_no_ldsn:=((n_length - 1) div maxmmusize) +1;
+          if new_no_ldsn > no_ldsn then
+            begin
+              CHK_LDSN_FREE(errnum,ldsn+no_ldsn,new_no_ldsn-no_ldsn);
+              if errnum <> e_ldsnfree then
+                begin
+                  if errnum = e_badldsn
+                    then errnum:=e_dsbase + e_dstoobig (* extends out of range *)
+                    else errnum:=e_dsbase + e_ldsnused;(* needed ldsn busy *)
+                  goto 10;
+                end;
+              errnum:=0;
+            end;
+
+        end;(*with*)
+
+      (* allocate/deallocate disc space if required *)
+      if (deltadiscsize <> 0) then                                           (*P*)
+        begin                                                                (*P*)
+          if c_ptr_ds_refdb^.fs_refnum = -1 then                             (*P*)
+            begin                                                            (*P*)
+              if discaddr.fid <> 0 then                                      (*P*)
+                begin  (* change disc space for temp file *)                 (*P*)
+                  fcbptr:=pointer(discaddr.fid + b_sysglobal_ptr);           (*P*)
+                  blkcnt:=(n_dlength - disclength) div 512;                  (*P*)
+                  if blkcnt <> 0 then                                        (*P*)
+                    begin                                                    (*P*)
+                      ALLOCPAGES(errnum,fcbptr,blkcnt);                      (*P*)
+                      if errnum > 0 then                                     (*P*)
+                        begin                                                (*P*)
+                          errnum:=e_dsbase+e_nodiscspace;                    (*P*)
+                          goto 10;                                           (*P*)
+                        end;                                                 (*P*)
+                      disclength:=n_dlength;                                 (*P*)
+                    end;                                                     (*P*)
+                end;                                                         (*P*)
+            end                                                              (*P*)
+           else                                                              (*P*)
+            begin (* a change in permanent file disc space requirements*)    (*P*)
+              SHOW_REFNUM(errnum,c_ptr_ds_refdb^.fs_refnum);
+              INFO(errnum,c_ptr_ds_refdb^.fs_refnum,attributes);
+              if errnum <> 0 then
+                begin
+                  errnum:=e_dsbase + e_filesyserr;
+                  goto 10;
+                end;
+
+              if (deltadiscsize < 0) and
+                 (n_dlength < attributes.size) then
+                begin (* shrinking disc space to size smaller than current leof *)
+                  (* set fmark and then truncate *)
+                  READ_DATA(errnum,c_ptr_ds_refdb^.fs_refnum,ord(@blkcnt),0,
+                            actcnt,absolute,n_dlength);
+                  if errnum <= 0 then TRUNCATE(errnum,c_ptr_ds_refdb^.fs_refnum);
+                  if errnum > 0 then
+                    begin
+                      errnum:=e_dsbase + e_filesyserr;
+                      goto 10;
+                    end;
+                end;
+
+              blkcnt:=(n_dlength-attributes.psize) div 512;
+              if blkcnt <> 0 then
+                begin
+                  ALLOCATE(errnum,c_ptr_ds_refdb^.fs_refnum,false,blkcnt,actcnt);
+                  if (errnum <> 0) or
+                     (actcnt < blkcnt) then
+                    begin
+                      errnum:=e_dsbase + e_nodiscspace;
+                      goto 10;
+                    end;
+                end;
+              disclength:=n_dlength;
+              HIDE_REFNUM(errnum,c_ptr_ds_refdb^.fs_refnum);
+            end;
+        end;
+
+      (* change memory size if required *)
+      if n_length = length
+        then newlength:=0  (* size does not need to change *)
+        else
+         begin
+           with c_ptr_ds_refdb^ do
+             begin
+               newlength:=n_length div mempgsize;
+
+               if boundF then
+                 begin
+                   (* make sure memory change will not cause possible *)
+                   (* data lockout for process.                         *)
+                   if DATA_LOCKOUT(c_sdb_ptr,true) then
+                     begin
+                       newlength:=0; (* disable the size change *)
+                       errnum:=e_dsbase+e_datalockout;
+                       goto 10;
+                     end;
+
+                   (* unbind data segment *)
+                   UNBIND_DATASEG(errnum,refnum);
+                   if errnum <> 0 then goto 10; (* take error exit *)
+
+                   (* bind data segment so size change will take place *)
+                   no_ldsn:=new_no_ldsn; (* new number of ldsn*)
+                   BIND_DATASEG(errnum,refnum);
+                   if errnum <> 0 then goto 10; (* take error exit *)
+                 end
+                else
+                 begin (* segment not bound--size change will take place next *)
+                       (* time segment is bound                               *)
+                   CLEAR_SRB(c_sdb_ptr);(* flag all processes of size change *)
+                 end;
+             end;(*with*)
+         end;
+
+      (* return current sizes *)
+      newmemsize:=n_length;
+      newdiscsize:=n_dlength;
+    end;(*with*)
+
+10: (* error exit *)
+
+  if semT then SIGNAL_SEM(c_mmrb^.sds_sem);   (* release sds semaphore *)
+end; (* SIZE_DATASEG *)
+
+
+
+procedure FLUSH_DATASEG(* var errnum: integer; refnum: integer *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The data segment defined by refnum will be written  *)
+       (*    to disc.  This procedure has no effect upon the     *)
+       (*    memory residence or binding of the data segment.    *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    refnum specifies the desired segment.               *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*                                                        *)
+       (* Side Effects:                                          *)
+       (*                                                        *)
+       (* Special Conditions of Use:                             *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful operation.                    *)
+       (*           = 1 Invalid refnum                           *)
+       (*                                                        *)
+       (**********************************************************)
+
+label 10;
+
+var
+  ordrefdbptr: absptr;
+  c_ds_refdb_ptr: ptr_ds_refdb;
+  (*$IFC DEBUG2*)
+  parmarr: parmcheck;
+  (*$ENDC*)
+
+begin
+  (*$IFC DEBUG3*)
+  if TRACE(mm,99) then writeln(' flush_dataseg called');
+  (*$ENDC*)
+  (*$IFC DEBUG2*)
+  parmarr.numcheck:=0;
+  if not VALID_ADDR(errnum,parmarr) then goto 10;
+  (*$ENDC*)
+
+  CHK_REFNUM(errnum,refnum,dsrefdb,ordrefdbptr);
+  if errnum = 0 then
+    begin (* valid refnum *)
+      c_ds_refdb_ptr:=pointer(ordrefdbptr);
+      FLUSH_SEG(errnum,c_ds_refdb_ptr^.a_sdb_ptr);
+      if errnum <> 0 then errnum:=e_dsbase+e_filesyserr;
+    end;
+
+10: (*error exit*)
+
+end;(* FLUSH_DATASEG *)
+
+
+procedure DS_CLEANUP;
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Any and all data segments that are still opened by  *)
+       (*    the current process will be closed.                 *)
+       (*                                                        *)
+       (**********************************************************)
+
+var
+  errnum: int2;
+  c_syslocal_ptr: slocal_ptr;
+  f_refdb_ptr, l_refdb_ptr, n_refdb_ptr: ptr_ds_refdb;
+  c_mrbt: mrbt_ptr;
+  c_pcb: ptr_pcb;
+
+begin
+  c_syslocal_ptr:=pointer(b_syslocal_ptr);
+
+  (* unlock all segments locked by this process *)
+  UNLOCKSEGS(errnum);
+
+  (* close every data segment that is still in the list of open data segments *)
+
+  with c_syslocal_ptr^ do
+    begin
+      l_refdb_ptr:=@hd_ds_refdb_list.fwd_link; (* stopper *)
+      f_refdb_ptr:=pointer(hd_ds_refdb_list.fwd_link + b_syslocal_ptr);
+      while f_refdb_ptr <> l_refdb_ptr do
+        begin
+          with f_refdb_ptr^ do
+            begin
+              n_refdb_ptr:=pointer(header.refdb_list.fwd_link+b_syslocal_ptr);
+              CLOSE_DATASEG(errnum,ds_refnum);    (* close the data seg *)
+            end;
+          f_refdb_ptr:=n_refdb_ptr;;
+        end;
+    end; (* with *)
+end; (* DS_CLEANUP *)
+
+
+
+procedure MEM_INFO(* var errnum: integer;
+                     var swapspace, dataspace,
+                         cur_codesize, max_codesize: longint *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    Information regarding the current state of memory   *)
+       (*    resources is returned.                              *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*    swapspace - the amount of swap space available on   *)
+       (*                the system that can be allocated to the *)
+       (*                calling process.                        *)
+       (*    dataspace - the total amount of data space currently*)
+       (*                bound to the calling process.           *)
+       (*    cur_codesize - the size of the code segment issuing *)
+       (*                   this call.                           *)
+       (*    max_codesize - the size of the largest user code    *)
+       (*                   segment which can be called by the   *)
+       (*                   calling process.                     *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful operation.                    *)
+       (*                                                        *)
+       (**********************************************************)
+
+   label 10;
+
+   var
+     c_syslocal: slocal_ptr;
+     c_mrbt: mrbt_ptr;
+     i: int2;
+     c_sdb: sdb_ptr;
+     data_swapable, data_locked, lockspace: int4;
+
+     (*$IFC DEBUG2*)
+     parmarr: parmcheck;
+     (*$ENDC*)
+
+   begin
+     (*$IFC DEBUG3*)
+     if TRACE(mm,99) then writeln(' mem_info called ');
+     (*$ENDC*)
+     (*$IFC DEBUG2*)
+     with parmarr do
+       begin
+         numcheck:=4;
+         parms[1].addr:=ord(@swapspace);
+         parms[1].readwrite:=true;
+         parms[2].addr:=ord(@dataspace);
+         parms[2].readwrite:=true;
+         parms[3].addr:=ord(@cur_codesize);
+         parms[3].readwrite:=true;
+         parms[4].addr:=ord(@max_codesize);
+         parms[4].readwrite:=true;
+       end;
+     if not VALID_ADDR(errnum,parmarr) then goto 10;
+     (*$ENDC*)
+
+     errnum:=0;
+     c_syslocal:= pointer(b_syslocal_ptr);
+     c_mrbt:=pointer(c_syslocal^.mrbt_addr);
+
+     (* current space occupied by bound data segments *)
+     PROCS_DATA_NEEDS(data_swapable,data_locked);
+     dataspace:=data_swapable + data_locked;
+
+     (* additional swapspace available to process *)
+     S_SWAP_SPACE(swapspace,lockspace);
+     swapspace:=swapspace - data_swapable;
+
+     (* size of calling code segment *)
+     i:=SEG_OF_CALLER;
+     c_sdb:=pointer(c_mrbt^[i].sdbRP+b_sysglobal_ptr);
+     cur_codesize:=c_sdb^.length;
+
+     (* size of largest code segment *)
+     max_codesize:=0;
+     for i:=codespacemmu to lusercodemmu do
+       begin
+         if c_mrbt^[i].sdbRP <> 0 then
+           begin
+             c_sdb:=pointer(c_mrbt^[i].sdbRP+b_sysglobal_ptr);
+             if c_sdb^.length > max_codesize then max_codesize:=c_sdb^.length;
+           end;
+       end;(*for*)
+
+10: (*error exit *)
+   end;(* MEM_INFO *)
+
+
+
+procedure INFO_ADDRESS(* var errnum: int2; address: int4; var refnum: int2 *);
+
+       (**********************************************************)
+       (*                                                        *)
+       (* Description:                                           *)
+       (*    The ds_refnum of the bound segment defining address *)
+       (*    is returned.                                        *)
+       (*                                                        *)
+       (* Input Parameters:                                      *)
+       (*    address is the logical address to be converted into *)
+       (*    a data segment refnum                               *)
+       (*                                                        *)
+       (* Output Parameters:                                     *)
+       (*    errnum indicates the success or failure of the      *)
+       (*    operation.                                          *)
+       (*    refnum defines the bound data segment               *)
+       (*                                                        *)
+       (* Error Conditions:                                      *)
+       (*    errnum = 0 Successful operation.                    *)
+       (*           = 303 No data segment bound to that address  *)
+       (*           = 314 Address not within ldsn range          *)
+       (*                                                        *)
+       (**********************************************************)
+
+   label 10;
+
+   var
+     c_mmu, c_ldsn: int2;
+
+     (*$IFC DEBUG2*)
+     parmarr: parmcheck;
+     (*$ENDC*)
+
+   begin
+     (*$IFC DEBUG3*)
+     if TRACE(mm,99) then writeln('Info_address called');
+     (*$ENDC*)
+     (*$IFC DEBUG2*)
+     with parmarr do
+       begin
+         numcheck:=1;
+         parms[1].addr:=ord(@refnum);
+         parms[1].readwrite:=true;
+       end;
+     if not VALID_ADDR(errnum,parmarr) then goto 10; (* take error exit *)
+     (*$ENDC*)
+
+     c_mmu:=address div maxmmusize;
+     c_ldsn:=c_mmu - ldsn1mmu + 1;
+     INFO_LDSN(errnum,c_ldsn,refnum);
+     if errnum = 302 then errnum:=e_dsbase + e_addrnoldsn;
+
+10: (* error exit *)
+
+   end; (*INFO_ADDRESS*)
+
+
+function REALADDR(addr: integer): longint;
+  (* convert a memory page to a mapped real memory address *)
+  begin
+    realaddr:=ord4(addr)*hmempgsize*2 + logrealmem;
+  end;(*realaddr*)
+
+
+procedure INIT_DRIVER_SPACE;
+
+  var
+    c_mmrb: mmrb_ptr;
+    ptr_drvrpool: ^DrvrCRec;
+    i: integer;
+    c_sdb: sdb_ptr;
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    with c_mmrb^ do
+      begin
+        c_sdb:=@DriverCode_sdb;
+        Map_Segment(c_sdb,DrvrCodeMMU,0,mmuReadWrite);
+        ptr_drvrpool:=pointer(logDrvrCode);
+        with ptr_drvrpool^ do
+          begin
+            header:=$85007ff0; (*needed for debugger to see driver code symbols*)
+            curpos:=REALADDR(c_sdb^.memaddr+1);
+            for i:=1 to maxcdrvr do
+              begin
+                with jumptab[i] do
+                  begin
+                    jumpinst:=$4EF9; (*JMP.L*)
+                    drvraddr:=0;
+                    drvrsize:=0;
+                  end;
+                with freeslot[i] do
+                  begin
+                    freeaddr:=0;
+                    freesize:=0;
+                  end;
+              end;
+          end;(*with*)
+        Map_Segment(@DriverCode_sdb,DrvrCodeMMU,0,mmuReadOnly);
+      end;(*with*)
+  end;(*INIT_DRIVER_SPACE*)
+
+
+function GET_DRIVER_SPACE(* var error: integer; codesize: int4): absptr *);
+  label 100;
+
+  var
+    c_sdb: sdb_ptr;
+    codepages: int2;
+    ptr_drvrpool: ^DrvrCRec;
+    addr: int4;
+    c_mmrb: mmrb_ptr;
+    i: integer;
+
+    function ExpandSpace: boolean;
+      label 10;
+
+      var
+        oldaddr, oldsize, newsize: int2;
+        i: integer;
+        intlevel: intson_type;
+
+      begin
+        ExpandSpace:=false;
+        with c_sdb^ do
+          begin
+            oldaddr:=memaddr;
+            oldsize:=memsize;
+            newsize:=oldsize+codepages;
+            newlength:=newsize;
+            Check_DS(c_sdb); (*force segment to expand*)
+            Del_SRB (c_sdb, c_pcb_ptr);   { keep dummy SRB list to a minimum }
+            if memsize = newsize then
+              begin (*expansion was successful*)
+                with ptr_drvrpool^ do
+                  begin
+                    (*move vector table to front of the segment *)
+                    (*Note: segment is still mapped to its old size.*)
+                    MOVER(REALADDR(oldaddr),REALADDR(memaddr),sizeof(DrvrCRec));
+                    (*Turn interrupts off till segment is adjusted to new size*)
+                    IntsOff(allints,intlevel);
+                    Map_Segment(c_sdb,DrvrCodeMMU,0,mmuReadWrite);
+                    IntsOn(intlevel);
+                    curpos:=REALADDR(memaddr+1);
+                    for i:=1 to maxcdrvr do
+                      with freeslot[i] do
+                        if freeaddr = 0 then
+                          begin
+                            freeaddr:=curpos;
+                            freesize:=codepages;
+                            ExpandSpace:=true;
+                            goto 10; (*get out of loop*)
+                          end;
+10:
+                  end;(*with*)
+              end;
+          end;(*with*)
+      end;(*ExpandSpace*)
+
+    function FindSpace(var addr: int4): boolean;
+      label 1, 10;
+
+      var
+        pass: int2;
+        i: integer;
+
+      begin
+        pass:=0;
+        FindSpace:=false;
+        with ptr_drvrpool^ do
+          begin
+1: (*try again after expansion*)
+            for i:=1 to maxcdrvr do
+              with freeslot[i] do
+                if (freeaddr <> 0) and (freesize >= codepages) then
+                  begin (* found space *)
+                    addr:=freeaddr;
+                    if freesize > codepages
+                      then freeaddr:=freeaddr+codesize
+                      else freeaddr:=0;
+                    freesize:=freesize-codepages;
+                    FindSpace:=true;
+                    goto 10; (* Quick exit out*)
+                  end;
+            if pass = 0 then
+              begin
+                pass:=1;
+                if ExpandSpace then goto 1;
+              end;
+          end;(*with*)
+10: (*quick exit*)
+      end;(*FindSpace*)
+
+  begin
+    Get_Driver_Space:=ord(nil);
+    error:=1;
+    codesize:=FullPages(codesize);
+    codepages:= codesize div mempgsize;
+    c_mmrb:=pointer(mmrb_addr);
+    with c_mmrb^ do
+      begin
+        WAIT_SEM(sds_sem,[]);
+        c_sdb:=@DriverCode_sdb;
+        ptr_drvrpool:=pointer(logDrvrCode);
+        Map_Segment(c_sdb,DrvrCodeMMU,0,mmuReadWrite);
+        if FindSpace(addr) then
+          begin
+            with ptr_drvrpool^ do
+              for i:=1 to maxcdrvr do
+                with jumptab[i] do
+                  if drvraddr = 0 then
+                    begin
+                      drvraddr:=addr;
+                      drvrsize:=codepages;
+                      Get_Driver_Space:=ord(@jumptab[i]);
+                      error:=0;
+                      goto 100; (*get out of loop*)
+                    end;
+100:
+          end;
+        SIGNAL_SEM(sds_sem);
+      end;(*with c_mmrb*)
+  end;(*GET_DRIVER_SPACE*)
+
+
+procedure REL_DRIVER_SPACE(* var error: integer; ordaddr: absptr *);
+  label 10, 20;
+
+  var
+    c_mmrb: mmrb_ptr;
+    c_sdb: sdb_ptr;
+    ptr_jumprec: ^jumprec;
+    ptr_drvrpool: ^DrvrCRec;
+    i: integer;
+    oldmemaddr, oldmemsize: integer;
+    done: boolean;
+    intlevel: intson_type;
+
+  begin
+    error:=0;
+    c_mmrb:=pointer(mmrb_addr);
+    with c_mmrb^ do
+      begin
+        WAIT_SEM(sds_sem,[]);
+        c_sdb:=@DriverCode_sdb;
+        Map_Segment(c_sdb,DrvrCodeMMU,0,mmuReadWrite);
+        ptr_jumprec:=pointer(ordaddr);
+        ptr_drvrpool:=pointer(logDrvrCode);
+        with c_sdb^, ptr_drvrpool^, ptr_jumprec^ do
+          begin
+            (*create a free entry*)
+            for i:=1 to maxcdrvr do
+              with freeslot[i] do
+                if freeaddr = 0 then
+                  begin
+                    freeaddr:=drvraddr;
+                    freesize:=drvrsize;
+                    drvraddr:=0;
+                    drvrsize:=0;
+                    goto 10; (*get out of loop*)
+                  end;
+10:         (*now try to reduce size of segment*)
+            repeat
+              for i:=1 to maxcdrvr do
+                with freeslot[i] do
+                  if freeaddr = curpos then
+                    begin (*free region at front - segment can be reduced in size *)
+                      (*move vector table to new location*)
+                      MOVER(REALADDR(memaddr),REALADDR(memaddr+freesize),sizeof(DrvrCrec));
+                      (*segment must now be mapped to its new smaller size before *)
+                      (*the actual segment is reduced in size since the reduction *)
+                      (*will overwrite some of the header data.  This is all the  *)
+                      (*result of trying to keep interrupt off time to a minimum. *)
+                      oldmemaddr:=memaddr;
+                      oldmemsize:=memsize;
+                      memaddr:=memaddr+freesize;
+                      newlength:=memsize-freesize;
+                      memsize:=newlength;
+                      INTSOFF(allints,intlevel);
+                      MAP_SEGMENT(c_sdb,DrvrCodeMMU,0,mmuReadWrite);
+                      INTSON(intlevel);
+                      (*segment is now mapped to smaller size yet memory not yet reduced*)
+                      memaddr:=oldmemaddr;
+                      memsize:=oldmemsize;
+                      CHECK_DS(c_sdb); (*force memory reduction*)
+                      (*segmemt now smaller in size*)
+                      freeaddr:=0;
+                      freesize:=0;
+                      curpos:=REALADDR(memaddr+1);
+                      done:=false; (*try to reduce segment some more*)
+                      goto 20;
+                    end;
+              done:=true; (*fell out of for loop*)
+20:         until done;
+          end;(*with c_sdb, ptr_drvrpool, ptr_jumprec*)
+        SIGNAL_SEM(sds_sem);
+      end;(*with c_mmrb*)
+  end;(*REL_DRIVER_SPACE*)
+
+
+procedure PRO_DRIVER_SPACE;
+  var
+    c_mmrb: mmrb_ptr;
+    c_sdb: sdb_ptr;
+
+  begin
+    c_mmrb:=pointer(mmrb_addr);
+    c_sdb:=@c_mmrb^.DriverCode_sdb;
+    Map_Segment(c_sdb,DrvrCodeMMU,0,mmuReadOnly);
+  end;(*PRO_DRIVER_SPACE*)
+
+
+
+
+ÿ

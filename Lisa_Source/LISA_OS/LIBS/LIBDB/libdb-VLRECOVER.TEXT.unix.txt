@@ -1,0 +1,519 @@
+{#F     libdb/vlrecover.text }
+{$S     swapaccs }
+{**************************************************************************
+
+                                recover
+
+        attempts to put btree back together after we ran out of space
+        in the middle of an insert or delete operation.  pstack contains
+        enough information to allow us to undo all the operations done
+        on the tree.  we start at the bottom of the tree and undo our
+        way up until we hit a level of the tree which is ok (vact =
+        undone).  the insert and delete algorithms are designed so that
+        the failing page operation is put back to rights before recover
+        is called
+
+        Input Parameters
+
+                fileid - file to be fixed
+
+         Output Parameter
+
+                kresult - error status, only returned if another error
+                        occurs during reconstruction
+
+*************************************************************************}
+
+{$S     swapaccs }
+procedure recover(var kresult : integer;
+                      fileid : integer);
+label
+        1,2,3;
+var
+        lbuff,rbuff,lowbuff,
+        level,
+        relprio,lowprio,
+        lresult,tresult,
+        descoff,
+        dindex,
+        nkeysl,nkeysr,nkeys : integer;
+        sr : stackrec;
+        pbdl,pbdr : ^ buffdesc;
+        pbl,pbr : ptrdata;
+        pdl,pdr,pdn : ptrpagedesc;
+        pol,por : ptroffsets;
+        pfd : ptrfiledesc;
+        ps : ^ stackrec;
+        ponkl : ^ integer;
+        t,
+        havelowbuff : boolean;
+        nextpage,priorpage : fileptr;
+
+
+        {*************************************************************
+
+                                getrightleft
+
+                gets the right and left page into buffers and sets up
+                the necessary local variables to access them.  if we
+                are undoing a delete, then we must allocate a replacement
+                page (since we never reuse a page that was freed, we
+                can always get one)
+
+        **************************************************************}
+{$S     swapaccs }
+        procedure getright_left;
+        label
+                1;
+        var
+                tresult : integer;
+        begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+                getpage(lresult,lbuff,fileid,sr.rec_lpage,true);
+                if lresult <> noerr then goto 1;
+                if (sr.vact = merge) or (sr.vact = merge_replace) then
+                    allocpage(lresult,fileid,rbuff)
+                else
+                    getpage(lresult,rbuff,fileid,sr.rec_rpage,true);
+                if lresult <> noerr then
+                    begin
+                    relbuff(tresult,lbuff,relprio);
+                    goto 1;
+                    end;
+                pbdl := @buffpool^[lbuff];
+                pbl := pbdl^.pbuff;
+                pdl := pointer(ord(pbl)+descoff);
+                pol := pointer(ord(pdl)-sizeof(integer));
+                nkeys := pdl^.nkeys;
+                pbdr := @buffpool^[rbuff];
+                pbr := pbdr^.pbuff;
+                pdr := pointer(ord(pbr)+descoff);
+                por := pointer(ord(pdr)-sizeof(integer));
+        1 :
+        end;
+
+
+        {**************************************************************
+
+                                copyold
+
+                rebuilds the deleted deleted record
+
+                in the case of a leaf page, we take the record from
+                   that pointed to by delrec in the recovery record
+                   of pstack
+                in the case of a nonleaf page, we can extract the
+                   record from the (already reconstructed) lower level
+                   page (afterwards, we release the lower level buffer)
+
+                we only keep around the lower buff when its high key
+                will be needed to reconstruct the next higher page.
+                this is only true for rotates and merges in nonleaf pages
+
+         *************************************************************}
+
+{$S     swapaccs }
+        procedure copy_old(buff : integer);
+        var
+                po,
+                polow : ptroffsets;
+                pr,
+                pb,
+                prec : ptrdata;
+                pfptr : ptrfileptr;
+                pd : ptrpagedesc;
+                buffindex,
+                ioff,
+                nkeys,
+                size : integer;
+                ponk : ^ integer;
+        begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+                buffindex := sr.index;
+                pb := buffpool^[buff].pbuff;
+                pd := pointer(ord(pb)+descoff);
+                po := pointer(ord(pd)-sizeof(integer));
+                ioff := po^[-buffindex];
+                nkeys := pd^.nkeys;
+                ponk := @po^[-nkeys];
+                if level = 0 then
+                    begin
+                    size := sr.delsize;
+                    prec := sr.delrec;
+                    end
+                else
+                    begin
+                    prec := buffpool^[lowbuff].pbuff;
+                    if level = 1 then
+                        size := entrysize(pfd^.firstvfld,pfd^.lastvsfld,
+                                          pfd^.lastvsfld,
+                                          pfd^.kvflds,pfd^.pedesc,prec)
+                                + sizeof(fileptr)
+                    else
+                        begin
+                        polow := pointer(ord(prec)+descoff-sizeof(integer));
+                        size := polow^[-1]-polow^[0];
+                        end;
+                    end;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'copy:',size);
+                    writeln(dumpfile,'before copy:');
+                    dumpp(fileid,buff);
+                    end;
+{$ENDC }
+
+                moverf(pointer(ord(pb)+ioff),pointer(ord(pb)+ioff+size),
+                       ponk^-ioff);
+                movl_inc(@ponk^,pointer(ord(ponk)-sizeof(integer)),
+                         nkeys-buffindex,size);
+                pr := pointer(ord(pb)+ioff);
+                if level = 1 then
+                    extractkey(pfd^.pedesc,pfd^.pedesc,pfd^.nsort,
+                               prec,
+                               pointer(ord(pr)+sizeof(fileptr)),pfd^.kvflds)
+                else
+                    movelf(prec,pr,size);
+                if level <> 0 then
+                    begin
+                    pfptr := @pr^;
+                    pfptr^ := buffpool^[lowbuff].page;
+                    end;
+                pd^.nkeys := pd^.nkeys+1;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'after copy:');
+                    dumpp(fileid,buff);
+                    end;
+{$ENDC }
+
+                if havelowbuff then
+                    begin
+                    relbuff(lresult,lowbuff,lowprio);
+                    havelowbuff := false;
+                    end;
+        end;
+
+
+{$S     swapaccs }
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if bdebug then
+            begin
+            writeln(dumpfile,'recover');
+            with pstack^[0] do
+                begin
+                writeln(dumpfile,'pstack^[0].vact=',ord(vact));
+                end;
+            dumpps(fileid);
+            end;
+{$ENDC }
+
+        dont_use_freelist := false;
+        havelowbuff := false;
+        pfd := pfiletable^[fileid];
+        descoff := pfd^.pagesize - sizeof(pagedesc);
+        level := 0;
+        relprio := isleaf;
+        ps := @pstack^[pfd^.depth];
+        repeat
+            sr := ps^;
+
+{$IFC debug }
+            if bdebug then
+                begin
+                writeln(dumpfile,'level,vact:',level:4,ord(ps^.vact):4);
+                end;
+{$ENDC }
+
+            case ps^.vact of
+            NoSibEmpty :  { a nonroot page w/out siblings became empty on delete }
+                begin
+                allocpage(lresult,fileid,rbuff);
+                if lresult <> noerr then goto 2;
+                pbdr := @buffpool^[rbuff];
+                pbdr^.state := dirty;
+                pbr := pbdr^.pbuff;
+                pdr := pointer(ord(pbr)+descoff);
+                por := pointer(ord(pdr)-sizeof(integer));
+                por^[0] := 0;
+                pdr^.nkeys := 0;
+                pdr^.prior := ps^.rec_lpage;
+                pdr^.next := ps^.rec_rpage;
+                if level = 0 then pdr^.ptype := leaftype
+                else pdr^.ptype := nonleaftype;
+                copy_old(rbuff);
+
+{$IFC debug }
+                if bdebug then dumpp(fileid,rbuff);
+{$ENDC }
+
+                post(lresult,rbuff);
+                if lresult <> noerr then goto 3;
+                if level = 0 then
+                    begin
+                    fix_pointers(lresult,pdr^.prior,pbdr^.page,next,fileid,
+                                 descoff);
+                    if lresult <> noerr then goto 3;
+                    fix_pointers(lresult,pdr^.next,pbdr^.page,prior,fileid,
+                                 descoff);
+                    if lresult <> noerr then goto 3;
+                    end;
+                havelowbuff := true;
+                end;
+
+
+            del :  { a simple deletion }
+                begin
+
+            {   recovery is simple - insert the deleted record }
+
+                getpage(lresult,lbuff,fileid,ps^.page,true);
+                if lresult <> noerr then goto 2;
+                copy_old(lbuff);
+
+{$IFC debug }
+                if bdebug then dumpp(fileid,lbuff);
+{$ENDC }
+
+                buffpool^[lbuff].state := dirty;
+                relbuff(lresult,lbuff,relprio);
+                if lresult = noerr then goto 1
+                else goto 2; { break }
+                end;
+
+            split,split_replace: { a page split (possibly as a result of
+                                       a replace }
+                begin
+
+            {   delete the inserted (replacement) record and merge the split
+                pages back into the old one.  if it was a replace, insert
+                the old record. if its a leaf, fix the prior pointer of
+                the following page  }
+
+                getright_left;
+                if lresult <> noerr then goto 2;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'before del');
+                    dumpp(fileid,lbuff);
+                    dumpp(fileid,rbuff);
+                    end;
+{$ENDC }
+
+                if ps^.index < nkeys then
+                    delrecord(pbl,pol,pdl,ps^.index)
+                else
+                    delrecord(pbr,por,pdr,ps^.index-nkeys);
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    dumpp(fileid,lbuff);
+                    dumpp(fileid,rbuff);
+                    end;
+{$ENDC }
+
+                t := mergepages(lbuff,rbuff,pfd^.pagesize);
+                if ps^.vact = split_replace then copy_old(lbuff);
+                nextpage := pdr^.next;
+                pdl^.next := nextpage;
+                priorpage := ps^.rec_lpage;
+
+{$IFC debug }
+                if bdebug then dumpp(fileid,lbuff);
+{$ENDC }
+
+                freepage(lresult,rbuff);
+                relbuff(lresult,lbuff,relprio);
+                if lresult <> noerr then goto 2;
+                if level = 0 then
+                    fix_pointers(lresult,NextPage,PriorPage,prior,fileid,descoff);
+                if lresult <> noerr then goto 2;
+                end;
+
+            irot,irot_replace: { an insert rotate (possibly as a result of
+                                       a replace }
+                begin
+
+            {   delete the inserted (replacement) record and rotate the
+                rotated records back where they belong.  if it was a replace,
+                insert the old record.   }
+
+                getright_left;
+                if lresult <> noerr then goto 2;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'before del');
+                    dumpp(fileid,lbuff);
+                    dumpp(fileid,rbuff);
+                    end;
+{$ENDC }
+
+                if ps^.insindex < nkeys then
+                    delrecord(pbl,pol,pdl,ps^.insindex)
+                else
+                    delrecord(pbr,por,pdr,ps^.insindex-nkeys);
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    dumpp(fileid,lbuff);
+                    dumpp(fileid,rbuff);
+                    end;
+{$ENDC }
+
+                dindex := ManyRotates(lbuff,rbuff,ps^.unrotPt,descoff);
+                if ps^.vact = irot_replace then copy_old(lbuff);
+                pbdl^.state := dirty;
+                pbdr^.state := dirty;
+                relbuff(lresult,lbuff,relprio);
+                if lresult <> noerr then goto 3;
+                havelowbuff := true;
+                end;
+
+            rot,rot_replace:  { a rotate, necessitated by a delete or a
+                                replace }
+                begin
+
+            {   first rotate back the rotated record.  then if it was a
+                replace, delete the replacement record.  finally insert
+                the old record.  keep around the right page for recovery
+                in the next level  }
+
+                getright_left;
+                if lresult <> noerr then goto 2;
+                if ps^.rec_lpage = ps^.page then { rotate was right to left }
+                    begin
+                    insrotate(pbl,pol,nkeys-1,0,rbuff,descoff);
+                    delrecord(pbl,pol,pdl,nkeys-1);
+                    end
+                else                 { rotate was left to right }
+                    begin
+                    insrotate(pbr,por,0,nkeys,lbuff,descoff);
+                    delrecord(pbr,por,pdr,0);
+                    end;
+                pbdl^.state := dirty;
+                pbdr^.state := dirty;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'after rotate');
+                    dumpp(fileid,rbuff);
+                    dumpp(fileid,lbuff);
+                    end;
+{$ENDC }
+
+                if ps^.rec_lpage = ps^.page then
+                    begin
+                    if ps^.vact = rot_replace then
+                        delrecord(pbl,pol,pdl,ps^.index);
+                    copy_old(lbuff);
+                    end
+                else
+                    begin
+                    if ps^.vact = rot_replace then
+                        delrecord(pbr,por,pdr,ps^.index);
+                    copy_old(rbuff);
+                    end;
+                relbuff(lresult,lbuff,relprio);
+                if lresult <> noerr then goto 3;
+                havelowbuff := true;
+                end;
+
+            merge,merge_replace: { a merge of pages, possibly necessitated
+                                   by a replace }
+                begin
+
+            {   if its a replace, then delete the replacement record first.
+                split apart the merged page and reinsert the old record in
+                its proper page.  if this was a leaf page, fixup the prior
+                pointer for the following page. keep the right page around
+                for recovery at the next level }
+
+                getright_left;
+                if lresult <> noerr then goto 2;
+                if ps^.vact = merge_replace then
+                    begin
+                    if ps^.rec_lpage = ps^.page then dindex := ps^.index
+                    else dindex := nkeys - ps^.numkeys + ps^.index;
+
+{$IFC debug }
+                    if bdebug then writeln(dumpfile,'di:',dindex);
+{$ENDC }
+
+                    delrecord(pbl,pol,pdl,dindex);
+                    nkeys := nkeys - 1;
+                    end;
+                if ps^.rec_lpage = ps^.page then nkeysl := ps^.numkeys - 1
+                else nkeysl := nkeys - ps^.numkeys + 1;
+                nkeysr := nkeys - nkeysl;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    writeln(dumpfile,'nkl,nkr:',nkeysl:5,nkeysr:5);
+                    end;
+{$ENDC }
+
+                ponkl := @pol^[-nkeysl];
+                movelf(pointer(ord(pbl)+ponkl^),pbr,pol^[-nkeys]-ponkl^);
+                movr_inc(@ponkl^,por,nkeysr,-ponkl^);
+                pbdl^.state := dirty;
+                nextpage := pdl^.next;
+                pdr^.next := nextpage;
+                pdr^.prior := ps^.rec_lpage;
+                priorpage := pbdr^.page;
+                pdl^.next := priorpage;
+                pdl^.nkeys := nkeysl;
+                pdr^.nkeys := nkeysr;
+                pdr^.ptype := pdl^.ptype;
+
+{$IFC debug }
+                if bdebug then
+                    begin
+                    dumpp(fileid,rbuff);
+                    dumpp(fileid,lbuff);
+                    end;
+{$ENDC }
+
+                if ps^.rec_lpage = ps^.page then copy_old(lbuff)
+                else copy_old(rbuff);
+                relbuff(lresult,lbuff,relprio);
+                if lresult <> noerr then goto 3;
+                if level = 0 then
+                   fix_pointers(lresult,NextPage,PriorPage,prior,fileid,descoff);
+                post(lresult,rbuff);
+                if lresult <> noerr then goto 3;
+                havelowbuff := true;
+                end;
+
+            end; { case }
+            lowbuff := rbuff;
+            level := level + 1;
+            lowprio := relprio;
+            relprio := isnonleaf;
+            ps := pointer(ord(ps)-sizeof(stackrec));
+        until ps^.vact = undone;
+        if havelowbuff then relbuff(lresult,lowbuff,lowprio);
+        if lresult = noerr then goto 1;
+
+3:      relbuff(tresult,rbuff,relprio);
+2:      if havelowbuff then relbuff(tresult,lowbuff,lowprio);
+        kresult := lresult;
+        pfd^.fstatus := inconsistent;
+1:      { kresult changed iff there was an error during recovery }
+end;
+
+ÿ

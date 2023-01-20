@@ -1,0 +1,1273 @@
+
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+{file: source/loader}
+
+PROGRAM LOADER;         { operating system loader}
+
+
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Bring up the system.  Steps include initialization,
+       (*    loading in system code/low level drivers/debuggers,
+       (*    creating and entering the psuedo outer process.
+       (*
+       (* Input Parameters:
+       (*    The boot prom inits several low core cells, describing the amount
+       (*    of and the base address of the equipped memory, and which device
+       (*    we are booting from.
+       (*
+       (* Output Parameters:
+       (*    Loader parameter pointer - points to the data passed
+       (*      to the OS, see file 'source/parms' for the contents.
+       (*
+       (*************************************************************)
+
+USES
+    (*$U object/ldutil.obj*)              ldutil,
+    (*$U object/prof.obj*)                lddrivers, {identical with 'twig.obj'}
+    (*$U object/driverdefs.obj*)          driverdefs,
+    (*$U object/sysglobal.obj*)           globalda,
+    (*$U object/procprims.obj*)           proc_prims,
+    (*$U object/asynctr.obj*)             asynctr,
+    (*$U object/genio.obj*)               genio,
+    (*$U object/twiggy.obj*)              twiggy,
+    (*$U object/vmstuff.obj *)            vmstuff,
+    (*$U object/sfileio.obj *)            sfileio,
+    (*$U object/fsprim.obj *)             fs_primitives,
+    (*$U object/ldlfs.obj*)               ldlfs;
+
+(*$R-*)
+
+CONST
+   max_mmu_seg_size = $20000;   { maximum number of bytes in an mmu segment}
+   maxsegments = 48;            { maximum number of segments in the code file, }
+   pagesize = 512;              { physical memories page size}
+
+{note: some constants are created as longint variables}
+
+   versionnumb = 22;            {version of loader data base }
+
+{ MMU definitions: }
+   basemmu = 16;        {first non-real-memory-type mmu}
+   debugmmu = 16;
+   firstosmmu = 17;     {first OS code segment}
+   mmucodemmu = 84;
+   realmemmmu = 85;     {first of 16 reserved for real memory}
+   superstkmmu = 101;
+   sysglobmmu = 102;
+   syslocmmu = 103;
+   stackmmu = 123;
+   shrsegmmu = 124;     {for intrinsics}
+   screenmmu = 125;
+{  iospacemmu = 126;    previously declared in driverdefs}
+   promreserved = 127;
+
+{values defining the attributes of newly programmed mmu cells}
+   mmureadonly =   5;
+   mmustack =      6;
+   mmureadwrite =  7;
+   mmuio =         8;
+   mmuabsent =    12;
+   mmuspecial =   15;
+
+   mmunotmem = 7;       {Value which, if exceeded, signifies a non-memory}
+                        { type of segment, ie, IO, ABSENT, or SPECIAL (PROM).}
+                        { (Used to distinguish when the physical adr of byte}
+                        {  zero is relevant to PROGMMU)  }
+
+   os_context = 0;      {this domain is the only one used by the loader}
+
+{addresses of especially important places:  }
+   adr_altscreen_ptr = $110;{where ptr to alternate screen lives}
+   adr_screen_ptr = $160;   {where ptr to application's screen lives}
+   adr_alt_screen = $170;   {where hwint finds physical adr of alternate scrn}
+   adr_prim_screen = $174;  {where hwint finds physical adr of primary screen}
+   adr_ldbase = $21c;       {where ldrldr stashes loader's base adr}
+
+   adr_maxsize = $294;      {where prom puts machines memsize}
+   adr_minsize = $2A4;      {where prom puts machines memsize}
+
+   adr_ld_fs_block0 = $210; {first block of fs in logical volume}
+   adr_log_vol = $212;      {no longer used, free to be re-defined}
+   adr_dev_type = $22E;     {twiggy, profile, or? }
+   adr_vol_starts = $216;   {location of logical volume's block adr}
+
+   adr_debugmode = $10000;  {where debug mode can be initiated, via boot prom,}
+                            {  merely by changing this place from -1.}
+
+TYPE
+
+{ the following types are inherited from the standard io unit:
+   filename = string[64];
+   absptr = longint;
+   byte = -128..127;
+}
+
+{ types of segments in the load file }
+   tsegclass = (kresidcs,       { kernel resident code segment }
+                sysinitcs,      { swappable portion of sys initialization }
+                dontload);      { not part of initialization }
+
+
+   memtype = (hi,lo);           { parameters to bgetspace, memtype for allocating}
+                                {  from hi or lo portion of memory, and          }
+   bgetparm = (onpage,dc);      {  bgetparm specifying whether memory allocation }
+                                {  must return a pointer on a page boundary.     }
+
+   {system mapping table (smt):}
+   smtent = packed record
+                     origin:integer;
+                     access:-128..127;
+                     limit:0..255;
+                   end;
+   smt = array[0..511] of smtent;
+   smt_ptr = ^smt;
+
+   tports = (uppertwig, lowertwig, parport,
+             slot11, slot12, slot13, slot14,
+             slot21, slot22, slot23, slot24,
+             slot31, slot32, slot33, slot34,
+             seriala, serialb, main_console, alt_console,
+             t_mouse, t_speaker, t_extra1, t_extra2, t_extra3);
+
+VAR
+
+   smt_adr: smt_ptr;   {pascal's way of finding smt, embodied in ldasm.obj}
+
+{ The segment class array shows whether a segment should be loaded into
+  one of the various memory regions: kernel-resident, user-resident, or a
+  swappable area}
+   segclass : array[1..maxsegments] of tsegclass;
+
+{ These guys accumulate outer proc launch info}
+   globals : integer;           {Amount of unit-global var space of OS}
+   mainentry : absptr;          {place where main program starts}
+
+(*$i source/parms.text*)        {loader data base, later passed to the OS}
+
+   ld_bootdev, log_vol: integer;{boot device TYPE, and drive selector}
+
+   debug_poker : ^integer;      {allows debug selector to be read}
+
+
+{ Here are the assembly language procedures, "compiled" elsewhere: }
+   function  GET_A5: longint; external;
+   procedure LDRLDR; external;
+   procedure INIT_DEBUGGER(p1,p2,p3,p4:absptr); external;
+   procedure SERNUM(var err : integer; var serno : longint); external;
+   procedure INIT_LLD(codebase : longint); external;
+   function  INITMMUTIL(freepage: absptr) : absptr; external;
+   procedure PROG_MMU(index,domain,mmucount,ret_domain: integer); external;
+   procedure ENTEROP(var pparms:integer; unitglobs : integer;
+                           endstackarea, pentry:absptr); external;
+   function  UNPACKCODE(version: longint; pinbuf, poutbuf, ptable : absptr;
+                        sizepacked, sizeunpacked: integer) : integer; external;
+
+
+function BGETSPACE(side:memtype; size:longint; pb:bgetparm) : absptr;
+       (*************************************************************)
+       (*                _____________ adr
+       (* Description:   |           |  0
+       (*                |___________|       Allocates space
+       (*    lomem >>>>> |           |         from high or
+       (*                | free      |         low memory.
+       (*                |  space    |
+       (*                |           |
+       (*                |___________|
+       (*    himem >>>>> |           |
+       (*                |___________| FFFFFF
+       (*
+       (* Input Parameters:
+       (*    Side - Requests memory from the hi or lo side of
+       (*             memory.
+       (*    Size - Bytes requested.
+       (*    Pb - Whether allocation must be on a page boundary.
+       (*           values are: ONPG, for on page boundary, or
+       (*                       DC, for dont care.
+       (*
+       (* Output Parameters:
+       (*    Bgetspace - returns a pointer to the first (lowest)
+       (*         byte of the allocated region.
+       (*
+       (* Side Effects:
+       (*    Updates free space data: himem, lomem.
+       (*
+       (* Error Conditions:
+       (*    Traps if allocatable memory impinges on the boot file,
+       (*    which lives in the middle of free memory, or if the
+       (*    'side' parameter is silly.
+       (*************************************************************)
+
+begin
+   case side of
+      lo: begin
+          if pb=onpage then     {round lomem up to next page boundary}
+            lomem := ((lomem+pagesize-1) div pagesize) * pagesize;
+          bgetspace := lomem;
+          lomem := lomem + size;
+          if lomem > toplomem then
+                TRAP(memexhaust);
+          end; { of case lo }
+      hi: begin
+          himem := himem - size; if pb=onpage then     {round himem down to the next page boundary}
+             himem := (himem div pagesize) * pagesize;
+          bgetspace := himem;
+          if himem < bothimem then
+                TRAP(memexhaust);
+          end; { of case hi }
+   end; { of case  }
+end; { of bgetspace }
+
+
+
+function FINDSPARE(size:longint) : integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Find the unused remainder of a memory segment.  Since
+       (*    segments are multiples of a physical page size, a
+       (*    segment of an arbitrary byte size inherits some number
+       (*    of 'extra' bytes, in the range 0 to pagesize-1.  This
+       (*    number is calculated by Findspare, so the caller can
+       (*    avoid the external fragmentation.
+       (*
+       (* Input Parameters:
+       (*    Size - The length of a page-aligned segment.
+       (*
+       (* Output Parameters:
+       (*    Findspare - Returns the remainer in the last page.
+       (*
+       (*************************************************************)
+
+var value : longint;
+
+begin
+   value := ((size + pagesize - 1) div pagesize) * pagesize;
+   findspare := value - size;
+end; { of findspare}
+
+
+
+procedure SETMMU(index:integer; base:absptr;
+                    length:longint; permits:integer);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Reconfigure an MMU segment. For a further discussion
+       (*       of the handling of mapping, see the design notes.
+       (*
+       (* Input Parameters:
+       (*    Index - which mmu segment.
+       (*    Base - where the segment starts.
+       (*    Length - how long it is, in bytes.
+       (*    Permits - operations allowed once mapping is on.
+       (*
+       (*************************************************************)
+begin
+   length := length + findspare(length);  {round size up to page boundary}
+   with smt_adr^[index] do
+   begin
+      origin := base div pagesize;
+      limit :=  length div pagesize;
+      access := permits;
+   end;
+   prog_mmu(index, os_context, 1, os_context);
+end; { of setmmu }
+
+
+
+procedure TERMINATE;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Dummy procedure to overcome reference in paslib.
+       (*
+       (*************************************************************)
+begin
+end; {of terminate}
+
+
+
+procedure RANGEERR;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Report the occurrence of a range error.
+       (*
+       (*************************************************************)
+begin
+   TRAP(ranger);
+end; {of range error}
+
+
+
+procedure BOOTINIT;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Bootinit is potpouri.  Highlights are:
+       (*          Initialize the loader's free space manager.
+       (*          Read parameters from the prom.
+       (*          Read configuration data from the configuration file.
+       (*          Initialize the mmu facilities.
+       (*          Allocate memory to the screen(s)
+       (*
+       (*************************************************************)
+const
+      ldstksize = 12228;        {space reserved for loader stack}
+      ldsize = 12228;           {12KB, co-incidental that it equals ldstksize}
+      slot_code = 2048;         {bytes of slot code space also deserving protect}
+      low_core = $800;          { start of allocatable space in lo memory }
+var   i : integer;
+      poke1promparam, poke2promparam : ^absptr;
+      index,domain:integer;
+      poker : ^absptr;
+      wordpoker : ^integer;
+      error : integer;
+      ldbase : longint;
+
+procedure SETVARS;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize statically defined system regions definitions,
+       (*     and get loader-loader data into pascal variables
+       (*
+       (*************************************************************)
+var
+   poker : ^integer;
+   longpoker : ^longint;
+
+begin
+{these are just first guesses at both variables and their values}
+   l_drivers := 2560;           {2.5 KB for low-level driver data}
+   l_sgheap := 27648;           { 27 KB for system heap }
+   l_opsyslocal := 10240;       { 10 KB Bytes for outer proc syslocal}
+   l_opustack := 34816;         { 34 KB for outer proc stack seg}
+   l_screen := 32768;           { 32 KB for debuggers screen}
+   l_scrdata := 512;            { .5 KB for screen driver data}
+
+   l_superstack := 1560;        {1.5 KB for supervisor stack }
+                                { (About 384 bytes per profile interrupt,
+                                   which could nest to around 4-deep,
+                                   as a (very) worst case. )  }
+
+   poker := pointer(adr_ld_fs_block0);
+   fs_block0 := poker^;
+   poker := pointer(adr_log_vol);
+   log_vol := poker^;
+   poker := pointer(adr_dev_type);
+   ld_bootdev := poker^;
+   longpoker := pointer(adr_ldbase);
+   ldbase := longpoker^;
+
+end; { of setvars}
+
+
+
+       (*************************************************************)
+       (*
+       (*  Here lies the body of bootinit.
+       (*
+       (*************************************************************)
+begin
+      SETVARS;
+      version := versionnumb;
+{ initialize the loader's memory allocator, except for himem, which
+  is inited in getpromparms }
+      toplomem := ldbase - ldstksize;
+      bothimem := ldbase + ldsize + slot_code;
+      lomem := low_core;
+      poke1promparam := pointer(adr_maxsize);   {read prom's idea of himem}
+      poke2promparam := pointer(adr_minsize);   {read prom's idea of lomem}
+      himem := poke1promparam^ - poke2promparam^;
+
+      wordpoker := pointer(adr_vol_starts);
+      INITMEDIA(log_vol, wordpoker^ + fs_block0);
+      SERNUM(error, ld_sernum);            {read machines serial number, if any}
+      if error<>0 then ld_sernum := 1;     {establish default, if necessary}
+
+{ allocate memory for the main screen}
+      b_screen := BGETSPACE(hi, l_screen, onpage);
+      l_physicalmem := b_screen + l_screen;
+
+{initialize mmu utilities, finding base of smt along the way}
+      smt_base := INITMMUTIL(BGETSPACE(lo,5*pagesize,onpage));
+      smt_adr := pointer(smt_base);
+
+{init the entire smt for absent, except for the 2 segments
+ just inited by initmmutil, ie, iospace and mmucodemmu:}
+      for i := 0 to 511 do {init all smt entries}
+      begin
+         with smt_adr^[i] do
+         begin
+            if (i<>iospacemmu) and (i<>mmucodemmu) then
+            begin
+               if i < basemmu then
+                  begin
+                     access := mmureadwrite;
+                     limit := 0;  {implies $20000 bytes}
+                     origin := i * $100;
+                  end
+               else if i=promreserved then
+                  begin
+                     access := mmuspecial;
+                     limit := 0;
+                     origin := 0;
+                  end
+               else
+                  begin
+                     access := mmuabsent;
+                     limit := 0;   {these two fields are really dont cares,}
+                     origin := 0;  {  given access field contents}
+                  end;
+               domain:=i div 128;
+               index :=i - domain * 128;
+               PROG_MMU(index,domain,1,os_context);
+            end; {of not iospace or mmucodemmu}
+         end; {of with smt_addr}
+      end; {of initing all smt entries}
+
+{complete smt initialization by setting entries inited in initmmutil: }
+      with smt_adr^[iospacemmu] do
+      begin
+         access := mmuio;
+         limit := 0; {for all of memory}
+         origin := 0;
+      end;
+      with smt_adr^[mmucodemmu] do
+      begin
+         access := mmureadwrite;
+         limit := 5; {one for the code, 4 for the smt}
+         origin := smt_base div pagesize;
+      end;
+end; { of bootinit }
+
+
+
+procedure LOADSYS(var entrypoint : absptr; var unitglobals : integer);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Load all resident and other segments required for
+       (*    initialization.  Create sysglobal.  Prepare the
+       (*    "psuedo-outer process", creating its stack and syslocal
+       (*    segments.  Construct a map of the base and length
+       (*    of system regions.
+       (*
+       (* Input Parameters:
+       (*    Entrypoint - returns the unmapped entrypoint of main
+       (*                  procedure of the program loaded.
+       (*    Unitglobals - amount of unit-global var space.
+       (*
+       (*************************************************************)
+CONST
+
+{ object file header values, ie, integer value corresponding to type byte }
+   nameblock = -128;     {$ff80 -  name block }
+   endblock = -127;      {$ff81 -  end block }
+   codeblock = -123;     {$ff85 -  code block }
+   packcodeblock = -96;  {$ffA0 -  packed code block }
+   execblock = -104;     {$ff98 -  executable block, alias jump table}
+   versionctrl = -103;   {$ff99 -  version control block }
+   darn_nonsense  = -98; {$ff9e - new (anonymous) xlinker record}
+   packtable = -95;      {$ffA1 -  pack table block }
+
+TYPE
+      iJTSegVariant = record
+                         SegmentAddr : absptr;(*points to code block*)
+                         SizePacked: integer; (*size of packed code with header*)
+                         SizeUnpacked: integer;(*size of unpacked code with header*)
+                         MemLoc : absptr;     (* logical adr *)
+                      end;
+
+      iJumpTvariant = record
+                         JumpL : integer;      (*jump opcode*)
+                         AbsAddr : absptr;     (*jump address*)
+                      end;
+
+      ld_jumptable = record
+                     numbofsegs : integer;
+                     aseg  : array [1..100] of iJTSegVariant;
+                  end; {of abbreviated jumptable}
+
+      desc_group = record
+                     desc_count : integer; {number of descriptors}
+                     adesc : array [1..100] of iJumpTvariant;
+                   end;
+
+VAR
+   error : integer;
+   enter_driver, driver_len : absptr;
+   lld_name, codename, unpkt_name : filename;
+   found1, found2, found3 : boolean;
+   globals:absptr;
+   jtbase : absptr;     {same as b_sysjt, defined to highlight}
+                        {  its transportation between procs}
+   search_ptr: absptr;  { next position in object file to be read }
+
+
+function BUILD_SYSGLOBAL(var globals:integer; var jtbase:absptr) : integer;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Create the system jump table inside jointly created
+       (*    sysglobal.  The mmu for sysglobal is initialized.
+       (*
+       (* Output Parameters:
+       (*    Globals - amount of global data in the system program.
+       (*    Jtbase - where the jump table was created.
+       (*    Build_sysglobal - returns the number of segments
+       (*
+       (*
+       (* Sysglobal segment is built to look like this:
+       (*
+       (*                _____________ adr
+       (*                |           |  0
+       (*
+       (*
+       (*                |___________|
+       (* bottom of sys_global       |
+       (*                |           |
+       (*                | Low-level driver buffers
+       (*                |___________|
+       (*                |           |
+       (*                | VM buffers|
+       (*                |___________|
+       (*                |           |
+       (*                | global    |
+       (* b_sysglobal>>> |  data     |
+       (*                |           |
+       (*                |           |
+       (* A5 >>>>>>>>>>> | A5 link   | (4 bytes for each of 8 entries)
+       (*                | Ret Adr=0 |
+       (*                | I Buf Ptr |
+       (*                | O Buf Ptr |
+       (*                | CommonSize|
+       (*                | Mon/OS Flag (=0 for OS)
+       (*                | C (Pascal Parm)
+       (*                | V (Pascal Parm)
+       (*                |___________|
+       (*                | intrinsic |
+       (*                |  ptrs     |
+       (*                | (wasted)  |
+       (*                |___________|
+       (*                |           |
+       (*                | System JT |
+       (*                |___________|
+       (*                |           |
+       (*                | Sysglobal |
+       (*                |   Heap    |
+       (* top of sys_global__________|
+       (*                |           |
+       (*
+       (*
+       (*                |___________| FFFFFF
+       (*
+       (* Special Conditions of Use:
+       (*    Proper allocation of space to sysglobal depends on
+       (*    there being NO vars in the system (main) program
+       (*
+       (*    The size of sysglobal is rounded up to a multiple of
+       (*    the page size, any 'extra' space being inherited by
+       (*    the sysglobal heap.
+       (*
+       (*************************************************************)
+CONST
+   stk_space = 32;      {amount of stuff pushed into global var space}
+   dc_size = 28;        {amount of garbage in middle of executable block}
+   intrin_ptr_size = $1E0; {amount of wasted space for intrinsic ptrs}
+
+VAR
+   header : byte;
+   garbage: longint;
+   jt_base, jt_base2 : ^ld_jumptable;   {NOTE: JTBASE <> JT_BASE !!!!}
+   numbsegs : integer;
+   blocksize : absptr;
+
+ begin
+   search_ptr:=0;
+   header := GETBYTE;           {read block type}
+   garbage:= GETBYTE;           {discard hi-part of size field}
+   search_ptr := search_ptr+GETWORD;     {address of next block}
+   if header = darn_nonsense then
+     begin (* skip darn nonsense block *)
+       FILLBUF(search_ptr);
+       header:=GETBYTE;       { block type }
+       garbage:=GETBYTE;      { discard hi-part of size field}
+       search_ptr:=search_ptr+GETWORD;   { address of next block }
+     end;
+   if header = versionctrl then
+     begin (* skip version control block *)
+       FILLBUF(search_ptr);
+       header:=GETBYTE;       { block type }
+       garbage:=GETBYTE;      { discard hi-part of size field}
+       search_ptr:=search_ptr+GETWORD;   { address of next block }
+     end;
+   if header = packtable then
+     begin (* OS code file has been packed - skip the packing table *)
+       if unpktaddr=0 then    {make sure pack table exists}
+          TRAP(no_pack);
+       FILLBUF(search_ptr);
+       header:=GETBYTE;       { block type }
+       garbage:=GETBYTE;      { discard hi-part of size field}
+       search_ptr:=search_ptr+GETWORD;   { address of next block }
+     end;
+   if (header <> execblock)  then
+   begin
+      trap(bad_os);
+   end;
+
+   garbage := GETLONG;          {discard jt's idea where it should be loaded}
+   l_sysjt := GETLONG;          { and its length}
+   globals := GETLONG+stk_space;{ and # of UNIT global vars (Main prog has NONE) }
+                                { ("+stk_space" makes space for monitor's }
+                                {    A5-based i/o ptrs, etc.) }
+
+   MOVEMULTIPLE(dc_size, lomem); {read intermediate jt portion to scratch space}
+   MOVEMULTIPLE(l_sysjt, lomem); {read jump table into scratch space, although}
+                                 { it still needs to be copied to the right spot}
+
+   jt_base := pointer(lomem);
+   numbsegs := jt_base^.numbofsegs;
+   build_sysglobal := numbsegs; {returns number of segments}
+   if numbsegs>maxsegments then
+       TRAP(bad_os);
+
+   l_vmbuffer := bufferpages * $218;    {allocate space for vm buffers}
+   l_intrin := intrin_ptr_size;
+
+{reclaim external fragments, donating  any found to sys global heap: }
+   blocksize := l_drivers + l_vmbuffer + globals +
+                                l_intrin + l_sysjt;  {handy subtotal}
+   l_sgheap := l_sgheap + FINDSPARE(l_sgheap + blocksize);
+
+   l_sys_global := blocksize + l_sgheap;
+
+{build map of sysglobal and it's component parts, allocating space as we go: }
+   b_sys_global := BGETSPACE(lo, l_sys_global, onpage);
+   b_drivers := b_sys_global;
+   b_vmbuffer := b_drivers + l_drivers;
+   garbage := b_vmbuffer + l_vmbuffer;
+   b_intrin:= garbage + globals;
+   b_sysjt := b_intrin + l_intrin;
+   b_sgheap:= b_sysjt + l_sysjt;
+
+   SETMMU(sysglobmmu,b_sys_global,l_sys_global,mmureadwrite);
+
+{AMAZINGLY, the temporary copy of the jump table, loaded into LOMEM/JTBASE^,
+ so many lines of code ago, is STILL INTACT, so all we need to do is copy
+ it up to b_sysjt!!!!!!!   What a clever fool I am.}
+   jt_base2 := pointer(b_sysjt);
+   MOVER(ord4(jt_base), ord4(jt_base2), l_sysjt);
+
+{finally, return long-lived jump table address, not temp copy at lomem:}
+   jtbase := b_sysjt;
+
+end; {of build_sysglobal}
+
+
+
+function LOADSEG(segnumb: integer; jtbase: absptr; var mmuselect: integer;
+                  hi_or_lo: memtype; var seglength, segbase : absptr;
+                  with_jt: boolean) : boolean;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Load a segment, returning its length.
+       (*
+       (* Input Parameters:
+       (*    Segnumb - Which segment to load.
+       (*    Jtbase - The segment's jump table address.
+       (*    Hi_or_lo - which side of memory to load code into.
+       (*    With_jt - whether the jump table is being loaded
+       (*               along with the segment(s).
+       (*
+       (* Output Parameters:
+       (*    Mmuselect - If 'with_jt' then (and only then) mmuselect
+       (*                  returns thru which mmu the segment descriptor
+       (*                  has built the segment address.
+       (*    Seglength - Returns the segment's length.
+       (*    Segbase - Returns the base address of the code.
+       (*    Loadseg - Returns whether there was any problem loading the segment.
+       (*
+       (*************************************************************)
+CONST
+   max_seg_length = $20000;
+
+TYPE
+   codeheader = record
+                     hdr : int1;
+                     size1 : int1;
+                     size2 : int2;
+                     reloff : int4;
+                  end;
+
+   BlkUnpackTab = record (* unpacking table *)
+                  btype: int1;  (* block type *)
+                  res1: int1;   (* reserved *)
+                  bsize: int2;  (* block size *)
+                  packversion: int4; (* packtable version *)
+                  unpackbytes: array[1..2] of int1; (* unpack bytes *)
+                end;
+
+VAR
+   codehd : codeheader;
+   hdrptr : ^codeheader;
+   poker : ^integer;
+   thisseg : ^iJTSegVariant;
+   counter, blocksize: longint;
+   header : byte;
+   reloffset : absptr;
+   i : integer;
+   jumptab : ^ld_jumptable;
+   lenpacked, lenunpacked: integer;
+   p_unpackTab: ^BlkUnpackTab;
+
+begin
+   lenpacked:=0;
+   lenunpacked:=0;
+   if NOT with_jt
+     then search_ptr := 0 {start at beginning of file}
+     else
+      begin {use file position already in effect(search_ptr); process jump table }
+         jumptab := pointer(jtbase);
+         if segnumb > jumptab^.numbofsegs then
+            begin
+               loadseg := false;
+               EXIT(loadseg);
+            end;
+
+         thisseg := @jumptab^.aseg[segnumb];    {find target segment table}
+         with thisseg^ do
+           begin
+             mmuselect := memloc DIV max_seg_length; {return mmu used}
+             lenpacked:=SizePacked;
+             lenunpacked:=SizeUnpacked;
+           end;
+      end;  {of processing jump table}
+
+
+{read in the code for the segment}
+   repeat
+      FILLBUF(search_ptr);
+      header := GETBYTE;                            {read block type}
+      counter:= GETBYTE;                            { and block size, already }
+      blocksize := GETWORD;
+      search_ptr := search_ptr + blocksize;         { address of next block}
+
+      if (counter<>0) or (blocksize<=0)  then       {being lost, blame it }
+         begin                                      {  on the object code!}
+            loadseg := false;
+            EXIT(loadseg);
+         end;
+
+      if ((lenpacked = 0) and (header=codeblock)) or
+         ((lenpacked <> 0) and (header = packcodeblock)) then
+         begin  {ONLY ONE PER SEGMENT IS THE RULE I DEPEND ON}
+            if lenunpacked = 0
+              then seglength:=blocksize (* use info from code block *)
+              else seglength:=lenunpacked; (* use info from JT *)
+            segbase :=
+               BGETSPACE(hi_or_lo,seglength,onpage); {return code HEADER base}
+            reloffset := GETLONG;
+
+            if lenpacked = 0
+              then MOVEMULTIPLE(seglength-8,segbase+8)  {load normal code}
+              else MOVEMULTIPLE(lenpacked-8,segbase+8); {load packed code}
+
+            with codehd do  {reconstitute header, write it with the code}
+               begin
+                  hdr := codeblock;     {whether originally unpacked or packed}
+                  size1 := 0;           {counter already verified to equal this}
+                  size2 := seglength;   {accounts for both packed/unpacked cases}
+                  reloff := reloffset;
+               end;
+            hdrptr := @codehd;
+            poker := pointer(segbase);
+            MOVER( ord4(hdrptr), ord4(poker), SIZEOF(codehd) );
+
+            if lenpacked <> 0 then
+              begin (* now unpack the code *)
+                p_unpacktab := pointer(unpktaddr);
+                error := UNPACKCODE(p_unpackTab^.packversion,segbase+12,
+                                  segbase+8, ord(@p_unpackTab^.unpackbytes),
+                                  lenpacked-12, lenunpacked-8);
+                if error<>0 then TRAP(bad_unpack); (* unpacking failed - take error exit*)
+              end;
+
+            seglength:=seglength - 8; (* return length WITHOUT header *)
+
+         end; { of codeblock}
+   until header = endblock;
+   loadseg := true;  {segment successfully loaded}
+
+end; { of loadseg }
+
+
+
+
+procedure ALLOC_SCREEN_DATA;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Reserve the region below the screen as a data buffer,
+       (*    and init some of the low core cells describing the screen.
+       (*
+       (*************************************************************)
+const
+   adr_osconsole = $1fc;    {address holding paslib's console screen selector}
+var
+   console_ptr : ^integer;  {constructs pointer to pastext initialization addr}
+   poker : ^longint;
+begin
+   b_scrdata := BGETSPACE(hi, l_scrdata, onpage);
+   l_scrdata := b_screen - b_scrdata + l_screen;
+   poker := pointer(adr_screen_ptr);    {init ptr to application screen}
+   poker^ := ord4(screenmmu) * max_mmu_seg_size + b_screen - b_scrdata;
+   poker := pointer(adr_altscreen_ptr); {init ptr to alternate screen}
+   poker^ := ord4(screenmmu) * max_mmu_seg_size + b_db_screen - b_scrdata;
+   SETMMU(screenmmu, b_scrdata, l_scrdata, mmureadwrite);
+   console_ptr := pointer(adr_osconsole);  {setup OS paslib to use lisa scrn/keys}
+   console_ptr^ := 0;
+end; {of Alloc_screen_data}
+
+
+
+procedure LOAD_DEBUGGER;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Install the standalone debugger if it exists.
+       (*
+       (*************************************************************)
+const
+   na = 0; {as in not applicable}
+   db_stacksize = $1000;
+var
+   poker : ^longint;
+   mmunumb: integer;   {which mmu a segment is targeted for}
+   debugname : filename;
+   mapped_adj, db_data_bot, scrn_base, globals, segments,
+      bitbkt, jtbase, code1leng, code1base,
+      code2leng, code2base : absptr;
+begin
+
+   debugname := 'SYSTEM.DEBUG';
+   have_lisabug := OPENINPUT(debugname);
+
+{allocate space for a second screen if lisabug exists:}
+   two_screens := have_lisabug;
+   l_db_screen := l_screen;
+   if two_screens then
+      b_db_screen := BGETSPACE(hi, l_db_screen, onpage)
+   else  {second screen not wanted}
+      b_db_screen := b_screen; {debugger uses appl. screen (or soroc) }
+
+   if have_lisabug then
+      begin
+         db_data_bot := BGETSPACE(hi, db_stacksize, onpage) + db_stacksize;
+         if not LOADSEG(na, na, mmunumb, hi, code1leng, code1base, false) then
+            TRAP(bad_debug);
+
+         debugname := 'SYSTEM.DEBUG2';
+         if not OPENINPUT(debugname) then
+            begin
+               code2leng := 0;
+               code2base := code1base;
+            end
+         else
+            if not LOADSEG(na, na, mmunumb, hi, code2leng, code2base, false)
+               then TRAP(bad_debug);
+
+         b_debugseg := code2base - $4000;
+         l_debugseg := b_db_screen + l_db_screen - b_debugseg;
+      end
+   else
+      begin
+         code1leng := 0;
+         b_debugseg := b_db_screen - $4000;
+         l_debugseg := $4000 + l_db_screen;
+      end;
+
+ {Debugger wants its own mmu, covering code, data, AND screen,
+  ALL of which must be contiguous.  In addition, the mmu must be offset
+  by $4000, so the front part of the debugger will have a particular
+  bit on in the PC during the time when setup is turned on. SHEESH.  }
+
+  {If debugger isn't loaded, then the same mmu merely maps the debugging screen,
+   plus the same $4000 (for no particular reason).  }
+
+   SETMMU(debugmmu, b_debugseg, l_debugseg, mmureadwrite);
+
+ {Convert debugger's mmu number into a pointer that converts a physical address
+  to an offset within that mmu segment, already adjusted for the $4000 bias
+  of the mmu segment}
+
+   mapped_adj := ord4(debugmmu) * max_mmu_seg_size - b_debugseg;
+
+   if code2leng=0 then code2base := 0
+   else code2base := mapped_adj+code2base+8;    { '+8' accounts for obj code hdr}
+
+   if code1leng=0 then code1base := 0
+   else code1base := mapped_adj+code1base+8;    { '+8' accounts for obj code hdr}
+
+   if have_lisabug then
+      INIT_DEBUGGER(mapped_adj+b_db_screen, mapped_adj+b_db_screen,
+                 code1base, code2base)
+   else
+      INIT_DEBUGGER(b_db_screen, b_db_screen, 0, 0);
+
+   poker := pointer(adr_alt_screen);    {establish unmapped adr of screens}
+   poker^ := b_db_screen;
+   poker := pointer(adr_prim_screen);
+   poker^ := b_screen;
+
+
+end; {of installing the debugger}
+
+
+
+procedure LOAD_UNPACKTABLE(itsname: filename; var base: absptr);
+       (************************************************************)
+       (*
+       (* Description:
+       (*    If present, load the table used for unpacking code segs
+       (*
+       (* Input Parameters:
+       (*    Itsname - name of the pack table.
+       (*
+       (* Output Parameters:
+       (*    base - returns the address where the pack table was loaded.
+       (*
+       (************************************************************)
+   var
+     header: byte;
+     counter, blocksize, memorysize: longint;
+
+   begin
+     base:=ord(nil);
+     if OPENINPUT(itsname) then
+       begin (* unpacking table on disk *)
+         search_ptr:=0;
+         FILLBUF(search_ptr);    (* next block *)
+         header:=GETBYTE;        (* block type *)
+         counter:=GETBYTE;
+         blocksize:=GETWORD;     (* block size *)
+         if header = packtable then
+           begin (* valid file *)
+             (* allocate space for file and read it into memory *)
+             memorysize:=blocksize;
+             base:=BGETSPACE(lo,memorysize,onpage);
+             search_ptr:=0;
+             FILLBUF(search_ptr);    (* next block *)
+             MOVEMULTIPLE(memorysize,base);
+           end;
+       end;
+   end;(*LOAD_UNPACKTABLE*)
+
+
+
+procedure LOAD_LLD(var codebase, codeleng : absptr);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Load the low-level drivers.
+       (*
+       (* Output Parameters:
+       (*    codebase - returns the (unmapped) base address of the drivers
+       (*    codeleng - returns the length of the drivers
+       (*
+       (*************************************************************)
+const
+   na = 0; {as in not applicable}
+var
+   mmunumb : integer;
+begin
+{ The last param, whether to process the jump table, renders the first 3 irrelevant}
+   if not LOADSEG(na, na, mmunumb, lo, codeleng, codebase, false) then
+      TRAP(bad_lld);
+end; {of loading/initing low-level drivers}
+
+
+
+procedure INSTALL_LLD(codebase, codeleng : absptr; var unpktbase : absptr);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Install the low-level drivers, including programming their mmu.
+       (*
+       (* Input Parameters:
+       (*    codebase - base address of the drivers
+       (*    codeleng - length of the drivers
+       (*
+       (* Output Parameters:
+       (*    unpktbase - returns the MAPPED address of the unpacking table.
+       (* Note:
+       (*    The unpacking table, if present, is mapped with the
+       (*    drivers to give them read only protection.
+       (*
+       (*************************************************************)
+var
+   mmunumb: integer;
+   base: absptr;
+   length, driver_base, offset: int4;
+begin
+   mmunumb := os_segs+firstosmmu;
+   if unpktbase <> ord(nil) then
+     begin  (* unpack table exists *)
+       base:=unpktbase;
+       offset:=codebase-unpktbase;
+       length:=codeleng + offset;
+       unpktbase:=ord4(mmunumb) * max_mmu_seg_size; (* mapped address or table *)
+       driver_base:=unpktbase + offset;
+     end
+    else
+     begin  (* no unpacking table *)
+       base:=codebase;
+       length:=codeleng;
+       driver_base:=ord4(mmunumb) * max_mmu_seg_size;
+     end;
+   SETMMU( mmunumb, base, length, mmureadonly);
+   INIT_LLD( driver_base + 8);
+end; {of loading/initing low-level drivers}
+
+
+
+procedure LOADCODE(jtbase:absptr; segcount:integer);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Load all kernel-resident and initialization segments,
+       (*    initializing an mmu for each segment.
+       (*
+       (* Input Parameters:
+       (*    Jtbase - the base of the system jump table.
+       (*    Segcount - number of segments in this program
+       (*
+       (* Special Conditions of Use:
+       (*    The kernel code segment MMU (but only the mmu) is increased in
+       (*    length by 256 bytes so that certain compiler code generation
+       (*    (strings may cause access to that distance off the
+       (*    end of the last procedure in the segment) doesn't
+       (*    cause a segment limit violation.
+       (*
+       (*************************************************************)
+CONST
+   maxstringleng=256;
+
+TYPE
+   segname = string[8];
+   poly = packed record        {convert byte to char type}
+           case char of
+             'c': (c:char);
+             'b': (b,d:byte);
+           end;
+VAR
+   segnumb : integer;
+   mmunumb: integer;   {which mmu a segment is targeted for}
+   substring, this_seg : segname;
+   x : poly;
+   j: integer;
+   hi_or_lo: memtype;
+   header: byte;
+   garbage: longint;
+   hunksize : longint;
+begin
+   { categorize each segment by its name and load the segment into memory }
+   { if name indicates such.                                              }
+   for segnumb := 1 to segcount do
+   begin
+      repeat
+         FILLBUF(search_ptr);
+         header := GETBYTE;
+         garbage := GETBYTE;
+         hunksize := GETWORD;
+         if (hunksize<>0) then search_ptr := search_ptr + hunksize
+         else TRAP(bad_os);
+      until header=nameblock;
+      garbage := GETLONG;       {skip module name field}
+      garbage := GETLONG;
+
+      if segnumb = 1 then
+        begin { segment 1, the ' <blank> ' segment is always kernel-resident}
+          swappedin[segnumb] := false;
+          segclass[segnumb] := kresidcs;
+          hi_or_lo:=hi;
+        end
+       else
+        begin
+          this_seg := '        ';  {8 blanks}
+          for j := 1 to 8 do
+          begin
+             x.b := GETBYTE;
+             this_seg[j] := x.c;   {feed byte from x.b via x.c}
+          end;
+
+          substring := COPY(this_seg,1,2);
+          if substring = 'ni' then  {NI means: Not Initially loaded}
+             begin
+                swappedin[segnumb] := false;
+                segclass[segnumb] := dontload;
+                b_oscode[segnumb] := 0;   {Distinguish between 'K-Resident' and    }
+                l_oscode[segnumb] := 0;   { 'Not Initially loaded' segs this way.  }
+             end
+          else if substring = 'kr' then {KR means: Kernel Resident}
+             begin
+                swappedin[segnumb] := false;
+                segclass[segnumb] := kresidcs;
+                hi_or_lo:=hi; {load at the high end of memory}
+             end
+          else
+             begin  {defaults to segments wanting to be pre-loaded}
+                swappedin[segnumb] := true;
+                segclass[segnumb] := sysinitcs;
+                hi_or_lo:=lo; {load at the low end of memory}
+             end;
+        end;
+
+      if segclass[segnumb] <> dontload then
+      begin
+         if not LOADSEG(segnumb, jtbase, mmunumb, hi_or_lo, l_oscode[segnumb],
+                        b_oscode[segnumb], true)
+            then TRAP(bad_os);
+
+         SETMMU(mmunumb, b_oscode[segnumb],
+                        l_oscode[segnumb]+maxstringleng, mmureadonly);
+      end;
+   end;(*for*)
+end; { of loadcode}
+
+
+
+procedure MAKESUPSTK;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Create the supervisor stack, including programming its mmu.
+       (*
+       (*************************************************************)
+begin
+   b_superstack := BGETSPACE(hi,l_superstack,onpage);
+   SETMMU(superstkmmu, b_superstack, l_superstack, mmustack);
+end; {of makesupstk}
+
+
+
+function  FINDMAINENTRY(jtbase, numbsegs:absptr) : absptr;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Find the address where the system's main procedure's
+       (*     entrypoint.
+       (*
+       (* Input Parameters:
+       (*    Jtbase - base address of the jump table
+       (*    Numbsegs - number of segments in the jump table
+       (*
+       (* Output Parameters:
+       (*    Findmainentry - returns the entrypoint.
+       (*
+       (*************************************************************)
+var jt_ptr : ^ld_jumptable;
+    proc_ptr : ^iJumpTVariant;
+begin
+   jt_ptr := pointer(b_sysjt);
+   proc_ptr := pointer( ord(@jt_ptr^.aseg[numbsegs+1]) + 2);
+   findmainentry := proc_ptr^.absAddr;    {returns MAPPED form of entrypoint}
+end; { of findmainentry }
+
+
+
+procedure ALLOC_OP;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Create the outer process' data space.  Unlike most
+       (*    processes, the outer process has no 'proclocal'
+       (*    segment, but it does have a user stack and syslocal
+       (*    segments.
+       (*
+       (*    The system initialization part of the OS completes
+       (*        the creation of the outer process.
+       (*
+       (*************************************************************)
+begin
+   l_opsyslocal := l_opsyslocal + FINDSPARE(l_opsyslocal);
+   b_opsyslocal := BGETSPACE(lo,l_opsyslocal,onpage);
+   SETMMU(syslocmmu,b_opsyslocal,l_opsyslocal,mmureadwrite);
+   l_opustack := l_opustack + FINDSPARE(l_opustack);
+   b_opustack := BGETSPACE(lo,l_opustack,onpage);
+   SETMMU(stackmmu,b_opustack,l_opustack,mmustack);
+end; { of allocate outer process}
+
+
+
+       (*************************************************************)
+       (*
+       (*   Here lies the body of LOADSYS.
+       (*
+       (*************************************************************)
+begin
+
+   lld_name := 'SYSTEM.LLD';
+   codename := 'SYSTEM.OS';
+   unpkT_name := 'SYSTEM.UNPACK';
+
+   LOAD_DEBUGGER;   {only after this routine will 'TRAP' report errors legibly}
+   LOAD_UNPACKTABLE(unpkt_name,unpktaddr);  (* NOTE : this MUST be followed by *)
+                                            (*        load of SYSTEM.LLD in the*)
+                                            (*        low portion of memory, so *)
+                                            (*        it can share the mmu with *0
+                                            (*        the low level drivers.*)
+   if not OPENINPUT(lld_name) then
+      TRAP(no_lld);     {no low-level driver file}
+
+ {load low level drivers (file has already been 'opened') }
+   LOAD_LLD(enter_driver, driver_len);
+   if not OPENINPUT(codename) then
+      TRAP(nocodefile);
+
+   ALLOC_SCREEN_DATA;                   {create screen driver data area}
+
+   os_segs := BUILD_SYSGLOBAL(unitglobals,
+                    jtbase);            {create sys global and jt}
+   INSTALL_LLD(enter_driver, driver_len, unpktaddr);{install driver,    }
+                                                    {unpacking table,   }
+                                                    {and finish init of lisabug.}
+   if debugmode then LDMACSBUG;
+
+   LOADCODE(jtbase, os_segs);           {load OS code}
+   MAKESUPSTK;                          {create the supervisor stack}
+   entrypoint := FINDMAINENTRY(jtbase, os_segs); {return program's entrypoint}
+   ALLOC_OP;                            {create outer process data spaces}
+   ldr_a5 := GET_A5;                    {pass loader's A5 value to the OS}
+end; { of loadsys}
+
+
+
+       (*************************************************************)
+       (*
+       (* Here lies the body of program LOADER
+       (*
+       (*************************************************************)
+
+begin { loader }
+
+   debug_poker := pointer(adr_debugmode);
+   debugmode := (debug_poker^<>-1);
+
+   BOOTINIT;
+   LOADSYS(mainentry, globals);
+
+   ENTEROP(version, globals, b_opustack+l_opustack, mainentry);
+
+{ Enterop never returns ! }
+
+   LDRLDR;      {dummy call to ldrldr to ensure linker doesnt skip it.}
+
+
+end. { of loader }
+ÿ

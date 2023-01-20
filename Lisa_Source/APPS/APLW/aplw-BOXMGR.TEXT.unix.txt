@@ -1,0 +1,573 @@
+{$I APLW/COMPFLAGS }                                            {gdf 1/16/84}
+{$R-}
+
+UNIT BoxMgr;
+
+(* Copyright 1983, 1984, Apple Computer Inc. *)
+
+INTERFACE
+
+{ gdf  2/27/84 -- insert trace calls for segmentation  }
+{ gdf  1/16/84 -- printing compile flag & include COMPFLAGS added }
+{ crc  3/04/83 -- install windowDwn on down only for page & line scrolling }
+{ bas   2/8/83 -- install windowDwn on button up/down for proper clipping }
+{ bas  10/5/82 -- arrow painting and thumb dragging }
+{ bas  9/24/82 -- blackened arrows and page flip icons on down }
+{ bas  9/11/82 -- split bug }
+{ bas  8/30/82 -- grow }
+{ bas  7/22/82 -- page flip icons }
+{ jrm  6/30/82 -- replaced SetClipRgn with SetClip }
+{ jrm  6/29/82 -- USES changes: LisaGraf => QuickDraw; moved USES UnitFile }
+{ bas 04/21/82 -- thumb dragging uses globalized windowDwn for proper clipping }
+{ crc 04/06/82 -- integration with new font manager }
+{ bas 02/18/82 -- install proper port on mouse up }
+{ bas 02/09/82 -- scroll box on dialog }
+{ bas 01/23/82 -- modify in style of wm library routines }
+{ bas 01/12/82 --  fix skewer drag bug }
+{ edited by bas 9/07/81 }
+
+USES
+     {$IFC sampcalls}                                               {gdf 2/24/84}
+        {$U aplw/tracecalls.obj} tracecalls,
+     {$ENDC}
+     {$U Obj:UnitStd }   UnitStd,
+     {$U Obj:UnitHz }    UnitHz,
+     {$U LibOS/Syscall }   Syscall,
+     {$U Obj:UnitFile }  UnitFile,
+     {$U Obj:Storage }   Storage,
+     {$U Obj:QuickDraw } QuickDraw,
+     {$U Obj:FontMgr }   FontMgr,
+     {$U Obj:WM.Events }  Events,
+     {$U Obj:WM.Folders } Folders,
+     {$U Obj:WmlStd     } WmlStd,
+     {$U Obj:WM.Menus   } Menus,
+     {$U Obj:AlertMgr   } AlertMgr,
+     {$U ApLW/Queue }      Queue,
+     {$U ApLW/UnitBox }    UnitBox,
+     {$U ApLW/BoxScid }    BoxScid,
+     {$U ApLW/UnitFolder } UnitFolder;
+
+
+PROCEDURE  InitBoxMgr           (hz: THz; cobox: TC; pq: TPQ);
+PROCEDURE  HandleBoxEvent       (VAR evDsc: TEvDsc; VAR actArea:TActArea);
+
+
+IMPLEMENTATION
+
+{$IFC fSymOK }
+{$D+ }
+{$ELSEC }
+{$D- }
+{$ENDC }
+
+
+TYPE
+        TySBSaveRestore = (saveSB, restoreSB);
+
+VAR dirScroll: TDir;
+    rFrame: TR; cdTabBot: TCd;
+    fDragFrame: BOOLEAN;
+    ptDelta, ptMouse, ptLast, ptIncr: TPt;
+
+     { info stashed on a down and held till the next down }
+    evDscDwn: TEvDsc; windowDwn: TWindow; ptDwn: TPt; iconDwn: TIcon;
+
+    mpDir: ARRAY [TF, TTyvh] OF TDir;  { determines scrolling direction }
+
+    oboxTab: TC;
+    fMoved: TF;
+
+
+     { thmdragRec contains state info for thumb dragging, skrdragRec contains
+       state info for skewer dragging.  they're very similar, so maybe should
+       be combined into a variant record. }
+
+    thmdragRec: RECORD
+                  tyvh: TTyvh;          { axis thumb moves along }
+                  cdMinMouse: TCd;      { min pos of mouse along axis }
+                  cdMaxMouse: TCd;      { max pos of mouse along axis }
+                  cdThumb: TCd;         { current pos of thumb }
+                  dcdOffset: TCd;       { cdMouse - dcdOffset = cdThumb }
+                  rMvThumb: TR;         { rect thumb occupies }
+                  rThumbOrig: TR;       { orig thumb rect }
+                  cThumbOrig: TC;       { original thumb percent }
+                END;
+
+    skrdragRec: RECORD
+                  tyvh: TTyvh;          { axis skewer moves along }
+                  cdMinMouse: TCd;      { min pos of mouse along axis }
+                  cdMaxMouse: TCd;      { max pos of mouse along axis }
+                  cdSkewer: TCd;        { current pos of skewer along axis }
+                  dcdOffset: TCd;       { cdMouse - dcdOffset = cdSkewer }
+                  cdLineFrom, cdLineTo: TCd;    { ortho line from here to there }
+                  fSplit: TF;           { split or resize }
+                END;
+
+{$ifc fThumbNumber}
+    SBSaveBits: BitMap;
+    SBBitImage: Array [0..15] of Longint; {64 bytes: enough space for elevator}
+{$endc}
+
+{$S LWResize}
+{-----------------}
+PROCEDURE XorFrame;
+{-----------------}
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    PenMode(14);         {inverse XOR}
+    PenPat(gray);
+    FrameRect(rFrame);
+    IF rFrame.top <> cdTabBot THEN BEGIN
+        MoveTo(rFrame.left, cdTabBot);
+        LineTo(rFrame.right-1, cdTabBot);
+    END;
+    MoveTo(rFrame.left, rFrame.bottom-dvScroll);
+    LineTo(rFrame.right-1, rFrame.bottom-dvScroll);
+    MoveTo(rFrame.right-dhScroll, cdTabBot);
+    LineTo(rFrame.right-dhScroll, rFrame.bottom-1);
+    PenNormal;
+END;
+
+
+{------------------}
+PROCEDURE InitFrame;
+{------------------}
+ { initialize the frame-dragging procedure }
+VAR pbox: TPbox; wInfo: WindowInfo;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    pbox := POINTER(ORD(bdsp) + oboxTab);
+    rFrame := pbox^.window^.portRect;  InsetRect(rFrame, -1, -1);
+    cdTabBot := rFrame.top;
+    GetWindInfo(pbox^.window, wInfo);
+    IF wInfo.hasTab THEN rFrame.top := rFrame.top - 15;
+    WITH pbox^.window^.portBits.bounds DO BEGIN
+        OffsetRect(rFrame, -left, -top);
+        cdTabBot := cdTabBot - top;
+    END;
+    IF fTstBox THEN WRITELN('Frame initted:');
+    SetClip(hrgnScreen);
+    XorFrame;
+END;
+
+
+{$S LWPreview}
+{---------------------------------}
+FUNCTION CClip (cLow, c, cHi: TC): TC;
+{---------------------------------}
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF      c < cLow THEN CClip := cLow
+    ELSE IF c > cHi  THEN CClip := cHi
+    ELSE                  CClip := c;
+END;
+
+
+{$S LWSplit}
+{--------------------}
+PROCEDURE XorSkewer;
+{--------------------}
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    PenPat(gray); PenMode(14);
+    WITH skrdragRec DO
+        IF tyvh = tyvhH THEN
+             BEGIN MoveTo (cdSkewer, cdLineFrom); LineTo (cdSkewer, cdLineTo); END
+        ELSE BEGIN MoveTo (cdLineFrom, cdSkewer); LineTo (cdLineTo, cdSkewer); END;
+    PenNormal;
+END;
+
+
+{----------------------------------------------------}
+PROCEDURE SetupSkewerDrag (pboxScrl: TPbox);
+{----------------------------------------------------}
+  { stuff the skewer drag descriptor record, skrdragRec, with the
+    info needed to drag the skewer with each Mouse Moved event }
+VAR pboxT, pboxBeg, pboxEnd: TPbox; tyvhOther: TTyvh;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    WITH skrdragRec DO BEGIN
+        tyvh := pboxScrl^.tyvh;  tyvhOther := TyvhNOT(tyvh);
+
+         { split if obox is first scroll box along its axis, else resize }
+        pboxT := POINTER(ORD(bdsp) + OboxPrvFromObox(evDscDwn.obox));
+        fSplit := (pboxT^.tybox <> tyboxScroll) OR (pboxT^.tyvh <> tyvh);
+
+         { limits of skewer are from top of pboxBeg to bottom of pboxEnd }
+        IF fSplit THEN BEGIN
+             pboxBeg := pboxScrl;  pboxT := pboxBeg;
+             REPEAT
+                 pboxEnd := pboxT;
+                 pboxT := POINTER(ORD(bdsp) + pboxEnd^.oboxNxt);
+             UNTIL (pboxT^.tybox <> tyboxScroll) OR (pboxT^.tyvh <> tyvh);
+        END ELSE BEGIN
+             pboxBeg := pboxT;  pboxEnd := pboxScrl;
+        END;
+
+        cdSkewer := pboxScrl^.r.topLeft.vh[tyvh];
+        cdLineFrom := pboxScrl^.r.botRight.vh[tyvhOther]-1;
+        pboxT := POINTER(ORD(bdsp) + oboxTab);
+        IF tyvh = tyvhH
+             THEN cdLineTo := pboxT^.r.bottom ELSE cdLineTo := pboxT^.r.left;
+        dcdOffset := ptDwn.vh[tyvh] - cdSkewer;
+        cdMinMouse := pboxBeg^.r.topLeft.vh[tyvh] + dcdOffset;
+        cdMaxMouse := pboxEnd^.r.botRight.vh[tyvh] + dcdOffset - 1;
+    END;
+    IF fTstBox THEN
+        WRITELN('SetupSkewerDrag   oboxScrl: ', evDscDwn.obox,  ', Horiz? ',
+                 pboxScrl^.tyvh=tyvhH, ', Split? ', skrdragRec.fSplit);
+    SetClip(hrgnScreen);
+    XorSkewer;  { hide initial }
+END;
+
+
+{$S LWPreview}
+FUNCTION IconHitTest (VAR posts: TPosts; cd: TCd): TIcon;
+VAR icon: TIcon;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    icon := iconSkewer;
+    WHILE cd >= posts[icon] DO icon := SUCC(icon);
+    IconHitTest := icon;
+END;
+
+
+PROCEDURE ShowThumb (rThmb: TR; saveRestore: TySBSaveRestore);
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    {$ifc fThumbNumber}
+    WITH SBSaveBits DO IF saveRestore = saveSB THEN BEGIN
+        CopyBits (thePort^.portBits, SBSaveBits, rThmb, bounds, srcCopy, NIL);
+        WITH thmdragRec
+         DO PaintThumb (rThmb, CThumbFromCd (cdThumb,
+                                             cdMinMouse - dcdOffset,
+                                             cdMaxMouse - dcdOffset));
+        TextFont (wmFont);
+        FrameRect(rThmb);
+    END ELSE BEGIN {restore}
+        CopyBits (SBSaveBits, thePort^.portBits, bounds, rThmb, srcCopy, NIL);
+    END;
+    {$elsec}
+    PenPat(ltGray);
+    PenMode(notPatXor);
+    FrameRect(rThmb);
+    {$endc}
+    PenNormal;
+END;
+
+
+PROCEDURE SetupThumbDrag (pbox: TPbox; VAR posts: TPosts);
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    WITH thmdragRec DO BEGIN
+        tyvh := pbox^.tyvh;
+        cdThumb    := posts[iconGryA];
+        dcdOffset  := ptDwn.vh[tyvh] - cdThumb;
+        cdMinMouse := posts[PRED(iconGryA)] + dcdOffset;
+        cdMaxMouse := posts[iconGryB] - dptThumb.vh[tyvh] + dcdOffset;
+        RThumb(pbox, cdThumb, rMvThumb);
+        rThumbOrig := rMvThumb;
+        cThumbOrig  := pbox^.cPercent;  { original percent }
+        ShowThumb(rMvThumb, saveSB);
+    END;
+    IF fTstBox THEN WRITELN('SetupThumbDrag');
+END;
+
+{$S LWWindow}
+{--------------------------------------------------------------------}
+PROCEDURE HandleBoxEvent { (VAR evDsc: TEvDsc; VAR actArea:TActArea) };
+{--------------------------------------------------------------------}
+VAR pbox, pboxDwn: TPbox;
+    obox: TC;
+    cdArrowTL: TCd;
+    ptAdj: TPt;
+
+{$S LWPreview}
+    PROCEDURE PaintIcon (pbox: TPbox; posts: TPosts; icon: TIcon; fBlack: TF);
+     { for iconArwA, ArwB, PagA, and PagB only }
+    VAR ptTL: TPt; prvCh: CHAR;
+    BEGIN
+        {$IFC sampcalls}  ALogCall;  {$ENDC}
+        SetWmFont;
+        ptTL := pbox^.r.topLeft;
+        ptTL.vh[pbox^.tyvh] := posts[PRED(icon)];
+        MoveTo(ptTL.h, ptTL.v);
+        IF icon IN [iconArwA, iconArwB] THEN
+            prvCh := rgSymArw[icon=iconArwA, pbox^.tyvh]
+        ELSE
+            prvCh := rgSymPag[icon=iconPagA, pbox^.tyvh];
+        IF NOT fBlack THEN TextMode(srcBic);
+        DrawChar(SUCC(prvCh));
+        RestoreLFont;
+    END;
+
+{$S LWWindow}
+    {----------------------------}
+    PROCEDURE DoDwn;
+    {----------------------------}
+    VAR posts: TPosts;
+
+    BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    CASE pbox^.tybox OF
+      tyboxTab:    BEGIN
+                   Break(1501);
+                   END;
+
+      tyboxGrow:   fDragFrame := TRUE;
+
+      tyboxScroll: BEGIN
+                   LMkPosts(pbox, posts);
+                   iconDwn := IconHitTest (posts, ptDwn.vh[pbox^.tyvh]);
+                   CASE iconDwn OF
+                     iconSkewer:    SetupSkewerDrag(pbox);
+                     iconArwA, iconArwB, iconPagA, iconPagB:
+                         BEGIN
+                         SetPort (windowDwn); BegGlobal;
+                         PaintIcon(pbox, posts, iconDwn, TRUE { black } );
+                         dirScroll := mpDir[iconDwn IN [iconArwA, iconPagA],  pbox^.tyvh];
+                         EndGlobal; SetPort(bdsp^.port);
+                         END;
+                     iconThumb:
+                         BEGIN
+                         SetPort (windowDwn); BegGlobal;
+                         SetupThumbDrag(pbox, posts);
+                         EndGlobal; SetPort(bdsp^.port);
+                         END
+                     END;
+                   END;
+      OTHERWISE    Break(302);
+      END; { case }
+    SetRect(actArea.rAct, 0, 0, 0, 0); { see all moves }
+    actArea.fInRect := TRUE;
+    IF fTstBox THEN  WRITELN ('DoDwn: iconDwn = ', ORD(iconDwn),
+                               ', fDragframe? ', fDragFrame);
+    END; { DoDwn }
+
+
+    {----------------------------}
+    PROCEDURE DoMove;
+    {----------------------------}
+    VAR pbox: TPbox;
+    BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF fDragFrame THEN BEGIN
+        ptMouse.v := CMax(ptMouse.v, 32);    { not above dialogue or menu }
+        IF (ptMouse.h <> ptLast.h) OR (ptMouse.v <> ptLast.v) THEN BEGIN
+            IF NOT fMoved THEN BEGIN
+                InitFrame; fMoved := TRUE;
+            END;
+            XorFrame;
+            ptIncr := ptMouse;  SubPt(ptLast, ptIncr);
+            AddPt(ptIncr, rFrame.botRight);
+            XorFrame;
+        END;
+    END ELSE IF iconDwn = iconSkewer THEN WITH skrdragRec DO BEGIN
+        ptMouse.vh[tyvh] := CClip (cdMinMouse, ptMouse.vh[tyvh], cdMaxMouse);
+        IF ptMouse.vh[tyvh] <> ptLast.vh[tyvh] THEN BEGIN
+             XorSkewer;  { hide old }
+             cdSkewer := ptMouse.vh[tyvh] - dcdOffset;
+             XorSkewer;  { draw new }
+         END;
+    END ELSE IF iconDwn = iconThumb THEN WITH thmdragRec DO BEGIN
+        ptMouse.vh[tyvh] := CClip (cdMinMouse, ptMouse.vh[tyvh], cdMaxMouse);
+        IF ptMouse.vh[tyvh] <> ptLast.vh[tyvh] THEN BEGIN
+            SetPort(windowDwn);
+            BegGlobal;
+            ShowThumb(rMvThumb, restoreSB);     { hide old }
+            cdThumb := ptMouse.vh[tyvh] - dcdOffset;
+            pbox := POINTER(ORD(bdsp) + evDscDwn.obox);
+            RThumb(pbox, cdThumb, rMvThumb);
+            ShowThumb(rMvThumb, saveSB);     { draw new }
+            EndGlobal;
+            SetPort(bdsp^.port);
+        END;
+    END;
+    ptLast := ptMouse;
+    END; { DoMove }
+ (*
+         {----------------------------}
+         PROCEDURE DoDblClick;
+         {----------------------------}
+         VAR pbox: TPbox;
+         BEGIN
+         {$IFC sampcalls}  ALogCall;  {$ENDC}
+         IF iconDwn = iconSkewer THEN XorSkewer
+         ELSE IF fDragFrame      THEN XorFrame;
+         iconDwn := iconNil;
+         fDragFrame := FALSE;
+         IF evDsc.obox = evDscDwn.obox THEN
+             BEGIN
+             pbox := POINTER(ORD(bdsp) + evDsc.obox);
+             IF pbox^.tybox = tyboxTab THEN Break(1503);
+             END;
+         END; { DoDblClick }
+ *)
+
+    {----------------------------}
+    PROCEDURE DoUp;
+    {----------------------------}
+    VAR oboxSplit: TC; pbox: TPbox; ptT: TPt; dcdMoved: TCd; posts: TPosts;
+    BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    CASE iconDwn OF
+        iconArwA, iconArwB, iconPagA, iconPagB:
+            BEGIN
+              SetPort(windowDwn); BegGlobal;
+              pbox := POINTER(ORD(bdsp) + evDscDwn.obox);
+              LMkPosts(pbox, posts);
+              PaintIcon(pbox, posts, iconDwn, FALSE { white });
+              EndGlobal; SetPort(bdsp^.port);
+            END;
+        iconThumb: WITH thmdragRec DO
+            BEGIN
+              evDsc.cPct := CThumbFromCd(cdThumb, cdMinMouse - dcdOffset,
+                                         cdMaxMouse - dcdOffset);
+              SetPort(windowDwn);
+              BegGlobal;
+              ShowThumb(rMvThumb, restoreSB);     { hide old }
+              IF rThumbOrig.topLeft.vh[tyvh] <> rMvThumb.topLeft.vh[tyvh] THEN BEGIN
+                  FillRect(rThumbOrig, ltgray);
+                  EraseRect(rMvThumb);
+                  {$ifc fThumbNumber}
+                  PaintThumb (rMvThumb, evDsc.cPct);
+                  {$elsec}
+                  FrameRect(rMvThumb);
+                  {$endc}
+              END;
+              EndGlobal;
+               { note: min cdThumb = min cdMouse - dcdOffset; similarly for max }
+              IF cThumbOrig <> evDsc.cPct THEN BEGIN
+                  evDsc.tyev := tyevThumb;
+                  evDsc.obox := oboxNil; { disable call to VisObox }
+                  evDsc.scid := ScidFromObox(evDscDwn.obox, tyvh);
+                  pbox := POINTER(ORD(bdsp) + evDscDwn.obox);
+                  pbox^.cPercent := evDsc.cPct;
+              END;
+            END;
+        iconSkewer: WITH skrdragRec DO
+            BEGIN
+              XorSkewer;
+              SetPort(windowDwn); { restore port }
+              ptMouse.vh[tyvh] := CClip (cdMinMouse, ptMouse.vh[tyvh], cdMaxMouse);
+              cdSkewer := ptMouse.vh[tyvh] - dcdOffset;
+              dcdMoved := ptMouse.vh[tyvh] - ptDwn.vh[tyvh];
+              IF dcdMoved <> 0 THEN
+                  IF NOT fSplit THEN BEGIN
+                      IF dcdMoved > 0 THEN
+                           dcdMoved := dcdMoved + 1; { bottom of skewer }
+                      SynResize(OboxPrvFromObox(evDscDwn.obox), evDscDwn.obox, dcdMoved)
+                  END ELSE IF ptMouse.vh[tyvh] <> cdMaxMouse THEN BEGIN
+                      { coerce ptMouse to be in the scroll box to split }
+                       ptT := ptDwn;
+                       ptT.vh[tyvh] := cdSkewer;
+                       oboxSplit := OboxFromPt(ptT, windowDwn);
+                       pbox := POINTER(ORD(bdsp) + oboxSplit);
+                       IF pbox^.tybox <> tyboxScroll THEN Break(1113);
+                       SynSplit(oboxSplit, cdSkewer - pbox^.r.topLeft.vh[tyvh]);
+                 END;
+              IF fTstBox THEN WRITELN('UP -- Split? ', fSplit, ', Horiz? ',
+                         tyvh=tyvhH, ', dcdMoved: ', dcdMoved)
+            END;
+        OTHERWISE IF fDragFrame THEN BEGIN
+            ptMouse.v := CMax(ptMouse.v, 32);    { not above dialogue or menu }
+            IF fMoved THEN BEGIN
+               XorFrame;
+               SetPort(windowDwn); { restore port }
+               SubPt(evDscDwn.r.topLeft, ptMouse);
+               GrowFolder(evDscDwn.obox, ptMouse);
+                  { evDsc.tyev := tyevGrow; }
+               fMoved := FALSE;
+               END;
+            fDragFrame := FALSE;
+            END;
+    END;  {case }
+    iconDwn := iconNil;
+    END; { DoUp }
+
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+{$ifc fDbgOk}
+IF fTstBox THEN
+   BEGIN
+   WRITELN('HandleBoxEvent called:');
+   PxEvDsc(evDsc);
+   END;
+{$endc}
+SetPort(bdsp^.port);
+pbox := POINTER(ORD(bdsp) + evDsc.obox);
+ { make the point NOT box-relative }
+ptMouse := evDsc.r.topLeft;
+AddPt(pbox^.r.topLeft, ptMouse);
+CASE evDsc.tyev OF
+ tyevDwn, tyevDblClick, tyevTripleClick:
+     BEGIN
+     oboxTab  := OboxFldr(evDsc.obox);
+     evDscDwn := evDsc; evDscDwn.r.topLeft := ptMouse; ptDwn := ptMouse;
+
+     pboxDwn := POINTER(ORD(bdsp) + evDsc.obox);
+     windowDwn := pboxDwn^.window;
+
+     IF oboxTab  <> oboxNil THEN DoDwn;
+     ptLast := ptMouse;
+     END;
+ tyevMove:
+     IF NOT (iconDwn IN [iconArwA, iconArwB, iconPagA, iconPagB])
+        AND evDsc.fMouseButton THEN DoMove;
+  (*
+     tyevDblClick:
+         DoDblClick;
+  *)
+ tyevUp:
+     DoUp;
+ tyevUpdate:    { called only for scroll and grow boxes }
+     BEGIN
+      { OffsetRect(evDsc.r, pbox^.r.left, pbox^.r.top); }
+     PaintBox(evDsc.obox);  { no beg/end global needed since in bdsp^.port }
+     END;
+ END;
+
+IF iconDwn IN [iconArwA, iconArwB, iconPagA, iconPagB] THEN
+     BEGIN
+      { scrolling or page scrolling }
+     evDsc.dir := dirScroll;
+     pbox := POINTER(ORD(bdsp) + evDsc.obox);
+     evDsc.scid := ScidFromObox(evDsc.obox, pbox^.tyvh);
+     evDsc.obox := oboxNil; { disable call to VisObox }
+     IF iconDwn IN [iconArwA, iconArwB]
+          THEN evDsc.tyev := tyevScroll ELSE evDsc.tyev := tyevPScroll;
+     END;
+{$ifc fDbgOk}
+IF fTstBox THEN
+    BEGIN WRITELN('End HandleBoxEvent with evDsc: '); PxEvDsc(evDsc); END;
+{$endc}
+END;
+
+{$S LWCreate}
+PROCEDURE InitBoxMgr;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF fTstBox THEN WRITELN('Initting box manager.');
+    InitBdsp(hz, cobox, pq);
+    fDragFrame := FALSE;
+    iconDwn := iconNil;
+    fMoved := FALSE;
+
+     { TRUE for ArwA, PagA; FALSE for ArwB, PagB }
+    mpDir[TRUE, tyvhH] := dirLft;   mpDir[FALSE, tyvhH] := dirRt;
+    mpDir[TRUE, tyvhV] := dirUp;    mpDir[FALSE, tyvhV] := dirDwn;
+
+    hrgnScreen := NewRgn;
+    SetRectRgn(hrgnScreen, 0, 0, 720, 364);
+    {$ifc fThumbNumber}
+    WITH SBSaveBits DO BEGIN
+        SetRect (bounds, 0, 0, dptThumb.h - 2, dptThumb.v);
+        rowBytes := 4;
+        baseAddr := @SBBitImage;
+    END;
+    {$endc}
+END;
+
+ { end of unit }
+END.
+ÿ

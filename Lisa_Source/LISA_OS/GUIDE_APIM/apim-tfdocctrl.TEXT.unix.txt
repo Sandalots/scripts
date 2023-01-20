@@ -1,0 +1,581 @@
+{******************************************************************************}
+{*                                                                            *}
+{*       LisaGuide - imlib unit : Copyright 1983, Apple Computer Inc.         *}
+{*                                                                            *}
+{******************************************************************************}
+
+UNIT IFDocCtrl;
+
+{ This UNIT contains the procedures that bring documents to the desktop and puts
+  them back, locates, starts, and stops tools, and the dummy which manages all
+  windows for which the tool code is not on-line. }
+
+{ The system error numbers in this module range from 800-899.
+  The highest number in use is 895.  }
+
+(* ===== Conditional compilation variable (R) =====
+         if TRUE, then compile for real FILER;
+                  else compile for pseudo-FILER, which
+                       runs under LisaTutor.
+*)
+{$DECL R}
+{$SETC R:=FALSE}
+
+
+INTERFACE
+
+USES {$U libos/SysCall  } SysCall,
+     {$U libos/PSysCall } PSysCall,
+     {$U UnitStd  } UnitStd,
+     {$U UnitHz   } UnitHz,
+     {$U Storage  } Storage,
+     {$U QuickDraw} QuickDraw,
+     {$U FontMgr  } FontMgr,
+     {$U WM.Events} Events,
+     {$U WM.Windows}Windows,
+     {$U WM.Folders}Folders,
+     {$U WM.Menus } Menus,
+     {$U AlertMgr } AlertMgr,
+     {$U dbenv    } dbenv,
+     {$U dbdecl1  } dbdecl1,
+     {$U PMDecl   } PMDecl,
+     {$U apim/TFGlobals } IFGlobals,
+     {$U apim/TFEntry   } IFEntry,
+     {$U apim/TCatalog  } IFCatalog,
+     {$U apim/tfilercomm } tfilercomm,
+     {$U Scrap    } Scrap;
+
+CONST
+       fNoErr      = 0;
+       aborted     = 31079;     { Operation aborted                }
+       fBadData    = 9;         { The doc's data is corrupted      }
+       fCantRead   = 3;         { Unable to read the source diskfile }
+       fCantWrite  = 4;         { Unable to write to dest diskfile }
+       fCatalogErr = 5;         { Err accessing filer catalog      }
+       fDirtyDoc   = 2;         { An edited doc can refuse to put back, etc. }
+       fNoMemory   = 7;         { Insufficient memory space        }
+       fNoSpace    = 6;         { Not enough room on disk for doc  }
+       fNotXfer    = 1;         { The document was not copied      }
+       fOneTool    = 10;        { Cant dup tool on same disk       }
+       fToolErr    = 8;         { Tool could respond normally      }
+
+       copyDsSize  = 30000;     { Size of file copy buffer         }
+
+TYPE
+       TfsInfoPtr    = ^Fs_Info;
+
+VAR
+       copyDsAddr:      LONGINT;
+       copyDsBound:     INTEGER;
+       copyDsMemSize:   LONGINT;
+       copyDsRefnum:    INTEGER;
+       folderPort:      GrafPort;
+       scrapTool:       TtoolID;     { Type of tool that can display it, 0 if not ours }
+       upTime:          LONGINT;     { Time the last wait alert went up }
+
+
+FUNCTION DiskObject (hVol: TentryHdl; objCatRID: TcatRID) : BOOLEAN;
+
+{ This proc checks to see if there are any disk files associated with the object }
+
+PROCEDURE DummyDisplay (wPtr: WindowPtr);
+
+PROCEDURE InitDocCtrl;
+{ This proc readies this unit for use. }
+
+PROCEDURE RemoveAlert;
+
+{ This proc takes down a wait alert after insuring that it has been visible to
+  the user far a minimum time period.  'upTime' must be set when WaitAlert is
+  called, i.e. 'upTime:=Time;'.  }
+
+PROCEDURE ShredContents(volHdl: TentryHdl; objCatRID: TcatRID);
+
+PROCEDURE ShredDoc (hVol: TentryHdl; catRID: TcatRID);
+
+{ This proc destroys the named document. If the document is on the desktop,
+  it is suspended, the disk files destroyed, and its window destroyed. }
+
+PROCEDURE ShredObject (volHdl: TentryHdl; objCatRID: TcatRID);
+
+PROCEDURE TellUserWhy (sVolHdl,dVolHdl: TentryHdl; sCatRID,deCatRID: TcatRID;
+                       theReason: INTEGER);
+
+{ This proc tells the user, via a stop alert, why the operation he requested
+  was not performed.  }
+
+PROCEDURE XferObject (VAR err: INTEGER; sCatRID: TcatRID; dParent: IdType;
+                   sVolHdl, dVolHdl: TentryHdl; excludeUnfiled: BOOLEAN;
+                   moving: BOOLEAN; diskCt: INTEGER; VAR newCatRID: TcatRID);
+
+{ This proc moves everything in sCatRID on sVolHdl into dParent on dVolHdl.
+  (If an object is open, the application is told to duplicate it.)  It is assumed
+  that there is sufficient disk space; if not, any diskfiles transferred to the
+  destination during this call are deleted, i.e. everything moves or nothing moves.
+
+  dParent is the object into which the sCatRID object is to be copied.  If the
+  operation is sucessful, the newly created catRID of the xfered object is returned
+  in newCatRID.
+
+  diskCt should normally be '0' except when the object being xfered is the whole
+  disk, in which case diskCt should be 1 (it is incremented to reflect the number
+  of destination diskettes used and so is not a boolean).  }
+
+
+IMPLEMENTATION
+
+
+CONST
+
+      copyDsDfName  = '{!CopyBufr}';
+      intLibName    = 'Intrinsic.lib';
+      minDsSize     =  512;
+      shellDfName   = 'filer';
+
+        { tool startup errors - ordered in report order }
+      noCode        = 1;        { No code file found             }
+      toolProtected = 2;        { Not executable on this machine }
+      toolInvalid   = 3;        { Code file is bad/incomplete    }
+      toolTooBusy   = 4;        { Not enough machine resources   }
+
+        { OS file system overhead }
+      entriesPerMapBlk = 119;   { OS keeps list of data blk ptrs ext to data blks }
+      fixedOverhead    = 2;     { 1 hints and label, 1 map block                  }
+
+TYPE
+      E_namePtr = ^E_name;
+
+VAR
+      blankStr:         NameString;
+      systemIntrinsics: Lf_List;     { The intrinsics used by the Filer }
+
+      waitList:   T_WaitList;  {*** O/S bug workaround ***}
+      eventBlk:   r_eventBlk;  {*** ditto ***}
+
+
+
+
+   { references into Filer }
+
+{FUNCTION OnDesktop (volHdl: TentryHdl; uniqueID: IDType): BOOLEAN;  EXTERNAL;}
+
+{**************************************************************************}
+{                         Internal Procedures                              }
+{**************************************************************************}
+
+
+{$S FDocCtrl}
+
+{**************************************************************************}
+{**************************************************************************}
+
+PROCEDURE XferObj (VAR err: INTEGER; sCatRID: TcatRID; VAR intoCatRID: TcatRID;
+                   sVolHdl, dVolHdl: TentryHdl; excludeUnfiled: BOOLEAN;
+                   moving: BOOLEAN; diskCt: INTEGER);
+
+VAR bigCatRID:   TcatRID;
+    catErr:      INTEGER;
+    catRec:      TcatRec;
+    dDevHdl:     TentryHdl;
+    deCatRID:    TcatRID;
+    pCatRec:     PtrCatRec;
+    sonCatRID:   TcatRID;
+    tempCatRID:  TcatRID;
+
+
+  PROCEDURE Abort;
+  BEGIN
+  IF trcFDocCtrl THEN WRITELN ('Abort');
+
+  ShredObj (dVolHdl, deCatRID);           { Delete the obj being moved }
+
+  IF trcFDocCtrl THEN WRITELN ('   exit Abort');
+  END;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('XferObj: obj ',sCatRID.uniqueID:1,
+                             ' from device ',sVolHdl^^.devHdl^^.nameHdl^^,
+                             ' into ',intoCatRID.uniqueID:1,
+                             ' on ',dVolHdl^^.devHdl^^.nameHdl^^);
+
+err := 0;
+bigCatRID.fatherID := idNIL;
+
+dDevHdl := dVolHdl^^.devHdl;
+
+  { Create the destination catalog entry }
+GetCatRec(catErr, sVolHdl, sCatRID, catRec);  { Get obj catRec             }
+CheckCatRec (catErr, 'XferObj: getting soruce catrec');
+IF (sCatRID.uniqueID = idDisk)
+THEN BEGIN
+  END
+ELSE BEGIN
+  catRec.parentID := intoCatRID.uniqueID;
+  AddCatRec (catErr, dVolHdl, catRec, (diskCt=0), deCatRID);
+  CheckCatErr (catErr, 'XferObj: could not add destination cat rec');
+  FlushCat (dVolHdl);
+  intoCatRID := deCatRID;
+  END;
+
+  { Xfer the object }
+IF trcFDocCtrl THEN WRITELN ('   object type: ',catRec.objKind:1);
+CASE catRec.objKind OF
+  docKind,                                    { The object is a document   }
+  docPad:  BEGIN
+      END;
+
+  calcKind,
+  computerKind,
+  clockKind,
+  printKind,
+  toolKind: BEGIN                             { The object is a tool       }
+      END;
+
+  folderPad,                                  { Might contain something    }
+  diskKind,                                   { The object is a container  }
+  disk1Kind,
+  disk2Kind,
+  profileKind,
+  folderKind: BEGIN
+      catErr := 0;
+
+      { position to first record of contents }
+      posApprox.fatherID := sCatRID.uniqueID;
+      PosCatRec(catErr, sVolHdl, posApprox, pCatRec); { Find first son     }
+      IF catErr <> endOfCat
+      THEN CheckCatErr (catErr, 'XferObj: positioning to first son');
+
+      sonCatRID.fatherID := sCatRID.uniqueID;
+      WHILE (catErr = 0) AND (pCatRec^.parentID = sCatRID.uniqueID) DO
+         BEGIN                               { Found a son, container not empty}
+         IF NOT (excludeUnfiled {AND OnDesktop (sVolHdl, pCatRec^.selfID)})
+         THEN BEGIN                          { Xfer the son                }
+           sonCatRID.uniqueID := pCatRec^.selfID;
+           tempCatRID := deCatRID;
+           XferObj (err, sonCatRID, tempCatRID, sVolHdl, dVolHdl, excludeUnfiled,
+                    moving, diskCt);
+           IF err <> 0 THEN Abort;
+           PosCatRec(catErr, sVolHdl, sonCatRID, pCatRec); { May have repositioned}
+           IF catErr <> endOfCat THEN CheckCatErr (catErr, 'XferObj: can''t reposition');
+           END;
+         IF catErr = 0
+         THEN BEGIN
+           PosCatRec(catErr, sVolHdl, posNext, pCatRec);{ Get next, maybe a son }
+           IF catErr <> endOfCat THEN CheckCatErr (catErr, 'XferObj: getting next son');
+           END;
+         END;
+      IF catErr <> endOfCat THEN SysErr (857, catErr);
+      END;
+
+  OTHERWISE SysErr (858, ORD(catRec.objKind));
+  END;
+
+IF trcFDocCtrl THEN WRITELN ('   exit XferObj: err = ',err:1,
+                             ', new obj: ',intoCatRID.uniqueID:1);
+END;
+
+{**************************************************************************}
+{                        External Procedures                               }
+{**************************************************************************}
+
+
+{$S FDocCtrl}
+
+FUNCTION DiskObject {hVol: TentryHdl; objCatRID: TcatRID) : BOOLEAN};
+VAR err:      INTEGER;
+    pCatRec:  PtrCatRec;
+    dfName:   E_Name;
+
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('DiskObject');
+DiskObject := FALSE;
+
+IF trcFDocCtrl THEN WRITELN ('   exit DiskObject');
+END;
+
+{*************************************************************************}
+
+PROCEDURE DummyDisplay {wPtr: WindowPtr};
+VAR
+    docHdl:   TentryHdl;
+    err:      INTEGER;
+    field:    TfieldVar;
+    volName:  FMaxStr;
+    toolName: FMaxStr;
+
+
+  PROCEDURE RetryMsg;
+  BEGIN
+  MoveTo (20, 45);
+  DrawString ('To try again, activate this document and');
+  MoveTo (20, 60);
+  DrawString ('button-down in the text area.');
+  END;
+
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('DummyDisplay');
+
+IF trcFDocCtrl THEN WRITELN ('   exit DummyDisplay');
+END;
+
+{*************************************************************************}
+
+{$S FInit }
+
+{**************************************************************************}
+
+PROCEDURE InitDocCtrl;
+
+VAR
+    copyDsInfoRec: DsInfoRec;
+    copyDsName:    Pathname;
+    err:           INTEGER;
+    eventChnName:  Pathname;
+    excepName:     T_Ex_Name;
+    newDiskSize:   LONGINT;
+    shellPathname: Pathname;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('InitDocCtrl');
+blankStr := '';
+upTime := Time;
+
+IF trcFDocCtrl THEN WRITELN ('   exit InitDocCtrl');
+END;
+
+
+{**************************************************************************}
+
+
+{$S FDocCtrl}
+
+PROCEDURE RemoveAlert;
+
+VAR
+    curTime:  LONGINT;
+
+BEGIN
+upTime := upTime + 200;
+REPEAT curTime := Time;
+UNTIL (curTime > upTime) OR (curTime < 0);   { Just loop if necessary }
+HideFolder (alertFolder);
+END;
+
+
+{**************************************************************************}
+
+{$S CopyStuf}
+
+PROCEDURE ShredDoc {hVol: TentryHdl; catRID: TcatRID};
+VAR
+     catRec:       TcatRec;
+     catName:      Pathname;
+     dfName:       E_Name;
+     dfPathname:   Pathname;
+     docHdl:       TentryHdl;
+     delDocName:   E_Name;
+     err:          INTEGER;
+     field:        TfieldVar;
+     upTime:       LONGINT;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('ShredDoc');
+
+ { Destroy the cat entry      }
+
+DelCatRec (err, hVol, catRID);
+SysErr (-841, err);
+FlushCat (hVol);
+
+IF trcFDocCtrl THEN WRITELN ('   exit ShredDoc');
+END;
+
+{**************************************************************************}
+
+PROCEDURE ShredContents {volHdl: TentryHdl; objCatRID: TcatRID};
+{ destroys contents of a filed object }
+
+VAR err:        INTEGER;
+    nextID:     IdType;
+    pCatRec:    PtrCatRec;
+    sonCatRID:  TcatRID;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN('ShredContents - parent: ',objCatRID.fatherID:1,
+                                            ' id: ',objCatRID.uniqueID:1);
+{ position to first record of contents }
+
+posApprox.fatherID := objCatRID.uniqueID;
+PosCatRec (err, volHdl, posApprox, pCatRec); { Find first son              }
+IF (err <> 0)
+THEN BEGIN
+  IF (err <> endOfCat) THEN DBError(err);
+  EXIT (ShredContents);                   { No contents to shred           }
+  END;
+
+sonCatRID.fatherID := objCatRID.uniqueID;
+sonCatRID.uniqueID := pCatRec^.selfID;
+
+{ Shred each object (and it's descendants) in this container }
+
+REPEAT
+   PosCatRec (err, volHdl, sonCatRID, pCatRec);{ Set to rec about to be shreded }
+   CheckCatErr (err, 'ShredContents: position to obj to be shredded');
+   PosCatRec (err, volHdl, posNext, pCatRec);
+   CASE err OF
+     0:        IF (pCatRec^.parentID = sonCatRID.fatherID)
+               THEN nextID := pCatRec^.selfID  { Found another son         }
+               ELSE nextID := idNil;           { No more sons in container }
+     endOfCat: nextID := idNIL;                { No more recs in db        }
+     OTHERWISE DBError(err);                   { OOPS!                     }
+     END;
+
+   ShredObject (volHdl, sonCatRID);
+   sonCatRID.uniqueID := nextID;
+   UNTIL nextID = idNIL;
+
+IF trcFDocCtrl THEN WRITELN('   exit ShredContents');
+END;
+
+{**************************************************************************}
+
+PROCEDURE ShredObject {volHdl: TentryHdl; objCatRID: TcatRID};
+{ destroys all disk structures for a filed object and its descendants }
+VAR err: INTEGER;
+    pCatRec: PtrCatRec;
+BEGIN
+IF trcFDocCtrl THEN WRITELN('ShredObject - parent: ',objCatRID.fatherID:1,
+                                       ' id: ',objCatRID.uniqueID:1);
+ShredContents(volHdl,objCatRID);
+PosCatRec(err,volHdl,objCatRID,pCatRec);
+IF err <> 0
+THEN BEGIN
+  IF dbgFiler THEN WRITELN ('   ShredObject - unable to position to rec');
+  err := 0;                        { Consider it shreded                   }
+  EXIT (ShredObject);
+  END;
+
+CASE pCatRec^.objKind OF
+  docKind,
+  docPad: ShredDoc(volHdl,objCatRID);
+
+  calcKind,
+  clockKind,
+  computerKind,
+  printKind,
+  toolKind:
+{$IFC R}
+            ShredTool (volHdl, objCatRID)
+{$ENDC}
+            ;
+
+  diskKind,
+  disk1Kind,
+  disk2Kind,
+  profileKind,
+  trashKind,
+  scrapKind,
+  scrap2Kind: ;     { catRecs for these objects are never deleted }
+
+  OTHERWISE BEGIN
+     DelCatRec(err,volHdl,objCatRID);
+     CheckCatErr(err,'ShredObject - Unable to delete rec');
+     FlushCat(volHdl);
+     END;
+  END;
+
+IF trcFDocCtrl THEN WRITELN('   exit ShredObject');
+END;
+
+{$S FDocCtrl}
+
+{**************************************************************************}
+
+PROCEDURE TellUserWhy {sVolHdl,dVolHdl: TentryHdl; sCatRID,deCatRID: TcatRID;
+                       theReason: INTEGER};
+VAR diskName:   FMaxStr;
+    docHdl:     TentryHdl;
+    docName:    FMaxStr;
+    err:        INTEGER;
+    field:      TfieldVar;
+    reply:      FReason;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('TellUserWhy: theReason ',theReason:1);
+
+CASE theReason OF
+  aborted: BEGIN
+        StopAlert (flrAlert, 255);
+        END;
+  fBadData : BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        ParamAlert (docName,'','');
+        StopAlert (flrAlert, 254);
+        END;
+  fCantRead: BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        GetObjName (sVolHdl, diskCatRID, diskName);
+        ParamAlert (docName,diskName,'');
+        StopAlert (flrAlert, 203);
+        END;
+  fCantWrite: BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        GetObjName (dVolHdl, diskCatRID, diskName);
+        ParamAlert (docName,diskName,'');
+        StopAlert (flrAlert, 204);
+        END;
+  fDirtyDoc : BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        ParamAlert (docName,'','');
+        StopAlert (flrAlert, 216);
+        END;
+  fNoMemory: BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        GetObjName (sVolHdl, diskCatRID, diskName);
+        ParamAlert (docName, diskName,'');
+        StopAlert (flrAlert, 206);
+        END;
+  fNoSpace: BEGIN
+        GetObjName (sVolHdl, sCatRID, docName);
+        GetObjName (dVolHdl, diskCatRID, diskName);
+        ParamAlert (docName, diskName,'');
+        StopAlert (flrAlert, 208);
+        END;
+  fOneTool: BEGIN
+        StopAlert (flrAlert, 249);
+        END;
+  fToolErr: BEGIN
+        END;
+  OTHERWISE SysErr (891, theReason);
+  END;
+
+IF trcFDocCtrl THEN WRITELN ('   exit TellUserWhy');
+END;
+
+
+{$S CopyStuf}
+
+{**************************************************************************}
+
+PROCEDURE XferObject {VAR err: INTEGER; sCatRID: TcatRID; dParent: IdType;
+                   sVolHdl, dVolHdl: TentryHdl; excludeUnfiled: BOOLEAN;
+                   moving: BOOLEAN; diskCt: INTEGER; VAR newCatRID: TcatRID};
+
+VAR intoCatRID:  TcatRID;
+
+BEGIN
+IF trcFDocCtrl THEN WRITELN ('XferObject');
+intoCatRID.fatherID := idNil;
+intoCatRID.uniqueID := dParent;
+XferObj (err, sCatRID, intoCatRID, sVolHdl, dVolHdl, excludeUnfiled, moving, diskCt);
+IF err = 0 THEN newCatRID := intoCatRID;
+IF trcFDocCtrl THEN WRITELN ('   exit XferObject: err =',err:1);
+END;
+
+{**************************************************************************}
+
+
+END.
+ÿ

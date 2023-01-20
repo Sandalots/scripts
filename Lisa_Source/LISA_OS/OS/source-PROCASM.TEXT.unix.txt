@@ -1,0 +1,506 @@
+;
+;   Assembly language routines to support scheduling and multi-tasking in
+;   the operating system.  These routines are used by the system Scheduler
+;   and its Pascal interface routines.
+;
+;   Copyright 1983, 1984, Apple Computer Inc.
+;
+          .PROC    ENTER_SC                 ; entry declaration for Enter_Scheduler
+          .REF     SCHEDULE                 ; external declaration for Scheduler
+          .REF     SIMPLESC                 ; external declaration for SimpleSched
+          .DEF     LAUNCH                   ; entry declaration for Launch
+          .DEF     PAUSE                    ; entry declaration for Pause
+          .DEF     SHIFTLRU                 ; entry declaration for ShiftLRU
+          .DEF     SCHDTRAP                 ; entry declaration for SCHDTRAP
+          .DEF     SCHEDDIS                 ; entry declaration for SchedDisable
+          .DEF     SCHEDENA                 ; entry declaration for SchedEnable
+          .DEF     QUEUE_PR                 ; entry declaration for Queue_Process
+;
+;
+;   general equates, constants, etc.
+;
+          .INCLUDE source/pascaldefs.text   ; EQUs for Pascal structures
+;
+SBIT      EQU      13                       ; Supervisor mode bit in SR
+T2VECTOR  EQU      $88                      ; TRAP(2) vector address
+SCHDTNUM  EQU      2                        ; Scheduler trap #
+STOPSR    EQU      $2000                    ; SR for STOPped state - all ints on
+USPDISP   EQU      60                       ; offset from D0 to A7 in save area
+A6DISP    EQU      ENV_SAVE+62              ; offset to A6 in save area
+FRSTCNTR  EQU      10                       ; offset in DCT to 1st ref counter
+INCBIT    EQU      6                        ; bit 14 in counter (int2) to increment
+;
+SYSCTNUM  EQU      1                        ; system call trap #
+STKPC     EQU      4                        ; offset from stack frame link to PC
+XITSCODE  EQU      255                      ; exit sys call trap sub-code
+RTEPC     EQU      2                        ; location of PC on Super stack
+INTSOFF   EQU      $2700                    ; SR for all interrupts off
+TOHDLR    EQU      1                        ; exit code for going to excep handler
+          .IF      DEBUG1
+USERTIME  EQU      47                       ; counter in measTable for user time
+SYSTIME   EQU      48                       ; counter in measTable for system time
+          .ENDC
+;
+;   macro to restore processor registers from a register save area pointed
+;   to by A6.  Used by procedures Launch and ReturnUser.
+;
+          .MACRO   SETREGS
+          MOVE.L   (A6)+,-(SP)              ; push PC on Supervisor's stack
+          MOVE     (A6)+,-(SP)              ; push SR on Supervisor's stack
+          MOVEA.L  USPDISP(A6),A0           ; put user's stack ptr in A0
+          MOVE     A0,USP                   ; set user's stack ptr
+          MOVEM.L  (A6)+,D0-D7/A0-A5        ; set other registers
+          MOVEA.L  (A6),A6                  ; set user's A6
+          .ENDM
+;
+;
+;   procedure Enter_Scheduler;
+;     { procedure to enter the system Scheduler from either the currently running
+;       process or from an interrupt handler on the Supervisor's stack }
+;
+          MOVE     SR,-(SP)                 ; push SR
+          BTST     #SBIT,(SP)+              ; if not in Supervisor state then
+          BEQ.S    USERMODE                 ;   go handle user state call
+;
+          ADDQ     #4,SP                    ; pop PC laid down by JSR Enter_Sched
+          BRA.S    SCHDTRAP                 ; go to TRAP(2) handler
+;
+USERMODE  LINK     A6,#0                    ; set stack frame link
+          TRAP     #SCHDTNUM                ; trap to Supervisor's stack
+          UNLK     A6                       ; remove stack frame
+          RTS                               ; return to the process
+;
+;
+;  Scheduler entry trap handler
+;
+SCHDTRAP  MOVE.L   A6,-(SP)                 ; push A6 on Supervisor's stack
+          MOVEA.L  SGLOBAL,A6               ; get ptr to sysglobal
+;
+          TST.L    C_PCB_PT(A6)             ; if c_pcb_ptr = nil then
+          BEQ.S    NILSETUP                 ;   don't bother saving state
+;
+;   save state (processor registers)
+;
+          MOVEA.L  B_SYSLOC(A6),A6          ; get ptr to syslocal in A6
+          LEA      A6DISP(A6),A6            ; get ptr to A6 location in save area
+;
+          MOVE.L   (SP)+,(A6)               ; pop & save A6 from Super stack
+          MOVEM.L  D0-D7/A0-A5,-(A6)        ; save A5-A0 & D7-D0 in save area
+          MOVE     USP,A0                   ; save user's stack ptr
+          MOVE.L   A0,USPDISP(A6)           ;  into environment save area
+          MOVE     (SP)+,-(A6)              ; save SR from Super stack to save area
+          MOVE.L   (SP)+,-(A6)              ; save PC from Super stack to save area
+          BRA.S    SETUP                    ; go set up Scheduler's environment
+;
+;   now set up Scheduler's environment on Supervisor's stack
+;
+NILSETUP  ADDQ     #4,SP                    ; pop A6 pushed for c_pcb_ptr test
+          ADDQ     #6,SP                    ; pop PC & SR laid down by trap
+;
+SETUP     MOVEA.L  SGLOBAL,A6               ; get ptr to sysglobal
+          MOVEA.L  SYSA5(A6),A5             ; set system A5 register
+          MOVEA.L  SCHDADDR(A6),A0          ; get address of Scheduler in A0
+          JMP      (A0)                     ; go to Scheduler
+;
+;
+;   procedure Pause;
+;     { procedure to place processor in the STOPped state waiting for an interrupt
+;       to restart the Scheduler }
+;
+PAUSE     STOP     #STOPSR                  ; wait around for an interrupt
+          RTS                               ; back to Scheduler
+;
+;
+;   procedure Launch;
+;     { procedure to launch a process from the Scheduler }
+;
+LAUNCH    MOVEA.L  A6,SP                    ; cut Supervisor's stack
+          ADDQ     #4,SP                    ;   back to base
+;
+          MOVEA.L  SGLOBAL,A6               ; get ptr to sysglobal in A6
+          MOVEA.L  B_SYSLOC(A6),A6          ; get ptr to syslocal in A6
+          LEA      ENV_SAVE(A6),A6          ; get ptr to save area in A6
+;
+          SETREGS                           ; set up processor registers
+;
+          RTE                               ; launch process
+;
+;
+;   procedure ShiftLRU (new_head : domainRange);
+;     { procedure to shift the LRU for the domains }
+;
+SHIFTLRU  MOVEA.L  (SP)+,A0                 ; pop & save return PC
+          MOVE.B   (SP)+,D0                 ; pop & save new_head
+;
+          LEA      DOMAINLR(A5),A1          ; get ptr to domainLRU
+          MOVEQ    #2,D1                    ; set up for scanning/shifting loops
+          MOVEQ    #1,D2                    ; set up for scanning/shifting loops
+;
+SCAN      CMP.B    (A1),D0                  ; domainLRU[scan] = new_head?
+          ADDQ     #1,A1                    ; A1 will be 1 too high
+          DBEQ     D1,SCAN                  ; loop until found or end
+;
+          SUB      D1,D2                    ; get correct shift count
+          BLT.S    DONE                     ; if shift count = -1 then go return
+          MOVEA.L  A1,A2                    ; set up for shifting
+          SUBQ     #1,A1
+          CMPI     #2,D2                    ; if not found then
+          BLT.S    SHIFT                    ;   decrement shift count
+          SUBQ     #1,D2
+;
+SHIFT     MOVE.B   -(A1),-(A2)              ; domainLRU[i] := domainLRU[i-1]
+          DBF      D2,SHIFT                 ; loop until shifting completed
+;
+          MOVE.B   D0,(A1)                  ; domainLRU[1] := new_head
+;
+          LSL.W    #8,D0                    ; form domain * 128 * 4
+          ADD.W    D0,D0                    ;    (= domain * 256 * 2)
+          MOVEA.L  PSMT_ADD(A5),A1          ; get smt_addr
+          ADDA.W   D0,A1                    ; form domain SMT base address
+          MOVE.L   A1,PDOMSMTB(A5)          ; domSMTBase := base address
+DONE      JMP      (A0)                     ; return
+;
+;
+;   procedure Queue_Process (pcb_ptr : ptr_PCB;  queue : q_type);
+;     { procedure to move a PCB between the scheduling queues }
+;
+          .MACRO   Q_PCB
+          MOVE.L   A0,(A1)                  ; set next ptr for PCB
+          MOVE.L   A2,PREV_SCH(A1)          ; set previous ptr for PCB
+          MOVE.L   A1,(A2)                  ; set next ptr for previous PCB
+          MOVE.L   A1,PREV_SCH(A0)          ; set previous ptr for next PCB
+          .ENDM
+;
+QUEUE_PR  MOVE.L   (SP)+,D0                 ; save return PC
+          MOVE.B   (SP)+,D1                 ; get queue
+          MOVEA.L  (SP)+,A1                 ; get pcb_ptr
+;
+;  dequeue PCB from current queue
+;
+          MOVEA.L  (A1),A0                  ; get next PCB ptr in A0
+          MOVEA.L  PREV_SCH(A1),A2          ; get previous PCB ptr in A2
+          MOVE.L   A0,(A2)                  ; set next ptr in previous PCB
+          MOVE.L   A2,PREV_SCH(A0)          ; set previous ptr in next PCB
+;
+          TST.B    D1                       ; if queue = Ready then
+          BEQ.S    RQ                       ;   go handle Ready queue
+;
+;  going to Blocked queue
+;
+          LEA      PFWD_BLO(A5),A0          ; get ptr to Blocked queue head
+          MOVEA.L  PREV_SCH(A0),A2          ; get ptr to last PCB in Blocked queue
+          Q_PCB                             ; queue the PCB into the Blocked queue
+          MOVEA.L  D0,A0                    ; get return PC
+          JMP      (A0)                     ; return
+;
+;  going to Ready queue
+;
+RQ        MOVE     PRIORITY(A1),D1          ; get pcb_ptr^.priority in D1
+          LEA      PFWD_REA(A5),A0          ; get head of Ready queue
+RQSCAN    MOVEA.L  (A0),A0                  ; get pcb_ptr^.next_schedPtr
+          CMP      PRIORITY(A0),D1          ; if pcb_ptr^.priority >= priority then
+          BLE.S    RQSCAN                   ;   continue scanning
+          MOVEA.L  PREV_SCH(A0),A2          ; get previous PCB ptr in A2
+          Q_PCB                             ; queue PCB into Ready queue
+;
+;  set Invoke_sched if needed (i.e. if there's now a PCB ahead of c_pcb_ptr
+;
+          MOVE.L   PC_PCB_P(A5),D1          ; get c_pcb_ptr
+          MOVE.L   PFWD_REA(A5),D2          ; get Ready queue head
+          CMP.L    D1,D2                    ; if c_pcb_ptr = fwd_ReadyQ then
+          BEQ.S    @1                       ;   then don't set Invoke_sched
+          BSET     #0,PINVOKE_(A5)          ; else Invoke_sched := true
+@1        MOVEA.L  D0,A0                    ; get return address
+          JMP      (A0)                     ; return
+;
+;
+;   procedure SchedDisable;
+;     { procedure to disable normal process scheduling while the boot volume
+;       is unmounted }
+;
+SCHEDDIS  MOVEA.L  SGLOBAL,A0               ; get ptr to sysglobal in A0
+          LEA      SIMPLESC,A1              ; get address of SimpleScheduler
+          MOVE.L   A1,SCHDADDR(A0)          ; SchdAddr := @SimpleScheduler
+          RTS
+;
+;
+;   procedure SchedEnable;
+;     { procedure to enable normal process scheduling after the boot volume
+;       has been re-mounted }
+;
+SCHEDENA  MOVEA.L  SGLOBAL,A0               ; get ptr to sysglobal in A0
+          LEA      SCHEDULE,A1              ; get address of Scheduler
+          MOVE.L   A1,SCHDADDR(A0)          ; SchdAddr := @Scheduler
+          RTS
+;
+;
+;
+;   Assembly language routines to support process management.
+;
+          .DEF     INVOKE                   ; entry declaration for Invoke
+;
+;
+;   procedure Invoke (proc : ptr_procedure;  parmval : int4);
+;     { procedure to cause another procedure to be invoked.  Control is passed to
+;       the procedure in such a way that it appears that Invoke was not called
+;       at all. }
+;
+INVOKE    MOVEM.L  (SP)+,A0-A2              ; pop off return PC, parm, & @proc
+          MOVEM.L  A0-A1,-(SP)              ; push back parm & return PC
+          JMP      (A2)                     ; go to the procedure - it returns
+;
+;
+;
+;   Assembly language routines to support system call/exit handling.
+;
+          .REF     SET_ADDR                 ; external dec for Set_Address_Space
+          .REF     MAP_DATA                 ; external dec for Map_DataSpace
+          .REF     SET_DOMA                 ; external dec for Set_Domain
+          .REF     BAD_SCAL                 ; external dec for Bad_SCall
+          .DEF     SETSYSMO                 ; entry declaration for SetSysmode
+          .DEF     EXITSYS                  ; entry declaration for ExitSys
+          .DEF     SYS_CALL                 ; entry declaration for Sys_Called
+          .DEF     RETURNUS                 ; entry declaration for ReturnUser
+          .DEF     TRAP1                    ; entry declaration for Trap(1)
+;
+          .IF      DEBUG1                   ; for performance measurement
+          .REF     RECORDIT                 ; external declaration for RecordIt
+          .REF     STARTTIM                 ; external declaration for StartTime
+          .REF     ADDTIME                  ; external declaration for AddTime
+          .ENDC
+;
+;   procedure SetSysmode;
+;     { procedure to set the current process in system mode.  This will copy the
+;       current A5 setting, the return PC, and the domain # of the current
+;       process into the SCB.  'System mode' will then be set for the current
+;       process - system A5 setting and data space mapped in domain 0. }
+;
+SETSYSMO  MOVEA.L  SGLOBAL,A2               ; get ptr to sysglobal A2
+          MOVEA.L  A2,A1                    ; get ptr to sysglobal in A1
+          MOVEA.L  A1,A0                    ; get ptr to sysglobal in A0
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal in A2
+          LEA      SCB(A2),A2               ; get ptr to the SCB in A2
+          MOVEA.L  C_PCB_PT(A1),A1          ; get ptr to current PCB in A1
+;
+          MOVE.L   A5,A5VALUE(A2)           ; save user's A5 in SCB
+          MOVE.B   DOMAIN(A1),DOMVALUE(A2)  ; remember user's domain in SCB
+;
+          MOVEA.L  SYSA5(A0),A5             ; set system A5
+          CLR.B    DOMAIN(A1)               ; c_pcb_ptr^.domain := 0
+          MOVE.L   GLOB_ID(A1),D0           ; get c_pcb_ptr^.glob_id in D0
+          LEA      DCT(A0),A0               ; get ptr to DCT in A0
+          CMP.L    OWNER(A0),D0             ; if DCT[0].owner <> PCB.glob_id then
+          BNE.S    @1                       ;   go set up domain 0 for process
+;
+          CLR.B    -(SP)                    ; push a 0
+          JSR      SET_DOMA                 ; call Set_Domain (0)
+          BRA.S    @2                       ; go return
+;
+@1        MOVE.L   D0,OWNER(A0)             ; DCT[0].owner := c_pcb_ptr^.glob_id
+          JSR      MAP_DATA                 ; call Map_DataSpace
+;
+@2        MOVE     USP,A0                   ; get user's stack ptr
+          MOVEA.L  SGLOBAL,A2               ; get ptr to sysglobal A2
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal in A2
+          LEA      SCB(A2),A2               ; get ptr to the SCB in A2
+          MOVE.L   (A0),PCVALUE(A2)         ; save user's return PC in SCB
+          LEA      EXITSYS,A1               ; get address of ExitSys in A1
+          MOVE.L   A1,(A0)                  ; replace user's PC w/ PC for ExitSys
+          RTS                               ; return
+;
+;
+;   procedure ExitSys;
+;     { procedure to exit from a system call procedure and return to the user
+;       via a TRAP(1)/255.  Note that this procedure is not called directly.
+;       Instead, the user's return PC is saved in the SCB and replaced by the PC
+;       for ExitSys when the system is entered (SetSysmode) so that when the
+;       system call procedure is exited, ExitSys is 'returned to' before returning
+;       to the user. }
+;
+EXITSYS   MOVEA.L  SGLOBAL,A2               ; get ptr to sysglobal
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal
+          LEA      SCB(A2),A2               ; get ptr to the SCB
+          MOVE.L   PCVALUE(A2),-(SP)        ; push user's return PC back on stack
+          CLR      -(SP)                    ; push a 0 for normal exit
+          MOVE.W   #XITSCODE,D0             ; put exit subcode in D0
+          TRAP     #SYSCTNUM                ; trap to handle final exit
+;
+;
+;   function Sys_Called : boolean;
+;     { function to determine whether the procedure calling Sys_Called was itself
+;       called from system code (true) or from user code (false). }
+;
+SYS_CALL  MOVEA.L  (SP)+,A0                 ; pop & save return PC in A0
+          CLR      (SP)                     ; Sys_Called := false
+          MOVE     SR,D0                    ; get SR in D0
+          BTST     #SBIT,D0                 ; if in Supervisor state then
+          BNE.S    @1                       ;   go return true
+          LEA      EXITSYS,A1               ; get address of ExitSys
+          CMPA.L   STKPC(A6),A1             ; if PC in stk frame = @ExitSys then
+          BEQ.S    @2                       ;   go return false
+;
+@1        BSET     #0,(SP)                  ; else Sys_Called := true
+@2        JMP      (A0)                     ; return
+;
+;
+;   procedure ReturnUser;
+;     { procedure to return control to a user process in user mode from system
+;       mode.  Used to return from a system call, to launch a user's exception
+;       handler, and to return control to user code after return from an
+;       exception handler.  Expects user's return PC to be on user's stack
+;       with an exit action subcode to be on top of the PC.  Called from the
+;       Supervisor's stack only.  The exit action subcodes are:
+;         0 - normal exit
+;         1 - exit to exception handler
+;         2 - exit from exception handler
+;
+;       Note that ReturnUser should be entered by doing a JMP only. }
+;
+RETURNUS  MOVEA.L  SGLOBAL,A2               ; get ptr to sysglobal in A2
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal in A2
+          LEA      SCB(A2),A2               ; get ptr to the SCB in A2
+          MOVE.B   DOMVALUE(A2),-(SP)       ; push domain value from SCB on stack
+          JSR      SET_ADDR                 ; call Set_Address_Space
+;
+          .IF      DEBUG1
+          MOVE     #SYSTIME,-(SP)
+          JSR      ADDTIME                  ; call AddTime (sysTime)
+          JSR      STARTTIM                 ; call StartTime
+          .ENDC
+          MOVEA.L  SGLOBAL,A2               ; get ptr to sysglobal in A2
+          MOVEA.L  A2,A1                    ; get ptr to sysglobal in A1
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal in A2
+          LEA      SCB(A2),A2               ; get ptr to SCB in A2
+          MOVEA.L  A5VALUE(A2),A5           ; restore user's A5
+;
+          MOVE     USP,A0                   ; get ptr to user's stack
+          MOVE     (A0)+,D0                 ; pop exit code into D0
+          MOVE.L   (A0)+,RTEPC(SP)          ; pop PC & place on Super stack for RTE
+          MOVE     A0,USP                   ; set new user's stack ptr
+;
+;   determine what type of return to make to user
+;
+          TST      D0                       ; if exit code <> 0 then
+          BNE.S    EXCEPXIT                 ;   go handle exception exit
+;
+;   do final exit sequence
+;
+          MOVE     #INTSOFF,D0              ; turn all interrupts
+          MOVE     D0,SR                    ;   off
+          TST.B    INVOKE_S(A1)             ; if Invoke_sched then
+          BNE.S    GO_SCHED                 ;   go Enter_Scheduler
+          MOVEA.L  C_PCB_PT(A1),A1          ; else get ptr to current PCB
+          TST.B    SOFTINTS(A1)             ; if softints <> [] then
+          BNE.S    GO_SCHED                 ;   go Enter_Scheduler
+          TST.W    EXCEP_PE(A1)             ; else if excep_pending > 0 then
+          BNE.S    GO_SCHED                 ;   go Enter_Scheduler
+;
+          RTE                               ; else just go back to current process
+;
+GO_SCHED  MOVE     (SP),D0                  ; put previous SR in D0
+          BSET     #SBIT,D0                 ; make sure it's still Super state
+          MOVE     D0,SR                    ; restore interrupts to previous level
+          JSR      ENTER_SC                 ; go to Scheduler
+;
+;   handle exception type exit
+;
+EXCEPXIT  CMPI     #TOHDLR,D0               ; if exit code <> to handler then
+          BNE.S    FROMHDLR                 ;   go handle return from handler
+;
+          RTE                               ; else go to user's handler
+;
+FROMHDLR  ADDQ     #6,SP                    ; pop PC & SR due to trap
+          MOVEA.L  B_SYSLOC(A1),A0          ; get ptr to syslocal in A0
+          LEA      ENV_SAVE(A0),A6          ; get ptr to evn save area in A6
+;
+          MOVE     #INTSOFF,D0              ; turn all interrupts
+          MOVE     D0,SR                    ;   off
+          TST.B    INVOKE_S(A1)             ; if Invoke_sched then
+          BNE.S    GO_ESCHED                ;   go Enter_Scheduler
+          MOVEA.L  C_PCB_PT(A1),A1          ; else get ptr to current PCB
+          TST.B    SOFTINTS(A1)             ; if softints <> [] then
+          BNE.S    GO_ESCHED                ;   go Enter_Scheduler
+          TST.W    EXCEP_PE(A1)             ; else if excep_pending > 0 then
+          BNE.S    GO_ESCHED                ;   go Enter_Scheduler
+;
+          SETREGS                           ; set new environment
+          RTE                               ; go back to current process
+;
+GO_ESCHED SETREGS                           ; set processor registers
+          JSR      ENTER_SC                 ; go to Scheduler
+;
+;
+;   System Call Trap Handler.  Checks the subcode passed in D0, verifies the
+;   number of passed parameters with the System Call Table, sets the calling
+;   process in system mode, and RTEs to the desired system call procedure.
+;
+TRAP1     CMPI     #XITSCODE,D0             ; if subcode = exit subcode (255) then
+          BEQ      RETURNUSER               ;   call ReturnUser
+;
+          MOVEM.W  D0-D1,-(SP)              ; save D0 and D1 on stack
+          JSR      SETSYSMODE               ; call SetSysmode
+          .IF      DEBUG1
+          MOVE     #USERTIME,-(SP)
+          JSR      ADDTIME                  ; call AddTime (userTime)
+          JSR      STARTTIM                 ; call StartTime
+          .ENDC
+          MOVEM.W  (SP)+,D0-D1              ; restore D0 and D1
+;
+          CMPI     #SUBC_MAX,D0             ; if subcode > max subcode then
+          BGT.S    T1ERR                    ;   go handle bad subcode
+;
+          MOVEA.L  SGLOBAL,A0               ; get ptr to sysglobal in A0
+;
+          .IF      DEBUG1                   ; for measurement
+          MOVEA.L  A0,A2                    ; get sysglobal ptr for later
+          .ENDC
+;
+          MOVEA.L  SCT_PTR(A0),A0           ; get ptr to system call table in A0
+          MOVEA.L  A0,A1                    ;   and in A1
+          SUBQ     #1,D0                    ; convert subcode to (0, subc_max-1)
+          BLT.S    T1ERR                    ; handle error if subcode < 0
+          ADDA.L   D0,A1                    ; get index to # parms field in A1
+          CMP.B    4*SUBC_MAX(A1),D1        ; if # parms <> # in table then
+          BNE.S    T1ERR                    ;   go handle error
+          ASL.L    #2,D0                    ; get index to sc_adr field in D0
+          MOVE.L   0(A0,D0),RTEPC(SP)       ; put sys call PC in Super stk for RTE
+;
+          .IF      DEBUG1                   ; for measurement
+          MOVEA.L  A2,A1                    ; save sysglobal ptr in A1
+          MOVEA.L  STATADDR(A2),A2          ; get ptr to statistics record
+          MOVEA.L  (A2),A2                  ; get ptr to histogram counters
+          ADDA.L   D0,A2                    ; get address to the needed counter
+          MOVE.L   (A2),D1                  ; get counter in D1
+          ADDQ.L   #1,D1                    ; increment the counter
+          MOVE.L   D1,(A2)                  ; store the counter back
+;
+          ASR      #2,D0                    ; put D0 back in subcode form
+          CMPI     #54,D0                   ; filter out some process mgmt calls
+          BLT.S    T1LOG
+          CMPI     #59,D0
+          BGT.S    T1LOG
+          BRA.S    ENTERSYS
+;
+T1LOG     MOVEA.L  A1,A2                    ; get ptr to sysglobal in A2
+          MOVEA.L  B_SYSLOC(A2),A2          ; get ptr to syslocal in A2
+          LEA      SCB(A2),A2               ; get ptr to the SCB in A2
+          MOVEA.L  C_PCB_PT(A1),A1          ; get ptr to current PCB in A1
+          MOVE.B   #40,-(SP)                ; push a 40 (log code for Sys Call)
+          MOVE.B   DOMVALUE(A2),-(SP)       ; push domain of process
+          MOVE     D0,-(SP)                 ; push subcode
+          MOVE.L   GLOB_ID(A1),-(SP)        ; push global id of process
+          CLR.L    -(SP)                    ; push a 0 (for later expansion)
+          JSR      RECORDIT                 ; call RecordIt
+          .ENDC
+
+ENTERSYS  RTE                               ; enter system call routine
+;
+;  error handling for Trap(1) - abort the calling process
+;
+T1ERR     LEA      BAD_SCAL,A0              ; get @Bad_SCall in A0
+          MOVE.L   A0,RTEPC(SP)             ; copy PC to Super stack for RTE
+          RTE                               ; go to Bad_SCall on user's stack
+;
+          .END
+
+ÿ

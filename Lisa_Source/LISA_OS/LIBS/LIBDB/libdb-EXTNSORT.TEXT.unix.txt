@@ -1,0 +1,322 @@
+{ Copyright 1983,Apple Computer Inc. }
+{$L- }
+{$R- }
+{$I- }
+{$U-}
+{$SETC OSBUILT := TRUE }
+Unit Extnsort;
+
+
+interface
+
+uses
+{$IFC OSBUILT }
+       {$U libsm/unitstd.obj} unitstd,
+       {$U libdb/dbenv.obj } dbenv,
+       {$U libin/INTRLIBp.obj } international,
+       {$U libdb/dbdecl1.obj } dbdecl1,
+       {$U libos/syscall.obj } syscall,
+       {$U libos/psyscall.obj } psyscall,
+       {$U libdb/lowlevel.obj } lowlevel,
+       {$U libdb/pooler.obj } pooler;
+{$ELSEC }
+   {$U libsm/unitstd.obj} unitstd,
+   {$U OBJ:dbenv.obj } dbenv,
+     {$U INTRLIB.obj } international,
+       {$U OBJ:dbdecl1.obj } dbdecl1,
+       {$U OBJ:syscall.obj } syscall,
+       {$U OBJ:lowlevel.obj } lowlevel,
+       {$U OBJ:pooler.obj } pooler;
+{$ENDC }
+
+Const
+        temperror = 3402;                        { temporary file error }
+        nullfile = 3403;                         { file was null }
+
+
+{***************************************************************************
+
+                                    sort
+
+        sort expects the user has already opened and positioned (if
+        necessary) the source file.  expects that the user has created
+        and opened the destination file. destfile is the refno of the
+        destination file. leaves destination file open.
+
+        input parameters:
+
+        tempdir1        first scratch prefix (should contain at least as much
+                            space as the destination file)
+        tempdir2        second scratch prefix (should contain at least
+                            as much space as the destination file)
+        destfile        refno of destination file
+        sort_ldsn       ldsn for sort segment
+        firstpage       byte at which first page is to be written into
+                            destination file
+        pagesize        # bytes in dest file pages
+        nsflds          # of fields to sort on
+        pkey            ptr to descriptor array for sort key
+        copyrecord      procedure to copy the next input record
+                            into the sort tree.  the procedure declaration
+                            have the following form:
+
+                            procedure copyrecord(prec : ptrdata);
+
+        readrecord      function to read the next input record and return
+                            its length. should return noerr on success
+                            and eos when no more records exist on input.
+                            the function should return the length of the
+                            next input record (in bytes) as it's return
+                            result.  must continue to return the same
+                            length and error code until a matching call
+                            to pcopyrec copies that record! the
+                            declaration must have the following form:
+
+                            function readrecord(var result : integer) : integer;
+
+        closeinput      procedure to close the input stream
+                            should return noerr on success.  the procedure
+                            declaration must have the following form:
+
+                            procedure closeinput(var result : integer);
+
+        keepduplicates  if true, then records with duplicates keys are
+                        retained
+
+        output parameters:
+
+        sresult         result code
+                            whatever errors are returned by proc parameters
+                            temperror
+                            nullfile
+                            ioerr
+                            noroom
+                            OS(make_dataseg,close_dataseg)
+        nrecords        number of records in final file
+        lastpage        new value of lastpage (as defined in filelabel) for
+                            the destination file
+
+******************************************************************************}
+
+procedure sort(var sresult : integer;
+               var nrecords,
+                   lastpage : fileptr;
+                   destfile : integer;
+                   sort_ldsn : integer;
+                   tempdir1,
+                   tempdir2 : ptrpathname;
+                   firstpage : fileptr;
+                   pagesize,
+                   nsflds : integer;
+                   pkey : ptrrecptr;
+                   procedure copyrecord(prec : ptrdata);
+                   function readrecord(var result : integer) : integer;
+                   procedure closeinput(var result : integer);
+                   keepduplicates : boolean);
+{^E}
+Implementation
+{$SETC NOSWAP := TRUE }
+Const
+
+        size_sort_segment = 32768;      {    initial size of heap }
+        GrowIncrement = 16384;          {    incr. by which heap is grown }
+        FudgeFactor = 32768;            {    margin of error in setting max. size
+                                             that heap can obtain }
+
+        nomem = 205;                    {  duplicates that exported by heap }
+
+        nrunentries = 32;
+
+        {  the compiler does no constant folding, so we must:
+           warning, these constants are dependent on other declarations  }
+
+        sort_overhead = 6;              { integer & ptr }
+        size_2_integer = 4;
+        size_2_ptrs = 8;
+        size_6_ptrs = 24;
+        size_3_maxrecs = 3000;          { size of 3 maxrecs }
+
+
+        maxlongint = 2147483648;
+
+Type
+        serial_number = array[0..2] of byte;    {#O  for temporary - the type
+                                                     of a machine serial#
+                                                     (the unique part) }
+        ptrptrdata = ^ptrdata;
+
+        runend = array[1..nrunentries] of fileptr;
+        ptrrunend = ^ runend;
+
+        ptrrundesc = ^ rundesc;
+        rundesc = record
+                      toprec,lastrec : ptrdata;     { of input buffer }
+                      pbuff          : ptrdata;     { input buffer    }
+                      pd             : ptrpagedesc;
+                      po             : ptroffsets;
+                      poo            : ptrinteger;
+                      ppriorrun,
+                      pnextrun       : ptrrundesc;  { link open runs }
+                      endrun,
+                      readaddr : fileptr;
+                  end;
+        runarray = array[1..1] of rundesc;
+        ptrrunarray = ^ runarray;
+
+        lisaobjs = array[0..1] of pathname;
+        lisarefs = array[0..1] of integer;
+
+{$IFC DOLLARD }
+{$D- }
+{$ENDC}
+{$S sortseg }
+
+(*
+{$S sortseg }
+procedure printpage(pkey : ptrrecptr;nflds,pagesize: integer;
+                    pb : ptrdata);
+var
+        pd : ptrpagedesc;
+        po : ptroffsets;
+        i : integer;
+begin
+        pd := @pb^[pagesize-sizeof(pagedesc)];
+        po := pointer(ord(pd)-sizeof(integer));
+        if pd^.ptype <> leaftype then writeln(dumpfile,'bad page type')
+        else
+            begin
+            writeln(dumpfile,pd^.nkeys:5,pd^.prior:14,pd^.next:14);
+            for i := 0 to pd^.nkeys-1 do
+                begin
+                writeln(dumpfile,'<',po^[-i],'>');
+                printkey(pkey,nflds,@pb^[po^[-i]]);
+                end;
+            writeln(dumpfile,'<',po^[-pd^.nkeys],'>');
+            end;
+
+end;
+*)
+{$S sortseg }
+{^T 20}
+{******************************************************************************
+
+                              createuniquefile
+
+         creates a unique temporary file under the prefix initially
+         contained in name.  opens the file and then immediately deletes it.
+         thus, when the file is closed it is deleted. also, the name can be
+         reused.
+
+******************************************************************************}
+
+procedure createuniquefile(var result : integer;
+                           var name   : pathname;
+                           var tempid : integer);
+const
+        length_sort_name = 4;
+        max_attempts = 10;
+        duplicate_file = 890;
+var
+        sort_name : packed array[1..length_sort_name] of char;
+        attempts,
+        tresult,
+        namelen : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        sort_name := '$@%&';
+        namelen := length(name);
+        name[0] := chr(namelen+length_sort_name);
+        movelg(@sort_name,pointer(ord(@name)+namelen+1),length_sort_name);
+        attempts := 0;
+        repeat
+            attempts := attempts + 1;
+{af}        make_secure(result,name,password);
+           {make_file(result,name,0);}
+            if result = noerr then
+                begin
+{af}            open_secure(result,name,tempid,
+                            [DRead,DWrite,Append,Private],password);
+               {open(result,name,tempid,[DRead,DWrite,Append,Private]);}
+{af}            kill_secure(tresult,name,password);
+               {kill_object(tresult,name);}
+                if (result <= noerr) and (tresult > noerr) then
+                    begin
+                    result := temperror;
+                    close_object(tresult,tempid);
+                    end;
+                end;
+        until (result <> duplicate_file) or (attempts > max_attempts);
+        if result > noerr then result := temperror;
+end; { createuniquefile }
+
+{$IFC OSBuilt }
+{$I libdb/sortruns.text }
+{$I libdb/merge.text }
+{$ELSEC }
+{$I l:sortruns.text }
+{$I l:merge.text }
+{$ENDC }
+{$S sortseg }
+{******************************************************************************
+
+                                sort
+
+          driver routine for sort
+
+******************************************************************************}
+
+procedure sort{(var sresult : integer;
+               var nrecords,
+                   lastpage : fileptr;
+                   destfile : integer;
+                   sort_ldsn : integer;
+                   tempdir1,
+                   tempdir2 : ptrpathname;
+                   firstpage : fileptr;
+                   pagesize,
+                   nsflds : integer;
+                   pkey : ptrrecptr;
+                   procedure copyrec(prec : ptrdata);
+                   function readrec(var result : integer) : integer;
+                   procedure closeinput(var result : integer);
+                   keepduplicates : boolean)};
+var
+        tresult,
+        sort_segment : integer;
+        segsize : longint;
+        tempfiles : lisaobjs;
+        temprefnos : lisarefs;
+        runs       : integer;
+        prunend : ptrrunend;
+begin
+
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        movelf(@tempdir2^,@tempfiles[0],length(tempdir2^)+1);
+        movelf(@tempdir1^,@tempfiles[1],length(tempdir1^)+1);
+
+        genruns(sresult,destfile,nrecords,lastpage,
+                closeinput,readrecord,copyrecord,
+                firstpage,pagesize,nsflds,pkey,
+                sort_ldsn,sort_segment,segsize,prunend,
+                runs,tempdir1,tempfiles[0],temprefnos[0],keepduplicates);
+        if sresult = noerr then
+            begin
+            if (runs = 0) then sresult := nullfile
+            else if (runs <> 1) then
+                 begin
+                 mergeruns(sresult,nrecords,lastpage,firstpage,
+                           pagesize,nsflds,pkey,tempfiles,temprefnos,runs,
+                           segsize,prunend,destfile,keepduplicates);
+                 close_dataseg(tresult,sort_segment);
+                 if tresult <> noerr then sresult := tresult;
+                 end;
+            end;
+
+end; { of sort }
+
+end.
+
+
+ÿ

@@ -1,0 +1,878 @@
+{CUnitFile
+
+lisa:UnitFile.i[*]
+
+Glisa:UnitFile
+Obj:UnitFile
+{{{}
+
+{<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>}
+
+{$R-}
+
+UNIT UnitFile;
+
+(* Copyright 1983, Apple Computer Inc. *)
+
+INTRINSIC SHARED;
+
+{ jrm  3/02/83 -- in IFilOpen: (1) error check after Make_File call (2) check for ifilNil
+{ s_w 11/01/82 -- D+/D- made dependent on fSymOk }
+{ crc  8/25/82 -- CleanIfil really does set accumulated error code to 0 }
+{ crc  8/17/82 -- CleanIfil sets accumulated error code to 0; added CErrOfIfil }
+{ crc  8/16/82 -- Moved in CleanIfil from UnitHz; error accumulated in rgStFile;
+                  no error returned by FilSwapOutN; IfilOpen sets fOpen to FALSE
+                  if open fails and yields ifilNil; range check on ifil arguments
+                  used as assignment destinations;  FILEs made non-relocatable;
+                  global refnum flag to IfilOpen }
+{ crc  7/21/82 -- rgStFile allocated on the heap; error code returned by all
+                  added RefnumOfIfil }
+{ jrm  7/21/82 -- os file system warnings ignored }
+{ crc  6/17/82 -- file naming: added KillFile, RenameFile, FMonitorFile and
+                  PathOfIfil; added path field to TStFile }
+{ jrm  6/ 4/82 -- Scrap and conditional compilation }
+{ crc 05/13/82 -- supports both monitor and os files }
+
+
+{=============================== INTERFACE ======================================}
+
+INTERFACE
+
+USES {$U libsm/UnitStd} UnitStd,
+     {$U libsm/UnitHz} UnitHz,
+     {$U libos/SysCall} SysCall,
+     {$U libos/PSysCall} PSysCall;
+
+CONST
+     ifilNil = -1;
+     ifilRangeWarn   = -4056;  { argument ifil out-of-range }
+     noMFileErr      =  4057;  { no more FILEs for monitor file open request }
+     ifilNotOpenWarn = -4058;  { argument ifil not open }
+     ivodNil = MAXINT;
+     ivodArgvod = 0;
+     ivodFst = 1;
+     cbVofilOnFile = 128; {This many bytes are allocated on file for the vofil}
+                          {the vofil record can expand to be this large}
+     cvodMore = 48;
+     cbBlkOfVofil = 512;  {Used by CblkOfIfil for files with stfile.cbBlk = 0
+                           i.e. for vofil's (virtual object files)}
+
+
+{$IFC NOT fDbgOk}
+     fTstFile = FALSE;
+{$ENDC}
+
+TYPE String255 = STRING[255];
+
+     TVod = RECORD
+            ib: TL;
+            cb:  TL;
+            END;
+
+     TVofil = RECORD
+            tyfil: TW;
+            ver:  TC;
+            ivodMac: TC;
+            vodArgvod: TVod;
+            END;
+
+     TArgvod = ARRAY [1..1] OF TVod;
+     TRgvod = ^TArgvod;
+
+     TSetaccess = MSet;
+
+VAR
+     Scrap_RefNum:  TL;
+
+{$IFC fDbgOk}
+     fTstFile: TF;
+{$ENDC}
+
+
+PROCEDURE InitFiles(hz: THz);
+
+FUNCTION  IfilOpen(VAR cError: TC; pathIn: String255 {Pathname}; cbBlk: TC;
+                   setaccess: TSetaccess; hzWrite: THz; password: E_name): TB;
+
+PROCEDURE CloseIfil(VAR cError: TC; ifil: TB);
+
+FUNCTION  FilCbOfN(n: TN): TC;
+
+FUNCTION  FilFSwapInN(hz: THz; n: TN): TF;
+
+PROCEDURE FilSwapOutN(hz: THz; n: TN);
+
+FUNCTION  NFromIfilIb(ifil: TB; ib: TL) : TN;
+
+FUNCTION  CBlkOfIfil(ifil: TC): TC;
+
+PROCEDURE RenameFile (VAR cError: TC; pathIn: String255 {Pathname};
+                      enameIn: TSp {E_name}; password: E_name);
+
+PROCEDURE KillFile (VAR cError: TC; pathIn: String255 {Pathname};
+                    password: E_name);
+
+FUNCTION  FMonitorFile (path: String255 {Pathname}): TF;
+
+PROCEDURE PathOfIfil (ifil: TC; VAR path: String255 {Pathname};
+                      VAR password: e_name);
+
+PROCEDURE SetIbLimOfIfil(ifil: TB; ibLim: TL);
+
+FUNCTION  RefnumOfIfil(ifil: TB):TC;
+
+PROCEDURE CleanIfil(VAR cError: TC; hz: THz; ifil: TB; fIgnoreDirty: TF);
+
+FUNCTION  CErrOfIfil(ifil: TB):TC;
+
+PROCEDURE GetVofil(ifil: TB; VAR vofil: TVofil);
+
+FUNCTION  IvodAdd(ifil: TB; hSrc: TH; cb: TL) : TC;
+
+PROCEDURE SetTyfilVer(ifil: TB; tyfil: TW; ver: TC);
+
+{============================== IMPLEMENTATION ==================================}
+
+IMPLEMENTATION
+{$IFC fSymOK}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+
+{$SETC doTraceSU := TRUE}
+{$SetC fTraceSU := doTraceSU AND fTRACE}
+
+CONST ifilLst = 8;
+cifilMore = 4;
+imfileLst = 3;
+
+TYPE TPMFile = ^TMFile;
+
+TStFile = RECORD
+                   fOpen: TF;
+                   fNew:  TF;
+                   fUCSD: TF;
+                   cbBlk:  TC;
+                   ibLim: TL (* logical length of the file *);
+                   cError: TC;  { first error encountered }
+                   path:  Pathname;
+                   password:  e_name;
+                   hz:  THz;
+                   vofil: TVofil;       {Valid if cbBlk = 0}
+                   CASE fMonitorFile: TF OF
+                     TRUE:  (pmfile: TPMFile);
+                     FALSE: (Refnum: TC);
+               END;
+
+TArgStFile = ARRAY[0..0] OF TStFile;
+
+TMFile = RECORD fOpen: TF;
+                xfile: FILE;
+         END;
+
+TArgMFile = ARRAY[0..imfileLst] OF TMFile;
+
+VAR rgStFile: ^TArgStFile;
+ifilMac: TC;
+hzIfil: THz;
+argMFile: TArgMFile;
+
+
+{$S SUcold}
+{---------------------------------------------}
+FUNCTION  IvodAdd{ifil: TB; hSrc: TH; cb: TL) : TC};
+{---------------------------------------------}
+VAR vofil:    TVofil;
+    vod: TVod;
+    n, nRgvod: TN;
+    pDst: TP;
+    ivod: TC;
+    hzDst: THz;
+    ibLimT: TL;
+    rgvod: TRgvod;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hzDst := rgStfile^[ifil].hz;
+IF rgStfile^[ifil].cbBlk <> 0 THEN
+     ivod := ivodNil
+ELSE BEGIN
+     vofil := rgStfile^[ifil].vofil;
+     ibLimT := rgStfile^[ifil].ibLim;
+     nRgvod := NFromIfilIb(ifil, ivodArgvod);
+     ivod := vofil.ivodMac;
+     IF (((ivod - ivodFst) * SIZEOF(TVod)) >= vofil.vodArgvod.cb) THEN
+          BEGIN
+          vofil.vodArgvod.ib := ibLimT;
+          vofil.vodArgvod.cb := vofil.vodArgvod.cb + (cvodMore * SIZEOF(TVod));
+          ibLimT := ibLimT + vofil.vodArgvod.cb;
+          ChangeNSize(hzDst, nRgvod, vofil.vodArgvod.cb);
+          rgStfile^[ifil].vofil := vofil;
+          rgStfile^[ifil].ibLim := ibLimT;
+          SetFDirty(hzDst, nRgvod, TRUE);
+          END;
+     WITH rgStfile^[ifil] DO
+       BEGIN
+       vod.ib := ibLimT;
+       ibLim := ibLimT + cb;
+       vod.cb := cb;
+       vofil.ivodMac := ivod + 1;
+       END;
+
+     rgvod := POINTER(ORD(PMapN(hzDst, nRgvod)));
+     rgvod^[ivod] := vod;
+     SetFDirty(hzDst, nRgvod, TRUE);
+
+     n := NFromIfilIb(ifil, ivod);
+     pDst := PCreateNob(hzDst, n, cb);
+     MoveRgch(POINTER(ORD(pDst)), POINTER(ORD(hSrc^)), cb);
+     SetFDirty(hzDst, n, TRUE);
+
+     END;
+IvodAdd := ivod;
+END;
+
+{$S SUlwwrk}
+PROCEDURE SetTyfilVer{ifil: TB; tyfil: TW; ver: TC};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+WITH rgStfile^[ifil] DO
+  BEGIN
+  vofil.tyfil := tyfil;
+  vofil.ver := ver;
+  END;
+END;
+
+{$S SUcold}
+PROCEDURE GetVofil{ifil: TB; VAR vofil: TVofil};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+vofil := rgStfile^[ifil].vofil;
+END;
+
+{---------------------------------- CleanIfil ------------------------------------}
+
+{$S SUcold}
+PROCEDURE CleanIfil (*(VAR cError: TC; hz: THz; ifil: TB; fIgnoreDirty: TF)*);
+LABEL   111;
+VAR
+ipn:    TC;
+pnob:   TPnob;
+nOrFd:    TNOrFd;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF fTstFile THEN WRITELN('CleanIfil - ifil:',ifil);
+IF (ifil < 0) OR  (ifil >= ifilMac) THEN BEGIN
+    cError := ifilRangeWarn;
+    EXIT (CleanIfil);
+    END;
+
+ipn := 0;
+WHILE ipn <= hz^.mskIpnLst DO
+     BEGIN
+111: pnob := hz^.hrgpnob^^[ipn];
+     IF (pnob <> NIL) THEN
+              BEGIN
+              nOrFd.n := pnob^.n;
+              IF nOrFd.fd.ifil = ifil THEN
+                     BEGIN
+                     IF fIgnoreDirty THEN pnob^.stn.fDirty := FALSE;
+                     UnlockN(hz, nOrFd.n);
+                     FreeN(hz, nOrFd.n);
+                     { FreeIpn may have remapped rgpno[ipn] so skip increment }
+                     GOTO 111;
+                     END;
+              END;
+     ipn := ipn + 1;
+     END;
+IF rgStFile^[ifil].cbBlk = 0 THEN
+     FreeN(hz, NFromIfilIb(ifil, ivodArgvod));
+cError := rgStFile^[ifil].cError;
+rgStFile^[ifil].cError := 0;
+END; {CleanIfil}
+
+
+
+{-------------------------------- FMonitorFile -----------------------------------}
+
+{$S SUlwop1}
+FUNCTION FMonitorFile {(path: Pathname): TF};
+{ File name containing a colon are assumed to be monitor files }
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+(*
+IF Pos(':', path)<>0 THEN
+    FMonitorFile := TRUE
+ELSE
+    FMonitorFile := FALSE;
+*)
+FMonitorFile := FALSE;
+END; {FMonitorFile}
+
+
+{---------------------------------- NFromIfilIb ----------------------------------}
+
+{$S SUlwop1}
+FUNCTION NFromIfilIb {ifil: TB; ib: TL) : TN};
+VAR
+nOrFd: TNOrFd;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+nOrFd.n := ib;
+nOrFd.fd.ifil := ifil;
+NFromIfilIb := nOrFd.n;
+END; {NFromIfilIb}
+
+
+{----------------------------------- InitFiles ----------------------------------}
+
+{$S SUinit}
+PROCEDURE InitFiles {(hz: THz)};
+VAR i: TC;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hzIfil := hz;
+ifilMac := ifilLst+1;
+AllocBk(hzIfil, @rgStFile, ifilMac*SIZEOF(TStFile), tybkStd);
+FOR i := 0 TO ifilLst DO rgStFile^[i].fOpen := FALSE;
+FOR i := 0 TO imfileLst DO argMFile[i].fOpen := FALSE;
+END; {InitFiles}
+
+
+
+{-------------------------------- IfilOpen --------------------------------------}
+
+{$S SUlwop1}
+FUNCTION IfilOpen {(VAR cError: TC; pathIn: String255; cbBlk: TC;
+                   setaccess: TSetaccess; hzWrite: THz; password: E_name)} ;
+LABEL 10, 20;
+VAR i,iDot: TC;
+    cIOResult: TC;
+    sp:        TSp;
+    path:      Pathname;
+    imfile:    TC;
+    fNewFile:  TF;
+    ibLim:     TL;
+    pc: TPc;
+    fsinfo: Fs_Info;
+    vofil: TVofil;
+    lbGot:  TL;
+    refnum: TC;
+    nRgvod: TN;
+    hT:     TH;
+    pDst: TP;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+fNewFile := (Append IN setaccess);
+path := pathIn;
+IF fTstFile THEN
+     WRITELN('IfilOpen:"',path,'", fNewFile:',fNewFile,
+       ', hzWrite: ', ORD(hzWrite), 'password:', password);
+IF cbBlk <> (cbBlk DIV 512) * 512 THEN Break(804);
+FOR i := 0 TO ifilMac-1 DO IF NOT rgStFile^[i].fOpen THEN GOTO 10;
+{make more ifils}
+ChangeSizeH(hzIfil, @rgStFile, (ifilMac+cifilMore)*SIZEOF(TStFile));
+FOR i := ifilMac TO ifilMac+cifilMore-1 DO rgStFile^[i].fOpen := FALSE;
+i := ifilMac;
+ifilMac := ifilMac+cifilMore;
+10:
+rgStFile^[i].fOpen := TRUE;
+rgStFile^[i].fNew  := fNewFile;
+rgStFile^[i].cbBlk := cbBlk;
+rgStFile^[i].fUCSD := FALSE;
+rgStFile^[i].path  := path;
+rgStFile^[i].password  := password;
+rgStFile^[i].cError:= 0;
+rgStFile^[i].hz  := hzWrite;
+
+rgStFile^[i].fMonitorFile := FMonitorFile(path);
+
+IF rgStFile^[i].fMonitorFile THEN BEGIN
+     FOR imfile := 0 TO imfileLst DO IF NOT argMFile[imfile].fOpen THEN GOTO 20;
+     cError := noMFileErr;
+     rgStFile^[i].fOpen := FALSE;
+     IfilOpen := ifilNil;
+     EXIT (IfilOpen);
+     20:
+     rgStFile^[i].pmfile := @argMFile[imfile];
+     argMFile[imfile].fOpen := TRUE;
+     END;
+
+IF fNewFile THEN
+     BEGIN
+     IF rgStFile^[i].fMonitorFile THEN
+          REWRITE(rgStFile^[i].pmfile^.xfile, path)
+     ELSE BEGIN
+          Make_Secure(cError, path, password);
+          IF fTstFile THEN IF NOT (cError IN [0, 890]) THEN
+              WRITELN('OS file system error ', cError, ' making file ', path);
+          IF (cError <= 0) OR (cError = 890) THEN
+               Open_Secure(cError, path, refnum, setaccess, password);
+          END;
+     END
+ELSE BEGIN
+     IF rgStFile^[i].fMonitorFile THEN
+          RESET(rgStFile^[i].pmfile^.xfile, path)
+     ELSE Open_Secure(cError, path, refnum, setaccess, password);
+     END;
+
+Scrap_RefNum := refnum;  { remember so that the filer can close it }
+
+IF rgStFile^[i].fMonitorFile THEN
+     BEGIN
+     cError := IOResult;
+     IF cError <> 0 THEN
+          BEGIN
+          rgStFile^[i].fOpen := FALSE;
+          argMFile[imfile].fOpen := FALSE;
+          i := ifilNil;
+          IF fTstFile THEN
+            WRITELN('Monitor file system error ', cIOResult, 'opening file ', path);
+          END
+     ELSE BEGIN
+          pc := POINTER(ORD(@rgStFile^[i].pmfile^.xfile) + 22);
+          (* p := POINTER(ORD(@rgStFile^) + i * SIZEOF(FILE) + 22); *)
+          ibLim := ORD4(pc^) * 512;
+          IF fTstFile THEN WRITELN('ibLim: ', ibLim);
+          END;
+     END
+ELSE BEGIN
+     IF cError > 0 THEN
+          BEGIN
+          rgStFile^[i].fOpen := FALSE;
+          i := ifilNil;
+          IF fTstFile THEN
+            WRITELN('OS file system error ', cError, ' opening file ', path);
+          END
+     ELSE BEGIN
+          IF fNewFile THEN
+               BEGIN
+               IF cbBlk = 0 THEN
+                    BEGIN
+                    vofil.ivodMac := ivodFst;
+                    vofil.vodArgvod.ib := cbVofilOnFile;
+                    vofil.vodArgvod.cb := (cvodMore * SIZEOF(TVod));
+                    ibLim := cbVofilOnFile + vofil.vodArgvod.cb;
+                    END
+               ELSE ibLim := 0;
+               END
+          ELSE BEGIN
+               INFO(cError, refnum, fsinfo);
+               ibLim := fsinfo.size;
+               IF cbBlk = 0 THEN
+                    BEGIN
+                    Read_Data(cError, refnum, ORD4(@vofil), SIZEOF(TVofil),
+                             lbGot, Absolute, 0);
+                    IF lbGot <> SIZEOF(TVofil) THEN
+                         BEGIN;
+                         rgStFile^[i].fOpen := FALSE;
+                         i := ifilNil;
+                         END;
+                    END;
+               END;
+          IF fTstFile THEN WRITELN('ibLim: ', ibLim);
+          END;
+     END;
+IF i <> ifilNil THEN
+      BEGIN
+      sp := COPY(path, 1, LENGTH(path));  {circumvent string size restrictions}
+      iDot := Pos('.', sp);
+      IF iDot<>0 THEN BEGIN
+        sp := Copy(sp, iDot+1, Length(sp)-iDot);
+        MakeSpUpper(sp);
+        IF sp = 'TEXT' THEN rgStFile^[i].fUCSD := TRUE;
+        END;
+      rgStFile^[i].ibLim := ibLim;
+      rgStFile^[i].vofil := vofil;
+      rgStFile^[i].refnum := refnum;
+      IF cbBlk = 0 THEN
+           BEGIN
+           nRgvod := NFromIfilIb(i, ivodArgvod);
+           IF fNewFile THEN
+                BEGIN
+                pDst := PCreateNob(hzWrite, nRgvod, vofil.vodArgvod.cb);
+                SetFDirty(hzWrite, nRgvod, TRUE);
+                END;
+           hT := HLockN(hzWrite, nRgvod, FALSE);
+           END;
+      END;
+IFilOpen := i;
+END; {IFilOpen}
+
+
+{------------------------------- CloseIfil --------------------------------------}
+
+{$S SUcold}
+PROCEDURE CloseIfil {(VAR cError: TC; ifil: TB)};
+VAR
+cbActual: TL;
+l: TL;
+cErrorT: TC;
+lbPut: TL;
+nRgvod: TN;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF fTstFile THEN WRITELN('ClosefFil [',ifil,']');
+IF (ifil < 0) OR  (ifil >= ifilMac) THEN BEGIN
+    cError := ifilRangeWarn;
+    EXIT (CloseIfil);
+    END;
+IF rgStFile^[ifil].fOpen THEN
+    IF rgStFile^[ifil].fMonitor THEN
+         BEGIN
+         CLOSE(rgStFile^[ifil].pmfile^.xfile, LOCK);
+         rgStFile^[ifil].pmfile^.fOpen := FALSE;
+         cError := IOResult;
+         END
+    ELSE BEGIN
+         WITH rgStFile^[ifil] DO
+           BEGIN
+           IF (cbBlk = 0) AND (vofil.ivodMac = ivodFst) THEN
+                KillFile(cError, path, password)
+           ELSE BEGIN
+                IF cError = 0 THEN
+                     Read_Data(cError, Refnum, ORD4(@l), 1, cbActual, Absolute, ibLim - 1);
+                IF cError = 0 THEN
+                     Truncate(cError, Refnum);
+                IF (cError = 0) AND (cbBlk = 0) THEN
+                     Write_Data(cError, refnum, ORD4(@vofil), SIZEOF(TVofil), lbPut,
+                               Absolute, 0);
+                Close_Object(cErrorT, Refnum);
+                IF cErrorT <> 0 THEN cError := cErrorT;
+                END;
+           END;
+         cError := rgStFile^[ifil].cError;
+         IF fTstFile THEN IF cError > 0 THEN
+              WRITELN('OS file system error ', cError, ' in CloseIfil ');
+         END
+ELSE
+    IF fTstFile THEN WRITELN('CloseIfil invoked but ifil ', ifil, ' not open');
+    cError := ifilNotOpenWarn;
+rgStFile^[iFil].fOpen := FALSE;
+END; {CloseIFil}
+
+
+{-------------------------------- FilCbOfN --------------------------------------}
+
+{$S SUlwwrk}
+FUNCTION FilCbOfN{n: TN) : TC};
+VAR nOrFd: TNOrFd;
+    cb: TC;
+    ifil: TB; ivodMac: TC;
+    hzT: THz; vofilT: TVofil;
+    rgvod: TRgvod;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+nOrFd.n := n; ifil := nOrFd.fd.ifil; nOrFd.fd.ifil := 0;
+WITH rgStFile^[ifil] DO BEGIN cb := cbBlk; vofilT := vofil; hzT := hz; END;
+IF cb = 0 THEN
+     BEGIN
+     {nOrFd.n = ivod}
+     IF nOrFd.n < vofilT.ivodMac THEN
+          BEGIN
+          IF nOrFd.n = ivodArgvod THEN
+               cb := vofilT.vodArgvod.cb
+          ELSE BEGIN
+               rgvod := POINTER(ORD(PMapN(hzT, NFromIfilIb(ifil, ivodArgvod))));
+               cb := rgvod^[nOrFd.n].cb;
+               END;
+          END;
+     END;
+FilCbOfn := cb;
+END;
+
+{-------------------------------- FilCbOfN --------------------------------------}
+
+{$S SUlwwrk}
+FUNCTION IbOfN(n: TN) : TL;
+VAR nOrFd: TNOrFd;
+    cb: TC; ib: TL;
+    ifil: TB; ivodMac: TC;
+    hzT: THz; vofilT: TVofil;
+    rgvod: TRgvod;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+nOrFd.n := n; ifil := nOrFd.fd.ifil; nOrFd.fd.ifil := 0;
+WITH rgStFile^[ifil] DO BEGIN cb := cbBlk; vofilT := vofil; hzT := hz; END;
+ib := nOrFd.n;
+IF cb = 0 THEN
+     BEGIN
+     {nOrFd.n = ivod}
+     IF nOrFd.n < vofilT.ivodMac THEN
+          BEGIN
+          IF nOrFd.n = ivodArgvod THEN
+               ib := vofilT.vodArgvod.ib
+          ELSE BEGIN
+               rgvod := POINTER(ORD(PMapN(hzT, NFromIfilIb(ifil, ivodArgvod))));
+               ib := rgvod^[nOrFd.n].ib;
+               END;
+          END;
+     END;
+IbOfN := ib;
+END;
+
+
+
+{------------------------------- FilFSwapIn -------------------------------------}
+
+{$S SUlwwrk}
+FUNCTION FilFSwapInN {(hz: THz; n: TN): TF};
+VAR nOrFd: TNOrFd;
+ ifil: TB;
+ ib: TL;
+ iBlk,cBlk: TC;
+ cError: TC;
+ lbReq:  TL;
+ lbGot:  TL;
+ lbPos:  TL;
+ pnob: TPnob; rgch: TRgch;
+ rgvod: TRgvod;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+nOrFd.n := n;
+ifil := nOrFd.fd.ifil;
+ib := IbOfN(n);
+IF fTstFile
+ THEN WRITELN('FilFSwapInN - ifil:',ifil,', ib:',ib);
+{$I-}
+pnob := PnobFromN(hz, n);
+rgch := @pnob^.data;
+IF rgStFile^[ifil].fMonitorFile THEN BEGIN
+    iBlk := ib DIV 512;
+    IF rgStFile^[ifil].fUCSD THEN iBlk := iBlk + 2;
+    cBlk := rgStFile^[ifil].cbBlk DIV 512;
+    IF cBlk = 0 THEN
+         FilFSwapInN := FALSE
+    ELSE FilFSwapInN :=
+      (BlockRead(rgStFile^[ifil].pmfile^.xfile, rgch^, cBlk, iBlk) = cBlk)
+      AND (IOResult = 0);
+    END
+ELSE BEGIN
+    lbReq := FilCbOfN(n);
+    lbPos := ib;
+    IF fTstFile THEN
+        WRITELN('Reading', lbReq, ' bytes from position', lbPos);
+    Read_Data(cError, rgStFile^[ifil].Refnum, ORD4(rgch),
+              lbReq,
+              lbGot,
+              Absolute,
+              lbPos);
+    IF fTstFile THEN IF NOT ((lbGot=lbReq) AND (cError<=0)) THEN
+        WRITELN('Error; read', lbGot, ' bytes with error', cError);
+    FilFSwapIn := (lbGot=lbReq) AND (cError<=0);
+    END;
+{$I+}
+END; {FilFSwapIn}
+
+
+{------------------------------------ LMin ---------------------------------------}
+
+{$S SUcold}
+FUNCTION LMin (one, two: TL):TL;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF one<=two THEN LMin:=one ELSE LMin:=two;
+END; {LMin}
+
+
+{-------------------------------- FilExtend -------------------------------------}
+
+{$S SUcold}
+PROCEDURE FilExtend (VAR cError: TC; refnum: TC; lbPos: TL; lbChunk: TL; rgch: TRgch);
+VAR
+ lbEnd:  TL;
+ lbPut:  TL;
+ fsinfo: Fs_Info;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+Info(cError, refnum, fsinfo);
+lbEnd := fsinfo.size;
+{Extend the file through byte position lbPos}
+WHILE (cError<=0) AND (lbEnd<lbPos) DO BEGIN
+    IF fTstFile THEN
+      WRITELN('Extending file from position', lbEnd, ' for',
+              LMin(lbChunk,lbPos-lbEnd), ' bytes');
+    Write_Data(cError, refnum, ORD4(rgch),
+               LMin(lbChunk,lbPos-lbEnd),
+               lbPut,
+               Absolute,
+               lbEnd);
+    lbEnd := lbEnd + lbPut;
+    END;
+IF fTstFile THEN IF cError>0 THEN
+   WRITELN('OS file system error ', cError, ' in FilExtend ');
+END; {FilExtend}
+
+
+{------------------------------- FilSwapOutN -------------------------------------}
+
+{$S SUcold}
+PROCEDURE FilSwapOutN {(hz: THz; n: TN)};
+VAR nOrFd: TNOrFd;
+ ifil: TB;
+ ib: TL;
+ iBlk,cBlk: TC;
+ lbReq:  TL;
+ lbPut:  TL;
+ lbPos:  TL;
+ fsinfo: Fs_Info;
+ cError: TC;
+ pnob: TPnob; rgch: TRgch;
+ rgvod: TRgvod;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+nOrFd.n := n;
+ifil := nOrFd.fd.ifil;
+ib := IbOfN(n);
+IF fTstFile
+ THEN WRITELN('FilSwapOutN - ifil:',ifil,', ib:',ib);
+{$I-}
+pnob := PnobFromN(hz, n);
+rgch := @pnob^.data;
+IF rgStFile^[ifil].fMonitorFile THEN
+    BEGIN
+    iBlk := ib DIV 512;
+    IF rgStFile^[ifil].fUCSD THEN iBlk := iBlk + 2;
+    cBlk := rgStFile^[ifil].cbBlk DIV 512;
+    IF BlockWrite(rgStFile^[ifil].pmfile^.xfile, rgch^, cBlk, iBlk) <> cBlk THEN
+        IF fTstFile THEN writeln(' bad blockwrite cblk is',cblk);
+    IF fTstFile THEN IF IOResult <> 0 THEN Writeln('IOResult = ', IOResult);
+    END
+ELSE (* not a moniitor file *) BEGIN
+    lbReq := FilCbOfN(n);
+    lbPos := ib;
+    IF fTstFile THEN WRITELN('Writing', lbReq, ' bytes to position', lbPos);
+    Write_Data(cError, rgStFile^[ifil].Refnum, ORD4(rgch),
+               lbReq,
+               lbPut,
+               Absolute,
+               lbPos);
+    IF cError=963 THEN BEGIN
+        FilExtend(cError, rgStFile^[ifil].Refnum, lbPos, lbReq, rgch);
+        Write_Data(cError, rgStFile^[ifil].Refnum, ORD4(rgch),
+                   lbReq,
+                   lbPut,
+                   Absolute,
+                   lbPos);
+        END;
+    IF fTstFile THEN IF (lbPut<>lbReq) OR (cError>0) THEN
+        WRITELN('OS file system error', cError, 'in FilSwapOutN');
+    IF cError > 0 THEN IF rgStFile^[ifil].cError = 0 THEN
+        rgStFile^[ifil].cError := cError;
+    END;
+{$I+}
+END; {FilSwapOutN}
+
+
+{------------------------------- CBlkOfIFil -------------------------------------}
+
+{$S SUlwop1}
+FUNCTION CBlkOfIFil {(ifil: TC): TC};
+VAR
+cbBlk: TL;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+cbBlk := rgStFile^[ifil].cbBlk;
+IF cbBlk = 0 THEN cbBlk := cbBlkOfVofil;
+CBlkOfIfil := ((rgStFile^[ifil].ibLim + cbBlk - 1) DIV cbBlk);
+END; {CBlkOfIFil}
+
+
+{------------------------------- SetIbLimOfIfil ---------------------------------}
+
+{$S SUcold}
+PROCEDURE SetIbLimOfIfil{ifil: TB; ibLim: TL};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+rgstfile^[ifil].ibLim := ibLim;
+END; {CBlkOfIFil}
+
+
+{-------------------------------- RenameFile ------------------------------------}
+
+{$S SUcold}
+PROCEDURE RenameFile {(VAR cError: TC; pathIn: String255;
+                      enameIn: TSp; password: E_name)};
+VAR
+  path: Pathname;
+  ename: E_Name;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+path := pathIn;
+ename := enameIn;
+IF fTstFile THEN WRITELN('Renaming file ', path, ' to ', ename, ', ', password);
+IF FMonitorFile(path) THEN cError := 0
+ELSE BEGIN
+    Rename_Secure (cError, path, ename, password);
+    IF fTstFile THEN IF cError > 0 THEN
+        WRITELN('OS error', CError, ' renaming ', path,
+                ' to ', ename, ', ', password);
+    END;
+END;  {RenameFile}
+
+
+{------------------------------ KillFile ----------------------------------}
+
+{$S SUcold}
+PROCEDURE KillFile {(VAR cError: TC; pathIn: Pathname;
+                      password: E_name)};
+VAR
+  path: Pathname;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+path := pathIn;
+IF fTstFile THEN WRITELN('Killing file ', path, ',', password);
+IF FMonitorFile(path) THEN cError := 0 ELSE KILL_Secure (cError, path, password);
+END;  {KillFile}
+
+
+{------------------------------ PathOfIfil ----------------------------------}
+
+{$S SUcold}
+PROCEDURE PathOfIfil {(ifil: TC; VAR path: String255;
+                      VAR password: e_name)};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF rgStFile^[ifil].fOpen THEN BEGIN
+    path := rgStFile^[ifil].path;
+    password := rgStFile^[ifil].password;
+  END
+ELSE BEGIN
+    path := '';
+    password := '';
+  END;
+END;  {PathOfIfil}
+
+
+{-------------------------------- RefnumOfIfil ----------------------------------}
+
+{$S SUcold}
+FUNCTION RefnumOfIfil {(ifil: TB):TC};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+  RefnumOfIfil := -1;
+  IF ifil < ifilMac THEN
+      IF rgStFile^[ifil].fOpen AND (rgStFile^[ifil].fMonitorFile = FALSE) THEN
+          RefnumOfIfil := rgStFile^[ifil].Refnum;
+END;  {RefnumOfIfil}
+
+
+{--------------------------------- CErrOfIfil ------------------------------------}
+
+{$S SUcold}
+FUNCTION  CErrOfIfil {(ifil: TB):TC};
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+  CErrOfIfil := rgStFile^[ifil].cError;
+END;  {CErrOfIfil}
+
+
+END. {UNIT UnitFile}
+
+
+
+
+
+
+
+ÿ

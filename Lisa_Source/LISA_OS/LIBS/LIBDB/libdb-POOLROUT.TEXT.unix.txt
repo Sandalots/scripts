@@ -1,0 +1,930 @@
+{#F     68sc:poolrout.text }
+
+{$IFC PRERELEASE }
+{$S debug }
+procedure dumpbuff{(first,last : integer)};
+var
+        i : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        for i := first to last do
+            with buffpool^[i] do
+                writeln('s,l,pf,pri,p:',state:7,locks:7,pfile:7,
+                        priority:7,page : 14);
+end;
+{$ENDC }
+{$IFC debugpool }
+procedure pdataread(fileid : integer;
+                     page : fileptr;
+                     buffer : integer);
+var
+        pd : ptrpagedesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pd := pointer(ord(buffpool^[buffer].pbuff)+
+                      pfiletable^[fileid]^.pagesize - sizeof(pagedesc));
+        write('dr(',fileid:2,',',page:7,',');
+        case pd^.ptype of
+        leaftype : write('D');
+        nonleaftype : write('N');
+        labeltype : write('L');
+        freetype : write('F');
+        otherwise write('U');
+        end;
+        writeln(')=',datareads);
+end;
+procedure pdatawrite(fileid : integer;
+                     page : fileptr;
+                     buffer : integer);
+var
+        pd : ptrpagedesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        pd := pointer(ord(buffpool^[buffer].pbuff)+
+                      pfiletable^[fileid]^.pagesize - sizeof(pagedesc));
+        write('dw(',fileid:2,',',page:7,',');
+        case pd^.ptype of
+        leaftype : write('D');
+        nonleaftype : write('N');
+        labeltype : write('L');
+        freetype : write('F');
+        otherwise write('U');
+        end;
+        writeln(')=',datawrites);
+end;
+{$S access }
+procedure dlabwrite(fileid : integer);
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        labwrites := labwrites + 1;
+        if pdebug then writeln('lw(',fileid:2,')=',labwrites);
+end;
+procedure ddatawrite(fileid : integer;
+                     page : fileptr;
+                     buffer : integer);
+var
+        pd : ptrpagedesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        datawrites := datawrites + 1;
+        if pdebug then pdatawrite(fileid,page,buffer);
+end;
+procedure ddataread(fileid : integer;
+                     page : fileptr;
+                     buffer : integer);
+var
+        pd : ptrpagedesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        datareads := datareads + 1;
+        if pdebug then pdataread(fileid,page,buffer);
+end;
+{$ENDC }
+{$S swapaccs }
+{*****************************************************************************
+
+                                no_room
+
+        returns true iff presult is a file system error that results from
+        running out of space.
+
+        Input Parameters
+
+        presult - OS error return from write
+
+*****************************************************************************}
+
+{$S swapaccs }
+function no_room{(presult : integer): boolean};
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        no_room := (presult = disk1full) or
+                   (presult = nohints) or
+                   (presult = leof_peof) or
+                   (presult = disk2full) or
+                   (presult = eofFound);
+end; { no_room }
+{^T 20}
+{******************************************************************************
+
+                               dowritenon
+
+           before the first write to a file an inconsistent status must be
+           posted to the file label
+
+           Input Parameters
+
+           fileid - index of file
+
+           Output Parameters
+
+           presult - return result
+
+               noerr
+               ioerr
+
+
+*****************************************************************************}
+
+{$S access }
+procedure dowritenon {(var presult : integer;
+                         fileid : integer)};
+var
+        tempresult : integer;
+        actual : fileptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+
+            (*dbif pdebug then writeln('wrion:',frefno);
+            if pdebug then writeln(fstatus);db*)
+
+            if fstatus = noerr then
+                begin
+                clearbit(@flags,ffileok);
+{$IFC debugpool }
+                dlabwrite(fileid);
+{$ENDC }
+                write_data(presult,frefno,ord(@pfiletable^[fileid]^),
+                           sizeof(filelabel),actual,absolute,0);
+                flush(tempresult,frefno);
+                if (presult = noerr) and (tempresult = noerr) then
+                    fstatus := writenon
+                else
+                    begin
+                    presult := ioerr;
+                    fstatus := inconsistent;
+                    end;
+                end
+            else presult := noerr;
+
+            (*dbif pdebug then writeln(fstatus);*)
+
+            end; { with }
+
+end;
+{^T 20}
+{*************************************************************************
+
+                           getanybuff
+
+        returns the lowest priority buffer (empty buffers have priority
+             -1) in the pool.  locked buffers are out of the
+             running.  returns -1 if all buffers are locked
+
+*************************************************************************}
+
+{$S access }
+function getanybuff : integer;
+var
+        pb : ^ buffdesc;
+        minbuff,
+        buff : integer;
+        minpriority : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        minbuff := -1;
+        minpriority := maxint;
+
+        pb := @buffpool^;
+        for buff := 0 to lastbuff do
+            begin
+            if pb^.priority <= minpriority then
+                if (pb^.locks = 0) then
+                    begin
+                    minpriority := pb^.priority;
+                    minbuff := buff;
+                    end;
+            pb := pointer(ord(pb) + sizeof(buffdesc));
+            end;
+
+        getanybuff := minbuff;
+
+end; { getanybuff }
+{^T 20}
+{**************************************************************************
+
+                            checkticks
+
+         called if addition + ticks >= maxint.  if this is true then all
+         priorities are translated so that addition + ticks < maxint.
+         if this computation would produce overflow, the priorities on all
+         the buffers and ticks must be translated by the lowest priority.
+         in some cases the spread may be too great so this procedure must be
+         repeatedly invoked to reduce the spread.
+
+**************************************************************************}
+
+{$S swapaccs }
+procedure checkticks(addition : integer);
+var
+        pb : ^ buffdesc;
+        i,
+        buff,
+        min,
+        lastmin : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+    {   compute the lowest priority such that translation
+        will prevent overflow -- usually, this min is very
+        close to ticks and one translation suffices  }
+
+        (*dbif pdebug then begin
+            writeln('translate:',ticks);
+            dumpbuff(0,lastbuff);
+        end;db*)
+
+        lastmin := -1;
+        repeat
+            min := maxint;
+            pb := @buffpool^;
+            for i := 0 to lastbuff do
+                begin
+                if (pb^.locks = 0) then
+                    if (pb^.priority <= min) and
+                       (pb^.priority > lastmin) then min := pb^.priority;
+                pb := pointer(ord(pb) + sizeof(buffdesc));
+            end;
+            if min > ticks then min := ticks;
+            lastmin := min
+        until addition < (maxint-(ticks-min));
+        ticks := ticks - min;
+
+        pb := @buffpool^;
+        for i := 0 to lastbuff do
+            begin
+            if (pb^.locks = 0) then
+                if (pb^.state <> empty) then
+                    if pb^.priority < min then pb^.priority := 0
+                    else pb^.priority := pb^.priority - min;
+            pb := pointer(ord(pb) + sizeof(buffdesc));
+            end;
+
+        (*dbif pdebug then begin
+            writeln('translation done:',ticks);
+            dumpbuff(0,lastbuff);
+            end;db*)
+
+end; { checkticks }
+{^T 20}
+{*****************************************************************************
+
+                                 lockbuff
+
+             performs lockbuff request:
+
+             1) finds min priority buff to take.
+             2) if that buff contains dirty data then a paging operation
+                is initiated and this request is queued waiting on that
+                io (and the state of the request is changed accordingly).
+             3) if that buff is empty or is clean, then the request is
+                granted immediately
+
+        OutPut Parameters
+
+        presult - return result
+            noerr
+            ioerr
+            noroom
+            nobuffs
+
+        buffer - number of buffer allocated
+
+
+****************************************************************************}
+
+{$S access }
+procedure lockbuff{(var presult : integer;
+                   var buffer  : integer)};
+
+var
+        actual : fileptr;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        buffer := getanybuff;
+
+        (*dbif pdebug then writeln('locking buff ',buffer);db*)
+
+        if buffer = -1 then presult := nobuffs
+        else
+            with buffpool^[buffer] do begin
+
+                (*dbdumpbuff(buffer,buffer);*)
+
+                if (state = dirty) then begin
+                    dowritenon(presult,pfile);
+                    with pfiletable^[pfile]^ do
+                        begin
+{$IFC debugpool }
+                        ddatawrite(pfile,page,buffer);
+{$ENDC }
+                        write_data(presult,frefno,ord(pbuff),pagesize,actual,
+                                   absolute,page);
+                        if presult <> noerr then
+                            if no_room(presult) then
+                                begin
+                                fstatus := noroom;
+                                presult := noroom;
+                                end
+                            else
+                                begin
+                                presult := ioerr;
+                                fstatus := inconsistent;
+                                end;
+                        end; { with }
+                end;
+                locks := 1;
+                state := empty;
+                page := nilptr;
+                presult := noerr;
+            end; { with }
+end;  { lockbuff }
+{^T 20}
+{*****************************************************************************
+
+                                  relbuff
+
+       releases buffer.  if this is the last lock, then state and
+       priority are set according to the request.  the request priority
+       is a relative priority and must be added to the current number
+       of accesses (ticks).  if the relative priority is negative then
+       the buffer is given a minimal priority (so that it is not long
+       for this world). it is the responsibility of the server to
+       make sure that state, fid and page have been set properly prior
+       to release.
+
+       Input Parameters
+
+       buffer - number of buffer to release
+       relpriority - release priority
+
+       Output Paramters
+
+       presult - return result
+            noerr
+            inconsistent
+
+
+****************************************************************************}
+
+{$S access }
+procedure relbuff{(var presult : integer;
+                      buffer  : integer;
+                      relpriority : integer)};
+var
+        pb : ^ buffdesc;
+        buff,
+        minpriority,
+        i : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if ticks >= (maxint-1) then checkticks(1);
+        ticks := ticks + 1;
+
+        (*dbif pdebug then begin
+            writeln('releasing buffer ',buffer);
+            dumpbuff(buffer,buffer);
+        end;db*)
+
+        with buffpool^[buffer] do
+            begin
+            if state = empty then presult := noerr
+            else
+                begin
+                presult := pfiletable^[pfile]^.fstatus;
+                if presult = writenon then presult := noerr;
+                end;
+            locks := locks - 1;
+            if locks = 0 then
+                begin
+                if state = empty then
+                    begin
+                    page := nilptr;
+                    priority := -1;
+                    end
+                else
+                    begin
+                    if relpriority < 0 then
+                        begin
+                        minpriority := maxint;
+                        pb := @buffpool^;
+                        for buff := 0 to lastbuff do
+                            begin
+                            with pb^ do
+                                if (locks = 0) and (state > empty) then
+                                    if (priority < minpriority) and
+                                       (buff <> buffer)
+                                    then minpriority := priority;
+                            pb := pointer(ord(pb) + sizeof(buffdesc));
+                            end;
+                        if (minpriority <= 0) or (minpriority = maxint)
+                        then priority := 0
+                        else priority := minpriority - 1;
+                        end
+                    else
+                        begin
+                        if ticks >= (maxint-relpriority) then
+                            checkticks(relpriority);
+                        priority := ticks+relpriority;
+                        end;
+                    end;
+                end; { if }
+            end; { with }
+
+        (*dbdumpbuff(buffer,buffer);db*)
+
+end; { dorelbuff }
+{^T 20}
+{****************************************************************************
+
+                               getbuff
+
+        returns a buffer with the desired file page, if it is in the buffer
+        pool, else the cheapest buffer is retrieved.  misss is true iff the
+        page wasn't in the pool
+
+        Input parameters
+
+        fileid - index of file
+        fpage - address of page
+
+        Output parameters
+
+        return result - buffer allocated
+        miss - true iff not in pool
+
+*****************************************************************************}
+
+{$S access }
+function getbuff(     fileid : integer;
+                      fpage : fileptr;
+                 var  miss : boolean) : integer;
+label
+        2,
+        22;
+var
+        pb : ^ buffdesc;
+        minbuff,
+        buff,
+        minpriority : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        minbuff := -1;
+        minpriority := maxint;
+
+        miss := true;
+        pb := @buffpool^;
+        for buff := 0 to lastbuff do
+            begin
+
+    {   Please avert your eyes from this short circuit boolean .... this
+        loop was determined to be in the path of a Vogon interstellar bypass }
+
+            if pb^.page <> fpage then goto 22;
+            if pb^.pfile <> fileid then goto 22;
+
+    {   Note that we depend on empty buffers having page = nilptr }
+
+            miss := false;
+            minbuff := buff;
+            goto 2; { break }
+
+        22: if pb^.priority <= minpriority then
+                if pb^.locks = 0 then
+                   begin
+                   minpriority := pb^.priority;
+                   minbuff := buff;
+                   end; { if }
+            pb := pointer(ord(pb) + sizeof(buffdesc));
+            end;
+
+2 : { break }
+
+        getbuff := minbuff;
+
+        (*dbif (minbuff = -1) and pdebug then dumpbuff(0,lastbuff);db*)
+
+end; { getbuff }
+{^T 20}
+{*****************************************************************************
+
+                                  getpage
+
+        performs buffered read to file.
+
+        1)  tries to find page in buffers, if page is in, returns buffer
+
+        2)  if can't find in buffers, the cheapest buffer is preempted
+            and the page is brought in
+
+        Input Parameters
+
+        fileid - file
+        rpage - page address
+        noinconsistent - true iff don't want to read from inconsistent file
+
+        Output Parameters
+
+        presult - return result
+            noerr
+            nobuffs
+            ioerr
+            noroom
+            ioerr
+            inconsistent
+
+        buffer - number of buffer returned
+
+****************************************************************************}
+
+{$S access }
+procedure getpage{(var presult : integer;
+                  var buffer  : integer;
+                      fileid : integer;
+                      rpage    : fileptr;
+                      noinconsistent : boolean)};
+label
+{$IFC trapio }
+        1,
+{$ENDC }
+        2;
+var
+        tresult : integer;
+        actual : fileptr;
+        miss : boolean;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        buffer := getbuff(fileid,rpage,miss);
+
+        (*dbif pdebug then
+            writeln('rread buffer,miss:',buffer,',',ord(miss));db*)
+
+        if buffer = -1 then presult := nobuffs
+        else
+            begin
+            with buffpool^[buffer] do
+                begin
+                if miss then
+                    begin
+                    if state = dirty then
+                        begin
+                        dowritenon(presult,pfile);
+                        with pfiletable^[pfile]^ do
+                            begin
+{$IFC debugpool }
+                            ddatawrite(pfile,page,buffer);
+{$ENDC }
+                            write_data(presult,frefno,ord(pbuff),pagesize,
+                                       actual,absolute,page);
+                            if presult <> noerr then
+                                begin
+                                if no_room(presult) then fstatus := noroom
+                                else fstatus := inconsistent;
+                                end;
+                            end;
+                        end;
+
+                {  initiate read in }
+
+                    pfile := fileid;
+                    page := rpage;
+                    with pfiletable^[fileid]^ do
+                        read_data(presult,frefno,ord(pbuff),pagesize,actual,
+                                  absolute,page);
+{$IFC debugpool }
+                    ddataread(fileid,page,buffer);
+{$ENDC }
+                    if presult <> noerr then
+                        begin
+{$IFC trapio }
+                        writeln(chr(7),'IOErr!!!',presult);
+                        1 : goto 1;
+{$ENDC }
+                        state := empty;
+                        page := nilptr;
+                        priority := -1;
+                        presult := ioerr;
+                        goto 2; { exit }
+                        end
+                    else
+                        begin
+                        if ticks >= (maxint-1) then checkticks(1);
+                        ticks := ticks + 1;
+                        state := clean;
+                        locks := 1;
+                        end
+                    end
+                else { hit }
+                    locks := locks + 1;
+                end; { with }
+            presult := pfiletable^[fileid]^.fstatus;
+            if presult = writenon then presult := noerr
+            else if ((presult = inconsistent) or (presult = noroom))
+                    and noinconsistent then
+                begin
+                relbuff(tresult,buffer,0);
+                if tresult <> noerr then presult := tresult;
+                end;
+        end; { if }
+
+
+2 :  { exit }
+
+
+end; { getpage }
+{^T 20}
+{*****************************************************************************
+
+                                  putpage
+
+        writes the data in buffer out to fileid at address wpage.  Sets
+        buffer descriptor to fileid,wpage.
+
+        Input Parameters
+
+        buffer - number of buffer with data
+        fileid - number of file
+        wpage - address of page
+
+        OutPut Parameters
+
+        presult - return result
+            noerr
+            noroom
+            ioerr
+            inconsistent
+
+****************************************************************************}
+
+{$S swapaccs }
+procedure putpage{(var presult : integer;
+                      buffer  : integer;
+                      fileid : integer;
+                      wpage     : fileptr)};
+
+{$IFC trapio }
+label
+        1,
+        2;
+{$ENDC }
+var
+        actual : fileptr;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^,buffpool^[buffer] do
+            begin
+            dowritenon(presult,fileid);
+            if presult = noerr then
+                begin
+{$IFC debugpool }
+                ddatawrite(fileid,wpage,buffer);
+{$ENDC }
+                write_data(presult,frefno,ord(pbuff),pagesize,actual,
+                           absolute,wpage);
+                end;
+            if presult <> noerr then
+                begin
+                if no_room(presult) then
+                    begin
+                    presult := noroom;
+{$IFC trapio }
+                    writeln(chr(7),'Noroom!!!');
+                    1 : goto 1;
+{$ENDC }
+                    end
+                else
+                    begin
+                    fstatus := inconsistent;
+{$IFC trapio }
+                    writeln(chr(7),'IOErr!!!',presult);
+                    2 : goto 2;
+{$ENDC }
+                    presult := ioerr;
+                    end;
+                end
+            else
+                begin
+                if ticks >= (maxint-1) then checkticks(1);
+                ticks := ticks + 1;
+                pfile := fileid;
+                page := wpage;
+                state := clean;
+                presult := fstatus;
+                if presult = writenon then presult := noerr;
+                end;
+            end; { with }
+end; { putpage }
+{^T 20}
+{*****************************************************************************
+
+                                  checkpt
+
+         all clean buffers are made empty or clean, when we hit the next
+         dirty buffer we initiate a buffer write.
+
+         Input Parameters
+
+         fileid - index of file
+         newstate - state to which buffers should go after being paged out -
+             empty or clean
+
+         Output Parameters
+
+         presult
+            noerr
+            inconsistent
+            noroom
+
+****************************************************************************}
+
+{$S access }
+procedure checkpt{(var presult : integer;
+                       fileid : integer;
+                       newstate : integer)};
+var
+        pb : ^ buffdesc;
+        tempresult : integer;
+        actual : fileptr;
+        buff : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[fileid]^ do
+            begin
+            pb := @buffpool^;
+            for buff := 0 to lastbuff do
+                begin
+                with pb^ do
+                    if (pfile = fileid) then  { assert locks = 0 }
+                        begin
+                        if state = dirty then
+                            begin
+                            dowritenon(presult,fileid);
+{$IFC debugpool }
+                            ddatawrite(fileid,page,buff);
+{$ENDC }
+                            write_data(tempresult,frefno,ord(pbuff),pagesize,
+                                       actual,absolute,page);
+                            if tempresult <> noerr then
+                                if no_room(tempresult) then fstatus := noroom
+                                else fstatus := inconsistent;
+                            end; {if}
+                        if state <> empty then state := newstate;
+                        if state = empty then
+                            begin
+                            page := nilptr;
+                            priority := -1;
+                            end;
+                        end; { if }
+                pb := pointer(ord(pb) + sizeof(buffdesc));
+                end;
+
+            if fstatus = inconsistent then presult := inconsistent
+            else if fstatus = noroom then presult := noroom
+            else presult := noerr;
+
+            (*dbif pdebug then writeln(fstatus);*)
+
+            if fstatus <> noerr then
+                begin
+                if fstatus = writenon then setbit(@flags,ffileok);
+{$IFC debugpool }
+                dlabwrite(fileid);
+{$ENDC }
+                write_data(tempresult,frefno,ord(@pfiletable^[fileid]^),
+                           sizeof(filelabel),actual,absolute,0);
+                if tempresult <> noerr then presult := inconsistent;
+                flush(tempresult,frefno);
+                if tempresult <> noerr then presult := inconsistent;
+                if presult = noerr then fstatus := noerr;
+                end
+            else presult := noerr;
+
+            end; { with }
+
+end; { checkpt }
+{*****************************************************************************
+
+                                  PageInvalidates
+
+         All pages for fileid are set to empty.
+
+         Input Parameters
+
+         fileid - index of file
+
+****************************************************************************}
+
+{$S access }
+procedure PageInvalidates{(fileid : integer)};
+var
+        pb : ^ buffdesc;
+        buff : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+pb := @buffpool^;
+for buff := 0 to lastbuff do
+    begin
+    with pb^ do
+        if (pfile = fileid) then  { assert locks = 0 }
+            begin
+            state := empty;
+            priority := -1;
+            page := nilptr;
+            end; { if }
+    pb := pointer(ord(pb) + sizeof(buffdesc));
+    end;
+end; { PageInvalidates }
+{***************************************************************************
+
+                                force_out
+
+        if the page wpage of file fileid is in the buffer pool, then it
+        is written to disk.  this routine is used to guarantee that every
+        write is to an address <= leof+1.
+
+        Input Parameters
+                fileid - the file in question
+                wpage - the particular page
+
+        Output Parameters
+                presult - return result
+
+*****************************************************************************}
+
+{$S swapaccs }
+procedure force_out{(var presult : integer;
+                        fileid : integer;
+                        wpage : fileptr)};
+var
+        buffer : integer;
+        miss : boolean;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        presult := noerr;
+        buffer := getbuff(fileid,wpage,miss);
+        if (buffer <> -1) and (not miss) then
+            if buffpool^[buffer].state <> clean then
+                putpage(presult,buffer,fileid,wpage);
+end; { force_out }
+
+{^T 20}
+{*****************************************************************************
+
+                                  doclose
+
+        the file is closed.  the file may be consistent or
+        inconsistent (an error occurred somewhere along the line).
+
+        1)  if there are dirty buffers, then the
+            process of flushing those buffers is initiated.
+
+        2)  the file label must be written out.
+
+        3)  the file must be closed.
+
+        Input Parameters
+
+        fileid - index of file
+
+        Output Parameters
+
+        presult - return result
+
+            noerr
+            inconsistent
+            noroom
+            OS(close_object)
+
+****************************************************************************}
+
+{$S swapaccs }
+procedure doclose{(var presult : integer;
+                       fileid : integer)};
+var
+        actual : fileptr;
+        tempresult : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif pdebug then writeln('doclose:',fileid:6);db*)
+
+        checkpt(presult,fileid,empty);
+        with pfiletable^[fileid]^ do
+            begin
+            close_object(tempresult,frefno);
+            if tempresult <> noerr then presult := tempresult;
+            end; { with }
+
+        pfiletable^[fileid] := nil;
+
+end; { doclose }
+
+
+ÿ

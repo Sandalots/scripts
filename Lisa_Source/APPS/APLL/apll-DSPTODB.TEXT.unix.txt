@@ -1,0 +1,711 @@
+
+{$S DBCPack}
+procedure DepositBcd (dbf:ptrDbField; db:ptrData; digit:integer;
+                 var digitOffset:integer);
+
+{******************************************************************************
+
+Function: Stuff the value in digit into the digitOffset'th 4-bit bucket of the
+          field described by dbf.  Update the digitOffset by one for the next
+          value to be inserted.
+
+Assumes:  digitOffset >= 0.
+          digit fits into a 4-bit bucket.
+
+******************************************************************************}
+
+var wordOffset: integer;
+    dbp:        ptrData;
+    bytePtr:    integer;
+    halfByte:   integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+{ find the word offset of the beginning of the field }
+if odd (dbf^.offset) then
+    begin
+    wordOffset := dbf^.offset - 1;
+    bytePtr := 2;
+    end
+else
+    begin
+    wordOffset := dbf^.offset;
+    bytePtr := 0;
+    end;
+
+{ now create a pointer to the word within the field }
+wordOffset := wordOffset + (2 * ((digitOffset + bytePtr) div 4));
+dbp := pointer(ord(db) + wordOffset);
+
+{ now set up the bit pointer within the word }
+halfByte := 12 - (((digitOffset + bytePtr) mod 4) * 4);
+
+{ finally, we can deposit the data }
+Deposit (digit, dbp, 4, halfByte);
+digitOffset := digitOffset + 1;
+end; { of DepositBcd }
+
+
+{$S DBCPack}
+procedure FillZeros (dbf:ptrdbfield; db:ptrdata);
+
+{************************************************************************
+
+Function: Fills a null BCD field with zeros.
+
+************************************************************************}
+
+var     dbi:  integer; { index to db record }
+        endindex: integer;
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+with dbf^ do
+  begin
+  dbi := offset;
+  endindex := offset+size;
+  end;
+while dbi < endindex do
+  begin
+  db^[dbi] := 0;
+  dbi := dbi+1;
+  end;
+end; { of FillZeros }
+
+{$S DBCPack}
+procedure CvtBcd (dbf:ptrdbfield; dsp:ptrdata; strtDsp:integer;
+    endDsp:integer; db:ptrdata);
+
+{************************************************************************
+
+Function: Convert a string of numbers into binary coded decimal and
+          stuff into the data base.
+
+Assumes:  The field is not empty (null).
+          Legal has been called.
+          Field in db has been filled with nulls.
+
+For phone numbers (and zip codes), if only 7 (5) digits are
+entered, the others are set to nulls--BCD 0.
+
+Calls:    DepositBcd
+
+************************************************************************}
+
+var      dbi:      integer;  { index to db record }
+         d:        integer;  { digit being deposited into data record }
+         i:        integer;  { index through dsp array }
+         digitCntr:integer;  { index through field in record }
+         digit:    integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbctest then writeln ('Entering CvtBcd');
+
+{ if phone number, fill from right, in case there is no area code }
+if dbf^.fldtype = ph then
+    begin
+    digitCntr := 9;         { indices are 0..9 }
+    i := enddsp;
+    while i >= strtdsp do
+      begin
+      digit := dsp^[i];
+      if (ord('0') <= digit) and (digit <= ord('9')) then
+          begin
+          DepositBCD(dbf,db,digit-47 {ord('0')+1},digitCntr);
+          digitCntr := digitCntr-2;   { digitCntr was incremented by DepositBCD }
+          end;
+      i := i-1;
+      end;
+
+    { fill area code with zeroes if not present }
+    while digitCntr >= 0 do
+        begin
+        DepositBCD(dbf, db, 1 {a zero digit}, digitCntr);
+        digitCntr := digitCntr - 2;     { digitCntr was incremented by DepositBCD }
+        end;
+    end
+
+else { zip or ss }
+  begin
+  digitCntr := 0;
+  i := strtdsp;
+  while i <= enddsp do
+    begin
+    digit := dsp^[i];
+    if (ord('0') <= digit) and (digit <= ord('9')) then
+      begin
+      DepositBCD(dbf,db,digit-47 {ord('0')+1},digitCntr);
+      end;
+    i := i+1;
+    end;
+
+   { if zip, fill rest of digits with zeros }
+   if dbf^.fldtype=zip then
+     while digitCntr<=9 do
+       DepositBCD(dbf,db,1,digitCntr);
+  end;
+
+end; { of CvtBcd }
+
+{$S DBCPack}
+procedure CvtNumber (dbf:ptrdbfield; dsp:ptrdata; strtDsp:integer;
+    endDsp:integer; db:ptrdata);
+
+{*************************************************************************
+
+Function: Converts a number from displayed to stored database format.
+
+Assumes: Edit check has already been performed.
+
+Calls:  VerifyNum
+
+Note: parsing a number is now controlled by the values of the
+      global variables cSeparator, cFraction, and prefPeriod
+      (defined in DBCONVERT.TEXT)
+*************************************************************************}
+
+var     total:    quadint;
+        money:    byte;
+        fract:    boolean;
+        ecinfo:   checkinfo;
+        errnum:   integer;
+        nptr:     nptrrec;
+        ntype:    integer; { low-level representation type }
+        sigLen:   integer;
+        sigDsp:   ptrdata;
+        ecp:      ptrlongStr;
+        e:        boolean;
+        i:        integer;
+
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbctest then writeln ('Entering CvtNumber');
+
+sigLen := endDsp - strtDsp + 1;
+ntype := dbf^.reptype;
+CLRQ(total);
+
+if sigLen <> 0 then
+  begin
+
+  sigDsp := pointer(ord(dsp)+StrtDsp);
+
+  if dbf^.fldtype=dol then
+    money:=1
+  else
+    money:=0;
+
+  { determine preferred fraction char from edit check }
+  if dbf^.editCheck[4]=0 then
+    fract := prefPeriod           { default }
+  else
+    begin
+    ecp := pointer(ord(dbf) + dbf^.display);
+    if ecp^[dbf^.editCheck[4]]='.' then
+      fract := true               { edit check uses '.' }
+    else
+      fract := false;             { edit check uses ',' }
+    end;
+
+  e := VerifyNum(sigDsp,sigLen,FALSE,money,fract,ecinfo,total,errnum);
+
+  { shift left for any absent digits to right of decimal }
+  for i:=ecinfo[5]+1 to dbf^.editcheck[5] do
+    e := MULQI(total, 10);
+
+  { must un-negate tickets }
+  if (ntype=ftyptick) and (ecinfo[1]<>0) then
+    e := NEGQ(total);
+
+  end; { of action for non-null number }
+
+  if dbctest then writeln ('Computed number: ', total[0], total[1],
+        total[2], total[3]);
+
+{ Now we have to store the rascal!  We rely on the property of 2's
+    complement integers that we can copy bytes from the right (barring
+    overflow stuff) and win. }
+nptr.ip := pointer(ord(db) + dbf^.offset);
+if ntype = ftypint1 then
+        begin
+        if sigLen = 0 then
+            nptr.bp^[0] := nullint1
+        else
+            nptr.bp^[0] := total[3];
+        end
+else if ntype = ftypint2 then
+        begin
+        if sigLen = 0 then
+            nptr.ip^ := nullint2
+        else
+            nptr.ip^ := total[3];
+        end
+else if ntype = ftypint4 then
+        begin
+        if sigLen = 0 then
+            nptr.lp^ := nullint4
+        else
+            begin
+            nptr.ip^ := total[2];
+            nptr.ip := pointer(ord(nptr.ip) + 2);
+            nptr.ip^ := total[3];
+            end;
+        end
+else if ntype = ftypint8 then
+        begin
+        if sigLen = 0 then
+            total[0] := nullint2;
+        if dbcTest then
+            writeln ('Number after null test: ', total[0], total[1],
+                total[2], total[3]);
+        nptr.qp^ := total;
+        end
+else { ntype = ftyptick }
+        begin
+        nptr.ip^ := total[1];
+        nptr.ip := pointer(ord(nptr.ip) + 2);
+        nptr.ip^ := total[2];
+        nptr.ip := pointer(ord(nptr.ip) + 2);
+        nptr.ip^ := total[3];
+        end;
+
+end; { of CvtNumber }
+
+
+{$S DBCPack}
+procedure CvtDate (dbf:ptrdbfield; dsp:ptrdata; strtDsp:integer;
+    endDsp:integer; db:ptrdata; var errNum:integer);
+
+{************************************************************************
+
+Function: Converts a date field to its stored value and places it in the
+          record.
+
+Assumes: The date field is not empty (null).
+         The date field has been filled with zeroes.
+
+Calls: AsciiToDate
+       DepositBcd
+
+************************************************************************}
+
+label 50; { error exit }
+
+var     d:         dateValues;
+        digit:     integer;
+        i:         integer;
+        ec4:       integer;
+        digitCntr: integer;
+        digArray:  array[1..4] of integer;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+{ set up the date structure }
+AsciiToDate (dbf, dsp, strtDsp, endDsp, d, errnum);
+if errnum <> 0 then
+    goto 50;
+
+{ stick year in the record }
+if d[3] <> -1 then
+    begin
+    ec4 := dbf^.editcheck[4];
+    i := 1;
+    while i <= ec4 do
+        begin
+        digArray[i] := d[3] mod 10;
+        d[3] := d[3] div 10;
+        i := i+1;
+        end;
+
+    digitCntr := 4 - ec4;
+    i := ec4;
+    while i >= 1 do
+        begin
+        if dbcTest then
+            writeln ('Depositing year digit: ', digArray[i] + 1);
+        DepositBcd (dbf, db, digArray[i] + 1, digitCntr);
+        i := i-1;
+        end;
+    end
+else
+    digitCntr := 4;
+
+if d[1] <> -1 then
+    begin
+    digit := d[1] div 10 + 1;
+    DepositBcd (dbf, db, digit, digitCntr);
+    digit := d[1] mod 10 + 1;
+    DepositBcd (dbf, db, digit, digitCntr);
+    end
+else
+    digitCntr := digitCntr + 2;
+
+if d[2] <> -1 then
+    begin
+    digit := d[2] div 10 + 1;
+    DepositBcd (dbf, db, digit, digitCntr);
+    digit := d[2] mod 10 + 1;
+    DepositBcd (dbf, db, digit, digitCntr);
+    end;
+50: end; { of CvtDate }
+
+
+{$S DBCPack}
+procedure CvtTime (dbf:ptrdbfield; dsp:ptrdata; strtDsp:integer;
+    endDsp:integer; db:ptrdata; var errNum:integer);
+
+{************************************************************************
+
+Function: Converts a time field to its stored value and places the value
+          in the database record.
+
+Assumes:  The time field is not empty (null).
+          The time field has been filled with zeroes.
+
+Calls:    AsciiToTime
+          DepositBcd
+
+************************************************************************}
+
+var     i:        integer;    { index for dsp array }
+        j:        integer;    { index for start of numbers in dsp }
+        tval:     timeValues; { time values }
+        digitCntr:integer;    { counter of 4-bit values placed in field }
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbctest then writeln ('Entering CvtTime');
+
+AsciiToTime (dbf, dsp, strtDsp, endDsp, tval, errnum);
+
+{ stick the value into the record now }
+digitCntr := 0;
+i := 1;
+while i <= 3 do
+  begin
+  if tVal[i] = -1 then
+      digitCntr := digitCntr + 2
+  else
+      begin
+      if dbctest then writeln ('Value to be placed in record:', tval[i]);
+      j := tval[i] div 10 + 1;
+      DepositBcd (dbf, db, j, digitCntr);
+      j := tval[i] mod 10 + 1;
+      DepositBcd (dbf, db, j, digitCntr);
+      end;
+  i := i+1;
+  end;
+
+end; { of CvtTime }
+
+
+{$S DBCPkStr}
+procedure CvtString (dbf:ptrdbfield; dsp:ptrdata; strtDsp:integer;
+    endDsp:integer; db:ptrdata; dblen:integer; var rsize:integer;
+    var rdelta:integer; var errnum:integer);
+
+{****************************************************************************
+
+Function: Convert a string value into database format.  Set rdelta to the
+          number of bytes by which the record grew (or shrank if the value
+          is negative).  If there isn't enough room, set rdelta to the
+          number of additional bytes needed.
+
+Assumes:  The displayed field may be empty (null).
+
+Errors:   Not enough room in the record area (recTooSmall).
+
+Calls:    FillZeros
+
+****************************************************************************}
+
+label 100;    { error exit }
+
+const   makeLower = 32;         { add to upper case char to make lower case }
+
+var     i:        integer;
+        start:    integer;
+        vf:       ptrvfld;
+        numBytes: integer;
+        pEC3:     ptrData;
+        sigLen:   integer;
+        ecp:      ^longstr;
+        eci:      integer;
+        eclen:    integer;
+        ce:       char;
+        chDsp:    ptrfstring;
+        dspi:     integer;
+        dspcode:  integer;
+        done:     boolean;
+
+begin
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbctest then writeln ('Converting a string');
+
+chDsp := POINTER(ORD(dsp));
+
+ecp := pointer(ord(dbf)+dbf^.display);
+eclen := length(ecp^);
+
+sigLen := endDsp - strtDsp + 1;
+if (dbf^.editcheck[4]<>0) and (sigLen>0) then
+  sigLen := dbf^.editcheck[4];  { we only store letters & numbers }
+
+if dbcTest then
+  writeln(dbf^.editcheck[4],siglen);
+
+{ find the location where the string is to be placed and prepare it for
+    moving the value in }
+if dbf^.reptype = ftypstr then { fixed-length string }
+    begin
+    start := dbf^.offset;
+    { fill with the appropriate character }
+    if sigLen = 0 then { null - fill with zeros }
+        FillZeros (dbf, db)
+    else { not null - fill with blanks }
+        begin
+        i := siglen;
+        while i < dbf^.size do
+          begin
+          db^[start + i] := ord(' ');
+          i := i+1;
+          end;
+        end;
+    end
+else { variable-length string }
+    begin
+    vf := pointer (ord(db) + dbf^.offset);
+    if (rsize - vf^.size + sigLen) > dblen then
+        begin
+        errnum := recTooSmall;
+        rdelta := sigLen - (dblen - (rsize - vf^.size));
+        goto 100;
+        end;
+    start := vf^.offset;
+    { adjust the amount of space in the record to hold the new string }
+    rdelta := sigLen - vf^.size;
+    numBytes := rsize - (vf^.size + vf^.offset);
+    if rdelta < 0 then
+        MoveLeft (db^[vf^.size + vf^.offset], db^[sigLen + vf^.offset],
+            numBytes)
+    else
+        begin
+        if rdelta > 0 then
+            MoveRight (db^[vf^.size + vf^.offset], db^[sigLen+vf^.offset],
+                numBytes);
+        end;
+    rsize := rsize + rdelta;
+    vf^.size := sigLen;
+    end; { of setting up an area for the variable-length text string }
+
+if dbf^.editcheck[4]=0 then { edit check specifies legal classes of chars }
+  begin
+
+  { shift alpha characters to match the edit check }
+  if sigLen > 0 then
+      begin
+      pEC3 := @dbf^.editcheck[3];
+      i := strtdsp;
+      while i <= enddsp do
+          begin
+          if (ORD(chDsp^[i]) in UCalpha) and (not inpset (pEC3, 0)) then
+              DownChrShift(POINTER(ORD(chDsp) + i), 1);
+          if (ORD(chDsp^[i]) in LCalpha) and (not inpset (pEC3, 1)) then
+              UpChrShift(POINTER(ORD(chDsp) + i), 1);
+          i := i+1;
+          end;
+
+      { move the characters into the location }
+      MoveLeft (dsp^[strtDsp], db^[start], sigLen);
+      end; { of action if there is at least one character }
+  end
+else                            { edit check contains a pattern }
+  begin
+  dspi := strtDsp;
+  eci := 2;             { indices start at 1; first char is open quote }
+  if dbcTest then
+    writeln('sigLen=',siglen:1);
+
+  i := 1;
+  while i <= siglen do     { assumes Legal was called and there are exactly the
+                                right number of chars in input }
+    begin
+
+    { skip to alpha or digit in input }
+    done := false;
+    while not done and (dspi<=endDsp) do
+      begin
+      dspcode := ord(chDsp^[dspi]);
+      if (dspcode in alphaSet) or (chr(dspcode) in ['0'..'9']) then
+        done := true;
+      dspi := dspi+1;
+      end;
+    { dspi points to char after the current one }
+
+    if dbctest then
+      writeln('next char:',chr(dspcode),dspcode);
+
+    { skip to alpha or digit or wild1Char wild2Char in ec }
+    done := false;
+    while not done and (eci<eclen) do
+      begin
+      ce := ecp^[eci];
+      if (ord(ce) in alphaSet) or (ce in ['0'..'9']) or
+         (ce=wild1Char) or (ce=wild2Char) then
+        done := true;
+      eci := eci+1;
+      end;
+    { eci points to char after current one }
+
+    if dbctest then
+      writeln('next ec char:',ce,ord(ce));
+
+    db^[start] := dspcode;
+
+    if ord(ce) in UCalpha then
+        UpChrShift(@db^[start], 1)
+    else if ord(ce) in LCalpha then
+        DownChrShift(@db^[start], 1);
+
+    if dbctest then
+      writeln('output char:',chr(db^[start]),db^[start]);
+
+    start := start+1;
+    i := i+1;
+    end; (* loop thru edit check *)
+  end;
+
+100: end; { of CvtString }
+
+
+{$S DBCPkStr}
+procedure Pack {stripflag:integer; dbf:ptrdbfield; dsp:ptrdata; dsplen:integer;
+                db:ptrdata; dblen:integer; var rsize:integer; var rdelta:integer;
+                var errnum:integer};
+
+{****************************************************************************
+Function: Convert the characters in curvalue to the type of the current field
+          and store the value in the data record.  Returns an error in errnum
+          if something goes wrong.  If that error is that the record space is
+          too small, returns the additional space required in rdelta.  Other-
+          wise, returns in rdelta the number of bytes by which the record grew
+          (shrunk if negative).
+
+Inputs: dbf:ptrdbfield - pointer to database field description (from file
+                         definition)
+        dsp:ptrdata - pointer to byte array containing displayed data
+        dsplen:integer - number of characters displayed
+        db:ptrdata - pointer to database record area in memory
+        dblen:integer - number of bytes allowed for record
+        rsize:integer - current record size; updated record size will be
+                        returned
+        errnum:integer - error number
+
+Assumes: Field has been appropriately checked for legality; punctuation is
+             optional.  If legality checking was not previously done, other
+             errors and/or erroneous (possibly meaningless) values will be
+             generated.
+         The field may be empty (except for ticket fields), in which case the
+             null value for the type is placed in the record.
+
+Errors: not enough room in record
+
+Calls: Quad arithmetic procedures (CLRQ, ADDQI, MULQI, NEGQ)
+       FillZeros
+       CvtBcd
+       CvtNumber
+       CvtTime
+       CvtDate
+       CvtString
+
+****************************************************************************}
+
+var strtDsp: integer;
+    endDsp:  integer;
+    sigLen:  integer;
+    endLen:  integer;
+
+
+begin { of Pack }
+{$IFC SAMPCALLS}  ALogCall;  {$ENDC}
+if dbctest then writeln ('Entering Pack');
+
+errnum := 0;
+rdelta := 0;
+
+{ strip off leading and trailing blanks }
+{u}
+if stripflag < 3 then
+  begin
+  sigLen := dspLen;
+  strtDsp := 0;
+  endDsp := sigLen - 1;
+  if sigLen <> 0 then
+      begin
+      if (stripflag = 0) or (stripflag = 2) then
+        begin
+        while (endDsp >= 0) and
+              ((chr(dsp^[endDsp]) = ' ') or
+               (chr(dsp^[endDsp]) = reqSpace)) do
+            begin
+            endDsp := endDsp - 1;
+            sigLen := sigLen - 1;
+            end;
+        end;
+
+      if (stripflag = 0) or (stripflag = 1) then
+        begin
+        endLen := sigLen;
+        while (strtDsp < endLen) and
+              ((chr(dsp^[strtDsp]) = ' ') or
+               (chr(dsp^[strtDsp]) = reqSpace)) do
+            begin
+            strtDsp := strtDsp + 1;
+            sigLen := sigLen - 1;
+            end;
+        end;
+      if dbcTest then
+        writeln ('Start: ', strtDsp, ' End: ', endDsp, ' Length less blanks: ',
+            sigLen);
+      end; { of action if the display length is greater than zero }
+  end;
+
+case dbf^.fldtype of
+
+    ss, zip, ph:
+        begin
+        FillZeros (dbf, db);
+        if sigLen <> 0 then
+            CvtBcd (dbf, dsp, strtDsp, endDsp, db);
+        end;
+
+    dol, num, tick:
+        CvtNumber (dbf, dsp, strtDsp, endDsp, db);
+
+    tim:begin
+        FillZeros (dbf, db);
+        if sigLen <> 0 then
+            CvtTime (dbf, dsp, strtDsp, endDsp, db, errNum);
+        end;
+
+    dt: begin
+        FillZeros (dbf, db);
+        if sigLen <> 0 then
+            CvtDate (dbf, dsp, strtDsp, endDsp, db, errNum);
+        end;
+
+    lets:
+        CvtString (dbf, dsp, strtDsp, endDsp, db, dblen, rsize, rdelta, errNum);
+
+    end; { of case }
+
+if dbctest then
+    begin
+    writeln ('Exiting Pack');
+{$IFC DEBUG}
+(*    PrintDbRec (db, dbLen);   *)
+{$ENDC}
+    end;
+end; { of pack }
+ÿ

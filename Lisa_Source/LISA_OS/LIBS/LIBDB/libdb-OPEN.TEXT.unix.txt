@@ -1,0 +1,764 @@
+{#f     libdb/open.text   }
+{$S openclose }
+{^T 20}
+{************************************************************************
+
+                                fileopen
+
+        returns initialized descriptor of file
+
+        - checks if we already have file open and if not
+
+          - allocates descriptor and opens file.
+          - verifies that the file is really a database file and is not in an
+            inconsistent state
+          - reads info from fixed part of file schema (lowlevel stuff) from
+            start of file
+
+        Input Parameters
+                intent - scan intent of reference
+                pfname - pts to pathname for file
+
+        Output Parameters
+                ddresult - return result
+                fileid - file index of descriptor for file
+
+        Return Results
+                noerr
+                nomem
+                ioerr
+                DBVersionMismatch
+                notdbfile
+                DBTooNew
+
+
+************************************************************************}
+
+{$S openclose }
+procedure fileopen(var ddresult : integer;
+                       intent : integer;
+                       pfname : ptrpathname;
+                   var fileid : integer);
+label
+        1,2,3,4,5,10;
+const
+        alreadyopen = 873;
+        OSClosed = -1173;
+        OSCrashed = -1174;
+        OSFileScavenged = -1175;
+var
+        F_info : Fs_info;
+        havebuff : boolean;
+        readsize,
+        readat,
+        actual : fileptr;
+        locfrefno,
+        lresult,
+        tresult,
+        firstpart,
+        i,
+        labbuffer : integer;
+        pbuffer,
+        pd,
+        pdesc : ptrdata;
+        edescsize : integer;
+        pftable : ptrdata;
+        pfd : ^ ptrfiledesc;
+        pfile : ptrfiledesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if dbdebug then dumpheap(@czone);
+{$ENDC }
+        havebuff := false;
+
+        {  first try to open file exclusive, then if that fails, see
+           if we already have it open  }
+
+        prefix_name(pfname);
+{af}    open_secure(lresult,prefix,locfrefno,
+                    [DRead,DWrite,Private,Global_RefNum],password);
+
+{!8-15-83  open(lresult,prefix,locfrefno,[DRead,DWrite,Private,Global_RefNum]);}
+
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'open(',alreadyopen,'):',lresult);
+{$ENDC }
+
+        if (lresult < noerr) then lresult := noerr;
+
+        if lresult <> noerr then
+            begin
+            if lresult = OSFileScavenged then
+                begin
+                    lresult := inconsistent;
+                    goto 2;
+                end
+            else if lresult <> alreadyopen then goto 1;
+            lookup(lresult,prefix,F_info);
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'open(',alreadyopen,'):',lresult);
+{$ENDC }
+
+            if lresult <> noerr then goto 1;
+            fileid := popenobj;
+            while fileid <> nilval do
+                with pfiletable^[fileid]^ do
+                    begin
+                    if compare(@uiddesc,@uiddesc,1,@openid,@F_info.fuid)
+                                   = eq then
+                        begin
+
+{$IFC debug }
+                        if dbdebug then writeln(dumpfile,'bingo?');
+{$ENDC }
+
+                        lresult := noerr;
+                        if (intent = update) or (intent = labelupdate) then
+                            writers := writers + 1
+                        else
+                            readers := readers + 1;
+                        goto 1;
+                        end;
+                    fileid := pnext;
+                    end;
+            lresult := alreadyopen;
+            goto 1;
+            end;
+
+        {  first cut is the deepest }
+
+        pfd := @pfiletable^;
+        for i := 0 to nfiles-1 do
+            begin
+            if pfd^ = nil then
+                begin
+                fileid := i;
+                goto 10; { break }
+                end;
+            pfd := pointer(ord(pfd)+sizeof(ptrfiledesc));
+            end;
+
+    {   expand the filetable }
+
+        lresult := nnew(@czone,(nfiles+1)*sizeof(ptrfiledesc),@pftable);
+        if lresult <> noerr then goto 2;
+        movelf(@pfiletable^,pftable,nfiles*sizeof(ptrfiledesc));
+        ndispose(@czone,@pfiletable^);
+        pfiletable := @pftable^;
+        pfiletable^[nfiles] := nil;
+        fileid := nfiles;
+        nfiles := nfiles + 1;
+
+10 :    lresult := nnew(@czone,sizeof(filedesc),@pfile);
+        if lresult <> noerr then goto 2;
+
+        with pfile^ do
+            begin
+            frefno := locfrefno;
+
+            if (intent = update) or (intent = labelupdate) then
+                begin
+                readers := 0;
+                writers := 1
+                end
+            else
+                begin
+                writers := 0;
+                readers := 1;
+                end;
+
+        {   get first block of label }
+
+            lockbuff(lresult,labbuffer);
+            if lresult <> noerr then goto 3;
+            havebuff := true;
+            pbuffer := buffpool^[labbuffer].pbuff;
+
+            read_data(lresult,frefno,ord(pbuffer),512,actual,absolute,0);
+            if lresult <> noerr then
+                begin
+                lresult := ioerr;
+                goto 4;
+                end;
+
+        {   copy out filelabel  }
+
+            movelf(pbuffer,@pfile^,sizeof(filelabel));
+            if not inpset(@flags,ffileok) then
+                begin
+                lresult := inconsistent;
+                goto 4;
+                end;
+
+        {   verify that this is a database file.   }
+
+            if (check_1_it <> leaftype) or
+               (check_2_it <> nonleaftype) then
+                begin
+                lresult := notdbfile;
+                goto 4;
+                end;
+
+       {    verify that the file's version matches current software }
+
+            if DBVers <> myprod_vers then
+                begin
+                lresult := DBTooNew;
+                if DBVers = V0myprod_vers then lresult := DBVersionMismatch
+                else if DBVers < V0myprod_vers then lresult := notdbfile;
+                goto 4;
+                end;
+
+         {  verify that the page size is not too big }
+
+            if pagesize > psize then
+                begin
+                lresult := badpagesize;
+                goto 4;
+                end;
+
+            pfldset := nil;
+            pkdesc := nil;
+
+            edescsize := nfields * sizeof(flddesc);
+
+        {   get record descriptor }
+
+            lresult := nnew(@czone,edescsize,@pedesc);
+            if lresult <> noerr then goto 4;
+
+            pd := @pedesc^;
+            pdesc := @pbuffer^[sizeof(filelabel)];
+            readat := 512;
+            readsize := 512 - sizeof(filelabel);
+            repeat
+                if edescsize > readsize then
+                    begin
+                    movelf(pdesc,pd,readsize);
+                    edescsize := edescsize - readsize;
+                    pd := @pd^[readsize];
+                    end
+                else movelf(pdesc,pd,edescsize);
+                readsize := firstpage - readat;
+                if readsize > psize then readsize := psize;
+                if readsize <> 0 then
+                    begin
+                    read_data(lresult,frefno,ord(pbuffer),readsize,actual,
+                              absolute,readat);
+                    readat := readat + readsize;
+                    pdesc := pbuffer;
+                    if lresult <> noerr then
+                        begin
+                        lresult := ioerr;
+                        goto 5;
+                        end;
+                    end;
+            until readsize = 0;;
+
+            relbuff(lresult,labbuffer,-1);
+            havebuff := false;
+            if lresult <> noerr then goto 5;
+
+            filldesc(lresult,pfile);
+            if lresult <> noerr then goto 5;
+
+        {   if this tree is too depth for current pstack, increase
+            maxdepth }
+
+            if depth > maxdepth then maxdepth := depth;
+
+        {   link in descriptor on list of open files }
+
+            pfiletable^[fileid] := pfile;
+            pnext := popenobj;
+            popenobj := fileid;
+            goto 1; { normal exit }
+
+    { error exits }
+
+    5 :     ndispose(@czone,@pedesc^);
+    4 :     if havebuff then relbuff(tresult,labbuffer,-1);
+    3 :     ndispose(@czone,@pfile^);
+            end; { with }
+
+2 :     close_object(tresult,locfrefno);
+
+1 : { error exit }
+        ddresult := lresult;
+{$IFC debug }
+        if dbdebug then dumpheap(@czone);
+{$ENDC}
+end; { fileopen }
+{**************************************************************************
+
+                                bitsize
+
+        computes bytes in a nbit bit vector (rounded even)
+
+***************************************************************************}
+{$S openclose }
+function bitsize(nbits : integer) : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        bitsize := wordsize*((nbits-1) div elemsize + 1);
+end; { bitsize }
+{**************************************************************************
+
+                                istuff
+
+        called when an index is being opened for update or as a via file.
+        if this is the first open of the index for update or as a via file,
+        the following must be done:
+
+        1) verify that the uniqueid of the index file matches the index
+           record in the data file label
+
+        2) allocate the recptr that describes where in the data record
+           each index field is (pkdesc).  each flddesc in this recptr
+           is a copy of the flddesc of that field in the data file.
+
+        3) allocate a bitmap for in which bit i is 1 iff field i of the
+           data file participates in the index record.  (pfldset).
+
+        4) pkdesc and pfldset are allocated together in one block.
+           pkdesc = nil iff the index has not been opened for update or as
+           a via file yet.
+
+        Input Parameters
+                onfile - data file index
+                pifile - index file descriptor
+                pirec - index label entry from data file label
+
+        Output Parameters
+                ddresult - return result
+
+        Return Results
+                noerr
+                nomem
+                wrongfile
+
+
+***************************************************************************}
+{$S openclose }
+procedure istuff(var ddresult : integer;
+                     onfile : integer;
+                     pifile : ptrfiledesc;
+                     pirec : ptrientry);
+var
+        lresult,
+        i,
+        dsize,
+        setsize,
+        sfield : integer;
+        pbits : ptrbits;
+        pkfld : ptrflddesc;
+        pifld : ptrisegment;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pfiletable^[onfile]^ do
+            begin
+            lresult := noerr;
+            if pifile^.pkdesc = nil then { 1st open for update or via }
+                begin
+                if compare(@uiddesc,@uiddesc,1,
+                   @pirec^.iunique,@pifile^.funiqueid) <> eq then
+                    lresult := wrongfile
+                else
+                    begin
+                    setsize := bitsize(nfields);
+                    dsize := pifile^.nfields*sizeof(flddesc);
+                    lresult := nnew(@czone,setsize+dsize,@pifile^.pkdesc);
+                    if lresult = noerr then
+                        begin
+                        pifile^.pfldset := pointer(ord(pifile^.pkdesc)+dsize);
+                        clearset(@pifile^.pfldset^,nfields);
+                        pbits := @pifile^.pfldset^;
+                        pifld := @pirec^.iflds;
+                        pkfld := @pifile^.pkdesc^;
+                        for i:= 1 to pirec^.ikeys do
+                            begin
+                            sfield := pifld^.field;
+                            pkfld^ := pedesc^[sfield];
+                            pkfld^.direction := pifld^.aord;{##}
+                            setbit(@pbits^,sfield);
+                            pkfld := pointer(ord(pkfld)+sizeof(flddesc));
+                            pifld := pointer(ord(pifld)+sizeof(isegment));
+                            end; { for }
+                        movelf(@pedesc^,@pkfld^,nkeys*sizeof(flddesc));
+                        for i := 0 to nkeys-1 do setbit(@pbits^,i);
+                        end; { then }
+                    end; { else }
+                end; { then }
+            end; { with }
+        ddresult := lresult
+end; { istuff }
+{^T 30}
+{**************************************************************************
+
+                                openindexes
+
+        See interface.
+
+***************************************************************************}
+{$S openclose }
+procedure openindexes{(var ddresult : integer;
+                      var viafile : integer;
+                          scanid : integer;
+                          ifilename : ptrpathname;
+                          intent : integer;
+                          labelusage : integer)};
+label
+        1,
+        10,
+        20,
+        100;
+var
+        loc_compact_state : states_de_compact;
+        have_keyfiles,
+        have_viafile,
+        read_all_indexes,
+        return_via,
+        match_it,
+        found_it : boolean;
+        ppath : ptrpathname;
+        labentry : labelentry;
+        pi : ptrientry;
+        lresult,
+        tresult,
+        tifile,
+        ifile,
+        onfile,
+        pathoff : integer;
+        pscan : ptrscandesc;
+        pifile : ptrfiledesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        read_all_indexes := inpset(@labelusage,1);
+        return_via := inpset(@labelusage,0);
+        found_it := labelusage = on_only;
+        have_keyfiles := false;
+        have_viafile := false;
+
+{$IFC debug }
+        if dbdebug then
+            begin
+            writeln(dumpfile,'oi:<',ifilename^,'>',
+                    onfile:3,intent:3,labelusage:3);
+            writeln('rai,rv:',ord(read_all_indexes):2,ord(return_via):2);
+            end;
+{$ENDC }
+
+
+        loc_compact_state := init_compact_state;
+
+100 :   {   compact retry point  }
+
+
+    {   scan the data file label checking all the index labelentries.
+        we are looking for one particular index (via index or new_index)
+        and/or all the indexes (update on onfile) }
+
+        pscan := pscantable^[scanid];
+        onfile := pscan^.onfile;
+        with pfiletable^[onfile]^ do
+            begin
+            labentry.ltype := indexfile;
+            lfetch(lresult,scanid,approx,1,@labentry);
+            while lresult = noerr do
+                begin
+                pi := @pscan^.ptrcos^;
+                if pi^.lab.ltype <> indexfile then goto 10;
+                ppath:=pointer(ord(@pi^.iflds)+pi^.ikeys*sizeof(isegment));
+
+
+{$IFC debug }
+                if dbdebug then writeln(dumpfile,'found ',ppath^);
+{$ENDC }
+
+
+                match_it := ifilename^ = ppath^;
+                if read_all_indexes or match_it then
+                    begin
+                    fileopen(lresult,intent,ppath,ifile);
+{$IFC debug }
+                    writeln(dumpfile,'open ',ppath^,':',lresult);
+{$ENDC }
+                    if lresult <> noerr then goto 1;
+                    pifile := pfiletable^[ifile];
+                    istuff(lresult,onfile,pifile,pi);
+                    if lresult <> noerr then
+                        begin
+                        freefile(tresult,ifile,intent);
+                        goto 1;
+                        end;
+                    if intent = update then
+                        begin
+                        tifile := pkeyfiles;
+                        while tifile <> fnilval do
+                            begin
+                            if tifile = ifile then goto 20; { already linked }
+                            tifile := pfiletable^[tifile]^.pkeyfiles;
+                            end;
+                        { not already linked from data file }
+                        pifile^.pkeyfiles := pkeyfiles;
+                        pkeyfiles := ifile;
+                    20:
+                        if (labelusage = on_and_via) and match_it then
+                            pifile^.writers := pifile^.writers + 1;
+                        have_keyfiles := true;
+                        end;
+                    if return_via and match_it then
+                        begin
+                        have_viafile := true;
+                        viafile := ifile;
+                        end;
+                    found_it := found_it or match_it;
+                    if not read_all_indexes then goto 10;
+                    end;
+                lfetch(lresult,scanid,next,0,nil);
+                end;
+            end;
+10:     if lresult <= fileempty then
+            if found_it then lresult := noerr else lresult := notfound;
+
+1 :
+{$IFC debug }
+        if dbdebug then writeln('oi:',lresult);
+{$ENDC }
+
+        if lresult <> noerr then
+            begin
+            if have_viafile then freefile(tresult,viafile,intent);
+            if have_keyfiles then freekeys(tresult,onfile);
+            end;
+        if retry_compact(lresult,loc_compact_state) then goto 100;
+
+        ddresult := lresult;
+end; { openindexes }
+{**************************************************************************
+
+                                cvt_scan
+
+        see interface.
+
+****************************************************************************}
+
+{$S openclose }
+procedure cvt_scan{(var ddresult : integer;
+                       scanid,
+                       sintent,
+                       sviafile : integer)};
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        with pscantable^[scanid]^ do
+            begin
+            with pfiletable^[onfile]^ do
+                if (sintent = readonly) or (sintent = labelreadonly)
+                then readers := readers + 1
+                else writers := writers + 1;
+            toss_scan(ddresult,scanid);
+            with pfiletable^[sviafile]^ do
+                begin
+                fnext := scans;
+                scans := scanid;
+                end;
+            viafile := sviafile;
+            intent := sintent;
+            ptrcos := nil;
+            touched := touch_by_vltree;
+            position := first;
+            end;
+end; { cvt_scan }
+{^T 30}
+{**************************************************************************
+
+                                openscan
+
+        see interface.
+
+***************************************************************************}
+
+{$S openclose }
+procedure openscan{(var ddresult : integer;
+                        onname,
+                        vianame : ptrpathname;
+                    var scanid : integer;
+                        sintent : integer)};
+label
+        1,2,10,100;
+var
+        loc_compact_state : states_de_compact;
+        pf,
+        uversion,
+        labelusage : integer;
+        ponfile : ptrfiledesc;
+        pstable : ptrdata;
+        psd : ^ ptrscandesc;
+        pscan : ptrscandesc;
+        on_is_via,
+        on_is_data : boolean;
+        lresult,
+        sonfile,
+        sviafile,
+        totalsize,
+        iscan,
+        tresult : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,
+                                'os:<',sintent,'>',onname^,',',vianame^);
+{$ENDC }
+
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+
+    {   1) open up the onfile labelreadonly so that we can get any info we
+           need from the label
+
+        2) figure out what info we need from the label.  there are four
+           cases:
+               onfile is data : viafile <> onfile,
+               onfile is data (update): viafile <> onfile and all the indexes,
+               onfile is data (update): all the indexes  and
+               nothing is needed
+
+           note : if the on file is already open for update, we already have
+           all the info we need already.
+
+        3) create the scan descriptor and set it up for labelreadonly
+
+        4) if we need index files opened etc. via the info in the label,
+           we call openindexes
+
+        5) convert the scan to sintent }
+
+
+        fileopen(lresult,labelreadonly,onname,sonfile);
+        if lresult <> noerr then goto 1;
+        ponfile := pfiletable^[sonfile];
+        on_is_via := onname^ = vianame^;
+
+        with ponfile^ do
+            begin
+            on_is_data := inpset(@flags,fdata);
+            totalsize := sizeof(scandesc)-sizeof(bits);
+
+            if on_is_via then
+                begin
+                labelusage := not_needed;
+                sviafile := sonfile;
+                end
+            else labelusage := via_only;
+            if sintent = update then
+                begin
+                if writers = 0 then labelusage := labelusage + on_only;
+                totalsize := totalsize + bitsize(nfields);
+                if not on_is_data then
+                    begin
+                    lresult := illegalscan;
+                    goto 2;
+                    end;
+                end;
+            end; { with }
+
+        {  make the scan descriptor }
+
+        psd := @pscantable^;
+        for iscan := 0 to nscans-1 do
+            begin
+            if psd^ = nil then goto 10;
+            psd := pointer(ord(psd)+sizeof(ptrscandesc));
+            end;
+
+        {  expand scantable }
+
+        lresult := nnew(@czone,(nscans+1)*sizeof(ptrscandesc),@pstable);
+        if lresult <> noerr then goto 2;
+        movelf(@pscantable^,pstable,nscans*sizeof(ptrscandesc));
+        ndispose(@czone,@pscantable^);
+        pscantable := @pstable^;
+        pscantable^[nscans] := nil;
+        nscans := nscans + 1;
+
+10:     lresult := nnew(@czone,totalsize,@pscan);
+        if lresult <> noerr then goto 2;
+        with pscan^ do
+            begin
+            onfile := sonfile;
+            viafile := sonfile;
+            with ponfile^ do
+                begin
+                intent := labelreadonly;
+                fnext := scans;
+                scans := iscan;
+                end;
+            ptrcos := nil;
+            touched := touch_by_vltree;
+            position := first;
+            end;
+        pscantable^[iscan] := pscan;
+
+        if labelusage > not_needed then
+            begin
+            openindexes(lresult,sviafile,iscan,vianame,sintent,labelusage);
+            if lresult <> noerr then
+                begin
+{$IFC debug }
+                if dbdebug then dumpfdesc(sonfile);
+{$ENDC }
+                closescan(tresult,iscan);
+                goto 1;
+                end;
+            end;
+
+    {   there should never be an error from cvt_scan here }
+
+        cvt_scan(tresult,iscan,sintent,sviafile);
+
+    {   if this is a first update open (scan of data), incr. update versions }
+
+        if inpset(@labelusage,1) then { first time open }
+            begin
+            uversion := ponfile^.updateversion + 1;
+            ponfile^.updateversion := uversion;
+            pf := ponfile^.pkeyfiles;
+            while pf <> nilval do
+                with pfiletable^[pf]^ do
+                    begin
+                    updateversion := uversion;
+                    pf := pkeyfiles;
+                    end;
+            end;
+
+        scanid := iscan;
+
+{$IFC debug }
+        if dbdebug then
+            begin
+            dumpheap(@czone);
+            writeln(dumpfile,'pscan:',ord(pscantable^[scanid]));
+            end;
+{$ENDC }
+
+        goto 1; { normal exit }
+
+    {   error exits }
+
+2 :     freefile(tresult,sonfile,labelreadonly);
+1 :     if retry_compact(lresult,loc_compact_state) then goto 100;
+
+        ddresult := lresult;
+
+{$IFC debug }
+        if dbdebug then writeln(dumpfile,'os:',ddresult:6,scanid:6);
+{$ENDC }
+
+end; { openscan }
+
+ÿ

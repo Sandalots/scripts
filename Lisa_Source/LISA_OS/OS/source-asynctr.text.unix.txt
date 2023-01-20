@@ -1,0 +1,357 @@
+{-----------------------------------------------------------------------------}
+{                                                                             }
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+{                                                                             }
+{-----------------------------------------------------------------------------}
+
+                         (* asynchronous and synchronous control *)
+UNIT asynctr;
+
+INTERFACE
+
+  USES
+  (*$U object/driverdefs.obj*)
+       driverdefs,
+  (*$U object/hwint.obj*)
+       hwint,
+  (*$U object/sysglobal.obj*)
+       globalda,
+  (*$U object/procprims.obj*)
+       proc_prims;
+
+ { The following has been moved to driverdefs
+  CONST
+    size_rspec_info = 3;                  (* size of specific info in reqblk *)
+
+
+  TYPE
+    reqsts_type = record                  (* request status    *)
+                    reqsrv_f : (active, in_service, complete);
+                    reqsuccess_f : boolean;  (* complete successfully or not *)
+                    reqabt_f : boolean;   (* abort pending or not *)
+                  end;
+
+    reqptr_type = ^reqblk;
+    reqblk = record                        (* request block  *)
+               pcb_chain : rb_headT;       (* pcb chain, block header *)
+               dev_chain : linkage;        (* device chain*)
+               list_chain: linkage;        (* list of request blocks for blocking*)
+               unblk_chain: reqptr_type;   (* list of req blocks for unblocking*)
+               blk_in_pcb: int1;           (* generic block type for future changes*)
+               reqstatus : reqsts_type;    (* request status *)
+               operatn: int1;              (* 0=write,1=read,2=format,3=unclamp,...*)
+               cfigptr: ptrdevrec;         (* identifies to which device this request
+                                              belongs if its an I/O request*)
+               req_extent: absptr;         (* extdptr_type when devt=diskdev,
+                                              seqextptr_type when devt=seqdev*)
+               hard_error: integer;        (* error code when reqstatus.reqsuccess_f
+                                              = FALSE*)
+               reqspec_info : longint;     (* specific information, such as sort
+                                              key for device's queue*)
+             end;
+
+    * moved to driverdefs }
+
+
+  procedure status_req (reqptr : reqptr_type;
+                        var status: reqsts_type);
+
+  procedure unblk_req (reqptr : reqptr_type;
+                       success_f: boolean);
+
+  procedure blk_req (reqptr : reqptr_type;
+                     var first_reqptr : reqptr_type);
+
+  procedure TIMER_UNBLK;
+
+
+
+IMPLEMENTATION
+
+(*$IFC NOT DEBUG*)
+(*$R-*)                         (* no range checking in production system *)
+(*$ENDC*)
+
+  CONST
+    ac_level = 50;                        (* trace level, fence is 100 *)
+    over_fence_level = 101;               (* over the fence level *)
+
+(*$S krgenio*)
+
+   procedure A5SETUP; external;
+
+   procedure TIMER_UNBLK;
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   pull all requests off unlbk queue and call unblk_process*)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Called with all ints off as an alarm routine (init'd    *)
+        (*   in PARAMEMINIT).                                        *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+    VAR
+      reqptr : reqptr_type;
+      pcb_ptr : ptr_pcb;
+      pblk_in_pcb: ptrblk_type;
+      intstatus : intson_type;
+
+    begin
+      A5SETUP; (*sets up A5 when called as alarm routine*)
+      INTSON (clokints);
+      INTSOFF (allints, intstatus);
+      while (unblk_tail <> nil) do
+      begin
+        reqptr := unblk_tail^.unblk_chain;
+        WITH reqptr^ do
+        begin (*remove this "head" request from the unblk chain*)
+          if unblk_chain = reqptr then
+            unblk_tail := nil
+          else
+            unblk_tail^.unblk_chain := unblk_chain;
+          INTSON (intstatus); (*execute rest of this with only clock ints off*)
+          pcb_ptr := pointer (pcb_chain.headr);
+          if pcb_ptr^.blk_state <> [] then (* process not currently running *)
+          begin
+            pcb_ptr^.pcbfreqptr := ord (reqptr);
+            pblk_in_pcb := @blk_in_pcb;
+            unblock_process (pcb_ptr, pblk_in_pcb^);
+          end;
+          INTSOFF (allints, intstatus);
+        end (*with*)
+      end (*while*)
+    end; (*timer_unblk*)
+
+(*$S kr_prims*)
+
+    procedure status_req (* reqptr : reqptr_type;
+                            var status: reqsts_type *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Returns the request status of the specified request     *)
+        (*   block.                                                  *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   reqptr: pointer to the request block                    *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   status: request status returned                         *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Must be called in Kernel mode.                          *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+        begin
+            status :=reqptr^.reqstatus;
+        end;  (* procedure status_req *)
+
+
+
+
+    procedure unblk_req (* reqptr : reqptr_type;
+                           success_f: boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   unblocks the process that is waiting for this request.  *)
+        (*   If the requester is not waiting for this request, the   *)
+        (*   request will be marked completed.                       *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   reqptr: pointer of the request that is completed.       *)
+        (*   success_f: successful flag, true if successful, false   *)
+        (*              otherwise.                                   *)
+        (* Output Parameters:                                        *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   The block process flag of all the request blocks in the *)
+        (*   current chain will be reset if the request in has the   *)
+        (*   block process flag set.                                 *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Must be called in Kernel mode. Can be called by either  *)
+        (*   on user stack or supervisor stack. Can be called by     *)
+        (*   either pascal routine or assembly routine.              *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+        var
+            intstatus : intson_type;
+            pcb_ptr : ptr_pcb;
+
+        begin                                   (* procedure unblk_req  *)
+            (*$IFC DEBUG2*)
+            if trace (ac, ac_level) then        (* trace level is 50, fence is 100 *)
+                writeln ('e unblk_req : ', ord (reqptr), ' success_f = ',
+                                                        success_f);
+            (*$ENDC*)
+
+            with reqptr^, reqstatus do
+              if reqsrv_f <> complete then
+                begin
+                  reqsrv_f := complete;
+                  if success_f then
+                      reqsuccess_f := not reqabt_f
+                  else
+                      reqsuccess_f := false;
+
+                  if pcb_chain.headr <> ord(nil) then
+                  begin (*start up an alarm as interrupt continuation routine*)
+                    pcb_ptr := pointer (pcb_chain.headr);
+                                (* req header is the third one in pcb *)
+                    (*$IFC DEBUG2*)
+                    if trace (ac, ac_level) then
+                      writeln ('  in current pcb chain : pcb_ptr =',
+                                                          ord (pcb_ptr));
+                    (*$ENDC*)
+
+                    intsoff (allints, intstatus);       (* turn off interrupt *)
+
+                    (*add to unblk chain for alarm to grab*)
+                    if unblk_tail = nil then
+                      unblk_chain := reqptr
+                    else
+                    begin
+                      unblk_chain := unblk_tail^.unblk_chain;
+                      unblk_tail^.unblk_chain := reqptr
+                    end;
+                    unblk_tail := reqptr;
+                    intson (intstatus);              (* turn interrupt back on *)
+                    ALARMRELATIVE (unblk_alarm, 0); (*unblk_proc exec's in alarm*)
+                  end;
+                  (* else, the requester was not blocked on this *)
+                  (* request   *)
+
+                end;  (* if req not complete *)
+
+            (*$IFC DEBUG2*)
+            if trace (ac, ac_level) then        (* trace level is 50, fence is 100 *)
+                writeln ('l unblk_req ');
+            (*$ENDC*)
+
+        end;   (* end of procedure unblk_req  *)
+
+
+
+
+    procedure blk_req (* reqptr : reqptr_type;
+                         var first_reqptr : reqptr_type *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   Blocks the calling process until any request in the     *)
+        (*   requests supplied by the caller is completed or aborted.*)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   reqptr : ptr to first request block in list of requests *)
+        (*            to block on.                                   *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   first_reqptr: pointer to the first request block that   *)
+        (*                  causes this process to be unblocked.     *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   Must be called in Kernel mode.                          *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+        var
+            req_ptr : reqptr_type;
+            int_status : intson_type;
+            intstat2: intson_type;
+            pcb_ptr : ptr_pcb;
+            pblk_in_pcb: ptrblk_type;
+
+        begin
+            intsoff (clokints, int_status);   (* turn off clock interrupts *)
+
+            (* if any request in the request list has been completed, return *)
+            (* with the pointer of the request block                         *)
+
+            first_reqptr := nil;
+            req_ptr := reqptr;
+            repeat
+              intsoff (allints, intstat2);      (* turn off ints each iteration*)
+              with req_ptr^ do
+                if reqstatus.reqsrv_f = complete then
+                  begin
+                    first_reqptr := req_ptr;
+                    req_ptr := reqptr   { stops loop }
+                  end
+                else
+                  begin
+                    pcb_chain.headr := c_pcb_ptr;
+                    req_ptr := pointer(list_chain.fwd_link + b_sysglobal_ptr -
+                                         Sizeof (linkage) - Sizeof (rb_headT))
+                  end;
+              intson (intstat2);
+            until req_ptr = reqptr;
+
+            if first_reqptr = nil then
+              begin
+                pcb_ptr := pointer (c_pcb_ptr);
+                pblk_in_pcb := @reqptr^.blk_in_pcb; (*use value from first request*)
+                (*$IFC DEBUG2*)
+                if trace (ac, ac_level) then
+                  writeln ('  b block_process : pcb_ptr =', c_pcb_ptr);
+                (*$ENDC*)
+
+                block_process (pcb_ptr, pblk_in_pcb^);
+                first_reqptr := pointer (pcb_ptr^.pcbfreqptr);
+                pcb_ptr^.pcbfreqptr := ord (nil);
+              end; (* if first_reqptr = nil *)
+
+              req_ptr := reqptr;
+              repeat
+                with req_ptr^ do
+                  begin
+                    pcb_chain.headr := ord(nil); (*clear all pcb pointers*)
+                    req_ptr := pointer(list_chain.fwd_link + b_sysglobal_ptr -
+                                         Sizeof (linkage) - Sizeof (rb_headT))
+                  end
+              until req_ptr = reqptr;
+
+              intson (int_status);
+
+            (*$IFC DEBUG2*)
+            if trace (ac, ac_level) then
+              writeln ('l blk_req :        pcb_ptr = ', c_pcb_ptr,
+                                        ' first_reqptr = ', ord (first_reqptr));
+            (*$ENDC*)
+        end;   (* end procedure block_req  *)
+
+
+
+
+
+    end.
+
+
+ÿ

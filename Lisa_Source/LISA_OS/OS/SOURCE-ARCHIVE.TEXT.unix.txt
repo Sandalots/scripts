@@ -1,0 +1,512 @@
+UNIT ARCHIVE;
+
+
+      (*  By Wendell Henry  1/17/83                                             *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+      (*                                                                        *)
+      (*  A device specific driver for the Archive streamer tape attached to a  *)
+      (*  Priam "T" controller                                                  *)
+
+INTERFACE
+
+  USES
+      (*$Uobject/driverdefs.obj*)
+      driverdefs,
+      (*$Uobject/driversubs.obj*)
+      driversubs;
+
+   function DRIVER (parameters: param_ptr): integer;
+
+IMPLEMENTATION
+
+  (*$R-*)                        (*rangecheck off *)
+
+  CONST
+    (* error responses *)
+    ok        = 0;
+    waitint   = 1;
+    baddcontrol=623;
+    nospace   = 610;
+    badxferlen= 608;
+    badcal    = 656;
+    resumable =-1840;
+    Treaderr  = 1841;
+    Twriterr  = 1842;
+    Tconerr   = 1843;
+    packeterr = 1844;
+    packet2err= 1845;
+
+    (* drive commands - same as offset into driver's command jump table*)
+    interrupt = 0;         (* process interrupt         *)
+    ReadTape  = 2;         (* read tape                 *)
+    WriteTape = 4;         (* write tape                *)
+    Tcontrol  = 6;         (* control tape              *)
+
+  TYPE
+    hbyte = -128..127;
+
+    inp_rec = record                  (*input parameters to driver *)
+                parm0: hbyte;         (*parameter 0   *)
+                parm1: hbyte;
+                parm2: hbyte;
+                parm3: hbyte;
+                parm4: hbyte;
+                parm5: hbyte;
+              end;
+    out_rec = record                  (*output parameters from driver*)
+                result0: hbyte;       (*result 0 - transaction status*)
+                result1: hbyte;       (*additional result bytes      *)
+                result2: hbyte;
+                result3: hbyte;
+                result4: hbyte;
+                result5: hbyte;
+              end;
+
+    ext_drive_cb = record    (*extension to drive_cb *)
+              (**)   hwbase: longint;      (* base address in I/O space *)
+              (**)   hwparity: longint;    (* base address of parity flag *)
+              (**)   device: hbyte;        (* device number*)
+              (**)   command: hbyte;       (* command to driver *)
+              (**)   response:integer;     (* response command from driver*)
+              (**)   input: inp_rec;       (* input parms to driver *)
+              (**)   output:out_rec;       (* result parms from driver *)
+              (**)   pe: hbyte;            (* parity state of I/O transfer*)
+              (**)   state: hbyte;         (* current state of driver *)
+              (**)   retries: integer;     (* # retries this request *)
+              (**)   tot_retries: integer; (* Total # retries this drive *)
+              (**)   error: integer;       (* Error from sector transfer *)
+              (**)   nxfercnt: integer;    (* Next blk xfer count*)
+              (**)   cxfercnt: integer;    (* Current blk xfer count*)
+              (**)   ctrltype: hbyte;      (* Controller type*)
+
+              (**)   packetLen: hbyte;     (* Number of valid bytes in packet*)
+              (**)   packet: array[0..15] of hbyte; (* Packet command*)
+
+                     (* Packet status report *)
+              (**)   pid: hbyte;           (* Packet id *)
+              (**)   pstate: hbyte;        (* Packet state *)
+              (**)   ptdf: hbyte;          (* Termination device flag *)
+              (**)   ppristat: hbyte;      (* Primary termination status *)
+              (**)   psecstat: hbyte;      (* Secondary termination status *)
+              (**)   pres1: hbyte;         (* Unused *)
+              (**)   poffset: integer;     (* Packet offset *)
+              (**)   plength: integer;     (* Packet length *)
+              (**)   pstepcode: hbyte;     (* Current step operation code *)
+              (**)   pstepnumb: hbyte;     (* Current step number *)
+              (**)   psectnumb: longint;   (* Total number of records copied *)
+              (**)   psdev: hbyte;         (* Source device select *)
+              (**)   psstat: hbyte;        (* Source device status *)
+              (**)   pssupstat: hbyte;     (* Supplemental source status *)
+              (**)   psaddr1: hbyte;       (* Source transfer address *)
+              (**)   psaddr2: hbyte;
+              (**)   psaddr3: hbyte;
+              (**)   pisectstep: longint;  (* Numb records input this copy step *)
+              (**)   pddev: hbyte;         (* Destination device select *)
+              (**)   pdstat: hbyte;        (* Destination device status *)
+              (**)   pdsupstat: hbyte;     (* Supplemental destination status *)
+              (**)   pdaddr1: hbyte;       (* Destination transfer address *)
+              (**)   pdaddr2: hbyte;
+              (**)   pdaddr3: hbyte;
+              (**)   posectstep: longint;  (* Numb records output this copy step*)
+              (**)   rtn_pstat: longint;   (* Return address from read_pstat*)
+                   end;
+
+   ptr_ext_drive_cb = ^ext_drive_cb;
+
+   statusrec = array[0..35] of hbyte;      (* packet status report record*)
+   ptr_statusrec = ^statusrec;
+   packetrec = array[0..15] of hbyte;      (* packet record*)
+   ptr_packetrec = ^packetrec;
+
+   tapecb = record  (* primary control block for tape driver *)
+              config_addr: ptrdevrec; (*This much must look like a *)
+              ext_ptr: absptr;        (*normal device control block*)
+              raw_data_ptr: longint;  (*start address of data*)
+              x_leng: longint;        (*offset to next data byte*)
+              sect_left: integer;     (*number of sectors to transfer*)
+              cur_req: reqptr_type;   (*current request *)
+              cur_info:seqextptr_type;(*info extension for current request*)
+              req_chain: linkage;     (*waiting requests*)
+            end;
+
+   ptr_tapecb = ^tapecb;
+
+   dctl_ext = record  (*request block extension for tape device control*)
+                error: integer;
+                info: array[0..35] of hbyte;
+              end;
+
+   ptr_dctl_ext = ^dctl_ext;
+
+   procedure ARCHIVEASM(cb_ptr: absptr); external;
+
+   procedure START_NEW_REQUEST(tapecb_ptr: ptr_tapecb); forward;
+
+   procedure FINISH_REQUEST(tapecb_ptr: ptr_tapecb; err: integer);
+
+     var
+       ptrsysg: ^longint;
+       prevints: intson_type;
+       result_ptr: ^out_rec;
+       extdrivecb_ptr: ptr_ext_drive_cb;
+       dctlext_ptr: ptr_dctl_ext;
+       p_longint: ^longint;
+       p_status, p2_status: ptr_statusrec;
+
+     begin
+       with tapecb_ptr^, cur_req^ do
+         begin
+           case operatn of
+             0,1: (*current request is tape I/O request*)
+               begin
+                 with cur_info^ do
+                   begin
+                     UNFREEZE_SEG(buff_rdb_ptr); (* seg can be moved *)
+                     ADJ_IO_CNT(false,buff_rdb_ptr); (* seg can be swapped *)
+                     xfer_count:=x_leng;
+                     hard_error:=err;
+                   end;(*with cur_info*)
+               end;
+             2: (*current request is tape control request*)
+               begin
+                 extdrivecb_ptr:=pointer(ext_ptr);
+                 dctlext_ptr:=pointer(ord(cur_info));
+                 with dctlext_ptr^ do
+                   begin
+                     error:=err; (* pass back results of operation*)
+                     (*return additional information*)
+                     case info[0] of
+                       8,9,10:
+                         begin (*return total number of sectors copied*)
+                           p_longint:=@info[0];
+                           p_longint^:=extdrivecb_ptr^.psectnumb;
+                         end;
+                       11,12,13:
+                         begin (*return packet status report*)
+                           p_status:=@extdrivecb_ptr^.pid;
+                           p2_status:=@info[0];
+                           p2_status^:=p_status^;
+                         end;
+                     end; (*case info[0]*)
+                   end;(*with dctlext_ptr*)
+               end;
+           end;(*case operatn*)
+           ptrsysg:=pointer(bsysglob);
+           UNBLK_REQ(cur_req,err=0);
+           INTSOFF(slotints,prevints);
+           DEQUEUE(cur_req^.dev_chain,ptrsysg^);
+           INTSON(prevints);
+           if req_chain.fwd_link = req_chain.bkwd_link
+             then cur_req:=nil     (* no waiting requests *)
+             else START_NEW_REQUEST(tapecb_ptr);
+         end;(*with tapecb_ptr, cur_req*)
+     end;(*Finish_Request*)
+
+
+   procedure START_NEW_REQUEST(* tapecb_ptr: ptr_tapecb *);
+
+     var
+       extdrivecb_ptr: ptr_ext_drive_cb;
+       error: integer;
+       dctlext_ptr: ptr_dctl_ext;
+       p_packet, p2_packet: ptr_packetrec;
+       prevints: intson_type;
+
+     begin
+       with tapecb_ptr^ do
+         begin
+           extdrivecb_ptr:=pointer(ext_ptr);
+           cur_req:=CHAIN_FORWARD(req_chain);
+           with extdrivecb_ptr^, cur_req^ do
+             begin
+               reqstatus.reqsrv_f:=in_service;
+               cur_info:=pointer(req_extent);
+               case operatn of
+                 0,1:  (* tape I/O request *)
+                   begin
+                     with cur_info^ do
+                       begin
+                         FREEZE_SEG(error,buff_rdb_ptr,buff_offset,
+                                    ord(cur_req),raw_data_ptr);
+                         if error = 0 then
+                           (* IF FREEZE_SEG FAILS THEN CUR_REQ IS LEFT WITH A *)
+                           (* NON-NIL VALUE SO NO NEW REQUESTS WILL BE STARTED*)
+                           (* UNTIL A REQRESTART IS RECEIVED                  *)
+                           begin  (*buffer frozen - start transfer *)
+                             if read_flag
+                               then command:=readTape
+                               else command:=writeTape;
+                             sect_left:=num_bytes div 512;
+                             x_leng:=0;
+                             with input do
+                               begin
+                                 parm0:=0; parm1:=0; parm2:=0;
+                                 parm3:=0; parm4:=0; parm5:=0;
+                               end;
+                           end;
+                       end;(*with cur_info*)
+                   end;
+                 2:  (*tape control request*)
+                   begin
+                     command:=TControl;
+                     dctlext_ptr:=pointer(ord(cur_info));
+                     with input, dctlext_ptr^ do
+                       begin
+                         parm0:=info[0];    (*dcode*)
+                         parm1:=0; parm2:=0;
+                         parm3:=0; parm4:=0; parm5:=0;
+                         (*setup additional information for request*)
+                         case parm0 of
+                           4,5:
+                             begin (*input number of file marks*)
+                               parm1:=info[1];
+                             end;
+                           8:
+                             begin (*devices for copy*)
+                               p2_packet:=@packet;
+                               if info[3] = 0 then
+                                 begin (*disk to tape*)
+                                   p2_packet^[2]:=$3; (*disk is counting device*)
+                                   p2_packet^[6]:=info[2]; (*source device=disk*)
+                                   p2_packet^[12]:=info[1];(*dest device=tape*)
+                                 end
+                                else
+                                 begin (*tape to disk*)
+                                   p2_packet^[2]:=$44; (*disk is counting device*)
+                                   p2_packet^[6]:=info[1]; (*source device=tape*)
+                                   p2_packet^[12]:=info[2];(*dest device=disk*)
+                                 end;
+                             end;
+                           11:
+                             begin (*input packet*)
+                               packetLen:=info[1]; (*packet length*)
+                               p_packet:=@info[2];
+                               p2_packet:=@packet;
+                               p2_packet^:=p_packet^; (*packet*)
+                             end;
+                         end;(*case parm0*)
+                       end;(*with input, dctlext_ptr*)
+                   end;
+               end;(*case operatn*)
+
+               INTSOFF(slotints,prevints);
+               ARCHIVEASM(ord(tapecb_ptr));
+               if response <> waitint then FINISH_REQUEST(tapecb_ptr,response);
+               INTSON(prevints);
+             end;(*with extdrivecb_ptr, cur_req*)
+         end;(*with tapecb_ptr*)
+     end;(*Start_New_Request*)
+
+
+
+   function DRIVER(* parameters: param_ptr): integer *);
+     (*Main routine of Priam Driver*)
+
+     var
+       extdrivecb_ptr: ptr_ext_drive_cb;
+       newextdrivecb: absptr;
+       dc_rec_ptr: ^dc_rec;
+       ptrsysg: ^longint;
+       seqext_ptr: seqextptr_type;
+       left_link: link_ptr;
+       prevints: intson_type;
+       ordptr: absptr;
+       reqptr: reqptr_type;
+       tapecb_ptr: ptr_tapecb;
+       result_ptr: ^out_rec;
+       dctlext_ptr: ptr_dctl_ext;
+       p_longint: ^longint;
+       p_status, p2_status: ptr_statusrec;
+       p_packet, p2_packet: ptr_packetrec;
+
+     begin
+       with parameters^, configptr^ do
+         case fnctn_code of
+
+          dinterrupt: (* interrupt from device*)
+            begin
+              tapecb_ptr:=pointer(cb_addr);
+              extdrivecb_ptr:=pointer(tapecb_ptr^.ext_ptr);
+              with extdrivecb_ptr^ do
+                begin
+                  command:=interrupt;
+                  ARCHIVEASM(ord(tapecb_ptr));
+                  driver:=response;
+                  if response <> waitint then FINISH_REQUEST(tapecb_ptr,response);
+                end;(*with extdrivecb_ptr*)
+            end; (*dinterrupt*)
+
+          dinit: (* first level of device initialization*)
+            begin
+              if cb_addr <> 0 then
+                begin (*already initialized*)
+                  driver:=0;
+                end
+               else
+                begin
+                  ptrsysg:=pointer(bsysglob);
+                  driver:=nospace; (*insufficient resources*)
+                  if GETSPACE(sizeof(tapecb),ptrsysg^,cb_addr) then
+                    if GETSPACE(sizeof(ext_drive_cb),ptrsysg^,newextdrivecb) then
+                      begin
+                        tapecb_ptr:=pointer(cb_addr);
+                        extdrivecb_ptr:=pointer(newextdrivecb);
+                        with tapecb_ptr^ do
+                          begin
+                            config_addr:=configptr;
+                            ext_ptr:=newextdrivecb;
+                            req_chain.fwd_link:=ord(@req_chain)-ptrsysg^;
+                            req_chain.bkwd_link:=req_chain.fwd_link;
+                            cur_req:=nil;
+                          end;
+                        with extdrivecb_ptr^ do
+                          begin
+                            hwparity:= ord4(iospacemmu)*$20000 +
+                                       ord4($4000)*slot_no;(*lo select space*)
+                            hwbase:= hwparity + $2000; (*hi select space *)
+                            response:=0;
+                            ctrltype:=3; (*Smart T*)
+                            device:=iochannel*16;
+                            state:=0;
+                            tot_retries:=0;
+                            error:=0;
+                          end;
+                        driver:=0;
+                      end
+                     else RELSPACE(cb_addr,ptrsysg^);
+                end;
+            end; (*dinit*)
+
+          seqio:  (* Sequential I/O for Tape *)
+            begin
+              seqext_ptr:=pointer(req^.req_extent);
+              if seqext_ptr^.num_bytes <= 0
+                then driver:=badxferlength
+                else
+                 begin
+                   driver:=0;
+                   ptrsysg:=pointer(bsysglob);
+                   tapecb_ptr:=pointer(cb_addr);
+                   with tapecb_ptr^ do
+                     begin
+                       INTSOFF(slotints,prevints);
+                       left_link:=pointer(req_chain.bkwd_link+ptrsysg^);
+                       ENQUEUE(req^.dev_chain,left_link^,ptrsysg^);
+                       INTSON(prevints);
+                       if cur_req = nil then START_NEW_REQUEST(tapecb_ptr);
+                     end;
+                 end;
+            end; (*seqio*)
+
+          Reqrestart:  (*Restart a request that was delayed due to FREEZE_SEG*)
+            begin
+              START_NEW_REQUEST(pointer(cb_addr));
+            end;(*Reqrestart*)
+
+          ddown:   (* first level of down a device *)
+            begin
+              tapecb_ptr:=pointer(cb_addr);
+              if tapecb_ptr <> nil then
+                with tapecb_ptr^ do
+                  begin
+                    ptrsysg:=pointer(bsysglob);
+                    RELSPACE(ext_ptr,ptrsysg^); (*release cb extension *)
+                    RELSPACE(ord(tapecb_ptr),ptrsysg^); (*release cb*)
+                    cb_addr:=ord(nil);
+                  end;
+              driver:=0;
+            end;(*ddown*)
+
+          dcontrol: (* device control *)
+            begin
+              ptrsysg:=pointer(bsysglob);
+              driver:=nospace;
+              dc_rec_ptr := pointer(parptr);
+              with dc_rec_ptr^ do
+               if (dversion <> 2) or (dcode <= 0) or (dcode > 13)
+                 then driver := baddcontrol (*invalid call*)
+                 else if GETSPACE(sizeof(reqblk),ptrsysg^,ordptr) then
+                  begin
+                    reqptr:=pointer(ordptr);
+                    with reqptr^ do
+                      if GETSPACE(sizeof(dctl_ext),ptrsysg^,req_extent) then
+                        begin
+                          with list_chain do
+                            begin
+                              fwd_link:=ord(@fwd_link)-ptrsysg^;
+                              bkwd_link:=fwd_link;
+                            end;
+                          cfigptr:=configptr;
+                          dctlext_ptr:=pointer(req_extent);
+                          operatn:=2;  (*device control*)
+                          with dctlext_ptr^ do
+                            begin
+                              info[0]:=dcode;
+                              (*save additional input information*)
+                              case dcode of
+                                4,5:
+                                  begin
+                                    info[1]:=ar10[0]; (*number of file marks*)
+                                  end;
+                                8:
+                                  begin
+                                    info[1]:=(ar10[0]-1)*16;  (*tape device*)
+                                    info[2]:=(ar10[2]-1)*16;  (*disk device*)
+                                    info[3]:=ar10[4];     (*copy direction*)
+                                  end;
+                                11:
+                                  begin
+                                    info[1]:=ar10[0]; (*packet length*)
+                                    p_packet:=@ar10[1];
+                                    p2_packet:=@info[2];
+                                    p2_packet^:=p_packet^; (*packet*)
+                                  end;
+                              end;(*case dcode*)
+                            end;
+                          LINK_TO_PCB(reqptr);
+                          tapecb_ptr:=pointer(cb_addr);
+                          with tapecb_ptr^ do
+                            begin
+                              INTSOFF(slotints,prevints);
+                              left_link:=pointer(req_chain.bkwd_link+ptrsysg^);
+                              ENQUEUE(reqptr^.dev_chain,left_link^,ptrsysg^);
+                              INTSON(prevints);
+                              if cur_req = nil then START_NEW_REQUEST(tapecb_ptr);
+                            end;
+
+                          (* Block process until request is complete*)
+                          BLK_REQ(reqptr,reqptr);
+
+                          (* Process resumes from this point when complete*)
+                          with dctlext_ptr^ do
+                            begin
+                              driver:=error; (*error response*)
+                              (*return additional information*)
+                              case dcode of
+                                8,9,10:
+                                  begin (*copy disk to tape*)
+                                    (*return number sectors copied*)
+                                    p_longint:=@info[0];
+                                    ar10[0]:=p_longint^;
+                                  end;
+                                11,12,13:
+                                  begin (*issue packet*)
+                                    (*return packet status report*)
+                                    p_status:=@info[0];
+                                    p2_status:=@ar10[0];
+                                    p2_status^:=p_status^;
+                                  end;
+                              end;(*case dcode*)
+                            end;(*with dctlext_ptr*)
+                          RELSPACE(ord(dctlext_ptr),ptrsysg^);
+                          CANCEL_REQ(reqptr);
+                        end
+                       else RELSPACE(ordptr,ptrsysg^);
+                  end;
+            end;(*dcontrol*)
+
+          otherwise driver:=badcal;
+         end;(*case fnctn_code*)
+     end;(*DRIVER*)
+end.
+ÿ

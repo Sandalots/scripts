@@ -1,0 +1,918 @@
+{******************************************************************************}
+{*                                                                            *}
+{*          The Selector Shell : Copyright 1983, Apple Computer Inc.          *}
+{*                                                                            *}
+{******************************************************************************}
+
+{$DECL debugging, timing, build }
+{$SETC debugging := false }
+{$SETC timing := false }
+{$SETC build  := false }
+{$SETC spring := true }
+
+{$R- } { turn off range checking for speed }
+
+PROGRAM Shell;
+
+{ Larry Rosenstein 11/22/82 }
+{ Marianne Hsiung 2/20/83 -- additions}
+{ mhmh 3/10/83 -- user interface }
+{ mhmh 3/17/83 -- shells are recognized because they are on the boot disk and start with "shell."}
+{                 shell no longer start up because of keypress }
+USES
+{$IFC build }
+    {$U obj:UnitStd     } UnitStd,
+    {$U libos/syscall.obj     } Syscall,
+    {$U libos/psyscall.obj    } PSyscall,
+    {$U libpl/ppaslibc.obj    } PPaslibC,
+    {$U obj:UnitHz      } UnitHz,
+    {$U obj:Storage     } Storage,
+    {$U obj:QuickDraw   } QuickDraw,
+    {$U obj:FontMgr     } FontMgr,
+    {$U obj:HwInt       } HWInt,
+    {$U obj:PmDecl      } pmdecl,
+    {$U obj:PMM         } pmm;
+{$ELSEC }
+    {$U UnitStd     } UnitStd,
+    {$U libos/syscall.obj     } Syscall,
+    {$U libos/psyscall.obj    } PSyscall,
+ {1/13/84 }
+    {$U libpl/paslibcall.obj  } paslibcall,
+    {$U libpl/ppaslibc.obj    } ppaslibc,
+    {$U UnitHz      } UnitHz,
+    {$U Storage     } Storage,
+   {$ifc spring }
+       {$U QuickDraw   } QuickDraw,
+       {$U FontMgr     } FontMgr,
+   {$elsec }
+       {$U FontMgr     } FontMgr,
+       {$U QuickDraw   } QuickDraw,
+   {$endc}
+   (*
+    {$U BlkIOIntr   } BlkIOIntr,
+    {$U BlockIO     } BlockIO,
+    *) {1/13/84}
+    {$U HwInt       } HWInt,
+    {$U PmDecl      } pmdecl,
+    {$U PMM         } pmm;
+{$ENDC }
+
+CONST
+  ShLDSN = 1;
+  ShHeapSize = $1000;                   { 4k data segment }
+  ShDSname = '{!ShellHeap}';
+
+  banner = 'Environments';
+
+  ContPos   = 0;
+  OffPos    = 1;
+  ResetPos  = 2;
+  SetDefPos = 3;
+  NoDefPos  = 4;
+  StartPos  = 5;
+  DefPos= 6;                            { must be last built-in command +1}
+
+  ContCommand    = 'OK';
+  OffCommand     = 'Power Off';
+  ResetCommand   = 'Restart';
+  QuitCommand    = 'Quit';                  { used in place of 'restart' if we are not system.shell }
+
+  SetDefCommand  = 'Set Default';           { center these strings of same length }
+  NoDefCommand   = ' No Default';
+  StartCommand   = '   Start   ';
+
+  MaxNCommand = 13;                         { max # commands }
+
+  CMDfield = 26;                            { max length of a command name = max_ename - length('.shell') }
+
+  { actions when a shell terminates }
+  aRestartMe = 1;
+  aSelectAnother = 2;                       { select another shell           }
+  aStartAnother = 3;                        { restart specified shell        }
+  aOff = 4;                                 { power off                      }
+  aReset = 5;                               { reset the machine              }
+
+  OWidth = 16;
+  OHeight = 8;                             { dimensions of roundrect ovals  }
+
+  TechDiff = 'The Environments window is having technical difficulties.';
+  FixIt    = 'The startup disk may be damaged; you should repair it.';
+
+TYPE
+  CMDtype = (cOff, cReset, cQuit, cSetDef, cNoDef, cStart, cShell);
+  Command = record                          { command definition             }
+        but:rect;                           { where the button is            }
+        hot:rect;                           { hot zone                       }
+        x,y: integer;                       { gotoxy coordinates             }
+        name: string[CMDfield];             { short description of command   }
+        case cType:CMDtype of               { what command does              }
+            cShell: ( fname:pathname;       { name of shell program to start }
+                      valid: boolean;
+                    );
+  end;
+
+  TermType = cOff..cQuit;                   { ways to terminate              }
+
+VAR
+
+dsPath:pathname;
+dsRnum:integer;
+dsPtr:longint;
+
+myPort:GrafPtr;
+penPT, mousePT:point;
+butUP: boolean;
+
+NextShell: e_name;              { found in event_text if son returns a next shell }
+
+NShells: integer;                               { # shells   }
+NCommand:integer;                               { # commands }
+CMDlist:array[0..MaxNCommand] of Command;       { zeroth element is fake continue button }
+
+osErr:integer;
+OSlongint: longint;
+
+defaultname: e_name;
+IamShell:boolean;               { true if this is the top-level shell }
+
+GotEvChan:boolean;
+ev_chan_refnum:integer;
+ev_blk:s_eventblk;              { event pointer used by StopMe        }
+
+MyName: e_name;
+MyPathName: pathname;
+m_info: minfo;                                  {10/24/83 machine info for pepsi }
+
+procID:longint;
+entry:NameString;
+waitList:t_waitlist;
+ev_ptr:r_eventblk;
+which:integer;
+
+i:integer;
+NextToDo, CurShell:integer;
+
+MesgRect, AlertRect,MainRect, TopRect: Rect;
+corners: RgnHandle;
+
+NeedRedisplay, done, DidMesgFlag:boolean;
+GSetupFlag, SSetupFlag: boolean;
+
+Fail1,Fail2: str255;
+FailFlag: boolean;
+
+{$S         }
+PROCEDURE WrapUp(ev_ptr:p_env_blk;ex_ptr:p_ex_data);
+{ SYS_TERMINATE exception handler }
+var     p:pathname;
+begin { WrapUp }
+    if ex_ptr^[0] >4 then writeln('Environments window process failed: ex_ptr^[0] = ',ex_ptr^[0]);
+    if (IamShell) then begin
+        BlockIODisinit;
+    end;
+    if (GSetupFlag) then begin
+        HideCursor;
+        p := ShDSname;
+        Kill_Dataseg(osErr,p);
+    end;
+end; { WrapUp }
+
+{$S graf    }
+FUNCTION heapError(hz:thz; bytesNeeded:integer):integer;
+begin
+  writeln(TechDiff);
+  writeln(FixIt);
+  HALT;
+end;
+
+PROCEDURE ErrorGraf(err:integer);
+begin
+  writeln(TechDiff);
+  writeln(FixIt);
+end;
+
+{$S      }
+FUNCTION Match(s1,s2:str255):boolean;
+          { return true if s1=s2 (ignoring case) }
+var     len,i:integer;
+        result:boolean;
+        c1,c2:char;
+begin { Match }
+    len := length(s1);
+    if (len=length(s2)) then begin
+        i := 1;
+        result := true;
+        while result and (i<=len) do begin
+            c1 := s1[i];
+            c2 := s2[i];
+            if c1 in ['A'..'Z'] then c1 := chr(ord(c1)+32);
+            if c2 in ['A'..'Z'] then c2 := chr(ord(c2)+32);
+            if c1<>c2 then result := false;
+            i := i+1;
+        end;
+    end else
+        result := false;
+    Match := result;
+end; { Match }
+
+{$S graf    }
+procedure DrawBox(r: rect; x,y: integer);
+begin
+    FillRect(r, white);
+    FrameRect(r);
+
+    moveto(r.right  , r.top+2);     { draw shadowing on right }
+    lineto(r.right  , r.bottom);
+    moveto(r.right+1, r.top+3);
+    lineto(r.right+1, r.bottom+1);
+    moveto(r.left+2 , r.bottom);    { draw shadowing on bottom }
+    lineto(r.right+1, r.bottom);
+    moveto(r.left+3 , r.bottom+1);
+    lineto(r.right+1, r.bottom+1);
+
+    gotoxy(x, y);
+end;
+
+procedure HideTheSquare;
+var CursorRect: rect;
+begin
+    SetRect(CursorRect,0,16,19,324);
+    (* gotoxy(0,0); *)
+    EraseRect(CursorRect);
+end;
+
+procedure DrawButton(buttonnum: integer);
+begin { DrawButton }
+    if (buttonnum = Startpos) and (NShells = 0) then begin
+        {don't draw this button}
+    end else with CMDlist[buttonnum] do begin
+        CursorShield(hot.left, hot.top, hot.right, hot.bottom);
+        if (cType = cShell) then begin
+            FillRect(but, white);
+            FrameRect(but);
+            if (buttonnum = CurShell) then InvertRect(but);
+        end else begin
+            if (buttonnum = StartPos) or (buttonnum = ContPos) then PenSize(3,2);
+            FillRoundRect(but,OWidth,OHeight, white);
+            FrameRoundRect(but, OWidth, OHeight);
+            PenSize(1,1);
+        end;
+        if (cType <> cShell) or (valid) then begin
+            gotoxy(x,y);
+            writeln(name);
+        end;
+        CursorDisplay;
+    end;
+end; { DrawButton }
+
+procedure DoAlert(mess1, mess2: str255);
+begin { DoAlert }
+    with AlertRect do CursorShield(left,top,right,bottom);
+    DrawBox(AlertRect, 4,2);
+    writeln(mess1);
+    gotoxy(6,3);
+    writeln(mess2);
+    CursorDisplay;
+    DrawButton(ContPos);
+    HideTheSquare;
+    DidMesgFlag := true;
+end; { DoAlert }
+
+procedure DoMesg(mesg:str255);
+begin
+    with MesgRect do CursorShield(left,top,right,bottom);
+    DrawBox(mesgRect, 4,2);
+    writeln(mesg);
+    HideTheSquare;
+    CursorDisplay;
+    DidMesgFlag := true;
+end;
+
+{$S         }
+PROCEDURE StopMe(why:TermType);
+{ Terminate with the given reason }
+begin {StopMe}
+    case why of
+        cQuit:  begin
+                    if (not NeedRedisplay) then DoMesg('The Environments window is quitting.');
+                    ev_blk[1] := aSelectAnother;
+                end;
+        cOff:   begin
+                    if (not NeedRedisplay) then DoMesg('The Lisa is turning off.');
+                    ev_blk[1] := aOff;
+                end;
+        cReset: begin
+                    if (not NeedRedisplay) then DoMesg('The Lisa will restart.');
+                    ev_blk[1] := aReset;
+                end;
+    end;
+    Terminate_Process(osErr,@ev_blk);
+end; {StopMe}
+
+PROCEDURE Setup;
+const   receive = true;
+        swappable = true;
+var     ex_name:t_ex_name;
+        ev_ch_name:pathname;
+        copyright: string[255];
+        hRefNum: integer;
+
+    procedure WhoAmI(var MyPathName: pathname; var MyName:e_name; var IamShell: boolean);
+    var pinfo:procinforec;
+    begin { WhoAmI }
+        Info_Process(OSerr,My_Id,pinfo);
+
+        MyPathName := pinfo.progpathname;
+        { progpathname is a FULL pathname }
+        delete(pinfo.progpathname,1,1);         { take off the first hyphen }
+        delete(pinfo.progpathname,1, pos('-', pinfo.progpathname));
+        MyName := pinfo.progpathname;
+
+        if (OSerr<>0) then begin
+            IamShell := false
+        end else if (pinfo.father_id=1 {root}) then begin
+            IamShell := true
+        end else
+            IamShell := false;
+    end; { WhoAmI }
+
+begin { Setup }
+
+    copyright := 'copyright 1983, Apple Computer Inc.';
+    GotEvChan := false;
+
+    WhoAmI(MyPathName, MyName, IAmShell);
+
+    if (IamShell) then begin
+        BlockIOInit;
+        pminit(OSerr);
+    end;
+
+    ex_name := 'SYS_TERMINATE';                     { exception handler stuff }
+    declare_excep_hdl(osERR,ex_name,@WrapUp);
+    if (osErr<>0) then begin
+        writeln(TechDiff);
+        writeln(FixIt);
+        HALT;
+    end;
+
+    { January 13, 1984 }
+    plinitheap(OSerr, hRefNum, $1000, $1000, 5, swappable);
+
+{$IFC timing }
+    moveconsole(OSerr, alscreen);
+    writeln('began the selector shell at ',timer:1);
+    moveconsole(OSerr, mainscreen);
+{$ENDC }
+
+    { local event channel for talking to son processes }
+    ev_ch_name := '';
+    ex_name := '';
+    Open_Event_Chn(osErr,ev_ch_name,ev_chan_refnum,ex_name,receive);
+    if OSerr<>0 then begin
+        writeln(TechDiff);
+        writeln(FixIt);
+        StopMe(cQuit);
+    end;
+    GSetupFlag := false;
+    SSetupFlag := false;
+    NeedRedisplay := true;
+    FailFlag := false;
+end; { Setup }
+
+{$S graf  }
+
+PROCEDURE SSetup; { Shell Setup }
+var     testfile: file;
+        i, OSerr, iores: integer;
+        bootdir: pathname;
+        prefix, entry: e_name;
+
+    procedure NewShell(Index: integer; entry: str255);
+    var     padspaces, i: integer;
+    begin { NewShell }
+        with CMDlist[Index] do begin
+            { put command, prompts, PriScrn, filename in shell array }
+            cType := cShell;
+            valid := true;
+            fname := entry;
+            name := copy(entry,7,length(entry)-6); { get rid of "shell." prefix }
+        end;
+    end; { NewShell }
+
+begin { SSetup }
+{$IFC timing  }
+    MoveConsole(OSerr, alscreen);
+    writeln('starting to scan directory at ', timer);
+{$ENDC }
+
+    CurShell := DefPos;                 { default will be first shell seen until told otherwise }
+    i := DefPos;
+
+    {  check the directory for shell files }
+    bootdir := '';
+    prefix := 'shell.'; {look for files that begin with "shell."}
+    reset_catalog(OSerr,bootdir);
+    while (OSerr = 0) do begin
+        get_next_entry(OSerr,prefix,entry);
+        if (OSerr = 0) and (not Match(entry,MyName)) and (i <= MaxNCommands) then begin
+            NewShell(i, entry);
+            if Match(defaultname, entry) then CurShell := i;     { note if matches file label name }
+            i := i+1;
+        end;
+    end; { while }
+
+    NShells  := i-DefPos;
+    if NShells = 0 then NCommand := 2 else NCommand := i-1;
+
+    { If we only have one shell, make sure it is the default for next time }
+    if (NShells = 1) then
+        write_label(OSerr,MyPathName,ord4(@CMDlist[DefPos].fname),max_ename+1,OSlongint);
+    SSetupflag := TRUE;
+
+{$IFC timing }
+    writeln('done scanning directory at ',timer);
+    MoveConsole(OSerr, mainscreen);
+{$ENDC}
+end; { SSetup }
+
+procedure GSetup;       { Graphics Setup }
+var     i, RowIndex, ColIndex, mainbottom: integer;
+        RefRect: rect;
+        ssport : RgnHandle;
+
+    function Max(x,y: integer):integer;
+    begin
+        if (x>y) then Max := x else Max := y;
+    end;
+
+    procedure CSetup;       { Command Setup }
+    var RefRect: rect;
+        dLine : integer;
+
+    begin {CSetup}
+
+        with CMDlist[ResetPos] do begin
+            if (IamShell) then begin            { stuff info into fields }
+                name := ResetCommand;
+                cType := cReset;
+            end else begin{ can't reset the machine if I'm not the shell }
+                name := QuitCommand;
+                cType := cQuit;
+            end;
+            SetRect(but, 170, 72, 170+length(name)*8 + 32, 95);
+            hot := but;
+            x := 22;
+            y := 6;
+        end;
+
+        with CMDlist[OffPos] do begin
+            name := OffCommand;
+            cType := cOff;
+            SetRect(but, 354, 72, 354+length(name)*8 + 32, 95);
+            hot := but;
+            x := 45;
+            y := 6;
+        end;
+
+        if NShells > 0 then begin
+            SetRect(RefRect, 490, 112, 490 + length(SetDefCommand)* 8 + 32, 135);
+            with CMDList[SetDefPos] do begin
+                name  := SetDefCommand;
+                cType := cSetDef;
+                but   := RefRect;
+                hot   := but;
+                x     := 62;
+                y     := 10;
+            end;
+
+            OffsetRect(RefRect,0, 30);
+            with CMDList[NoDefPos] do begin
+                name  := NoDefCommand;
+                cType := cNoDef;
+                but   := RefRect;
+                hot   := but;
+                x     := 62;
+                y     := 13;
+            end;
+
+            dLine := Max(CMDlist[NCommands].y, 17) - 10;
+
+            OffsetRect(RefRect, 0, 10*dLine);
+            with CMDList[StartPos] do begin
+                name := StartCommand;
+                cType := cStart;
+                but := RefRect;
+                hot := but;
+                x := 62;
+                y := 13 + dline;
+            end;
+        end;
+
+        with CMDlist[ContPos] do begin    { do stuff for fake continue button }
+            name := ContCommand;
+            SetRect(but, 673 - (length(name) * 8 + 32) ,32,673, 55);
+            SetRect(hot, 0,0,0,0);  { non-existent hot spot }
+            x := 80 - length(name) + 1;
+            y := 2;
+        end;
+
+    end; {CSetup}
+
+begin { GSetup }
+    dsPath := ShDSname;
+    Open_Dataseg(OSerr,dsPath,dsRnum,dsPtr,shLDSN);
+    if (OSerr=0) then begin
+        Kill_Dataseg(OSerr,dsPath);
+        Close_Dataseg(OSerr,dsRnum);
+    end;
+    Make_Dataseg(OSerr,dsPath,ShHeapSize,ShHeapSize,
+                 dsRnum,dsPtr,ShLDSN,ds_Private);
+    if (OSerr<>0) then begin
+        MoveConsole(OSerr,alscreen);
+        Kill_Dataseg(OSerr,dsPath);
+        writeln(TechDiff);
+        writeln(FixIt);
+        StopMe(cQuit);
+    end;
+    InitHeap(pointer(dsPtr),pointer(dsPtr+ShHeapSize),@heapError);
+    InitGraf(@thePort {$ifc not spring } ,@errorGraf {$endc });
+    New(myPort);
+    OpenPort(myPort);
+    InitCursor;
+    backpat(gray);
+
+    { make the screen look like a roundrect by defining corners and painting them }
+    ssport := newrgn;
+    corners := newrgn;
+    OpenRgn;
+    FrameRoundRect(thePort^.PortRect,2*OWidth,2*OHeight);
+    CloseRgn(ssport);
+    DiffRgn(thePort^.visrgn,ssport,corners);
+
+    SetRect(RefRect, 140, 117, 155, 130);
+    colindex := 21; rowindex := 10;
+    mainbottom := 130;
+    for i := DefPos to Ncommands do with CMDlist[i] do begin
+        { initialize buttons }
+        but := RefRect;
+        hot := but;
+        hot.right := 180 + 8*length(name);          { is this right ? }
+        { set (x,y) }
+        x := ColIndex;
+        y := RowIndex;
+
+        offsetRect(RefRect, 0,20);
+        mainbottom := mainbottom + 20;
+        rowIndex := rowindex + 2;
+    end;
+
+    CSetup;     { Set up built-in commands }
+
+    SetRect(MesgRect, 25, 30, 695, 55);
+    SetRect(AlertRect,25, 25, 695, 65);
+    SetRect(TopRect, 0,0,720,15);
+    SetRect(MainRect, 20, 22, 700, Max(270, mainbottom));
+
+    DidMesgFlag := false;
+    GSetupFlag := true;
+end; {GSetup}
+
+
+procedure SelectDefault;
+begin
+    curshell := DefPos;
+end;
+
+procedure SelectShell;
+var     i, temp: integer;
+        cont, done, keypushed:boolean;
+
+    procedure DoDisplay;
+    var i: integer;
+    begin { DoDisplay }
+        DrawBox(MainRect, 35,1);
+        MoveTo(MainRect.left,44); LineTo(MainRect.right,44);
+        write(banner);
+        {$IFC debugging }
+            write(' (Process ',My_Id:1,' here.)');
+        {$ENDC}
+        for i := 1 to NCommands do DrawButton(i);
+        HideTheSquare;
+        DidMesgFlag := false;
+    end; { DoDisplay }
+
+
+    PROCEDURE MouseState(var p:point;var up, keypushed:boolean);
+    var     kev:KeyEvent;
+    begin { MouseState }
+        keypushed := false;
+        if (KeybdEvent(false,false,kev)) then begin
+              { wait for event ? NO!}
+            if (kev.key=6) then begin
+                p.h := kev.mouseX;
+                p.v := kev.mouseY;
+                up := (ord(kev.ascii)=1);
+                exit(MouseState);
+            end else if (kev.key = 8) and (up) then begin  {power off}
+                up := false;
+                keypushed := true;
+                i := OffPos;
+            end;
+        end else begin
+            MouseLocation(p.h, p.v);
+        end;
+    end; { MouseState }
+
+    procedure change;        { change default }
+    begin { change }
+        with CMDlist[CurShell] do begin
+            if (valid) and (cType = cShell) then begin
+                DoAlert('The Environments window is setting the default',
+                        concat('to the ',name,'.'));
+                DefaultName := fname;
+                write_label(OSerr, MyPathName,ord4(@fname),max_ename+1,OSlongint);
+            end;
+        end;
+    end; { change }
+
+    procedure SSInit;       { SelectShell Initialization }
+    var     KEvent:keyevent;
+    begin { SSInit }
+        if (not SSetupFlag) then SSetup;
+        if (not GSetupFlag) then GSetup;
+
+        if NeedRedisplay then begin
+            SetScreenKeybd(PriScrn);            { move all output to the primary screen }
+            MoveConsole(OSerr, MainScreen);
+
+            EraseRect(theport^.portrect);
+            fillrect(TopRect, white);
+            with TopRect do begin
+                moveto(left,bottom);
+                lineto(right, bottom);
+            end;
+            paintRgn(corners);                  { black out the corners }
+            DoDisplay;
+            NeedRedisplay := false;
+        end;
+        HideTheSquare;
+        PenSize(1,1);
+        while KeyBdEvent(true, false, KEvent) do { get rid of keypresses };
+        ShowCursor;
+        InitCursor;
+        if FailFlag then DoAlert(Fail1,Fail2);
+    end; {SSInit }
+
+begin { SelectShell }
+
+    SSInit;
+    if (NShells = 0) then DoAlert('ERROR:  You have no environments on the startup disk !!!',
+                                  'You should startup from another disk and repair this one.');
+    cont := TRUE;
+    while cont do begin
+
+        butUP := true;
+        while butUP do MouseState(mousePT,butUP,keypushed);         { wait for mouse button down }
+
+        if DidMesgFlag then begin
+            DoDisplay;
+            DidMesgFlag := false;
+        end;
+
+        while not butUP do begin { track mouse while button is down }
+            done := false;
+            i := 0;
+            while (i <= NCommand) and (not done) do begin
+                if PTInRect(MousePT, CMDList[i].hot) then with CMDlist[i] do begin
+                    if (cType = cShell) then begin
+                        if (i <> Curshell) then begin
+                            InvertRect(CMDList[Curshell].but);
+                            CurShell := i;
+                            InvertRect(but);
+                        end;
+                    end else begin { we've stumbled into a new button }
+                        InvertRoundRect(but,OWidth,OHeight);      { highlight }
+                        while PTInRect(MousePT, hot) and not butUP do
+                            MouseState(MousePt, butUP, keypushed);
+                        if not butUP then begin { we fell out of the button }
+                            InvertRoundRect(but,Owidth,OHeight);
+                            done := true;
+                        end;
+                    end;
+                    done := true;
+                end else
+                    i := i+1;
+            end; { while (i <= NCommand) }
+
+            MouseState(MousePt, butUP, keypushed);
+        end; { while not butUP }
+
+        if i > NCommand then i := curshell; { force a noop }
+
+        with CMDList[i] do begin                                { do what we should do  }
+            (* if cType <> cShell then InvertRoundRect(but,OWidth,OHeight); *)
+            case cType of
+                cShell: begin
+                          if valid then begin
+                            CurShell := i;
+                          end else begin                        { toggle the shell to be valid   }
+                            valid := true;
+                            DrawButton(i);                      { redraw it                      }
+                            HideTheSquare;
+                          end;
+                        end;
+                cOff, cReset, cQuit: StopMe(CMDlist[i].ctype);
+                cSetDef: change;
+                cNoDef: begin
+                          DefaultName[0] := chr(0);         { this will be garbage to the default mechanism }
+                          DoAlert('No default is set; when you start the Lisa, you will',
+                                  'have to choose an environment from the Environments Window.');
+                          write_label(OSerr, MyPathName,ord4(@DefaultName),1,OSlongint);
+                        end;
+                cStart: cont := false;
+            end; {case}
+        end; { with }
+
+    end; {while cont }
+    Fail1 := 'The Environments Window can not start up';
+    Fail2 := concat('the ',CMDList[CurShell].name,'.');
+    HideCursor;
+  end; {SelectShell}
+
+{$S       }
+function DoDefault: boolean;
+var     KEvent: keyevent;
+        LabelLength: integer;
+
+    function MountGuide(dname: e_name): boolean;
+    const   Guidevol = 'GUIDE';
+            Guidename = '-guide-LisaGuide.shell';       { hard-coded LisaGuide name requirements }
+    var     vname, password, devname: e_name;
+    begin
+        devname := dname;
+        MountGuide := false;
+        Mount(OSerr,vname,password,devname);
+        if (OSerr <= 0) and Match(vname, GuideVol) then begin
+            { succeeded in mount }
+            CMDlist[DefPos].fname := GuideName;
+            CMDList[DefPos].name := 'LisaGuide';
+            Fail1 := 'The Environments Window is having trouble starting LisaGuide;';
+            Fail2 := 'the LisaGuide twiggy may be damaged.';
+            MountGuide := true;
+        end else begin
+            Unmount(OSerr,vname);
+        end;
+    end;
+
+begin { DoDefault }
+    DoDefault := false;
+    if IamShell then begin
+        { attempt LisaGuide mount of upper and lower twiggy }
+        if MountGuide('upper') then DoDefault := true
+        else if MountGuide('lower') then DoDefault := true
+        else begin { no LisaGuide twiggy }
+            read_label(OSerr,MyPathName,ord4(@defaultname),max_ename+1, OSlongint);
+            { get the default name from the file label }
+{$R- }
+            LabelLength := ord(defaultname[0]);
+{$R+ }
+            if (LabelLength = 0) then begin
+                Dodefault := FALSE; { NoDefault is set }
+            end else begin { not the no default option }
+                Fail1 := 'The Environments Window cannot start the default environment;';
+                Fail2 := 'you should set the default to the environment you want.';
+                if (LabelLength <= max_ename) then begin
+                    { we have a reasonable thing in the file label }
+                    CMDlist[DefPos].fname := defaultname;
+                    if (not KeyBdPeek(false, 1, KEvent)) then begin { do we see a keypress ? }
+                        DoDefault := TRUE;
+                    end else begin
+                        while KeyBdEvent(true, false, KEvent) do { get rid of them };
+                    end;
+                end else begin
+                    FailFlag := true;
+                end;
+            end;
+        end;
+    end else begin {I am not shell}
+        Fail1 := 'The Environments Window is not system.shell and cannot start the default';
+        Fail2 := 'environment;  you should set the default to the environment you want.';
+    end;
+end; { DoDefault }
+
+
+PROCEDURE EjectDisk(dName: e_name);
+VAR fsParams: UT_ParmT;
+    err: TC;
+BEGIN
+  UnMount(err, dName);
+  if err <= 0 then begin
+    fsParams.command := eject;
+    fsParams.dev_name := dName;
+    FS_Utilities(err, fsParams);
+  end;
+END;
+
+    procedure StuffName(e:s_eventblk; var NextShell:e_name);
+    type
+        bhtrix = record case boolean of           { record to change e_name into a }
+              true :  ( a: s_eventblk );          { packed array of char[1..32]    }
+              false:  ( b: longint;               { into event_text[2..9]          }
+                        c: longint;
+                        d: packed array[1..32] of char;
+                      );
+        end;
+    var i:integer;
+        dummyblock:bhtrix;
+    begin{ StuffName }
+        DummyBlock.a := e;
+        i := max_ename;
+        done := FALSE;
+        while not done and (i > 1) do begin
+          if  (DummyBlock.d[i] = ' ') then begin
+              i := i-1;
+          end else done := TRUE;
+        end;
+        nextshell[0] := chr(i);       { stuff length field }
+        while i >= 1 do begin         { make sure you do it from the end !!! }
+            NextShell[i]:= DummyBlock.d[i];
+            i := i-1;
+        end;
+    end;{ StuffName }
+
+BEGIN { the program }
+    Setup;
+
+    if DoDefault then begin
+        SelectDefault;
+    end else begin
+        SSetup;
+        if nshells <> 1 then SelectShell
+        else SelectDefault;
+    end;
+
+    while true do with CMDlist[CurShell] do begin { We know it is a cShell }
+        if (not NeedRedisplay) then begin
+            DoMesg(concat('The Environments window is starting the ',name,'.'));
+        end;
+        FailFlag := FALSE;
+        entry := '';
+        Make_Process(osErr,procID,fname,entry,ev_chan_refnum);
+        if (osErr > 0) then begin
+            (* flush buffers here *)
+            FailFlag := TRUE;
+            NextToDo := aSelectAnother;
+            valid := false;
+        end else begin { made the process successfully }
+
+            NeedRedisplay := true;
+
+            waitList.length := 1;
+            waitList.refnum[0] := ev_chan_refnum;
+            Wait_Event_Chn(osErr,waitList,which,@ev_ptr);
+            Kill_Process(osErr,procID);
+
+            (*  flush buffers here *)
+
+            if ev_ptr.event_text[0]=call_term { called Terminate_Process } then
+                NextToDo := ev_ptr.event_text[1]
+            else
+                NextToDo := aSelectAnother;
+
+        end; { made the process successfully }
+
+        if IAmShell then begin
+            mach_info(osErr, m_info);           { if it's a lisa then eject the upper twiggy }
+            if m_info.cpu_board = cpub_lisa then ejectdisk('upper');
+            ejectdisk('lower');
+        end;
+
+        case NextToDo of
+            aRestart:       { do nothing };
+            aSelectAnother:
+                SelectShell;
+            aStartAnother:
+                begin
+                  StuffName(ev_ptr.event_text,NextShell); {get name of NextShell out of event_text }
+                  if not(SSetupFlag) then SSetup;
+                  done := FALSE;
+                  i := DefPos;
+                  while (i <= NCommands) and (not done) do
+                      if Match(CMDlist[i].fname, NextShell) and
+                         CMDlist[i].valid then begin
+                          curshell := i;
+                          done := TRUE;
+                      end else
+                          i := i+1;
+                  if (i > NCommands) then SelectShell;
+                end;
+            aOff:
+                StopMe(cOff);
+            aReset:
+                StopMe(cReset);
+            otherwise SelectShell;
+        end; { case NextToDo }
+    end; { infinite loop reading commands }
+END.
+ÿ

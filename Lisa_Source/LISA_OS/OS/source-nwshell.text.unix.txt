@@ -1,0 +1,2245 @@
+program Shell;
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+  { program to implement a simple shell for program development on the
+    Lisa Operating System.  It is created by the operating system as part of
+    its initialization under the name of 'SYSTEM.SHELL'.  The Shell provides
+    a set of commands to execute and debug programs and perform basic file
+    system type operations. }
+
+  uses
+    {$U object/hwint }
+    HWInt,
+    {$U object/syscall }
+    SysCall,
+    {$U object/psyscall }
+    PSysCall;
+
+
+  const
+    maxSpace = 8000;                         { 32K bytes of stack for checking }
+
+    ESC = 27;                                { <ESC> character }
+
+    slash = 33;                              { '/' key for NMI programming }
+
+    versMsg = 'UltraDOS Shell - Version 7 - Copyright 1/24/84 by UltraLabs, Inc.';
+
+    prompt = 'UltraDOS: X(ecute, D(ebug, F(iler, P(rivFiler, T(ime, L(ib, V(ers, O(ff, Q(uit ';
+
+
+  type
+    consoleDest = (altscr, mainscr);         { possible destinations for console }
+
+    cmdLine = string[79];                    { command line prompt }
+    xFileName = pathname;                    { string for exec file names }
+
+  var
+    cmd : char;                              { command to Shell }
+    comm_chan : integer;                     { refnum of comm chan for sons }
+    son_wait_list : t_waitlist;              { for Wait_Event_Chn }
+    term_event : s_eventblk;                 { term event to send to father }
+    report : boolean;                        { true if reporting should be done }
+    error : integer;                         { for exec stuff }
+    execFile : xFileName;                    { exec file name }
+
+
+  procedure BlockioInit;  external;
+    { kludgy procedure in PasLib to initialize Blockio structures }
+
+  procedure BlockioDisnit;  external;
+    { kludgy procedure in PasLib to clean up Blockio structures }
+
+  procedure MoveConsole (var errnum : integer;  scr : consoleDest);  external;
+    { kludgy definition for changing destination of writeln output }
+
+  function ExecFlag : boolean;  external;
+    { kludgy definition for exec file routine }
+
+  procedure ExecReset (var error : integer;  var filename : xFileName;
+                       stopexec : boolean);  external;
+    { kludgy definition for exec file routine }
+
+
+  procedure ClearStack;
+    { procedure to initialize current dynamic stack space to all $Fs to
+      determine stack usage requirements of various system call procedures. }
+
+    var
+      i : integer;                             { index for initializing space }
+      space : array[1..maxSpace] of longint;   { initialized stack space }
+
+    begin
+      for i := 1 to maxSpace do
+        space[i] := -1
+    end { ClearStack };
+
+
+  procedure CheckStack;
+    { procedure to dtermine the amount of stack space used by a system call
+      procedure just executed. }
+
+    var
+      i : integer;                             { index for checking space }
+      space : array[1..maxSpace] of longint;   { stack space to check }
+
+    begin
+      i := 1;
+      while space[i] = -1 do
+        i := i + 1;
+
+      writeln ('   dynamic stack space used = ', (maxSpace-i)*4:1)
+    end { CheckStack };
+
+
+  procedure TermHandler (env_ptr : p_env_blk;  data_ptr : p_ex_data);
+    { SYS_TERMINATE exception handler for terminating Shell. }
+
+    var
+      errnum : integer;                      { error return }
+
+    begin
+      BlockioDisinit;   { kludgy PasLib work }
+      writeln;
+      writeln ('   Shell process terminating...');
+      if report then writeln ('   cause = ', data_ptr^[0]:1);   { for testing }
+      writeln;
+
+      Terminate_Process (errnum, @term_event)
+    end { TermHandler };
+
+
+  procedure Flush_FileSys;
+    { procedure to ensure that the File System's buffers have been flushed and
+      that the disk is in a good state. }
+
+    var
+      errnum : integer;                      { error return }
+      flush_cmd : ut_parmt;                  { command for flushing }
+
+    begin
+      flush_cmd.command := flushBuffers;
+      FS_Utilities (errnum, flush_cmd);
+      if errnum <> 0 then
+        begin  { shouldn't happen }
+          writeln;
+          writeln ('   *** Error flushing File System buffers = ', errnum:1);
+          writeln
+        end
+    end { Flush_FileSys };
+
+
+  procedure UCSD_IOError (errcode : integer);
+    { procedure to display a meaningful error message for errors encountered during
+      I/O to UCSD/Monitor files. }
+
+    var
+      errmess : string[52];
+
+    begin
+      case errcode of
+        0 : errmess := 'No error';
+        1 : errmess := 'Bad block, Parity error (CRC)';
+        2 : errmess := 'Bad Unit Number';
+        3 : errmess := 'Bad Mode, Illegal operation';
+        4 : errmess := 'Undefined hardware error';
+        5 : errmess := 'Lost unit, unit is no longer on-line';
+        6 : errmess := 'Lost file, File is no longer in directory';
+        7 : errmess := 'Bad Title, Illegal file name';
+        8 : errmess := 'No room, insufficient space';
+        9 : errmess := 'No Unit, no such volume on line';
+       10 : errmess := 'No file, no such file on volume';
+       11 : errmess := 'Duplicate file';
+       12 : errmess := 'Not closed, attempt to open an open file';
+       13 : errmess := 'Not open, attempt to access a closed file';
+       14 : errmess := 'Bad format, error in reading real or integer';
+       15 : errmess := 'Ring buffer overflow';
+       16 : errmess := 'Write protect error';
+      end { case errcode };
+
+      if errcode < 17 then writeln (errmess)
+      else
+        writeln ('Unknown UCSD-type error code = ', errcode:1)
+    end { UCSD_IOError };
+
+
+  procedure SetEnvironment;
+    { procedure to set the correct operating environment on the console for
+      running the Shell.  The normal debugging environment is for the alternate
+      screen to be visible and all Pascal i/o to be directed there. }
+
+    var
+      errnum : integer;                      { error return }
+      cntrl : string[2];                     { string for sending control chars }
+
+    begin
+      {CursorHide;}
+      if not EnableDBG (true) then
+        begin
+          SetNMIKey (0);
+          MoveConsole (errnum, mainscr);
+          SetScreenKeybd (priscrn);
+        end
+      else
+        begin  { set up screen and keyboard for normal debugging }
+          SetNMIKey (slash);
+          MoveConsole (errnum, altscr);
+          SetScreenKeybd (AltScrn);
+          { clear rest of screen }
+          cntrl := '  ';
+          cntrl[1] := chr(ESC);
+          cntrl[2] := 'Y'; {'*' will clear entire page }
+          write (cntrl)
+        end
+    end { SetEnvironment };
+
+
+  procedure Initialize;
+    { procedure to initialize some data sturctures and perform other start up
+      functions for the Shell. }
+
+    var
+      null_ec : pathname;                    { null EC pathname }
+      null_excep : t_ex_name;                { null exception name }
+      term_excep : t_ex_name;                { SYS_TERMINATE exception name }
+      errnum : integer;                      { error return }
+      currentDT : time_rec;                  { current date/time }
+
+    begin
+      { do system initialization for BlockIO }
+      BlockioInit;
+
+      { establish Shell's normal operating priority }
+      SetPriority_Process (errnum, My_Id, 200);
+
+      { set up communication channel for creating processes to run programs }
+      null_ec := '';   null_excep := '';
+      Open_Event_Chn (errnum, null_ec, comm_chan, null_excep, true { receive });
+      if errnum <> 0 then
+        begin
+          writeln ('   *** errnum from Open_Event_Chn = ', errnum);
+          exit (Shell)
+        end;
+      with son_wait_list do
+        begin
+          length := 1;
+          refnum[0] := comm_chan
+        end;
+
+      { set up exception handler for Shell termination }
+      term_excep := 'SYS_TERMINATE';
+      Declare_Excep_Hdl (errnum, term_excep, @TermHandler);
+
+      { tell father to re-start Shell if it unexpectedly dies }
+      term_event[1] := 1;
+
+      report := false;
+
+      { make sure the clock is running correctly }
+      Get_Time (errnum, currentDT);
+      if errnum = 639 then
+        begin  { clock hasn't been initialized }
+          with currentDT do
+            begin
+              year := 1982;
+              day := 153;
+              hour := 0;
+              minute := 0;
+              second := 0;
+              msec := 0
+            end;
+          Set_Time (errnum, currentDT);
+          if errnum <> 0 then
+            writeln ('   error initializing the clock = ', errnum :1)
+        end { clock initialization };
+
+      SetEnvironment;
+
+      Flush_FileSys
+    end { Initialize };
+
+
+  procedure ExecuteProgram (debug : boolean);
+    { procedure to execute a program under the operating system.  A process is
+      created to execute the specified program and the Shell then waits for the
+      new process to terminate before accepting the next command.  If the debug
+      flag is true, the global OS debug flag will be set so that the newly
+      created process will come up in the Debugger. }
+
+    var
+      pname : pathname;                       { pathname of program to execute }
+      null_entry : namestring;                { null entry point name }
+      errnum : integer;                       { error return for system calls }
+      son_id : longint;                       { id of new process for program }
+      ec_refnum : integer;                    { returned by Wait_Event_Chn }
+      sonTerm_event : r_eventblk;             { 'SYS_SON_TERM' event block }
+      event_ptr : p_r_eventblk;               { ptr to term event }
+      debug_allSons : boolean;                { true if all sons to be debugged }
+      ans : char;                             { answer to additional questions }
+      asynch : boolean;                       { true if asynchronous execution }
+
+    procedure StartExecFile;
+      { procedure used by ExecuteProgram to start execution of an exec file. }
+
+      begin
+        execFile := Copy (pname, 2, Length(pname)-1);   { ignore '<' }
+        ExecReset (errnum, execFile, false { open });
+
+        if errnum = 10 { not found } then
+          begin  { try again with '.TEXT' }
+            execFile := Concat (execFile, '.TEXT');
+            ExecReset (errnum, execFile, false)
+          end;
+
+        if errnum = 0 then
+          writeln ('   Starting exec file...')
+        else if errnum < 17 then
+          begin
+            write ('   ');
+            UCSD_IOError (errnum)
+          end
+        else if errnum = 50 then
+          writeln ('   Premature EOF in exec file')
+        else
+          writeln ('   Illegal exec file name')
+      end { StartExecFile };
+
+
+    procedure Print_MakeError;
+      { procedure used by ExecuteProgram to recover from any errors returned
+        by Make_Process.  An error message based on the error from Make_Process
+        is displayed. }
+
+      var
+        errmsg : string[80];                  { Make_Process error message }
+
+      begin
+        case errnum of
+          130 : errmsg := Concat ('   Can''t open program file ', pname);
+          131 : errmsg := Concat ('   Error reading program file ', pname);
+          132 : errmsg := Concat ('   ', pname, ' is not a valid program file');
+          133 : errmsg := '   Can''t get a segment for new process''s stack';
+          134 : errmsg := '   Can''t get a segment for new process''s syslocal';
+          135 : errmsg := '   Can''t get sysglobal space for new process';
+          136 : errmsg := '   Can''t use specified event channel';
+          138 : errmsg := '   Error accessing program file while loading';
+          141 : begin
+                  errmsg := '   Error trying to access a library file while ';
+                  errmsg := Concat (errmsg, 'loading (e.g. file not found)')
+                end;
+          142 : errmsg := Concat ('   ', pname, ' is a protected file');
+          143 : begin
+                  errmsg := '   Program uses an Intrinsic Unit not found ';
+                  errmsg := Concat (errmsg, 'in INTRINSIC.LIB')
+                end;
+          144 : begin
+                  errmsg := '   Program uses an Intrinsic Unit whose name/type ';
+                  writeln (errmsg);
+                  errmsg := '   doesn''t agree with INTRINSIC.LIB'
+                end;
+          145 : begin
+                  errmsg := '   Program uses a shared segment not found ';
+                  errmsg := Concat (errmsg, 'in INTRINSIC.LIB')
+                end;
+          146 : begin
+                  errmsg := '   Program uses a shared segment whose name ';
+                  writeln (errmsg);
+                  errmsg := '   doesn''t agree with INTRINSIC.LIB'
+                end;
+          147 : errmsg := '   Can''t get syslocal space for a program descriptor';
+          148 : begin
+                  errmsg := '   No space for shared Intrinsic globals needed by ';
+                  errmsg := Concat (errmsg, 'program')
+                end;
+         -149 : begin
+                  errmsg := '   WARNING: program file has been scavenged and ';
+                  errmsg := Concat (errmsg, 'changed')
+                end;
+         -150 : begin
+                  errmsg := '   WARNING: a library file has been scavenged and ';
+                  errmsg := Concat (errmsg, 'changed')
+                end;
+          otherwise
+            begin  { unknown error }
+              writeln ('   Unknown Make_Process error - ', errnum:1);
+              errmsg := ''
+            end
+        end { case };
+
+        writeln (errmsg)
+      end { Print_MakeError };
+
+
+    begin  { ExecuteProgram }
+      null_entry := '';   asynch := false;
+      event_ptr := @sonTerm_event;
+
+      if debug then write ('   Debug what file?  ')
+        else write ('   Execute what file?  ');
+      readln (pname);
+
+      if (pname <> '') and (ord(pname[1]) <> ESC) then
+        begin  { non-null name }
+          if debug and (pname[1] <> '<') then
+            begin  { debugging }
+              write ('   Debug all son processes as well?  ');
+              readln (ans);
+              if ord(ans) = ESC then
+                begin  { forget it }
+                  writeln;
+                  exit (ExecuteProgram)
+                end
+              else if (ans = 'y') or (ans = 'Y') then
+                debug_allSons := true
+              else
+                debug_allSons := false;
+              Set_DebugMode (errnum, true)
+            end { debugging };
+
+          if pname[1] = '<' then StartExecFile
+          else
+            begin  { executing a program }
+              if report then ClearStack;
+              writeln ('   Creating new process...');
+              writeln;
+
+              if pname[1] = '@' then
+                begin  { asynchronous execution of process }
+                  Delete (pname, 1, 1);   { get rid of '@' }
+                  asynch := true
+                end;
+
+              if asynch then
+                Make_Process (errnum, son_id, pname, null_entry, 0)
+              else
+                Make_Process (errnum, son_id, pname, null_entry, comm_chan);
+              if report then CheckStack;
+              if errnum <> 0 then Print_MakeError
+              else if not asynch then
+                begin  { wait for the new process }
+                  if not debug_allSons then Set_DebugMode (errnum, false);
+
+                  { wait (at a low priority) for son to terminate }
+                  SetPriority_Process (errnum, My_ID, 1);
+                  Wait_Event_Chn (errnum, son_wait_list, ec_refnum, event_ptr);
+                  if errnum <> 0 then
+                    writeln ('   *** Error from Wait_Event_Chn = ', errnum);
+
+                  { make sure the process is really gone }
+                  repeat
+                    Activate_Process (errnum, son_id, false)   { kludge }
+                  until errnum > 0;
+
+                  SetPriority_Process (errnum, My_ID, 200);   { normal priority }
+
+                  if report then
+                    with sonTerm_event do
+                      begin
+                        writeln;
+                        writeln ('   On termination of Shell''s son:');
+                        writeln ('     event_text[0] = ', event_text[0]:3, '   ',
+                                 'event_text[1] = ', event_text[1]:3);
+                        writeln
+                      end;
+
+                  SetEnvironment;
+
+                  Flush_FileSys
+                end { wait for process }
+            end { executing a program }
+        end { non-null name };
+
+      Set_DebugMode (errnum, false);
+      writeln
+    end { ExecuteProgram };
+
+
+  procedure ListVersions;
+    { procedure to list the version numbers of the various components of the
+      operating system.  This relies on the special interface to gain access
+      to the functions that return the version numbers for the various
+      functional areas of the OS. }
+
+    var
+      versions : vers_info;                         { version numbers of OS }
+
+    begin
+      List_Versions (versions);
+
+      with versions do
+        begin
+          writeln;
+          writeln ('   OS component version numbers:');
+          writeln ('     PPrim_Version  = ', PPrim_V);
+          writeln ('     PM_Version     = ', PM_V);
+          writeln;
+          writeln ('     GDVersion      = ', GDV);
+          writeln ('     MMPrimVersion  = ', MMPrimV);
+          writeln ('     MMVersion      = ', MMV);
+          writeln ('     DSVersion      = ', DSV);
+          writeln;
+          writeln ('     ExprmVersion   = ', ExprmV);
+          writeln ('     ExmgrVersion   = ', ExmgrV);
+          writeln ('     ECVersion      = ', ECV);
+          writeln ('     TimeVersion    = ', TimeV);
+          writeln;
+          writeln ('     VMVersion      = ', VMV);
+          writeln ('     SFVersion      = ', SFV);
+          writeln ('     PrimVersion    = ', PrimV);
+          writeln ('     UIVersion      = ', UIV);
+          writeln ('     Init_Version   = ', InitV);
+          writeln ('     CUR_Version    = ', CUR_V);
+          writeln;
+          write   ('     OS Version     = ', OSVers DIV 100:1, '.');
+          write   (OSVers MOD 100 DIV 10:1, '.', OSVers MOD 100 MOD 10:1);
+          writeln;
+          writeln
+        end
+    end { ListVersions };
+
+
+  procedure FlipPrompt (var prompt : cmdLine;  p1 : cmdLine;  p2 : cmdLine);
+    { procedure to change a prompt from its current setting to the other form
+      of the command line (i.e.  alternate between p1 and p2). }
+
+    begin
+      if prompt = p1 then prompt := p2
+        else prompt := p1
+    end { FlipPrompt };
+
+
+{$s PFileSeg }
+  procedure PrivFiler;
+    { procedure that provides special commands mostly for managing volumes under
+      the OS (supported by the privileged interface). }
+
+    const
+      pf1prompt = 'PrivFiler: O(nline, E(ject, F(ix, I(nit, Z(ap, P(rotect, W(riteBT, Q(uit, ? ';
+      pf2prompt = '           N(ewTwig, D(ump ';
+
+    var
+      prompt : cmdLine;                            { Priv Filer's prompt }
+      cmd : char;                                  { Priv Filer's command }
+
+
+
+    procedure OnLineVols;
+      { procedure to display the Lisa FS volumes that are currently mounted and
+        'on-line' in the system. }
+
+      const
+        devField = 20;                             { width of field for dev name }
+
+      var
+        errnum, geterr : integer;                  { error returns }
+        outLine : string[80];                      { to avoid slow PasLib }
+        devname : e_name;                          { device name to check }
+        dev_pname : pathname;                      { pathname form of device }
+        WD_name : pathname;                        { pathname of working device }
+        attributes : fs_info;                      { info on listed device }
+        nextEntry : longint;                       { for enumerating devices }
+        config : ConfigDev;                        { info on a configured device }
+        PMrec : PMemRec;                           { current parameter memory }
+        i : integer;                               { for appending blanks }
+
+      begin
+        writeln;
+        writeln ('      Devices/Volumes Currently Configured/Online');
+        writeln;
+        writeln ('      Device Name              Mounted Volume Name');
+        writeln ('      -----------              -------------------');
+
+        Get_Working_Dir (errnum, WD_name);
+        Read_PMem (errnum, PMrec);
+        nextEntry := 0;
+
+        repeat
+          GetNxtConfig (geterr, nextEntry, PMrec, config);
+          if geterr = 0 then
+            begin  { got a configured device }
+              dev_pname := Concat ('-', config.DevName);
+              devname := dev_pname;
+
+              LookUp (errnum, dev_pname, attributes);
+              if errnum <> 0 then
+                writeln ('   *** errnum from LookUp = ', errnum:1)
+              else
+                with attributes do
+                  begin  { display the info }
+                    if dev_pname = WD_name then outLine := '  wd  '
+                      else outLine := '      ';
+
+                    outline := Concat (outLine, devname);
+                    for i := Length(devname) to devField do
+                      outLine := Concat (outLine, ' ');
+
+                    if mounted and blockstructured then
+                      outLine := Concat (outLine, '    -', volname)
+                    else if mounted then
+                      outLine := Concat (outLine, '     ', devname);
+
+                    writeln (outLine)
+                  end { display }
+            end { configured device }
+        until geterr > 0;
+
+        writeln;
+        writeln
+      end { OnLineVols };
+
+
+
+    procedure EjectDisk;
+      { procedure to eject a disk in the File System. }
+      var
+        devname : e_name;                          { disk to eject }
+        errnum : integer;                          { error return }
+        eject_cmd : ut_parmt;                      { command to eject }
+
+      begin
+        write ('   Eject what disk?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            with eject_cmd do
+              begin
+                command := eject;
+                dev_name := devname
+              end;
+            if report then ClearStack;
+            FS_Utilities (errnum, eject_cmd);
+            if report then CheckStack;
+
+            if errnum <> 0 then
+              writeln ('   Error ejecting disk ', devname, ' = ', errnum:1)
+          end;
+
+        writeln
+      end { EjectDisk };
+
+
+    procedure F_Disk;
+      { procedure to F(ix) a disk in the File System.  The specified disk is
+        scavenged to reclaim any lost files or pages. }
+
+      var
+        devname : e_name;                          { device to fix }
+        errnum : integer;                          { error return }
+        fix_cmd : ut_parmt;                        { command to fix }
+
+      begin
+        write ('   Fix what disk?  ');
+        readln (devname);
+        if ord(devname[1]) <> ESC then
+          begin  { do it }
+            with fix_cmd do
+              begin
+                command := fsScavenge;
+                sdev_name := devname;
+                soptions := [no_abort]
+              end;
+            writeln ('   Beginning scavenge operation...');
+            if report then ClearStack;
+            FS_Utilities (errnum, fix_cmd);
+            if report then CheckStack;
+
+            if errnum <> 0 then
+              writeln ('   Error fixing disk ', devname, ' = ', errnum:1)
+          end { do it};
+
+        writeln
+      end { F_Disk };
+
+
+    procedure InitVolume;
+      { procedure to initialize a new volume in the File System.  The hints are
+        written to the # of pages specified. }
+
+      var
+        devname : e_name;                          { device to initialize }
+        errnum : integer;                          { error return }
+        numPages : longint;                        { # pages to initialize }
+        init_cmd : ut_parmt;                       { command to initialize }
+
+      begin
+        write ('   Initialize what device?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            write ('   How many pages to initialize?  ');
+            readln (numPages);
+            if numPages >= 0 then
+              begin
+                with init_cmd do
+                  begin
+                    write ('   Name of new volume?  ');
+                    readln (newvolname);
+                    if ord(newvolname[1]) = ESC then
+                      begin
+                        writeln;
+                        exit (InitVolume)
+                      end;
+
+                    write ('   New volume password?  ');
+                    readln (newpassword);
+                    if ord(newpassword[1]) = ESC then
+                      begin
+                        writeln;
+                        exit (InitVolume)
+                      end;
+
+                    command := initvol;
+                    idev_name := devname;
+                    pages := numPages;
+                    max_sfiles := 0   { take what I can get }
+                  end;
+                writeln ('   Beginning initialization operation...');
+                if report then ClearStack;
+                FS_Utilities (errnum, init_cmd);
+                if report then CheckStack;
+
+                if errnum <> 0 then
+                  writeln ('   Error initializing volume = ', errnum:1)
+              end
+          end;
+
+        writeln
+      end { InitVolume };
+
+
+    procedure ZapVol;
+      { procedure to 'zap' (scratch) a volume in the File System. }
+
+      const
+        fuzz = 'ekijjx';
+
+      var
+        devname : e_name;                          { device to zap }
+        errnum : integer;                          { error return }
+        zap_cmd : ut_parmt;                        { command to zap }
+        vname  : e_name;                           { for password stuff }
+        cover_up : string[3];
+        c : string [1];
+
+procedure Check_PassWord;
+  var
+    i : integer;
+
+  begin
+    cover_up := '...';
+    cover_up[1] := chr(8);
+    cover_up[2] := ' ';
+    cover_up[3] := chr(8);
+    i := 1;
+    vname := '';
+
+    write ('What is the password?  ');
+
+    read(c);
+
+    while not eoln do
+    begin
+      if i <= max_ename then
+      begin
+        vname := concat (vname, c);
+        i := i + 1;
+      end;
+
+      write (cover_up);
+      read (c);
+    end;
+
+    readln;  (* clear eoln *)
+
+    for i := 1 to length (vname) do vname [i] := chr (ord (vname [i]) + i);
+    if vname <> fuzz then
+      begin
+        writeln ('Invalid password.');
+        writeln;
+        exit (ZapVol)
+      end
+  end { Check_PassWord };
+
+
+      begin  { ZapVol }
+        if not report then
+          begin
+            writeln ('   Zap is not a supported function.');
+            writeln;
+            exit (ZapVol)
+          end;
+
+        Check_PassWord;
+
+        write ('   Zap what device?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            if vname <> fuzz then exit (ZapVol);
+            with zap_cmd do
+              begin
+                command := zap;
+                dev_name := devname
+              end;
+            if report then ClearStack;
+            if vname <> fuzz then exit (ZapVol);
+            FS_Utilities (errnum, zap_cmd);
+            if report then CheckStack;
+
+            if errnum <> 0 then
+              writeln ('   Error zapping device ', devname, ' = ', errnum:1)
+            else
+              writeln ('   Zapped device ', devname)
+          end;
+
+        writeln
+      end { ZapVol };
+
+
+    procedure NewTwiggy;
+      { procedure to format a new Twiggy disk in the system. }
+
+      var
+        devname : e_name;                          { device to format }
+        errnum : integer;                          { error return }
+        fmat_cmd : ut_parmt;                       { command to format }
+
+      begin
+        write ('   Format disk on what device?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            with fmat_cmd do
+              begin
+                command := format;
+                dev_name := devname
+              end;
+            writeln ('   Beginning format operation...');
+            if report then ClearStack;
+            FS_Utilities (errnum, fmat_cmd);
+            if report then CheckStack;
+
+            if errnum <> 0 then
+              writeln ('   Error formatting on device ', devname, ' = ', errnum:1)
+            else
+              writeln ('   Formatted disk on device ', devname)
+          end;
+
+        writeln
+      end { NewTwiggy };
+
+
+    procedure WriteBootTracks;
+      { procedure to write the boot track information for a volume onto a new
+        disk in the system. }
+
+      var
+        devname : e_name;                          { device to write BTs on }
+        errnum : integer;                          { error return }
+        wbt_cmd : ut_parmt;                        { command for boot tracks }
+
+      begin
+        write ('   Write boot tracks on what device?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            with wbt_cmd do
+              begin
+                wbt_cmd.command := writeBT;
+                dev_name := devname
+              end;
+            writeln ('   Beginning write boot tracks operation...');
+            if report then ClearStack;
+            FS_Utilities (errnum, wbt_cmd);
+            if report then CheckStack;
+            if errnum <> 0 then
+              writeln ('   Error writing boot tracks on device ', devname,
+                       ' = ', errnum:1)
+            else
+              writeln ('   Wrote boot tracks on device ', devname)
+          end;
+
+        writeln
+      end { WriteBootTracks };
+
+
+    procedure ProtectFile;
+      { procedure used to protect a file on a Lisa volume }
+
+      var
+        filename : pathname;                      { file name to kill }
+        errnum : integer;                         { error return }
+        attributes : fs_info;                     { info on listed file }
+        ans : string[10];                         { for verifying protect w/ user }
+
+      begin
+        write ('   Protect what file?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) <> ESC) then
+          begin  { got a file name }
+            Lookup (errnum, filename, attributes);
+            if errnum <> 0 then
+              begin
+                writeln ('   errnum from Lookup for file = ', errnum:1);
+                writeln;
+                exit (ProtectFiles)
+              end
+            else if attributes.protected then
+              begin
+                writeln ('   File is already protected.');
+                writeln;
+                exit (ProtectFile)
+              end
+            else
+              begin  { make sure }
+                write ('   Do you really want to protect this file?  ');
+                readln (ans);
+
+                if (ans <> '') and (ord(ans[1]) = ESC) then
+                  begin
+                    writeln;
+                    exit (ProtectFiles)
+                  end;
+
+                if (ans = 'y') or (ans = 'Y') then
+                  begin  { do it }
+                    if report then ClearStack;
+                    Protect (errnum, filename, true { master }, 0 { 'flowered' });
+                    if report then CheckStack;
+                    if errnum = 0 then
+                      writeln ('   Protected file ', filename)
+                    else
+                      writeln ('   Failed to protect file.  Error = ', errnum:1)
+                  end
+              end { sure }
+          end { got a filename };
+
+        writeln
+      end { ProtectFile };
+
+
+    procedure DumpPage;
+      { procedure to dump a page (in hex) from the specified disk device. }
+
+      var
+        devname : e_name;                          { device to dump from }
+        errnum : integer;                          { error return }
+        page_num : longint;                        { page # to dump }
+        dump_cmd : ut_parmt;                       { command to dump }
+
+      begin
+        write ('   Dump page on what device?  ');
+        readln (devname);
+        if (ord(devname[1]) <> ESC) then
+          begin  { do it }
+            write ('   Dump what page?  ');
+            readln (page_num);
+            if page_num >= 0 then
+              begin
+                writeln;
+                with dump_cmd do
+                  begin
+                    command := dumpdata;
+                    ddev_name := devname;
+                    pagenum := page_num
+                  end;
+
+                if report then ClearStack;
+                FS_Utilities (errnum, dump_cmd);
+                if report then CheckStack;
+
+                if errnum <> 0 then
+                  writeln ('   Error dumping page = ', errnum:1)
+                else
+                  writeln
+              end
+          end { do it};
+
+        writeln
+      end { DumpPage };
+
+
+    begin
+      writeln;
+      prompt := pf1prompt;
+
+      repeat
+        write (prompt);
+        read (cmd);
+        writeln;
+
+        case cmd of
+          'o', 'O' : OnlineVols;
+
+          'e', 'E' : EjectDisk;
+
+          'f', 'F' : F_Disk;
+
+          'i', 'I' : InitVolume;
+
+          'z', 'Z' : ZapVol;
+
+          'n', 'N' : NewTwiggy;
+
+          'w', 'W' : WriteBootTracks;
+
+          'p', 'P' : ProtectFile;
+
+          'd', 'D' : DumpPage;
+
+          '?'      : FlipPrompt (prompt, pf1prompt, pf2prompt)
+        end
+      until (cmd = 'q') or (cmd = 'Q');
+
+     writeln
+    end { PrivFiler };
+
+
+{$s FileSeg }
+  procedure Filer;
+    { procedure to provide commands to perform file system operations on user
+      defined files.  All commands available in this Filer are implemented with
+      calls to the standard file system interface routines. }
+
+
+    const
+      f1prompt = 'Filer: T(rans, L(ist, N(ew, K(ill, R(ename, M(ount, U(nmount, Q(uit, ? ';
+      f2prompt = '       W(orkingDir, newC(atalog, S(afety, D(eleteFiles ';
+
+    var
+      prompt : cmdLine;                            { Filer's command prompt }
+      cmd : char;                                  { Filer's command }
+
+    procedure Transfer;
+      { procedure used by Filer to perform file transfers between UCSD/Monitor
+        volumes and Lisa volumes. }
+
+(*$I-*)   { no ioerror checking }
+
+const pagesize = 512;
+      blocks = 62;
+      maxbuf = 31743;     (* (512*blocks)-1 *)
+
+type byte = -128..127;
+     error = integer;
+
+var page, actual : longint;
+    i, j, blockcount, refnum, io_error, block_num : integer;
+    c:packed array [0:15] of char;
+    val:byte;
+    ecode:error;
+    name, lfilename, filename : pathname;
+    fileid : file;
+    ans : string [1];
+    newlisafile : boolean;
+    access : mset;
+    databuf : array [0..maxbuf] of byte;
+
+procedure Upshift (var name : pathname);
+  { procedure to upshift a file name to all upper case }
+
+  var
+    shiftDiff : integer;                           { upper/lower case difference }
+    i : integer;                                   { for scanning string }
+
+  begin
+    shiftDiff := ord('a') - ord('A');
+
+    for i := 1 to Length (name) do
+      if name[i] in ['a'..'z'] then
+        name[i] := chr(ord(name[i]) - shiftDiff)
+  end { Upshift };
+
+
+procedure mainstuff;
+
+label 2;
+
+
+begin
+  writeln('UCSD to Lisa File System File Transfer Utility  ');
+  access := [dwrite];
+
+  (*  Find out what UCSD file to transfer   *)
+
+  writeln;
+  write ('What Lisa or UCSD file to transfer?  '); readln (filename);
+
+  while filename <> '' do
+  begin
+
+    (*  try to open that file   *)
+
+    reset (fileid, filename);
+    io_error := ioresult;
+    if io_error <> 0 then
+    begin
+      UCSD_IOError (io_error);
+      goto 2;
+    end;
+
+
+    (*  find out the destination file to transfer to in the Lisa file system  *)
+
+    repeat
+      repeat
+        write ('What Lisa file to transfer into?  ');
+        readln (name);
+        if length (name) > 64 then writeln ('Lisa filename is too long.');
+      until length (name) <= 64;
+
+      if (name = '') or (ord(name[1]) = ESC) then
+        begin  { forget it }
+          close (fileid);
+          io_error := ioresult;
+          if io_error <> 0 then UCSD_IOError (io_error);
+          exit (MainStuff)
+        end;
+
+      (*  create the new Lisa file  *)
+
+      newlisafile := true;
+      make_file (ecode, name, 0);   (* create the new file *)
+      if ecode = 890 then
+      begin     (* file already exists, does the user want to write over it? *)
+        write ('Lisa file ',name,' already exists.  Do you want to replace it?  ');
+        readln (ans);
+        if (ans='y') or (ans='Y') then  ecode := 0;
+        newlisafile := false;
+      end
+      else
+      if ecode <> 0 then
+      begin
+        writeln ('Error trying to create Lisa file ', name, ' = ' , ecode:1);
+        goto 2;
+      end;
+    until ecode = 0;
+
+
+    (* open the Lisa file to transfer into     *)
+
+    open (ecode, name, refnum, access);
+    if ecode > 0 then
+    begin
+      writeln ('Error on open for file ',name, ' = ', ecode:1);
+      goto 2;
+    end;
+
+
+    (*  read UCSD file and write to Lisa file until end of file   *)
+    block_num := 0;
+    repeat
+      blockcount := blockread (fileid, databuf, blocks, block_num);
+      io_error := ioresult;
+      if io_error <> 0 then
+        begin
+          UCSD_IOError (io_error);
+          ecode := io_error;
+          blockcount := 0
+        end;
+      if blockcount > 0 then
+      begin
+        block_num := block_num + blockcount;
+        actual := 0;
+        write_data (ecode, refnum, ord(@databuf), 512*blockcount,
+                                                          actual, sequential, 0);
+        if ecode <> 0 then writeln ('Error code ',ecode,' writing to Lisa file.')
+        else if actual=0 then writeln ('Out of disk space writing to Lisa file.');
+      end;
+    until eof(fileid) or (ecode <> 0) or (actual = 0);
+
+
+    (*  close UCSD file   *)
+
+    close (fileid);
+    io_error := ioresult;
+    if io_error <> 0 then UCSD_IOError (io_error);
+
+
+    (*  close Lisa file   *)
+    (*  if writing to an old file, truncate it to the current size, then close it *)
+    if not newlisafile (* was an old file *) then truncate (ecode, refnum);
+    close_object (ecode, refnum);
+    if ecode <> 0 then
+      writeln ('Error on close for file ', name , ' = ', ecode)
+    else
+      begin
+        writeln ('Closed Lisa file called ', name);
+        Upshift (name);
+        if name = 'INTRINSIC.LIB' then
+          begin  { see if user wants auto change }
+            write ('Change INTRINSIC.LIB Directory now?  ');
+            readln (ans);
+            if ord(ans[1]) = ESC then exit (MainStuff);
+            if (ans = 'y') or (ans = 'Y') then
+              begin  { change it }
+                Change_Directory (ecode, false);
+                if ecode <> 0 then
+                  writeln ('Error changing Directory = ', ecode:1)
+                else
+                  begin
+                    writeln ('The Directory has been successfully changed.  Be certain to');
+                    writeln ('transfer any library files that have changed to ensure');
+                    writeln ('consistency with the new INTRINSIC.LIB')
+                  end
+              end
+          end { auto change }
+      end { lisa file successfully closed };
+
+    (*  Find out what UCSD file to transfer   *)
+
+2:  writeln;
+    write ('What Lisa or UCSD file to transfer?  '); readln (filename);
+
+
+  end { while };
+
+end { mainstuff };
+
+
+begin
+  mainstuff;
+  writeln
+end { Transfer };
+
+(*$I+*)   { i/o checking back on }
+
+
+
+    procedure ListFiles;
+      { procedure used by Filer to list the files on a Lisa volume }
+
+      var
+        errnum : integer;                            { error return }
+        e_type : entrytype;                          { type of entry }
+        e_size : longint;                            { size of entry (LEOF) }
+        e_blocks : longint;                          { physical size (PEOF) }
+        e_protect : boolean;                         { protected flag for entry }
+        volname : pathname;                          { volume to list }
+        directory : pathname;                        { path of directory }
+        pname : pathname;                            { pathname for Lookup }
+        null_prefix : e_name;                        { null prefix for GNE }
+        ent_name : e_name;                           { next file name to list }
+        outLine : string[50];                        { for building output line }
+        attributes : fs_info;                        { info on the volume }
+        i : integer;                                 { loop index for blanks }
+        numFiles : integer;                          { total # of files }
+        numBlocks : longint;                         { total # of blocks }
+        qInfo : Q_Info;                              { quick info on the entry }
+
+      procedure GetVolInfo;
+        { procedure used by ListFiles to get desired information about the volume
+          containing the entries being listed. }
+
+        begin
+          { get volume name and directory from path supplied by user }
+          Lookup (errnum, volname, attributes);
+          if errnum <> 0 then
+            begin
+              writeln ('   Error from Lookup of path = ', errnum:1);
+              writeln;
+              exit (ListFiles)
+            end;
+          with attributes do
+            begin
+              if otype = object_t then
+                directory := Concat (dir_path, '-', name)
+              else
+                directory := dir_path;
+
+              dir_path[1] := '+';
+              dir_path := Concat (dir_path, '-')   { sentinel }
+            end;
+          volname := Copy (attributes.dir_path, 1, Pos('-', attributes.dir_path));
+          volname[1] := '-';
+
+          { get volume info }
+          Lookup (errnum, volname, attributes);
+          if errnum <> 0 then
+            begin
+              writeln ('   Error from Lookup of volume = ', errnum:1);
+              writeln;
+              exit (ListFiles)
+            end;
+        end { GetVolInfo };
+
+      procedure GetInfo (var errnum : integer;   var pname : pathname;
+                         var e_type : entrytype;  var e_size : longint;
+                         var e_blocks : longint;  var e_protect : boolean);
+        { procedure used by ListFiles to get desired catalog information about
+          the entries being listed. }
+
+        var
+          attributes : fs_info;                      { info on the entry }
+
+        begin
+            Lookup (errnum, pname, attributes);
+
+            with attributes do
+              begin
+                e_type := etype;
+                e_size := size;
+                e_blocks := psize;
+                e_protect := protected
+              end;
+        end { GetInfo };
+
+      function Listing : boolean;
+        { function to determine whether catalog listing should continue. }
+
+        var
+          key_event : KeyEvent;                      { for stopping listing }
+          cmd : char;                                { for clearing readln }
+
+        begin
+          Listing := true;
+          if not AltKeyPeek (true, 1, key_event) then exit (Listing);
+
+          writeln;
+          read (cmd);
+          if ord(cmd) = ESC then Listing := false
+        end { Listing };
+
+      begin  { ListFiles }
+        null_prefix := '';
+        write ('   List files on what volume?  ');
+        readln (volname);
+        if (volname <> '') and (ord(volname[1]) = ESC) then
+          begin
+            writeln;
+            exit (ListFiles)
+          end;
+
+        if volname = '' then
+          begin
+            Get_Working_Dir (errnum, volname);
+            if errnum <> 0 then
+              begin
+                writeln ('   Error getting working directory = ', errnum:1);
+                exit (ListFiles)
+              end
+          end;
+
+        Reset_Catalog (errnum, volname);
+        if errnum <> 0 then
+          writeln ('   Error resetting catalog = ', errnum:1)
+        else
+          begin  { list catalog }
+            GetVolInfo;
+            writeln ('   Contents of ', directory, ' :');
+            writeln ('      name', 'type':38, 'size':12, 'blocks':13,
+                     'protected':13);
+            writeln;
+
+            numFiles := 0;   numBlocks := 0;
+            while (errnum = 0) and Listing do
+              begin
+                if report then
+                  Get_Next_Entry (errnum, null_prefix, ent_name)
+                else
+                  begin
+                    Lookup_Next_Entry(errnum, null_prefix, qInfo);
+                    ent_name := qInfo.name
+                  end;
+                if (errnum > 0) and (errnum <> 848 { EOF }) then
+                  writeln ('   unexpected errnum from GNE = ', errnum:1)
+                else if errnum = 0 then
+                  begin  { got entry ok }
+                    pname := Concat (directory, '-', ent_name);
+                    if report then
+                      GetInfo (errnum, pname, e_type, e_size, e_blocks, e_protect)
+                    else
+                      with qInfo do
+                        begin
+                          e_type := etype;
+                          e_size := size;
+                          e_blocks := psize;
+                          e_protect := protected
+                        end;
+
+                   if errnum <> 0 then
+                      writeln ('   errnum from Lookup after GNE = ', errnum:1)
+                    else
+                      begin
+                        outLine := Concat ('      ', ent_name);
+                        for i := Length(ent_name)+1 to Sizeof(e_name) do
+                          outLine := Concat (outLine, ' ');
+
+                        if e_type = catentry then write (outLine, '   catalog')
+                        else
+                          begin  { entry is an object }
+                            write (outLine, '          ', e_size:10,
+                                   e_blocks DIV attributes.datasize:11);
+
+                            if e_protect then write ('      protected');
+
+                            numFiles := numFiles + 1;
+                            numBlocks := numBlocks +
+                                           e_blocks DIV attributes.datasize
+                          end;
+                        writeln
+                      end
+                  end { got entry }
+              end { catalog scan };
+
+            writeln;
+            writeln ('   total # files = ', numFiles:1,
+                     '          # blocks used = ', numBlocks:1);
+            with attributes do
+              writeln ('   ', freecount:1, ' blocks free out of ', vol_size:1);
+            writeln
+          end;
+
+        writeln
+      end { ListFiles };
+
+
+    procedure MakeFile;
+      { procedure used by Filer to make a new file on a Lisa volume }
+
+      var
+        filename : pathname;                        { name of new file }
+        errnum : integer;                           { error return }
+
+      begin
+        write ('   New file name?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) <> ESC) then
+          begin
+            if report then ClearStack;
+            Make_File (errnum, filename, 0);
+            if report then CheckStack;
+            if errnum = 0 then
+              writeln ('   Created file ', filename)
+            else
+              writeln ('   Failed to create file.  Error = ', errnum:1)
+          end;
+        writeln
+      end { MakeFile };
+
+
+    procedure KillFile;
+      { procedure used by Filer to kill a file on a Lisa volume }
+
+      var
+        filename : pathname;                      { file name to kill }
+        errnum : integer;                         { error return }
+
+      begin
+        write ('   Kill what file?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) <> ESC) then
+          begin
+            if report then ClearStack;
+            Kill_Object (errnum, filename);
+            if report then CheckStack;
+            if errnum = 0 then
+              writeln ('   Killed file ', filename)
+            else
+              writeln ('   Failed to kill file.  Error = ', errnum:1)
+          end;
+        writeln
+      end { KillFile };
+
+
+    procedure RenameFile;
+      { procedure used by Filer to rename a Lisa file }
+
+      var
+        filename : pathname;                      { file name to rename }
+        newname : e_name;                         { new name of file }
+        errnum : integer;                         { error return }
+
+      begin
+        write ('   Rename what file?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) <> ESC) then
+          begin
+            write ('   New name?  ');
+            readln (newname);
+            if (newname <> '') and (ord(newname[1]) <> ESC) then
+              begin
+                if report then ClearStack;
+                Rename_Entry (errnum, filename, newname);
+                if report then CheckStack;
+                if errnum = 0 then
+                  writeln ('   Renamed file ', filename, ' to ', newname)
+                else
+                  writeln ('   Failed to rename file.  Error = ', errnum:1)
+              end
+          end;
+
+        writeln
+      end { RenameFile };
+
+
+    procedure MountVolume;
+      { procedure used by Filer to mount a Lisa volume }
+
+      var
+        devname : e_name;                         { device to mount on }
+        volname : e_name;                         { volume mounted }
+        errnum : integer;                         { error return }
+        password : e_name;                        { password of vol mounted }
+
+      begin
+        write ('   Mount what device?  ');
+        readln (devname);
+        if (devname <> '') and (ord(devname[1]) <> ESC) then
+          begin
+            if report then ClearStack;
+            Mount (errnum, volname, password, devname);
+            if report then CheckStack;
+
+            if errnum > 0 then
+              begin
+                write ('   Failed to mount volume on device ', devname);
+                writeln ('.  Error = ', errnum:1)
+              end
+            else
+              begin  { mounted volume }
+                writeln ('   Mounted volume ', volname);
+                case errnum of
+          -1174 : begin
+                    write ('   WARNING: volume was left mounted when system ');
+                    writeln ('last crashed.')
+                  end;
+          -1175 : writeln ('   WARNING: volume has been scavenged ');
+                end { case }
+              end {mounted volume }
+          end;
+
+        writeln
+      end { MountVolume };
+
+
+    procedure UnmountVolume;
+      { procedure used by Filer to unmount a Lisa volume }
+
+      var
+        volname : e_name;                         { volume to unmount }
+        errnum : integer;                         { error return }
+
+      begin
+        write ('   Unmount what volume?  ');
+        readln (volname);
+        if (volname <> '') and (ord(volname[1]) <> ESC) then
+          begin
+            if report then ClearStack;
+            Unmount (errnum, volname);
+            if report then CheckStack;
+            if errnum = 0 then
+              writeln ('   Unmounted volume ', volname)
+            else
+              begin
+                write ('   Failed to unmount volume ', volname);
+                writeln ('.  Error = ', errnum:1)
+              end
+          end;
+        writeln
+      end { UnmountVolume };
+
+
+    procedure WorkingDir;
+      { procedure used by Filer to get the current working directory and set a
+        new working directory if the user wants to }
+
+      var
+        wd : pathname;                           { working directory name }
+        errnum : integer;                        { error return }
+
+      begin
+        Get_Working_Dir (errnum, wd);
+        if errnum <> 0 then
+          writeln ('   Error getting working directory = ', errnum:1)
+        else
+          begin
+            writeln ('   Current working directory is ', wd);
+            write ('   New working directory?  ');
+            readln (wd);
+            if (wd <> '') and (ord(wd[1]) <> ESC) then
+              begin
+                Set_Working_Dir (errnum, wd);
+                if errnum = 0 then
+                  writeln ('   New working directory is ', wd)
+                else
+                  writeln ('   Error setting working directory = ', errnum:1)
+              end
+          end;
+        writeln
+      end { WorkingDir };
+
+
+    procedure MakeCatalog;
+      { procedure used by Filer to make a new catalog on a Lisa volume }
+
+      var
+        catname : pathname;                         { name of new catalog }
+        errnum : integer;                           { error return }
+
+      begin
+        write ('   New catalog name?  ');
+        readln (catname);
+        if (catname <> '') and (ord(catname[1]) <> ESC) then
+          begin
+            if report then ClearStack;
+            Make_Catalog (errnum, catname, 0);
+            if report then CheckStack;
+            if errnum = 0 then
+              writeln ('   Created catalog ', catname)
+            else
+              writeln ('   Failed to create catalog.  Error = ', errnum:1)
+          end;
+        writeln
+      end { MakeCatalog };
+
+
+    procedure SetSafety;
+      { procedure to turn the safety switch of a file on or off. }
+
+      var
+        filename : pathname;                        { name of file to set }
+        errnum : integer;                           { error return }
+        ans : char;                                 { answer to prompt }
+        on_off : boolean;                           { true if switch should be on }
+
+      begin
+        write ('   Set safety switch for what file?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) <> ESC) then
+          begin
+            write ('   Set switch on? (off is default) ');
+            readln (ans);
+            if (ans = 'y') or (ans = 'Y') then on_off := true
+              else on_off := false;
+
+            if ord(ans) <> ESC then
+              begin
+                Set_Safety (errnum, filename, on_off);
+                if errnum <> 0 then
+                  writeln ('   Error setting safety switch for file ', filename,
+                           ' = ', errnum)
+                else if on_off then
+                  writeln ('   Safety switch for file ', filename, ' is on')
+                else
+                  writeln ('   Safety switch for file ', filename, ' is off')
+              end
+          end;
+
+        writeln
+      end { SetSafety };
+
+
+    procedure DeleteFiles;
+      { procedure to do a 'wild card' kill on files in a Lisa OS directory.
+        The user is prompted with the name of each file in the directory to be
+        delted or saved. }
+
+      var
+        errnum : integer;
+        filename : pathname;
+        c : char;
+        prefix : e_name;
+        entry : e_name;
+        ufile : pathname;
+
+      begin
+        write ('   Delete files in which catalog?  ');
+        readln (filename);
+        if (filename <> '') and (ord(filename[1]) = ESC) then
+          begin
+            writeln;
+            exit (DeleteFiles)
+          end;
+        if filename = '' then Get_Working_Dir (errnum, filename);
+        write ('   Use what prefix name?  ');
+        readln (prefix);
+        if (prefix <> '') and (ord(prefix[1]) = ESC) then
+          begin
+            writeln;
+            exit (Deletefiles)
+          end;
+
+        Reset_Catalog (errnum, filename);
+        if errnum = 0 then
+        repeat
+          Get_Next_Entry (errnum, prefix, entry);
+          if errnum = 0 then
+            begin  { got an entry }
+              write ('   Delete file named ',entry,'?  ');
+              read (c); writeln; if eoln then readln;  (* clears eoln *)
+              if ord(c) = ESC then
+                begin
+                  writeln;
+                  exit (DeleteFiles)
+                end;
+
+              if (c = 'Y') or (c = 'y') then
+                begin
+                  ufile := concat (filename,'-',entry);
+                  kill_object (errnum, ufile);
+                  if errnum = 0 then writeln ('   File ', ufile,' deleted.')
+                  else
+                    writeln ('   Can''t kill file.  Error = ', errnum:1);
+                end;
+           end { got an entry }
+        until errnum <> 0
+        else writeln ('   Error using pathname ''', filename, ''' = ', errnum:1);
+
+        writeln
+      end { DeleteFiles };
+
+    begin  { Filer }
+      writeln;
+      prompt := f1prompt;
+
+      repeat
+        write (prompt);
+        read (cmd);
+        writeln;
+
+        case cmd of
+          't', 'T' : Transfer;
+
+          'l', 'L' : ListFiles;
+
+          'n', 'N' : MakeFile;
+
+          'k', 'K' : KillFile;
+
+          'r', 'R' : RenameFile;
+
+          'm', 'M' : MountVolume;
+
+          'u', 'U' : UnmountVolume;
+
+          'w', 'W' : WorkingDir;
+
+          'c', 'C' : MakeCatalog;
+
+          's', 'S' : SetSafety;
+
+          'd', 'D' : DeleteFiles;
+
+          '?'      : FlipPrompt (prompt, f1prompt, f2prompt)
+        end;
+
+        Flush_FileSys
+      until (cmd = 'q') or (cmd = 'Q');
+
+      writeln
+    end { Filer };
+
+
+{$s          }
+  procedure DoDateTime;
+    { procedure to display the current date/time setting and change it if the
+      user wants to. }
+
+    const
+      minMonth = 1;
+      maxMonth = 12;
+      minDay = 1;
+      maxDay = 31;
+      minYear = 0;
+      maxYear = 99;
+      minHour = 0;
+      maxHour = 23;
+      minMinute = 0;
+      maxMinute = 59;
+      minSecond = 0;
+      maxSecond = 59;
+
+    type
+      monthRange = minMonth..maxMonth;
+
+      dayRange = minDay..maxDay;
+
+      yearRange = minYear..maxYear;
+
+      monthName = string[15];
+
+      JdateRange = 0..366;
+
+      dateRec = record
+                  monthNum : monthRange;
+                  dayNum : dayRange;
+                  yearNum : yearRange
+                end;
+
+      monthRec = record
+                   name : monthName;
+                   numDays : dayRange
+                 end;
+
+      string80 = string[80];
+
+    var
+      monthInfo : array[monthRange] of monthRec;   { info on months}
+      currentDT : time_rec;                        { current date/time }
+      newDT : time_rec;                            { new date/time }
+      errnum : integer;                            { error return for time calls }
+      today : dateRec;                             { date form of current D/T }
+      newday : dateRec;                            { date form of new D/T }
+      dateString : string80;                       { string form of new date }
+      timeString : string80;                       { string form of new time }
+      token : integer;                             { for parsing input strings }
+      stupid : JdateRange;                         { for the beloved compiler }
+
+
+    procedure InitMonthInfo;
+      { procedure to set up month information table }
+
+      var
+        i : monthRange;                            { for setting up month info }
+
+      begin
+        for i := 1 to 12 do
+          with monthInfo[i] do
+            case i of
+               1 : begin
+                      name := 'January';
+                      numDays := 31
+                    end;
+
+               2 : begin
+                      name := 'February';
+                      numDays := 28
+                    end;
+
+               3 : begin
+                      name := 'March';
+                      numDays := 31
+                    end;
+
+               4 : begin
+                      name := 'April';
+                      numDays := 30
+                    end;
+
+               5 : begin
+                      name := 'May';
+                      numDays := 31
+                    end;
+
+               6 : begin
+                      name := 'June';
+                      numDays := 30
+                    end;
+
+               7 : begin
+                      name := 'July';
+                      numDays := 31
+                    end;
+
+               8 : begin
+                      name := 'August';
+                      numDays := 31
+                    end;
+
+               9 : begin
+                      name := 'September';
+                      numDays := 30
+                    end;
+
+              10 : begin
+                      name := 'October';
+                      numDays := 31
+                    end;
+
+              11 : begin
+                      name := 'November';
+                      numDays := 30
+                    end;
+
+              12 : begin
+                      name := 'December';
+                      numDays := 31
+                    end
+            end { case }
+      end { InitMonthInfo };
+
+
+    procedure DaytoDate (day : JdateRange;  var date : dateRec);
+      { procedure to convert from Julian date to conventional date for
+        displaying. }
+
+      var
+        tDay : JDateRange;                         { local copy of day }
+
+      begin
+
+        with date do
+          begin
+            monthNum := 1;   tDay := day;
+
+            if yearNum MOD 4 = 0 then monthInfo[2].numDays := 29;
+            while tDay > monthInfo[monthNum].numDays do
+              begin
+                tDay := tDay - monthInfo[monthNum].numDays;
+                monthNum := monthNum + 1
+              end;
+
+            dayNum := tDay
+          end { with date };
+
+        monthInfo[2].numDays := 28
+      end { DaytoDate };
+
+    procedure DatetoDay (date : dateRec;  var day : JdateRange);
+      { procedure to convert from conventional date to Julian date. }
+
+      var
+        i : monthRange;                            { for setting up month info }
+
+      begin
+        i := 1;   day := 0;
+
+        with date do
+          begin
+            if yearNum MOD 4 = 0 then monthInfo[2].numDays := 29;
+            while i < monthNum do
+              begin
+                day := day + monthInfo[i].numDays;
+                i := i + 1
+              end;
+
+            day := day + dayNum
+          end { with date };
+
+        monthInfo[2].numDays := 28
+      end { DatetoDay };
+
+
+    procedure StrtoInt (str : string80;  var int : longint);
+      { routine to convert a string to an integer.  The compiler does not
+        provide facilities to accomplish this. }
+
+      var
+        i : integer;
+        power : longint;
+        stop : 1..2;
+        digit : integer;
+
+      begin
+        if str[1] = '-' then stop := 2
+          else stop := 1;
+
+        int := 0;   power := 1;
+        for i := Length (str) downto stop do
+          begin
+            digit := ord(str[i]) - ord('0');
+            int := int + digit * power;
+            if (digit < 0) or (digit > 9) then
+              begin  { a bad string }
+                int := 32767;   { overflow, sort of }
+                exit (StrtoInt)
+              end;
+            power := power * 10
+          end;
+
+        if str[1] = '-' then int := -int
+      end { StrtoInt };
+
+
+    procedure GetToken (var inString : string80;  delim : string80;
+                        var token : integer;  minVal, maxVal : integer);
+      { procedure to get the next 'token' from the input string for building
+        up dates and times.  If the next token is invalid (i.e. isn't in the
+        specified range, the command is aborted. }
+
+      var
+        numString : string80;                      { local string copy of token }
+        num : longint;                             { local numeric copy of token }
+        tokenLength : integer;                     { string length of token }
+
+      begin
+        if inString = '' then token := -1   { take default }
+        else
+          begin  { get the token }
+            tokenLength := Pos (delim, inString) - 1;
+            if tokenLength <= 0 then tokenLength := Length (inString);
+            numString := Copy (inString, 1, tokenLength);
+            Delete (inString, 1, tokenLength + 1);
+            StrtoInt (numString, num);
+            if (num >= minVal) and (num <= maxVal) then
+              token := num
+            else
+              begin  { got a bad token }
+                if delim = '/' then
+                  writeln ('   Invalid date specified')
+                else
+                  writeln ('   Invalid time specified');
+                writeln;
+                exit (DoDateTime)
+              end
+          end { get the token }
+      end { GetToken };
+
+
+    begin  { DoDateTime }
+      InitMonthInfo;
+
+      { report the current date/time }
+      if report then ClearStack;
+      Get_Time (errnum, currentDT);
+      if report then CheckStack;
+      if errnum <> 0 then
+        begin  { shouldn't happen }
+          writeln ('   Error from Get_Time = ', errnum:1);
+          writeln;
+          exit (DoDateTime)
+        end;
+
+      with currentDT do
+        begin
+          today.yearNum := year MOD 100;   { only the last 2 digits }
+          DaytoDate (day, today);
+          write ('   Current date/time is:   ');
+          with today do
+            write (monthInfo[monthNum].name, ' ', dayNum:2, ', ', year:4, '  -  ');
+          if hour < 10 then write ('0');
+          write (hour:1, ':');
+          if minute < 10 then write ('0');
+          write (minute:1, ':');
+          if second < 10 then write ('0');
+          writeln (second:1)
+        end;
+
+      { make a date change, if desired }
+      write ('   New date (e.g. 4/15/82)?  ');
+      readln (dateString);
+      if (dateString <> '') and (ord(dateString[1]) = ESC) then
+        begin
+          writeln;
+          exit (DoDateTime)
+        end;
+
+      if dateString <> '' then
+        begin  { change the date }
+          { get the date/time again in case user took a long time to respond }
+          Get_Time (errnum, currentDT);
+          if errnum <> 0 then
+            begin  { shouldn't happen }
+              writeln ('   Error from Get_Time = ', errnum:1);
+              writeln;
+              exit (DoDateTime)
+            end;
+          with currentDT do
+            begin
+              today.yearNum := year MOD 100;   { only the last 2 digits }
+              DaytoDate (day, today)
+            end;
+
+          with newday do
+            begin
+              GetToken (dateString, '/', token, minMonth, maxMonth);
+              if token <> -1 then monthNum := token
+                else monthNum := today.monthNum;
+              GetToken (dateString, '/', token, minDay, maxDay);
+              if token <> -1 then dayNum := token
+                else dayNum := today.dayNum;
+              GetToken (dateString, '/', token, minYear, maxYear);
+              if token <> -1 then yearNum := token
+                else yearNum := today.yearNum
+            end;
+
+          newDT := currentDT;
+          with newDT do
+            begin
+              year := 1900 + newday.yearNum;
+              DatetoDay (newday, stupid);
+              day := stupid
+            end;
+
+          if report then ClearStack;
+          Set_Time (errnum, newDT);
+          if report then CheckStack;
+          if errnum <> 0 then
+            writeln ('   Error setting new date = ', errnum:1)
+        end { change the date };
+
+      { make a time change, if desired }
+      write ('   New time (e.g. 13:43:07)?  ');
+      readln (timeString);
+      if (timeString <> '') and (ord(timeString[1]) = ESC) then
+        begin
+          writeln;
+          exit (DoDateTime)
+        end;
+
+      if timeString <> '' then
+        begin  { change the time }
+          { get the date/time again in case user took a long time to respond }
+          Get_Time (errnum, newDT);
+          if errnum <> 0 then
+            begin  { shouldn't happen }
+              writeln ('   Error from Get_Time = ', errnum:1);
+              writeln;
+              exit (DoDateTime)
+            end;
+
+          with newDT do
+            begin
+              GetToken (timeString, ':', token, minHour, maxHour);
+              if token <> -1 then hour := token;
+              GetToken (timeString, ':', token, minMinute, maxMinute);
+              if token <> -1 then minute := token;
+              GetToken (timeString, ':', token, minSecond, maxSecond);
+              if token <> -1 then second := token
+            end;
+
+
+          Set_Time (errnum, newDT);
+          if errnum <> 0 then
+            writeln ('   Error setting new date = ', errnum:1)
+        end { change the time };
+
+      writeln
+    end { DoDateTime };
+
+
+  procedure LibraryChange;
+    { procedure to change the Directory in memory to the current copy of
+      INTRINSIC.LIB on disk. }
+
+    var
+      errnum : integer;                      { error return for Change_Directory }
+      ans : char;                            { for verifying file transferred }
+
+    begin
+      writeln;
+      write ('   Has the new INTRINSIC.LIB been transferred to the OS volume?  ');
+      readln (ans);
+
+      if ord(ans) = ESC then
+        begin
+          writeln;
+          exit (LibraryChange)
+        end;
+
+      if (ans <> 'y') and (ans <> 'Y') then
+        writeln ('   Please transfer INTRINSIC.LIB before using this command.')
+      else
+        begin
+          if report then ClearStack;
+          Change_Directory (errnum, false);
+          if report then CheckStack;
+          if errnum <> 0 then
+            writeln ('Error changing Directory = ', errnum:1)
+          else
+            begin
+              writeln ('The Directory has been successfully changed.  Be certain to');
+              writeln ('transfer any library files that have changed to ensure');
+              writeln ('consistency with the new INTRINSIC.LIB')
+            end
+        end;
+
+      writeln
+    end { LibraryChange };
+
+
+  procedure PowerOff;
+    { procedure to perform the power down operation. }
+
+    var
+      errnum : integer;                      { error return }
+      ans : string[10];                      { for verifying power off w/ user }
+
+    begin
+      writeln;
+      write ('   WARNING: Do you really want to turn off Lisa?  ');
+      readln (ans);
+
+      if (ans = 'y') or (ans = 'Y') then
+        begin  { really do it }
+          term_event[1] := 4;   { signals power off intention }
+          exit (Shell)
+        end;
+
+      writeln
+    end { PowerOff };
+
+
+  procedure Quit;
+    { procedure to quit the Shell and either cause a new one to be created, or
+      shut down the operating system and reset Lisa (to return to the Monitor). }
+
+    var
+      errnum : integer;                      { error return }
+      ans : string[10];                      { for verifying quitting w/ user }
+
+    begin
+      writeln;
+      write ('   Do you want to re-start the Shell?  ');
+      readln (ans);
+
+      if (ans <> '') and (ord(ans[1]) = ESC) then
+        begin
+          writeln;
+          exit (Quit)
+        end;
+
+      if (ans <> 'y') and (ans <> 'Y') then
+        begin  { don't restart Shell - run Selector Shell or reset machine }
+          term_event[1] := 5;
+          write ('   Do you want to run the Selector Shell?  ');
+          readln (ans);
+          if (ans = 'y') or (ans = 'Y') then
+            begin
+              term_event[1] := 2;
+              write ('   Do you want to go to lunch?  ');
+              readln
+            end
+        end;
+
+      Kill_Process (errnum, My_Id);   { for testing Kill_Process }
+      if errnum <> 0 then
+        writeln ('   Error killing Shell = ', errnum:1);
+
+      writeln
+    end { Quit };
+
+
+  begin  { Shell }
+    Initialize;
+    writeln;   writeln;   writeln;
+    writeln (versMsg);
+    writeln;
+
+    while true do { forever }
+      begin
+        write (prompt);
+        read (cmd);
+        writeln;
+
+        case cmd of
+          'x', 'X' : ExecuteProgram (false);
+
+          'd', 'D' : ExecuteProgram (true);
+
+          'f', 'F' : Filer;
+
+          'p', 'P' : PrivFiler;
+
+          't', 'T' : DoDateTime;
+
+          'l', 'L' : LibraryChange;
+
+          'v', 'V' : ListVersions;
+
+          'o', 'O' : PowerOff;
+
+          'q', 'Q' : Quit;
+
+          '"'      : report := not report;   { secret toggle }
+
+          otherwise  if ExecFlag then
+                       ExecReset (error, execFile, true { close })
+        end
+      end { command loop }
+  end { Shell }.
+
+
+ÿ

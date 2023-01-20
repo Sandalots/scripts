@@ -1,0 +1,331 @@
+;-----------------------------------------------------------------------------;
+;                                                                             ;
+;               Copyright 1983, 1984, Apple Computer Inc.                     ;
+;                                                                             ;
+;-----------------------------------------------------------------------------;
+
+        .proc   nmi,0
+        .def    init_nmi_trapv
+        .def    macsbug
+        .def    pmacsbug
+
+        .ref    exit_syscall
+        .ref    enter_scheduler
+;       .ref    nmi_excep
+        .ref    system_error
+        .ref    pe_event
+        .ref    NMISync
+
+        .include source/pascaldefs.text
+
+;
+; low memory locations used by this module
+;
+nmivector       .equ    $7c     ; nmi vector
+enter_macsbug   .equ    $234    ; contains jmp macsbug
+adrlisabug      .equ    $236    ; low memory address for saving lisabug
+                                ; entry point address
+regdisplay      .equ    $23a    ; low memory address for telling macsbug
+                                ; the register display format -
+                                ; 0 for bus error, 1 for other, 2 for current registers
+                                ; $23c contains pointer to saved registers
+
+statusreg       .equ    iommu+$f800             ; status register
+memeradr        .equ    iommu+$f000             ; memory error address latch
+;via2bas         .equ    iommu+$d181
+;reg15           .equ    30                      ; cops ora/ira 15
+;ifr             .equ    iommu+$d19b             ; cops interrupt flag register
+
+bsofterr        .equ    0                       ; bit of soft error
+bharderr        .equ    1                       ; bit of hard error
+bca1            .equ    1                       ; bit of ca1
+
+regs_s          .equ    15*4                    ; registers saved size
+
+; parity error constants
+;
+disabhpe        .equ    iommu+$e01c             ; disable hard pe detection
+enabhpe         .equ    iommu+$e01e             ; enable hard pe detection
+
+disabspe        .equ    iommu+$e014             ; disable soft pe detection
+enabspe         .equ    iommu+$e016             ; enable soft pe detection
+
+pe_mask1        .equ    $fffe                   ; mask to extract normal pe addr
+pe_mask2        .equ    $fc00                   ; mask to extract video pe addr
+
+srch1sz         .equ    64                      ; bytes to test(normal access pe)
+srch2sz         .equ    32768                   ; bytes to test(video access pe)
+pe_sr           .equ    60                      ; bytes from a7 to SR at pe time
+
+                .MACRO  CLRHPE                  ; clear hard parity error
+                tst.b   disabhpe                ; disable hard pe detection
+                tst.b   enabhpe                 ; enable hard pe detection
+                .ENDM
+
+                .MACRO  CLRSPE                  ; clear soft parity error
+                tst.b   disabspe                ; disable soft pe detection
+                tst.b   enabspe                 ; enable soft pe detection
+                .ENDM
+
+;
+; nmi handler
+;
+nmi_handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save registers
+        move.l  sglobal,a0
+        move.l  sysa5(a0),a5            ; set up system a5
+        jsr     NMISync                 ; let HWINT know we are here
+        move.w  statusreg,d7
+        btst    #bharderr,d7            ; hard error set ?
+        beq     parityerr               ; yes
+;
+; no parity error, see if from nmi key
+;
+nmikey
+        .IF     DEBUG
+        movem.l (sp)+,d0-d7/a0-a6       ; then, to RTE
+        bra     lisabugentry            ; go to macsbug, and it will return to user
+        .ENDC
+
+        movem.l (sp)+,d0-d7/a0-a6       ; if production system, nop
+        rte
+
+
+
+;
+; parity error handling
+;
+parityerr
+;       contents of status reg in d7
+        move.l  sglobal,a4
+        clr.l   d1
+        move.w  memeradr,d1            ; get addr of pe from hardware latch
+        move.b  pe_phase(a4),d0        ; get phase of parity error handling
+        bne     pe_again               ; jmp if secondary parity error
+;
+;       initial entry to parity error handling routine
+        move.b  #1,pe_phase(a4)        ; set phase of handling = 1
+        move.l  d1,d2
+        andi.w  #pe_mask1,d1           ; extract address
+        eor.w   d1,d2                  ; extract access mode at time of pe
+        beq     pe_norm                ; jmp if pe during normal access
+;
+;       pe during video access - address in hardware latch partially invalid
+;       search major part of memory for bad location
+;
+        andi.w  #pe_mask2,d1           ; extract valid part of address
+        move.w  d1,pe_loc1(a4)         ; save original bad location
+        moveq   #14,d2                 ; shift count
+        asl.l   d2,d1                  ; adjust to byte addr
+        move.l  d1,a1
+        move.l  #srch2sz,d0            ; length of search for pe
+        move.b  #1,pe_access(a4)       ; error is during video access
+        bra     pe_find                ; go find location with pe
+;
+;       pe during normal access - address in bad_loc1 is valid
+;       search memory in restricted range for bad location
+;
+pe_norm move.w  d1,pe_loc1(a4)         ; save original bad location
+        asl.l   #5,d1                  ; adjust to byte addr
+        move.l  d1,a1
+        move.l  #srch1sz,d0            ; length of search for pe
+        move.b  #2,pe_access(a4)       ; error is during normal access
+;
+pe_find btst    #bsofterr,d7           ; test soft pe indicator
+        bne     @1                     ; go find hard pe
+;
+;       soft pe
+        clrspe                         ; clear soft pe indicator in status reg
+        moveq   #1,d1                  ; pe type = hardware corrected soft pe
+        bra     pe_rec2                ; go record pe
+;
+;       hard pe
+@1      suba.l  membase(a4),a1         ; relative to physical memory base
+        adda.l  #realmmu,a1            ; starting addr for search
+        move.l  a1,a2
+        adda.l  d0,a2                  ; ending addr for search
+;
+        move.b  #2,pe_phase(a4)        ; start of phase 2
+        clrhpe                         ; clear hard pe indicator in status reg
+;
+;       loop thru address range attempting to locate word with pe
+;
+pe_loop move.l  a1,pe_loc2(a4)         ; addr to be tested
+        move.w  (a1),d5                ; access location
+        nop
+        cmpi.b  #2,pe_phase(a4)        ; still in phase 2?
+        bne     pe_found               ; jmp if no
+        addq.l  #2,a1                  ; bump test addr
+        cmp.l   a1,a2                  ; at end?
+        bne     pe_loop                ; jmp if no
+;
+;       unlocated hard pe
+        moveq   #4,d1                  ; pe type = unlocatable hard pe
+        suba.l  d0,a1                  ; recalculate original starting address
+        bra     pe_rec1                ; go record pe
+;
+;       located hard pe
+pe_found
+        clrhpe                         ; clear hard pe indicator in status reg
+;
+        move.b  #3,pe_phase(a4)        ; start of phase 3
+        move.w  d5,(a1)                ; store in location with pe
+        move.w  (a1),d5                ; access location again
+        nop
+        moveq   #2,d1                  ; assume pe type = correctable hard pe
+        cmpi.b  #3,pe_phase(a4)        ; still in phase 3?
+        beq     pe_rec1                ; go record pe
+;
+;       uncorrectable parity error
+        clrhpe                         ; clear hard pe indicator in status reg
+        moveq   #3,d1                  ; pe type = uncorrected hard pe
+;
+;       record parity error
+;       a1 contains the bad location mapped into REALMMU address space
+;       convert to absolute physical address
+pe_rec1 suba.l  #realmmu,a1
+        adda.l  membase(a4),a1         ; a1 = absolute physical address
+;
+;       a1 contains physical address of bad location
+pe_rec2 move.l  sysa5(a4),a5           ; setup a5 for call to pascal routine
+        move.w  pe_sr(sp),d0           ; get SR at time of pe
+        asr.w   #5,d0                  ; shift supv bit to boolean position
+        move.w  pe_access(a4),-(sp)    ; pe_access and pe_phase
+        move.w  d1,-(sp)               ; pe type
+        move.l  a1,-(sp)               ; pe address
+        move.w  d0,-(sp)               ; pe_onsupvstk
+        jsr     pe_event               ; call PE_EVENT
+        move.b  #0,pe_access(a4)       ; clear access field
+        move.b  #0,pe_phase(a4)        ; clear phase field
+        movem.l (sp)+,d0-d7/a0-a6      ; restore registers
+        jsr     enter_scheduler
+;
+;       secondary parity error has occurred
+pe_again
+        cmpi.b  #2,pe_access(a4)       ; original pe from normal access?
+        beq     @1                     ; jump if yes
+;
+;       original pe from video access
+        andi.w  #pe_mask2,d1           ; extract valid address bits
+        bra     @2
+;
+;       original pe from normal access
+@1      andi.w  #pe_mask1,d1           ; extract valid address bits
+;
+@2      cmp.w   pe_loc1(a4),d1         ; current pe = original pe?
+        beq     @3                     ; jump if yes
+;
+;       secondary pe not one we are looking for - ignore it
+        clrhpe                         ; clear hard pe detection in status reg
+        bra     @4
+;
+;       secondary pe is one we are looking for
+@3      addi.b  #1,pe_phase(a4)        ; bump the handling phase
+;
+@4      movem.l (sp)+,d0-d7/a0-a6      ; restore registers
+        rte                            ; return
+
+;
+; power failure occurs  - for genuine power failure handler
+;
+powerfail
+;       move.w  #6,-(sp)
+;       jsr     system_error
+;       bra     loopp
+
+
+
+init_nmi_trapv
+        move.w  #$4ef9,enter_macsbug             ; set up jmp inst
+        move.l  nmivector,adrlisabug            ; save the lisabug entry point
+        lea     nmi_handler,a1
+        move.l  a1,nmivector                    ; install the real nmi handler
+        rts
+
+
+
+
+;
+; system call procedure prog_nmi_key (var errnum : integer;
+;                                     keycode : integer);
+;
+
+;prog_nmi_key
+;   has to call setNMI now - in HWINT unit
+;        unlk    a6
+;        move.l  (SP)+,a0        ; return pc
+;        addq    #6,SP           ; pop the parameters to this call
+;        jmp     (a0)
+
+
+
+macsbug
+;
+; This routine will trap to macsbug.  It can be called from user state or
+; supervisor state.  Trap 7 is used for user state entry.
+; This routine should not destroy any registers.
+; It sets up $238 to display current registers first.
+;
+        move.w  #2,regdisplay   ; so macsbug can display all current registers
+
+pmacsbug
+;
+; Alternate macsbug entry point, $238, $23a must be set up by caller : the
+; register display format and pointer to saved registers.
+;
+
+        move.l  d0,-(sp)        ; save d0 on user stack
+        move.w  sr,d0           ; in supervisor state?
+        btst    #13,d0
+        bne     supstate
+
+userstate                       ; caller IS in user state
+        move.l  a0,-(sp)        ; save a0 on user stack
+        lea     @1,a0           ; return addr for trap 7
+        ori.w   #$2000,d0       ; set sup. bit to get on supervisor stack
+        trap    #7              ;
+@1
+;
+; Now we are on supervisor stack
+;
+        clr.l   -(sp)           ; reserve place for pc for trap
+        andi.w  #$dfff,d0       ; reset the supervisor bit, since from user stack
+        move.w  d0,-(sp)        ; sr for trap
+;
+; Now restore d0 and move return pc on user stack to the reserved place on
+; supervisor stack
+;
+        move    usp,a0
+        lea     12(a0),a0
+        move    a0,usp          ; now user stack is intact
+        move.l  -8(a0),d0       ; restore d0
+        move.l  -4(a0),2(sp)    ; put the user return pc into sup. stack
+        move.l  -12(a0),a0      ; restore a0
+        bra     lisabugentry    ; go to lisabug
+
+supstate                        ; caller IS in supervisor state
+        move.l  (sp)+,d0        ; restore d0 saved
+        move.w  sr,-(sp)        ; push sr (return adr already on sup stack)
+
+
+lisabugentry            ;IF Lisabug exists, emulate a
+                        ;  level 7 interrupt to get there:
+
+        movem.l a0/d0,-(SP)     ;save regs while doing Lisabug presence check
+        move.l  sglobal,a0      ;skip lisabug if not ENABLED
+        move.b  lb_enabled(a0),d0
+        bne.s   its_enabled
+        movem.l (SP)+,a0/d0
+        rte                     ;NO, it's not, so return immediately to caller
+its_enabled
+        movem.l (SP)+,a0/d0
+        jmp     enter_macsbug   ; jmp via low core to get to macsbug
+
+
+
+
+        .end
+
+
+
+ÿ

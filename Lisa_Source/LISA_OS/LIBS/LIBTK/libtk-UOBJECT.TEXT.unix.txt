@@ -1,0 +1,919 @@
+UNIT UObject;
+{Copyright 1983, 1984, Apple Computer, Inc.}
+{Implementation is in UOBJECT2-3-4}
+
+{$SETC IsIntrinsic := TRUE}
+
+{$IFC IsIntrinsic}
+INTRINSIC;
+{$ENDC}
+
+{$SETC ErrsToFile := FALSE }
+
+{$IFC ErrsToFile}
+{****************************************}     {$E ERRS.TEXT}      {****************************************}
+{$ENDC}
+
+{NOTE: The implementation of class TObject is quite obscure because this is actually system-type code}
+
+{Segments: SgABCini(tialize), SgABCdat(a structures), SgABCdbg}
+
+{
+=========================================== SPECIFICALLY IN UObject ============================================
+
+----------CLASSES------     ------------------VARIABLES-------------------- ------------- COMMENTS -------------
+
+  TObject
+
+    TCollection             size dynOffset holeStart holeSize holeStd       -- indexed access (At, InsAt, Each)
+        TList                                                                 -- contains object handles
+        TArray              recordBytes                                       -- contains records (even lengths)
+        TString                                                               -- contains characters
+        TFile               path scanners                                     -- disk file (Exists, Rename)
+    TScanner                collection position increment scanDone atEnd    -- sequential access (Scan, Insert)
+        TListScanner                                                          -- an object at a time
+        TArrayScanner                                                         -- a record at a time
+        TStringScanner      error actual                                      -- a character at a time (Xfer)
+            TFileScanner    accesses refnum                                   -- through a whole TFile
+
+
+========================================= IN ALL DATA STRUCTURE UNITS ==========================================
+
+               === KEY ===>   $ = in UObject  @ = in UHuge  * in UDb  # in UMac
+
+----------CLASSES----------     ---------------VARIABLES------------------- ------------- COMMENTS -------------
+
+$ TObject
+
+$   TCollection                   size dynOffset holeStart holeSize holeStd -- indexed access (At, InsAt, Each)
+$       TList                                                                 -- contains object handles
+  @         TLinkList               head tail                                   -- stored in TLinks
+  @         THugeList               hugeArray                                   -- stored in linked blocks
+$       TArray                      recordBytes                               -- contains records (even lengths)
+  @         THugeArray              minBlockLength maxBlockLength blocks        -- impl. with linked blocks
+$       TString                                                                 -- contains characters
+$       TFile                       path scanners                             -- disk file (Exists, Rename)
+  *     TDb                                                                   -- contains keyed records
+  *         TDbFile                 file rScanDesc                              -- key is a PAOC/String
+  *         TRsFile                 endIncrement firstKey lastKey scanners      -- key is a LONGINT (SwapIn)
+  *             TDbRsFile           dbFile                                        -- implemented with a TDbFile
+        #       TMcRsFile           ???                                           -- implemented in the Mac ROM
+
+$   TScanner                   collection position increment scanDone atEnd -- sequential access (Scan, Insert)
+$       TListScanner                                                          -- an object at a time
+  @         TLnkLstScanner          scanLink
+  @         THgeLstScanner          blkArrScanner
+$       TArrayScanner                                                         -- a record at a time
+  @         THgeArrScanner          cacheBlock cacheIndex                       -- through a THugeArray
+$       TStringScanner              error actual                              -- a character at a time (Xfer)
+$           TFileScanner            accesses refnum                           -- through a whole TFile
+  *         TRsScanner              whichWay key buffer                         -- through a single resource
+  *     TDbScanner                  error                                     -- a key at a time
+  *         TDbFiScanner            rScanDesc                                   -- through a TDbFile
+  *         TRsFiScanner                                                        -- a resource at a time
+  *             TDbRsFiScanner      dbRecSeq dbRecSize                            -- through a TDbRsFile
+        #       TMcRsFiScanner      ???                                           -- implemented in the Mac ROM
+
+  @ TLink                           element next                            -- has one element of a TLinkList
+}
+
+INTERFACE
+{$SETC LibraryVersion := 30 } { 10 = 1.0 libraries; 13 = 1.3 libraries; 20 = Pepsi,
+                                29 = V12.0 Libraries, 30 = V13.0+ libraries }
+{$SETC compatibleLists := FALSE }
+
+USES
+
+    UnitStd,
+    UnitHz,
+    {$U LIBOS/SysCall   } SysCall,
+{$IFC LibraryVersion > 20}
+    {$U LIBOS/PSysCall  } PSysCall,
+{$ENDC}
+{$IFC LibraryVersion <= 20}
+    {$U UClascal}           UClascal,
+{$ELSEC} {$IFC LibraryVersion < 30}
+    {$U LIBTK/UClascal}     UClascal,     {Needed for interface}
+{$ELSEC}
+    {$U LIBPL/UClascal}     UClascal,     {Needed for interface}
+{$ENDC}
+{$ENDC}
+      { The next units needed to find out where the printer is located, from parameter memory,
+        so we can tell Paslib where it is. (Needed for debugger Output Redirect.) }
+     PmDecl,
+     Pmm,
+{$IFC LibraryVersion > 10}
+     {$U LIBPL/PaslibCall} PaslibCall,
+     {$U LIBPL/PPasLibc } PPasLibC,
+{$ENDC}
+
+     {$U HWInt}             HWInt;
+
+
+{$SETC fDbgOK := FALSE}{FALSE} {override UnitStd to test Tool Kit}
+{$SETC fSymOK := FALSE}{FALSE} {override UnitStd to test Tool Kit}
+
+{$SETC fDbgObject    := fDbgOK}
+{$SETC fRngObject    := fDbgOK}
+{$SETC fSymObject    := fSymOK}
+
+{$SETC fDebugMethods := fDbgObject} {include debugging methods in the compilation}
+
+{$SETC fCheckHeap    := fDbgObject} {if VAR also true, check heap}
+{$SETC fTrace        := fDbgObject} {if VAR also true, trace entries/exits}
+{$SETC fMaxTrace     := fTrace AND FALSE} {if TRUE trace entries/exits on minor procedures too}
+
+{$SETC fCheckIndices := fDbgObject} {if VAR also true, check subscripts}
+
+CONST
+
+    prcsLdsn        = 1;            {ldsn for the process data segment}
+    prcsDsBytes     = 15000;        {default heap size for a process data segment}
+
+    MaxBreaks       = 10;
+
+    outputRMargin   = 85;
+    erInternal      = 4200;         {Stolen from list of errors in UABC for newHeap}
+
+    MAXLINT         = $7FFFFFFF;
+
+TYPE
+
+  {Aliases needed to compile QuickDraw}
+
+    Ptr = ^LONGINT;
+    ProcPtr = Ptr;
+    Handle = ^Ptr;
+
+  {Aliases for commonly used types}
+
+    S8 = STRING[8];
+    S255 = STRING[255];
+
+    TFilePath = S255;   {Increased from 66 because of the new hierarchical file system;
+                            corresponds to Pathname in SYSCALL}
+    TFilePart = STRING[32]; {length of each level in a pathname; corresponds to e_name in SYSCALL}
+    TPassword = TFilePart;
+
+    THeap = Ptr;    {alias for THz in UnitHz}
+    TClass = Ptr;   {alias for TPSliceTable in UClascal}
+
+    Byte = -128..127;
+    TPString = ^S255;
+
+    TpINTEGER = ^INTEGER;
+    TpLONGINT = ^LONGINT;
+
+    TAuthorName = STRING[32];
+    TClassName  = STRING[8];
+
+    TClassWorld = RECORD    {Alias for TWorld in IMPLEMENTATION}
+        infRecs:    TArray {OF name, size, author, & version information};
+        classes:    TArray {OF TClass -- the pointer in each Clascal object};
+        authors:    TArray {OF PACKED ARRAY [1..SIZEOF(TAuthorName)] OF CHAR};
+        aliases:    TArray {OF PACKED ARRAY [1..SIZEOF(TClassName)] OF CHAR};
+        END;
+
+    TEnumAccesses = (fRead, fWrite, fAppend, fPrivate); {not allowing global_refnum at this time}
+    TAccesses = SET OF TEnumAccesses;
+    TIOMode = (fAbsolute, fRelative, fSequential);
+    xReadWrite = (xRead, xWrite);
+    SizeOfNumber = 1..4;
+
+    TScanDirection = (scanForward, scanBackward);
+
+    TConvResult = (cvValid, cvNoNumber, cvBadNumber, cvOverflow);
+
+
+  {Classes}
+
+    TObject = SUBCLASS OF NIL
+
+      {Creation and Destruction}
+        FUNCTION  TObject.CREATE(object: TObject; heap: THeap): TObject; ABSTRACT;
+        PROCEDURE TObject.Become(object: TObject);              {SELF becomes obj and former SELF is freed}
+        FUNCTION  TObject.Class: TClass;                        {its class pointer}
+        FUNCTION  TObject.CloneObject(heap: THeap): TObject;    {clones just the object, not its dependents}
+        FUNCTION  TObject.Clone(heap: THeap): TObject; DEFAULT; {clones the object and its known dependents}
+        PROCEDURE TObject.FreeObject; DEFAULT;                  {frees just the object, not its dependents}
+        PROCEDURE TObject.Free; DEFAULT;                        {frees the object and its known dependents}
+        FUNCTION  TObject.Heap: THeap;                          {which heap it is in}
+        FUNCTION  TObject.HeapBytes: INTEGER;                   {number of bytes occupied in that heap}
+        PROCEDURE TObject.Read(s: TStringScanner);              {reads the object & its known dependents}
+        PROCEDURE TObject.Write(s: TStringScanner);             {writes the object & its known dependents}
+
+      {Debugging}
+        {$IFC fDebugMethods}
+        PROCEDURE TObject.Fields(PROCEDURE Field(nameAndType: S255)); DEFAULT; {See end of file for comment}
+        PROCEDURE TObject.Debug(numLevels: INTEGER; memberTypeStr: S255); DEFAULT;
+         {writes an object down to numLevels:
+                  numLevels=0 => write only class;
+                  numLevels=1 => write class, non-Object fields, and class of Object fields
+                  etc.}
+        {$ENDC}
+
+      {Version Conversion}
+        PROCEDURE TObject.Convert(fromVersion: Byte);  {Override it to finish conversion from an old version}
+        FUNCTION  TObject.JoinClass(newClass: TClass): TObject;        {Called for you by version conversion}
+
+        END;
+
+
+    TCollecHeader =  RECORD
+        classPtr:       TClass;
+        size:           LONGINT;    {number of real elements, not counting the hole}
+        dynStart:       INTEGER;    {bytes from the class ptr to the dynamic data; MAXINT if none allowed}
+        holeStart:      INTEGER;    {0 = at the beginning, size = at the end; MAXINT = none allowed}
+        holeSize:       INTEGER;    {measured in MemberBytes units}
+        holeStd:        INTEGER;    {if the holeSize goes to 0, how much to grow the collection by}
+        END;
+
+    TFastString = RECORD            {only access ch[i] when hole is at end & TString is not subclassed}
+        header:         TCollecHeader;
+        ch:             PACKED ARRAY[1..32740] OF CHAR;
+        END;
+    TPFastString = ^TFastString;
+    THFastString = ^TPFastString;
+
+    TArrayHeader =  RECORD
+        classPtr:       TClass;
+        size:           LONGINT;    {number of real elements, not counting the hole}
+        dynStart:       INTEGER;    {bytes from the class ptr to the dynamic data}
+        holeStart:      INTEGER;    {0 means hole at the beginning, size means hole at the end}
+        holeSize:       INTEGER;    {measured in MemberBytes units}
+        holeStd:        INTEGER;    {if the holeSize goes to 0, how much to grow the collection by}
+        recordBytes:    INTEGER;
+        END;
+
+
+    TCollection = SUBCLASS OF TObject
+
+      {Variables}
+        size:           LONGINT;    {number of real elements, not counting the hole}
+        dynStart:       INTEGER;    {bytes from the class ptr to the dynamic data}
+        holeStart:      INTEGER;    {0 means hole at the beginning, size means hole at the end}
+        holeSize:       INTEGER;    {measured in MemberBytes units}
+        holeStd:        INTEGER;    {if the holeSize goes to 0, how much to grow the collection by}
+
+        {The field "size" is a LONGINT for the benefit of huge collections like remote data bases.
+         It is always in the INTEGER range for non-subclassed TLists, TArrays, and TStrings.
+
+         The field "dynStart" is an offset from Handle(collection)^ and tells where the dynamic part
+         of the data is stored, if any.  This convention allows subclasses to add fields.
+
+         When editing a collection, there may be an unused "hole" somewhere in the storage block.  The
+         fields "holeStart" and "holeSize" specify (in member-sized units) the starting index of the
+         hole and the length of the hole.  When holeSize is zero, there is no hole.  If members are
+         added when there is no hole, the storage block is expanded to allow for at least another
+         "holeStd" members.
+
+         CREATE has an argument that lets the initial collection have a hole at the end, so that
+         Ins- methods can be called to initialize the collection without any storage allocation.
+
+         StartEdit sets holeStd to its argument, which forces subsequent edit methods to leave intact
+         any hole they might form. StopEdit squeezes out the hole and sets holeStd to zero, which
+         forces subsequent edit methods that get called with no hole to squeeze out any hole they may form.
+         Thus, every StartEdit that has a nonzero argument should be terminated by a call on StopEdit to
+         save space.}
+
+      {Creation and Destruction}
+        FUNCTION  TCollection.CREATE(object: TObject; heap: THeap; initialSlack: INTEGER): TCollection;
+        FUNCTION  TCollection.Clone(heap: THeap): TObject; OVERRIDE;
+
+      {Attributes}
+        FUNCTION  TCollection.MemberBytes: INTEGER; ABSTRACT;
+        FUNCTION  TCollection.Equals(otherCollection: TCollection): BOOLEAN;
+
+      {Slack control}
+        PROCEDURE TCollection.StartEdit(withSlack: INTEGER);
+        PROCEDURE TCollection.StopEdit;
+
+      {Generic Inserts}
+        PROCEDURE TCollection.InsManyAt(i: LONGINT; otherCollection: TCollection; index, howMany: LONGINT);
+        PROCEDURE TCollection.InsNullsAt(i, howMany: LONGINT);
+
+   (* BEGIN CONCEPTUAL METHODS (parameter types differ in subclasses; sometimes extra parameters required)
+
+      {Enumerate members}
+        PROCEDURE TCollection.Each(PROCEDURE DoToMember(member: "TMember")); CONCEPTUAL;
+        FUNCTION  TCollection.Pos(after: LONGINT; member: "TMember"): LONGINT; CONCEPTUAL;
+        FUNCTION  TCollection.Scanner: TScanner; CONCEPTUAL;           {c.ScannerFrom(-MaxLInt, scanForward)}
+        FUNCTION  TCollection.ScannerFrom(firstToScan: LONGINT; scanDirection: TScanDirection): TScanner; CONCEPTUAL;
+
+      {Inspect members}
+        FUNCTION  TCollection.At(i: LONGINT): "TMember"; CONCEPTUAL;
+        FUNCTION  TCollection.First: "TMember"; CONCEPTUAL;
+        FUNCTION  TCollection.Last: "TMember"; CONCEPTUAL;
+        FUNCTION  TCollection.ManyAt(i, howMany: LONGINT): "TCollection"; CONCEPTUAL;
+
+      {Insert members}
+        PROCEDURE TCollection.InsAt(i: LONGINT; member: "TMember"); CONCEPTUAL;
+        PROCEDURE TCollection.InsFirst(member: "TMember"); CONCEPTUAL;
+        PROCEDURE TCollection.InsLast(member: "TMember"); CONCEPTUAL;
+
+      {Delete members}
+        PROCEDURE TCollection.DelAll; CONCEPTUAL;
+        PROCEDURE TCollection.DelAt(i: LONGINT); CONCEPTUAL;
+        PROCEDURE TCollection.DelFirst; CONCEPTUAL;
+        PROCEDURE TCollection.DelLast; CONCEPTUAL;
+        PROCEDURE TCollection.DelManyAt(i, howMany: LONGINT); CONCEPTUAL;
+
+      {Change member}
+        PROCEDURE TCollection.PutAt(i: LONGINT; member: "TMember"); CONCEPTUAL;
+
+   END CONCEPTUAL METHODS *)
+
+      {Private methods -- to be called by subclasses only!!!}
+        {$IFC fRngObject}
+        PROCEDURE TCollection.CheckIndex(index: LONGINT);
+        {$ENDC}
+        FUNCTION  TCollection.AddrMember(i: LONGINT): LONGINT;       {The address is only valid momentarily}
+        PROCEDURE TCollection.CopyMembers(dstAddr, startIndex, howMany: LONGINT);
+        PROCEDURE TCollection.EditAt(atIndex: LONGINT; deltaMembers: INTEGER);           {Transfers no data}
+        PROCEDURE TCollection.ResizeColl(membersPlusHole: INTEGER);      {Resizes at end, no fields changed}
+        PROCEDURE TCollection.ShiftColl(afterSrcIndex, afterDstIndex, howMany: INTEGER); {No fields changed}
+
+        END;
+
+    TList = SUBCLASS OF TCollection
+
+      {Variables}
+
+      {Creation and Destruction}
+        FUNCTION  TList.CREATE(object: TObject; heap: THeap; initialSlack: INTEGER): TList;
+        FUNCTION  TList.Clone(heap: THeap): TObject; OVERRIDE;
+        PROCEDURE TList.Free; OVERRIDE;
+
+      {Debugging}
+       {$IFC fDebugMethods}
+        PROCEDURE TList.Debug(numLevels: INTEGER; memberTypeStr: S255); OVERRIDE;
+            { numLevels=0   print just class of list;
+                        1   also print size of list;
+                        2   also print compacted list of member classes
+                      >=3   print class, size, and call Debug(numLevels-1) on members
+            }
+        PROCEDURE TList.DebugMembers;
+       {$ENDC}
+
+      {Attributes}
+        FUNCTION  TList.MemberBytes: INTEGER; OVERRIDE;
+
+      {Enumerate members}
+        PROCEDURE TList.Each(PROCEDURE DoToObject(object: TObject)); DEFAULT;
+        FUNCTION  TList.Pos(after: LONGINT; object: TObject): LONGINT;
+        FUNCTION  TList.Scanner: TListScanner;
+        FUNCTION  TList.ScannerFrom(firstToScan: LONGINT; scanDirection: TScanDirection): TListScanner; DEFAULT;
+
+      {Inspect members}
+        FUNCTION  TList.At(i: LONGINT): TObject; DEFAULT;
+        FUNCTION  TList.First: TObject; DEFAULT;
+        FUNCTION  TList.Last: TObject; DEFAULT;
+        FUNCTION  TList.ManyAt(i, howMany: LONGINT): TList; DEFAULT;
+
+      {Insert members}
+        PROCEDURE TList.InsAt(i: LONGINT; object: TObject); DEFAULT;
+        PROCEDURE TList.InsFirst(object: TObject);
+        PROCEDURE TList.InsLast(object: TObject);
+
+      {Delete members}
+        PROCEDURE TList.DelAll(freeOld: BOOLEAN); DEFAULT;
+        PROCEDURE TList.DelAt(i: LONGINT; freeOld: BOOLEAN); DEFAULT;
+        PROCEDURE TList.DelFirst(freeOld: BOOLEAN);
+        PROCEDURE TList.DelLast(freeOld: BOOLEAN);
+        PROCEDURE TList.DelManyAt(i, howMany: LONGINT; freeOld: BOOLEAN); DEFAULT;
+        PROCEDURE TList.DelObject(object: TObject; freeOld: BOOLEAN);
+        FUNCTION  TList.PopLast: TObject;
+
+      {Change member}
+        PROCEDURE TList.PutAt(i: LONGINT; object: TObject; freeOld: BOOLEAN); DEFAULT;
+
+        END;
+
+    TArray = SUBCLASS OF TCollection     {*** WARNING: The Ptrs below become invalid if the heap compacts!!!}
+
+      {Variables}
+        recordBytes: INTEGER;
+
+      {Creation and Destruction}
+        FUNCTION  TArray.CREATE(object: TObject; heap: THeap; initialSlack, bytesPerRecord: INTEGER): TArray;
+
+      {Attributes}
+        FUNCTION  TArray.MemberBytes: INTEGER; OVERRIDE;
+
+      {Enumerate members}
+        PROCEDURE TArray.Each(PROCEDURE DoToRecord(pRecord: Ptr)); DEFAULT;
+        FUNCTION  TArray.Pos(after: LONGINT; pRecord: Ptr): LONGINT;
+        FUNCTION  TArray.Scanner: TArrayScanner;
+        FUNCTION  TArray.ScannerFrom(firstToScan: LONGINT; scanDirection: TScanDirection): TArrayScanner; DEFAULT;
+
+      {Inspect members}
+        FUNCTION  TArray.At(i: LONGINT): Ptr; DEFAULT;
+        FUNCTION  TArray.First: Ptr;
+        PROCEDURE TArray.GetAt(i: LONGINT; pRecord: Ptr); DEFAULT;  {Sort of: pRecord^ := SELF.At(i)^}
+        FUNCTION  TArray.Last: Ptr;
+        FUNCTION  TArray.ManyAt(i, howMany: LONGINT): TArray; DEFAULT;
+
+      {Insert members}
+        PROCEDURE TArray.InsAt(i: LONGINT; pRecord: Ptr); DEFAULT;
+        PROCEDURE TArray.InsFirst(pRecord: Ptr);
+        PROCEDURE TArray.InsLast(pRecord: Ptr);
+
+      {Delete members}
+        PROCEDURE TArray.DelAll; DEFAULT;
+        PROCEDURE TArray.DelAt(i: LONGINT); DEFAULT;
+        PROCEDURE TArray.DelFirst;
+        PROCEDURE TArray.DelLast;
+        PROCEDURE TArray.DelManyAt(i, howMany: LONGINT); DEFAULT;
+
+      {Change member}
+        PROCEDURE TArray.PutAt(i: LONGINT; pRecord: Ptr); DEFAULT;
+
+        END;
+
+    TString = SUBCLASS OF TCollection
+
+      {Variables}
+
+      {Creation and Destruction}
+        FUNCTION  TString.CREATE(object: TObject; heap: THeap; initialSlack: INTEGER): TString;
+
+      {Attributes}
+        FUNCTION  TString.MemberBytes: INTEGER; OVERRIDE;
+
+      {Enumerate members}
+        PROCEDURE TString.Each(PROCEDURE DoToCharacter(character: CHAR));
+        FUNCTION  TString.Pos(after: LONGINT; character: CHAR): LONGINT;
+        FUNCTION  TString.Scanner: TStringScanner;
+        FUNCTION  TString.ScannerFrom(firstToScan: LONGINT; scanDirection: TScanDirection): TStringScanner;
+
+      {Inspect members}
+        FUNCTION  TString.At(i: LONGINT): CHAR;
+        FUNCTION  TString.First: CHAR;
+        FUNCTION  TString.Last: CHAR;
+        FUNCTION  TString.ManyAt(i, howMany: LONGINT): TString;
+        PROCEDURE TString.ToPStr(pStr: TPString);
+        PROCEDURE TString.ToPStrAt(i, howMany: LONGINT; pStr: TPString);
+
+      {Insert members}
+        PROCEDURE TString.InsAt(i: LONGINT; character: CHAR);
+        PROCEDURE TString.InsFirst(character: CHAR);
+        PROCEDURE TString.InsLast(character: CHAR);
+        PROCEDURE TString.InsPStrAt(i: LONGINT; pStr: TPString);
+
+      {Delete members}
+        PROCEDURE TString.DelAll;
+        PROCEDURE TString.DelAt(i: LONGINT);
+        PROCEDURE TString.DelFirst;
+        PROCEDURE TString.DelLast;
+        PROCEDURE TString.DelManyAt(i, howMany: LONGINT);
+
+      {Change member}
+        PROCEDURE TString.PutAt(i: LONGINT; character: CHAR);
+
+      {QuickDraw}
+        PROCEDURE TString.Draw(i: LONGINT; howMany: INTEGER);
+        FUNCTION  TString.Width(i: LONGINT; howMany: INTEGER): INTEGER;
+
+        END;
+
+    TFile = SUBCLASS OF TCollection
+
+      {Variables}
+        path:       TFilePath;
+        password:   TPassword;              {The current password protecting this file, and used for all
+                                                accesses to it;  client is responsible for setting this
+                                                field after the TFile is created; ignored if
+                                                LibraryVersion <= 20}
+        scanners:   TList {OF TScanner};
+
+      {Creation and Destruction}
+        FUNCTION  TFile.CREATE(object: TObject; heap: THeap; itsPath: TFilePath;
+                                itsPassword: TPassword): TFile;
+                    {itsPassword is ignored from LibraryVersion <= 20}
+
+        PROCEDURE TFile.Free; OVERRIDE;                         {Frees the scanners as well}
+        FUNCTION  TFile.Clone(heap: THeap): TObject; OVERRIDE;  {Illegal}
+
+      {Attributes}
+        FUNCTION  TFile.MemberBytes: INTEGER; OVERRIDE;
+
+      {Enumerate members}
+        FUNCTION  TFile.Scanner: TFileScanner;                  {f.ScannerFrom(0, [fRead, fWrite])}
+        FUNCTION  TFile.ScannerFrom(firstToScan: LONGINT; manip: TAccesses): TFileScanner;
+
+      {Catalog}
+        PROCEDURE TFile.ChangePassword(VAR error: INTEGER; newPassword: TPassword);
+                    {also changes the password field, if successful}
+        PROCEDURE TFile.Delete(VAR error: INTEGER);
+        FUNCTION  TFile.Exists(VAR error: INTEGER): BOOLEAN;
+        FUNCTION  TFile.WhenModified(VAR error: INTEGER): LONGINT;
+        PROCEDURE TFile.Rename(VAR error: INTEGER; newFileName: TFilePath);
+        FUNCTION  TFile.VerifyPassword(VAR error: INTEGER; password: TPassword): BOOLEAN;
+
+        END;
+
+    TScanner = SUBCLASS OF TObject
+
+      {Variables}
+        collection:     TCollection; {The collection being scanned}
+        position:       LONGINT;     {The current position (between members: 0=before first, size+1=after last)}
+        increment:      INTEGER;     {1 if scanning forward, -1 if scanning backward}
+        scanDone:       BOOLEAN;     {TRUE if next .Scan call should return FALSE, leaving its VAR parameter alone}
+        atEnd:          BOOLEAN;     {TRUE if next .Scan call will return FALSE because at end of collection}
+
+        FUNCTION  TScanner.CREATE(object: TObject; itsCollection: TCollection; itsInitialPosition: LONGINT;
+                                  scanDirection: TScanDirection): TScanner;
+
+      {Close and Reopen}
+        PROCEDURE TScanner.Close; DEFAULT;  {If disk-based, flush buffers and tell OS to close file, else no-op}
+        PROCEDURE TScanner.Open; DEFAULT;   {If disk-based, tell OS to reopen file and fill first buffer}
+
+      {Slack Control}
+        PROCEDURE TScanner.Allocate(slack: LONGINT); DEFAULT;   {Like collection.StartEdit(slack)}
+        PROCEDURE TScanner.Compact; DEFAULT;                    {Like collection.StopEdit}
+
+      {Positioning}
+        FUNCTION  TScanner.Advance(PROCEDURE DoToCurrent(anotherMember: BOOLEAN)): BOOLEAN;
+        PROCEDURE TScanner.Done; DEFAULT;                       {Set scanDone so that Scan will return FALSE}
+        PROCEDURE TScanner.Reverse; DEFAULT;                    {Reverse the scan direction}
+        PROCEDURE TScanner.Seek(newPosition: LONGINT); DEFAULT; {Forces to legal places}
+        PROCEDURE TScanner.Skip(deltaPos: LONGINT); DEFAULT;    {Forces to legal places}
+
+   (* BEGIN CONCEPTUAL METHODS (parameter types differ in subclasses; sometimes extra parameters required)
+
+      {Data Transfer}
+        FUNCTION  TScanner.Obtain: "TMember"; CONCEPTUAL; {Return previous member (redundant right after Scan)}
+        FUNCTION  TScanner.Scan(VAR member: "TMember"): BOOLEAN; CONCEPTUAL; {Return next & advance past it}
+
+      {Editing}
+        PROCEDURE TScanner.Append(member: "TMember"); CONCEPTUAL;   {Add a new member after position, scan past it}
+        PROCEDURE TScanner.Delete; CONCEPTUAL;                      {Delete previous member and adjust position}
+        PROCEDURE TScanner.DeleteRest; CONCEPTUAL;                  {Delete everything after SELF.position}
+        PROCEDURE TScanner.Replace(member: "TMember"); CONCEPTUAL;  {Replace previous member and maintain position}
+
+   END CONCEPTUAL METHODS *)
+
+        END;
+
+    TListScanner = SUBCLASS OF TScanner
+
+      {Variables}
+
+      {Creation and Destruction}
+        FUNCTION  TListScanner.CREATE(object: TObject; itsList: TList; itsInitialPosition: LONGINT;
+                                      itsScanDirection: TScanDirection): TListScanner;
+        PROCEDURE TListScanner.Free; OVERRIDE;
+
+      {Traversal}
+        FUNCTION  TListScanner.Obtain: TObject; DEFAULT; {Return previous member (redundant right after Scan)}
+        FUNCTION  TListScanner.Scan(VAR nextObject: TObject): BOOLEAN; DEFAULT;{Return next, advance past it}
+
+      {Editing}
+        PROCEDURE TListScanner.Append(object: TObject); DEFAULT;   {Add object after position, scan past it}
+        PROCEDURE TListScanner.Delete(freeOld: BOOLEAN); DEFAULT;  {Delete previous object, adjust position}
+        PROCEDURE TListScanner.DeleteRest(freeOld: BOOLEAN); DEFAULT; {Delete all objects after position}
+        PROCEDURE TListScanner.Replace(object: TObject; freeOld: BOOLEAN); DEFAULT;     {Replace previous}
+
+        END;
+
+    TArrayScanner = SUBCLASS OF TScanner
+
+      {Variables}
+
+      {Creation and Destruction}
+        FUNCTION  TArrayScanner.CREATE(object: TObject; itsArray: TArray; itsInitialPosition: LONGINT;
+                                       itsScanDirection: TScanDirection): TArrayScanner;
+        PROCEDURE TArrayScanner.Free; OVERRIDE;
+
+      {Traversal}
+        FUNCTION  TArrayScanner.Obtain: Ptr; DEFAULT; {Return previous member (redundant right after Scan)}
+        FUNCTION  TArrayScanner.Scan(VAR pNextRecord: Ptr): BOOLEAN; DEFAULT; {Return next & advance past it}
+
+      {Editing}
+        PROCEDURE TArrayScanner.Append(pRecord: Ptr); DEFAULT; {Add a new record after position, scan past it}
+        PROCEDURE TArrayScanner.Delete; DEFAULT;               {Delete previous record and adjust position}
+        PROCEDURE TArrayScanner.DeleteRest; DEFAULT;           {Delete all records after position}
+        PROCEDURE TArrayScanner.Replace(pRecord: Ptr); DEFAULT;{Replace previous record and maintain position}
+
+        END;
+
+    TStringScanner = SUBCLASS OF TScanner
+
+      {Variables}
+        actual: LONGINT;                                {no. bytes last xfered}
+
+      {Creation and Destruction}
+        FUNCTION  TStringScanner.CREATE(object: TObject; itsString: TString; itsInitialPosition: LONGINT;
+                                        itsScanDirection: TScanDirection): TStringScanner;
+        PROCEDURE TStringScanner.Free; OVERRIDE;
+
+      {Traversal}
+        FUNCTION  TStringScanner.Obtain: CHAR; DEFAULT; {Return previous member (redundant right after Scan)}
+        FUNCTION  TStringScanner.Scan(VAR nextChar: CHAR): BOOLEAN; DEFAULT;   {Return next & advance past it}
+
+      {Editing}
+        PROCEDURE TStringScanner.Append(character: CHAR); DEFAULT; {Add char after position, scan past it}
+        PROCEDURE TStringScanner.Delete; DEFAULT;                  {Delete previous char, adjust position}
+        PROCEDURE TStringScanner.DeleteRest; DEFAULT;              {Delete all chars after position}
+        PROCEDURE TStringScanner.Replace(character: CHAR); DEFAULT;{Replace previous char, maintain position}
+
+      {Typed Sequential Data Transfer: characters are read/written from left to right regardless of increment}
+        FUNCTION  TStringScanner.ReadArray(heap: THeap; bytesPerRecord: INTEGER): TArray; {reads size first}
+        FUNCTION  TStringScanner.ReadNumber(numBytes: SizeOfNumber): LONGINT;  {iff numBytes is even then signed}
+        FUNCTION  TStringScanner.ReadObject(heap: THeap): TObject;                   {tells object to Read(SELF)}
+        PROCEDURE TStringScanner.WriteArray(a: TArray);  {inverse of ReadArray: writes size but not recordBytes}
+        PROCEDURE TStringScanner.WriteNumber(value: LONGINT; numBytes: SizeOfNumber);{does not write size}
+        PROCEDURE TStringScanner.WriteObject(object: TObject);                       {tells object to Write(SELF)}
+        PROCEDURE TStringScanner.XferContiguous(whichWay: xReadWrite; collection: TCollection);
+                         {xfers the size and members, non-recursively; xRead appends what it reads}
+        PROCEDURE TStringScanner.XferFields(whichWay: xReadWrite; object: TObject); {xfers all but the class}
+        PROCEDURE TStringScanner.XferPString(whichWay: xReadWrite; pStr: TPString); {it better be long enough}
+
+      {Untyped Data Transfer: characters are read/written from left to right regardless of increment}
+        PROCEDURE TStringScanner.XferSequential(whichWay: xReadWrite; pFirst: Ptr; numBytes: LONGINT); DEFAULT;
+        PROCEDURE TStringScanner.XferRandom(whichWay: xReadWrite; pFirst: Ptr; numBytes: LONGINT;
+                                            mode: TIOMode; offset: LONGINT); DEFAULT;
+
+        END;
+
+    TFileScanner = SUBCLASS OF TStringScanner
+
+      {Variables}
+        accesses:   TAccesses;                              {[fRead, fWrite, fAppend, fPrivate]}
+        refnum:     INTEGER;                                {OS file refnum, or -1 if not open now}
+        error:      INTEGER;    {EOF is not an error}       {first error (or warning if no error) encountered}
+
+      {Creation and Destruction}
+        FUNCTION  TFileScanner.CREATE(object: TObject; itsFile: TFile; manip: TAccesses): TFileScanner;
+        PROCEDURE TFileScanner.FreeObject; OVERRIDE;        {also closes the OS file}
+        PROCEDURE TFileScanner.Free; OVERRIDE;              {if the last scanner, frees the TFile, too}
+
+      {Close and Reopen}
+        PROCEDURE TFileScanner.Close; OVERRIDE;
+        PROCEDURE TFileScanner.Open; OVERRIDE;
+
+      {Slack Control}
+        PROCEDURE TFileScanner.Allocate(slack: LONGINT); OVERRIDE; {Get slack DIV pageSize unused disk pages}
+        PROCEDURE TFileScanner.Compact; OVERRIDE;                  {Return unused disk pages to free space}
+
+      {Positioning}
+        PROCEDURE TFileScanner.Seek(newPosition: LONGINT); OVERRIDE;
+        PROCEDURE TFileScanner.Skip(deltaPos: LONGINT); OVERRIDE;
+
+      {Traversal}
+        FUNCTION  TFileScanner.Obtain: CHAR; OVERRIDE; {Return previous member (redundant right after Scan)}
+        FUNCTION  TFileScanner.Scan(VAR nextChar: CHAR): BOOLEAN; OVERRIDE;   {Return next & advance past it}
+
+      {Editing}
+        PROCEDURE TFileScanner.Append(character: CHAR); OVERRIDE; {Acts like: Replace; Skip(1)}
+        PROCEDURE TFileScanner.Delete; OVERRIDE;                  {Acts like: Skip(-1)}
+        PROCEDURE TFileScanner.DeleteRest; OVERRIDE;              {Shorten file size to SELF.position}
+        PROCEDURE TFileScanner.Replace(character: CHAR); OVERRIDE;{Replace previous member and maintain position}
+
+      {Untyped Data Transfer: characters are read/written from left to right regardless of increment}
+        PROCEDURE TFileScanner.XferSequential(whichWay: xReadWrite; pFirst: Ptr; numBytes: LONGINT); OVERRIDE;
+        PROCEDURE TFileScanner.XferRandom(whichWay: xReadWrite; pFirst: Ptr; numBytes: LONGINT;
+                                          mode: TIOMode; offset: LONGINT); OVERRIDE;
+
+       END;
+
+{$IFC compatibleLists}
+
+    {Backward compatibility classes}
+
+    TDynamicArray = SUBCLASS OF TArray
+        ch: {UNPACKED} ARRAY [0..16370] OF CHAR;
+        FUNCTION  TDynamicArray.CREATE(object: TObject; heap: THeap; bytesPerRecord: INTEGER;
+                                       initialSize: INTEGER): TDynamicArray;
+        FUNCTION  TDynamicArray.NumRecords: INTEGER;
+        PROCEDURE TDynamicArray.BeSize(newSize: INTEGER);
+        END;
+
+    TIndexList = SUBCLASS OF TList
+        elements: ARRAY[1..1] OF TObject;
+        FUNCTION  TIndexList.CREATE(object: TObject; heap: THeap; initialSize: INTEGER): TIndexList;
+        FUNCTION  TIndexList.numElements: INTEGER;
+        END;
+
+    TLinkList = SUBCLASS OF TList
+        FUNCTION  TLinkList.CREATE(object: TObject; heap: THeap): TLinkList;
+        FUNCTION  TLinkList.numElements: INTEGER;
+        END;
+
+    TBlockList = SUBCLASS OF TList
+        FUNCTION  TBlockList.CREATE(object: TObject; heap: THeap; itsMinBlockSize: INTEGER): TBlockList;
+        FUNCTION  TBlockList.numElements: INTEGER;
+        END;
+
+    TFileStream = SUBCLASS OF TFileScanner
+        FUNCTION  TFileStream.CREATE(object: TObject; heap: THeap; path: S255; manip: TAccesses): TFileStream;
+        FUNCTION  TFileStream.Size: LONGINT;
+        END;
+
+{$ENDC}
+
+
+VAR
+
+    mainDsRefnum:           INTEGER;                    {refnum of the process data segment}
+    mainHeap:               THeap;                      {heap of the process}
+    mainLdsn:               INTEGER;                    {ldsn of the process data segment}
+    fCheckIndices:          BOOLEAN;
+
+    onDesktop:              BOOLEAN;                    {Is there a DM (Desktop Manager) to talk to?}
+    wmIsInitialized:        BOOLEAN;                    {Has OpenWM been done?}
+    isInitialized:          BOOLEAN;                    {Iff TRUE, shouldn't tell DM initFailed any more}
+    amDying:                BOOLEAN;                    {Iff TRUE, I have called ImDying}
+
+    myWorld:                TClassWorld;                {For Version Conversion}
+
+
+    { Variables for Debugging }
+        indentTrace:    INTEGER;
+
+          { stuff for the intelligent output }
+        currXPos:       INTEGER;
+        outputIndent:   INTEGER;
+
+        {$IFC fTrace}
+            { TRUE if we want to inhibit tracing; client must save and restore its value;
+                    normally this is needed only if you override the Debug method }
+        fDebugRecursion:    BOOLEAN;
+            { how often to call KeyPress from debugger to check for user interrupt }
+        keyPresLimit:       INTEGER;
+        {$ENDC}
+
+
+{$IFC fCheckHeap}
+FUNCTION CountHeap(heap: THeap): INTEGER;
+{$ENDC}
+
+FUNCTION  Min(i, j: LONGINT): LONGINT;
+FUNCTION  Max(i, j: LONGINT): LONGINT;
+
+PROCEDURE XferLeft(source, dest: Ptr; nBytes: INTEGER);
+PROCEDURE XferRight(source, dest: Ptr; nBytes: INTEGER);
+FUNCTION  EqualBytes(source, dest: Ptr; nBytes: INTEGER): BOOLEAN;
+
+FUNCTION  LIntAndLInt(i, j: LONGINT): LONGINT;
+FUNCTION  LIntOrLInt(i, j: LONGINT): LONGINT;
+FUNCTION  LIntXorLInt(i, j: LONGINT): LONGINT;
+
+FUNCTION  NewObject(heap: THeap; itsClass: TClass): TObject;
+FUNCTION  NewDynObject(heap: THeap; itsClass: TClass; dynBytes: INTEGER): TObject;
+PROCEDURE ResizeDynObject(object: TObject; newTotalBytes: INTEGER);
+FUNCTION  NewOrRecycledObject(heap: THeap; itsClass: TClass; VAR chainHead: TObject): TObject;
+PROCEDURE RecycleObject(object: TObject; VAR chainHead: TObject);
+PROCEDURE Free(object: TObject);
+
+{$IFC compatibleLists}
+    {Backward compatibility procedures}
+
+FUNCTION  SubObject(super: TObject; itsClass: TClass): TObject;
+PROCEDURE FileDelete(path: S255);
+PROCEDURE FileLookup(VAR error: INTEGER; path: S255);
+PROCEDURE FileRename(oldPath, newPath: S255);
+FUNCTION  FileModified(path: S255): LONGINT;
+{$ENDC}
+
+FUNCTION  Superclass(class: TClass): TClass;
+FUNCTION  ClassDescendsFrom(descendant, ancestor: TClass): BOOLEAN;
+
+PROCEDURE NameOfClass(class: TClass; VAR className: TClassName);
+FUNCTION  SizeOfClass(class: TClass): INTEGER;
+
+{The next 3 can only be called from a class-init block or a subroutine of a class-init block}
+PROCEDURE UnitAuthor(companyAndAuthor: TAuthorName);                            {required once per unit}
+PROCEDURE ClassAuthor(companyAndAuthor: TAuthorName; classAlias: TClassName);   {optional}
+PROCEDURE ClassVersion(itsVersion, oldestItCanRead: Byte);                      {optional}
+
+FUNCTION  ValidObject(hndl: Handle): BOOLEAN;
+
+PROCEDURE ABCBreak(s: S255; errCode: LONGINT);
+
+PROCEDURE ClascalError(error: INTEGER);
+
+{Some useful procedures; we should decide once and for all whether or not to keep any or all of these}
+PROCEDURE LIntToHex(decNumber: LONGINT; hexNumber: TPString);
+            {NOTE: hexNumber must be >= 8 characters, regardless of size of decNumber}
+PROCEDURE LIntToStr(decNumber: LONGINT; str: TPString);
+            {NOTE: str must be >= 11 characters (sign + 10 digits), regardless of size of decNumber}
+PROCEDURE IntToStr(decNumber: INTEGER; str: TPString);
+            {NOTE: str must be >= 6 characters (sign + 5 digits), regardless of size of decNumber}
+PROCEDURE HexStrToLInt(hexString: TPString; VAR decNumber: LONGINT; VAR result: TConvResult);
+PROCEDURE StrToLInt(str: TPString; VAR decNumber: LONGINT; VAR result: TConvResult);
+PROCEDURE StrToInt(str: TPString; VAR decNumber: INTEGER; VAR result: TConvResult);
+
+PROCEDURE TrimBlanks(str: TPString);
+FUNCTION  CharUpperCased(ch: CHAR): CHAR;
+PROCEDURE StrUpperCased(str: TPString);
+
+PROCEDURE SplitFilePath(VAR fullPath, itsCatalog, itsFilePart: TFilePath);
+    {fullPath = CONCAT(itsCatalog, itsFilePart}
+
+PROCEDURE LatestError(newError: INTEGER; VAR previousError: INTEGER);
+        {This is used to handle error codes returned by multiple operations, so that you end up with
+            the first error number or warning number (error code < 0) if there was no error.
+         You should pass in the latest error as 'newError' and the variable that is to be the final
+            error code as 'previousError'.  Here is the actual code of LatestError:
+
+                         IF ((newError > 0) AND (previousError <= 0) OR
+                             (newError < 0) AND (previousError = 0)) THEN
+                            previousError := newError
+        }
+
+{$IFC fDbgObject}
+PROCEDURE EntDebugger(inputStr, enterReason: S255);
+PROCEDURE DumpVar(pVariable: Ptr; nameAndType: S255); {used mainly by TProcess.DumpGlobals}
+PROCEDURE WrStr(str: S255);         { write a string with wrap-around }
+PROCEDURE WrLn;                     { goto next line, and output indent }
+{$IFC fDebugMethods}
+PROCEDURE WrObj(object: TObject; numLevels: INTEGER; memberTypeStr: S255);
+{$ENDC}
+{$ENDC}
+
+{$IFC fDbgObject OR fDebugMethods}
+FUNCTION CheckKeyPress(routine: S255): BOOLEAN;
+{$ENDC}
+
+FUNCTION  NewHeap(VAR error: INTEGER; heapStart, numBytes: LONGINT; numObjects: INTEGER): THeap;
+FUNCTION  MakeDataSegment(VAR error, dsRefnum: INTEGER; firstTryVolume, thenTryVolume: TFilePath;
+                               ldsn, memBytes, diskBytes: INTEGER): LONGINT;
+
+PROCEDURE SetHeap(heap: THeap);
+PROCEDURE GetHeap(VAR heap: THeap);
+    {We can't USE Unit Storage because of type name conflicts (Ptr, Handle, ProcPtr)}
+
+
+FUNCTION  NeedConversion(exClassWorld: TClassWorld; VAR olderVersion, newerVersion: BOOLEAN): BOOLEAN;
+PROCEDURE ConvertHeap(heap: THeap; exClassWorld: TClassWorld);
+
+PROCEDURE MarkHeap(heap: THeap; mpAddress: LONGINT);
+PROCEDURE SweepHeap(heap: THeap; report: BOOLEAN);
+
+{$IFC fTrace}
+PROCEDURE BP(MyTraceLevel:integer);
+               {Trace entry to method and write SELF (unless CREATE, Debug, or FreeObject)}
+PROCEDURE EP;  {Trace entry from method and write SELF (unless CREATE, Debug, FreeObject, or Free)}
+{$ENDC}
+
+
+        (* ========================  RULES FOR WRITING A Fields FUNCTION  ====================
+
+         This function must be defined in every class until the compiler generates this info automatically!
+
+            PROCEDURE TWhatever.Fields{(PROCEDURE Field(nameAndType: S255))};
+            BEGIN  {THE FIELDS MUST BE LISTED IN DECLARED ORDER, NONE OMITTED AND NONE ADDED}
+              {Tell the superclass first (unnecessary if it is TObject)}
+                SUPERSELF.Fields(Field);
+              {The following type names are recognized by the parser}
+                Field('flag: BOOLEAN');
+                Field('coCode: Byte');
+                Field('inputChar: CHAR');
+                Field('version: INTEGER');
+                Field('width: LONGINT');
+                Field('viewLPt: LPoint');
+                Field('boundLRect: LRect');
+                Field('size: Point');
+                Field('ptr: Ptr');
+                Field('boundRect: Rect');
+                Field('someName: STRING[100]');
+              {If the last field is a Byte or a BOOLEAN, force padding to a word boundary by...
+                Field('');
+              {Every Registered Class name is recognized}
+                Field('miscObj: TObject');
+                Field('myPanel: TPanel');
+                Field('mySel: TMySelection');
+                Field('appSpecific: TAppSpecific');
+              {You may report more than one field in a single call to reduce code space}
+                Field('boundLRect: LRect; size: Point; ptr: Ptr; mySel: TMySelection');
+              {Unpacked invariant RECORDs are recognized}
+                Field('info: RECORD version: INTEGER; size: Point END');
+              {If the record has variants, select among them before calling Field()}
+                CASE SELF.variant OF
+                    flavor1: Field('RECORD version: INTEGER; size: Point END');
+                    flavor2: Field('RECORD viewLPt: LPoint END');
+                    END;
+              {Unpacked ARRAYs with literal bounds are recognized}
+                Field('desc: ARRAY [1..99] OF RECORD version: INTEGER; id: ARRAY [1..2] OF CHAR END');
+              {Other constructs and type names are NOT recognized; substitute one of the above forms}
+              {As a last resort, use ARRAY [1..SIZEOF(SELF.fieldName)] OF Byte}
+            END;
+        *)
+
+IMPLEMENTATION
+
+{$I LIBTK/UOBJECT2.text}  {Objects, Classes, Streams, and Resources}
+{$I LIBTK/UOBJECT3.text}  {Arrays and Lists}
+{$I LIBTK/UOBJECT4.text}  {Debugger}
+
+(**********
+{$I UOBJECT2.text}  {Objects, Classes, Streams, and Resources}
+{$I UOBJECT3.text}  {Arrays and Lists}
+{$I UOBJECT4.text}  {Debugger}
+**********)
+
+END.
+
+
+ÿ

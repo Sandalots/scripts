@@ -1,0 +1,1226 @@
+
+{$R-}
+
+UNIT UnitFf;
+
+(* Copyright 1983, Apple Computer Inc. *)
+
+INTRINSIC SHARED;
+
+{ bh   1/06/84  --  Converted to New Print Shop Interface }
+{ jrm  7/15/83  --  TTyDec, TTyRlU }
+{ tjm  4/12/83  --  compute correct value for cRunMax }
+{ crc 11/17/82  --  Exports ffVerPrPrf, removed erroneous printer preference
+                    check from IcsFfCreate }
+{ s_w 11/ 1/82  --  D+/D- option controlled by fSymOk }
+{ jrm 11/ 1/82  --  moved in dxMinTab definition from UnitTld }
+{ ???  8/25/82  --  LpLimFf in ffleader replaced by LpLim in csff; hz now a parm }
+{ jrm  8/16/82  --  wrote GetLeaderOfIcsFf; }
+{ crc  7/22/82  --  PrPrfs added to ffleader }
+{ jrm  6/29/82  --  USES change: LisaGraf => QuickDraw }
+{ crc  6/18/82  --  Added function IfilOfFf; USES UnitHz before UnitFile }
+{ jrm  6/ 4/82  --  Scrap and conditional compilation }
+{ crc 05/03/82  --  FreeFfIcs now closes ifil }
+{ crc 04/06/82  --  integration with new font manager }
+{ bas 01/13/82  --  USES for new wm }
+{ bas 12/14/81  --  USES for lisaprint }
+{ bas 12/10/81  --  integration with font manager }
+
+INTERFACE
+
+USES
+     {$U libsm/UnitStd    } UnitStd,
+     {$U libsm/UnitHz     } UnitHz,
+     {$U libos/SysCall    } SysCall,
+     {$U libsu/UnitFile   } UnitFile,
+     {$U libqd/QuickDraw  } QuickDraw,
+     {$U libfm/FontMgr    } FontMgr,
+     {$U libqd/Storage    } Storage,
+     {$U libsu/UnitFmt    } UnitFmt,
+     {$U libpm/PmDecl     } PmDecl,
+     {$U libpr/PrStdInfo  } PrStdInfo,
+     {$U libsu/UnitCS     } UnitCS;
+
+CONST
+     {$IFC NOT fDbgOk} fTstFf = FALSE; {$ENDC}
+     pwFf = -13142;
+     pwNotFf = 0;
+     cbPgff = 512;         {should be large enough for prrec}
+     dxMinTab = 6;
+     ffVersion = 5;        {current version number stuffed into ff leader}
+     ffVerPrPrf = 2;       {1st version containing PrPrf field}
+     ffVerNewRgfbcs = 3;   {It was necessary to swap the order of the character
+                           and paragraph extensions in the pgff so that
+                           we could have one paragraph extension larger than
+                           ofbcLitMin bytes}
+     ffVerMsgFst = 3;      {1st version for which "can't read" message put out}
+     ffVerCommaDecimal = 4;{1st version with .fDecimalComa field in TTbd }
+     ffVerPrRec = 5;       {1st version with prrec--spring 84}
+TYPE
+
+  TTyRlU = (tyrluEnglish, tyrluMetric, tyrluPica, tyrluElite);
+
+  TFfLeader = RECORD
+            password: TW; {=ffPassword => this is a lotus file}
+            version:  TC;
+            lpHdrFst: TLp;
+            lpFtrFst: TLp;
+            lpTxtFst: TLp;
+            dummyLpLimFf: TB; { No longer used, the field is left as a place
+                                holder until/if we rev the file format }
+            tyrlu: TTyRlU;   (* ruler units for the document *)
+            pglp: TPglp;
+            prprf: TPrRec;   { defined only for version >= ffVerPrRec }
+            END;
+
+VAR
+    cspdFf: TCspd;
+{$IFC fDbgOk}
+    fTstFf: TF;
+{$ENDC}
+
+PROCEDURE PxHcsff (hcs: THcs);
+
+PROCEDURE PxLeader(VAR leader: TFfleader);
+
+PROCEDURE SeqLpdFf (lpd: TLpd; VAR achad: TAChad);
+
+FUNCTION IcsFfCreate (ifil: TC; icsFig: TB; hz: THz; VAR ffleader: TFfleader) : TB;
+
+PROCEDURE FreeFfIcs (icsFf: TB);
+
+PROCEDURE WriteIcsFf(icsDoc: TB; pglp: TPglp; tyrluFf: TTyRlU;
+                     ifil: TB; ifilFig: TB; hzDoc: THz);
+
+PROCEDURE InitFF;
+
+FUNCTION LpMacFf(icsFf: TB) : TLp;
+
+PROCEDURE SetLeaderOfIcsFfFromIFil(ics: TB; ifil: TC; hz: THz);
+
+FUNCTION IfilOfFf (icsFf: TB):TB;
+
+PROCEDURE GetLeaderOfIcsFf(icsFf: TB; VAR ffleader: TFfLeader);
+
+
+IMPLEMENTATION
+
+{$IFC fSymOK}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+
+CONST ichPgLst = 503;  {511-SIZEOF(TFfTrail)}
+     cbFreePg = 504;
+     ichMaxPg = cbFreePg;
+     irunChLst = 251; {ichPgLst DIV 2}
+     ofbcLitMin = 96;
+     ofbcMax = 127;
+     cbFbcMax = 200;
+     cRunMax = 170;    {(ichMaxPg DIV 3) + 1}
+     ofbcVan = 112;    {ofbcLitMin + fVan}
+     ofbcStd = 97;     {ofbcLitMin + fStd}
+     ofbcParLstDummy = 127;
+
+TYPE TCsff = RECORD
+             cs:     TCs;
+             leader: TFfLeader;
+             lpLim:  TLp;
+             ifil: TC;
+             icsFig: TB;
+             END;
+    TPcsff = ^TCsff;
+    THcsff = ^TPcsff;
+
+    TFfTrail = RECORD
+             clpPrv: TC;         {chars to start of previous para}
+             clpNxt:  TC;         {chars to start of next para}
+             irunParFst: TC;        {run table for paragraphs}
+             irunChFst: TC;        {run table for characters}
+             END;
+
+    TRun = PACKED RECORD    {run table entry}
+             ofbc: 0..127;        {offset to rgfbc; > ofbcLitMin -> literal.}
+             ichFst: 0..511;
+             END;
+    TFs = PACKED RECORD
+             fill: 0..511;
+             three: 0..3;    {always 3}
+             fVan:  TF;
+             fBold:  TF;
+             fItalic:  TF;
+             fUnderline:  TF;
+             fStd:  TF;
+             END;
+    TOfbcOrFs = RECORD
+             CASE BOOLEAN OF
+              TRUE: (ofbc: TC);
+              FALSE: (fs: TFs);
+              END;
+
+    TARgRun = ARRAY [0..irunChLst] OF TRun;
+    TRgRun = ^TARgRun;
+
+    TAPgff = RECORD   {Page of formatted file}
+             CASE BOOLEAN OF
+              TRUE: (argch: ARRAY [0..ichPgLst] OF TCh;
+                     trailer: TFfTrail);
+              FALSE: (argRun: TARgRun);
+              {Note: actual last char used is argch[argRun[irunChLst].ichFst-1].}
+              END;
+    TPgff = ^TAPgff;
+
+    TFp = RECORD {File position}
+             ipg: TC;
+             ich:  TC;
+             END;
+
+    TARgw = ARRAY [0..0] OF TW;
+    TRgw = ^TARgw;
+
+    TAWad = RECORD
+             rgw: TRgw;
+             iwFst: TC;
+             iwLIm: TC;
+             END;
+    TWad = ^TAWad;
+
+VAR cbPgffLong: TL;
+   hfccFf: THfcc;
+   fpParPrv: TFp;
+   badFbcCh, badFbcPar: TBad;
+   wadRunCh, wadRunPar: TWad;
+   chadPg: TChad;
+   ifilFfMsg: TC;
+
+{$S SegPxScr }
+{--------------------------------------------}
+PROCEDURE PxLeader { (VAR leader: TFfleader) };
+{--------------------------------------------}
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$IFC fDbgOk}
+WITH leader DO
+    BEGIN
+    WRITELN('   leader -- password: ', password, '; version: ', version);
+    WRITELN('             lpTxtFst: ', lpTxtFst, '; lpHdrFst: ',
+             lpHdrFst, '; lpFtrFst:', lpFtrFst);
+    WRITELN('             yTopHdr:', pglp.yTopHdr:4, '; dyHdr:', pglp.dyHdr:4,
+            '; dyHtBody: (', pglp.dyHtBody:4, ';   dyBotBody:', pglp.dyBotBody:4);
+    END;
+{$ENDC}
+END;
+
+{$S SegPxScr }
+{-------------------------------}
+PROCEDURE PxHcsff { (hcs: THcs) };
+{-------------------------------}
+VAR hcsff: THcsff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$IFC fDbgOk}
+hcsff := POINTER(ORD(hcs));
+WITH hcsff^^ DO
+    BEGIN
+    WRITELN('hcsff -- ifil:', ifil:3, ', lpLim: ', lpLim);
+    PxLeader(leader);
+    END;
+{$ENDC}
+END;
+
+(* PROCEDURE PxBadFbc(badFbc: TBad; name: TSp);
+    VAR ifbc: TC;
+        rgfbc: TRgb;
+    BEGIN
+    WRITELN(name);
+    ifbc := 0;
+    WHILE ifbc < badFbc^.ichLim DO
+         BEGIN
+         rgfbc := @badFbc^.rgb^[ifbc];
+         PxRgfbc(rgfbc);
+         ifbc := ifbc + IfbcLstApplyRgfbc(rgfbc, NIL, NIL) + 1;
+         END;
+    WRITELN;
+    END;
+*)
+
+{$S SegPxScr }
+{----------------------------}
+PROCEDURE PxPgff(pgff: TPgff);
+{----------------------------}
+{$IFC fDbgOk}
+LABEL 11;
+{$ENDC}
+VAR irunC, irunP: TC;
+   ichC, ichP, ich, ichLimPg: TC;
+   ofbcMacPgff, ofbc: TC;
+   rgfbc: TRgb;
+   ofbcLimPar, ofbcLimCh: TC;
+(* PROCEDURE PxWad(wad: TWad; name: TSp);
+    VAR iw: TC;
+        pRun: ^TRun;
+    BEGIN
+    WRITELN(name);
+    WRITELN('    ofbc  ichFst');
+    WRITELN('    ----  ------');
+    FOR iw := 0 TO wad^.iwFst - 1 DO
+         BEGIN
+         pRun := @wad^.rgw^[iw];
+         WITH pRun^ DO WRITELN('  [ ', ofbc:4, ' : ', ichFst:4, ' ]');
+         END;
+    WRITELN;
+    END;
+*)
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$IFC fDbgOk}
+WRITELN;
+WRITE('Pgff: (',ORD(pgff),') ');
+WITH pgff^, pgff^.trailer DO
+    BEGIN
+    WRITELN('clpPrv:', clpPrv:4, '; clpNxt:', clpNxt:4,
+           '; irunParFst:', irunParFst:4, '; irunChFst:', irunChFst:4);
+    irunP := irunParFst;
+    irunC := irunChFst;
+    ichC := 0;
+    ichP := 0;
+    ichLimPg := argRun[irunChLst].ichFst;
+    ich := 0;
+    ofbcMacPgff := (irunParFst * 2) - ichLimPg;
+    ofbcLimPar := 0;
+    ofbcLimCh := 0;
+    WHILE TRUE DO
+         BEGIN
+         IF ich = ichP THEN
+              BEGIN
+              IF (ichP > 0) AND (argch[ichP - 1] <> chCr) THEN Break(113);
+              ofbc := argRun[irunP].ofbc;
+              WRITE('<--PAR (', ich:1, ': ', ofbc:1, ': ', irunP:1, ')-->');
+              IF ichP > 0 THEN
+                   IF argch[ichP - 1] <> chCr THEN
+                        WRITELN('Error -- par end w/o <cr>');
+              IF ofbc < ofbcLitMin THEN
+                   BEGIN
+                   IF ofbc >= ofbcMacPgff THEN
+                        Break(107)
+                   ELSE BEGIN
+                        IF ofbc > ofbcLimPar THEN ofbcLimPar := ofbc;
+                        { this needs ffVerNewrgfbcs update whihc requires
+                          access to hcsff^^.leader.version
+                          rgFbc := POINTER(ORD(pgff) + irunParFst*2 - ofbc);
+                          PxRgfbc(rgFbc);
+                        }
+                        END;
+                   END;
+              irunP := irunP + 1;
+              IF irunP < irunChFst
+                   THEN ichP := argRun[irunP].ichFst
+                   ELSE ichP := cbPgff;
+              END
+         ELSE IF (argch[ich] = chCr) AND (ichP <> ich + 1) THEN Break(114);
+         IF ich = ichC THEN
+              BEGIN
+              ofbc := argRun[irunC].ofbc;
+              WRITE('<-(', ich:1, ': ', ofbc:1, ': ', irunC:1, ')->');
+              IF ofbc < ofbcLitMin THEN
+                   BEGIN
+                   IF ofbc >= ofbcMacPgff THEN
+                        Break(107)
+                   ELSE BEGIN
+                        IF ofbc > ofbcLimCh THEN ofbcLimCh := ofbc;
+                        { this needs ffVerNewrgfbcs update whihc requires
+                          access to hcsff^^.leader.version
+                          rgFbc := POINTER(ORD(pgff) + ichLimPg + ofbc);
+                          PxRgfbc(rgFbc);
+                        }
+                        END;
+                   END;
+              irunC := irunC + 1;
+              ichC := argRun[irunC].ichFst;
+              END;
+         IF ich = ichLimPg THEN GOTO 11;
+         WRITE(CHR(argch[ich]));
+         ich := ich + 1;
+         END;
+    11:
+    WRITELN;
+    IF irunP <> irunChFst THEN
+         WRITELN('Error - irunP (', irunP, ') <> irunParLim (', irunChFst, ')');
+    IF irunC <> irunChLst + 1 THEN
+         WRITELN('Error - irunC (', irunC, ') <> irunChLst + 1');
+    IF ofbcLimCh + ofbcLimPar >= ofbcMacPgff THEN
+         WRITELN('Error - ofbc tables overlap.');
+
+    { These globals are not initialized
+      further, the printout seems redundant
+    PxBadFbc(badFbcCh, '  badFbcCh:');
+    PxBadFbc(badFbcPar, '  badFbcPar:');
+    PxWad(wadRunCh, '  wadRunCh:');
+    PxWad(wadRunPar, '  wadRunPar:');
+    }
+    END;
+{$ENDC}
+END;
+
+
+{$S SUlwop1 }
+{---------------------------------}
+FUNCTION LpMacFf {(icsFf: TB) : TLp };
+{---------------------------------}
+VAR hcsff: THcsff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   hcsff := POINTER(ORD(rghcs^[icsFf]));
+   LpMacFf := hcsff^^.lpLim;
+END;
+
+{$S SUinit}
+{----------------}
+PROCEDURE InitFf;
+{----------------}
+VAR cError: TC;
+    spPath: String255;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+  WITH cspdFf DO
+    BEGIN
+    argproc[iprocSeqLpd]       := @SeqLpdFf;
+    argproc[iprocFindLpFixed]  := @FindLpFstPar;
+    argproc[iprocCrd]          := pointer(procNil);
+    argproc[iprocFreeIcs]      := @FreeFfIcs;
+    argproc[iprocFSelLpBounds] := @TrueStdSelLpBounds;
+    argproc[iprocPxHcs]        := @PxHcsFf;
+    argproc[iprocHilight]      := pointer(procNil);
+    argimgp[iimgpScrn]         := pointer(procNil);
+    argimgp[iimgpQume]         := pointer(procNil);
+    END;
+spPath := 'System.BadPageMsg.Lotus';
+ifilFfMsg := IfilOpen(cError, spPath, cbPgff, [dRead, global_Refnum], hzNil,'');
+IF cError > 0 THEN ifilFfMsg := ifilNil;
+END;
+
+{$S SUlwwrk}
+{---------------------------------------------------------------------------}
+FUNCTION IrunFindIch(ich: TC; VAR argRun: TARgRun; irunFst, irunLst: TC): TC;
+{---------------------------------------------------------------------------}
+LABEL 99;
+VAR irun: TC;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+FOR irun := irunLst DOWNTO irunFst DO
+    IF argRun[irun].ichFst <= ich THEN
+         BEGIN
+         IrunFindIch := irun;
+         GOTO 99;
+         END;
+Break(110);
+99:
+END;
+
+{$S SUlwwrk}
+{--------------------------------------------------------}
+FUNCTION PgffMapIpg(ipg: TC; ifil: TB; fDirty: TF; hz: THz): TPgff;
+{--------------------------------------------------------}
+VAR fd: TFd;
+   pn: TPn;
+   cbPg: TL;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+cbPg := SIZEOF(TAPgff);
+pn := @fd;
+pn^ := (ipg+1) * cbPg;
+fd.ifil := ifil;
+PgffMapIpg := POINTER(ORD(PMapN(hz, pn^)));
+IF fDirty THEN SetFDirty(hz, pn^, TRUE);
+END;
+
+{$S SUlwwrk}
+{------------------------------------------------}
+PROCEDURE SeqLpdFf { (lpd: TLpd; achad: TAchad) };
+{------------------------------------------------}
+LABEL 99, 117;
+VAR pgff: TPgff;
+    pgffNxt: TPgff;
+    cchSeq: TC;
+    fp: TFp;
+    achadSrc: TAChad;
+    irun, irunPF: TC;
+    ichLimPgff: TC;
+    rgFbc: TRgb;
+    ifbcLst: TC;
+    hcsff: THcsff;
+    i: TC;
+    ofbcOrFs:       TOfbcOrFs;
+    ichLimRun:  TC;
+    lpLimFf: TLp;
+    ofbcPar, ofbcMacPgff: TC;
+    hzFf: THz;
+    lpPgff: TLp;
+    ffVer: TC;
+    ichLimNxt: TC;
+    itb, itbLim: TC;
+    rgtbd: TRgtbd;
+
+{$S SUcold}
+    PROCEDURE ReturnVanishPage;
+    BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+    lpd^.rce := @lpd^.arce;
+    lpd^.arce.fVan := TRUE;
+    lpd^.lpFstPar := lpPgff; lpd^.lpLimPar := lpPgff + cbPgffLong;
+    cchSeq := lpd^.lpLimPar - lpd^.lp;
+    END;
+{$S SUlwwrk}
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+WITH rghcs^[lpd^.ics]^^ DO
+    BEGIN
+    IF tycs <> tycsFf THEN Break(109);
+    hzFf := hz;
+    END;
+hcsff := POINTER(ORD(rghcs^[lpd^.ics]));
+ffVer := hcsff^^.leader.version;
+lpLimFf := hcsff^^.lpLim;
+
+IF fTstFf THEN
+    WRITELN('SeqLpdFf: ff:(lpLimFf:', lpLimFf, ',ifil:',hcsff^^.ifil,')');
+
+lpd^.lp := LpMinP(lpd^.lpLim, lpLimFf);
+WITH achad DO
+    BEGIN
+    cchSeq := LpMinP(ichLim - ichFst, lpLimFf - lpd^.lp);
+    ichLim := ichFst+cchSeq;
+    END;
+IF fTstFf THEN WRITELN(' achad:(',achad.ichFst,',',achad.ichLim,')');
+IF cchSeq = 0 THEN
+    BEGIN
+    IF fTstFf THEN WRITELN('End of ff document.');
+    achad.ichFst := achad.ichLim;
+    GOTO 99;
+    END;
+
+fp.ipg := lpd^.lp DIV SIZEOF(TAPgff);
+lpPgff := fp.ipg * cbPgffLong;
+fp.ich := lpd^.lp - lpPgff;
+pgff := PgffMapIpg(fp.ipg, hcsff^^.ifil, FALSE, hzFf);
+IF (pgff = NIL) AND (ifilFfMsg <> ifilNil) AND (ffVer >= ffVerMsgFst) THEN
+     pgff := PgffMapIpg(0, ifilFfMsg, FALSE, hzFf);
+
+IF pgff = NIL THEN
+     ReturnVanishPage
+ELSE BEGIN
+     WITH pgff^ DO
+         BEGIN
+         ichLimPgff := argRun[irunChLst].ichFst;
+         ofbcMacPgff := (trailer.irunParFst * 2) - ichLimPgff;
+         irun := IrunFindIch(fp.ich, argRun, trailer.irunChFst, irunChLst);
+         IF irun = irunChLst
+              THEN ichLimRun := cbPgff
+              ELSE ichLimRun := argrun[irun+1].ichFst;
+         cchSeq := CMin(cchSeq, ichLimRun-fp.ich);
+         END;
+     IF fTstFf THEN
+         BEGIN
+         WITH lpd^ DO WRITELN(' lp:', lp, '; fp: [',fp.ipg:3,';',fp.ich:4,']');
+         WITH pgff^ DO
+              BEGIN
+              WRITELN('irunCh:', irun:4,
+                      '; argrun[irunCh+1].ichFst:',argrun[irun+1].ichFst:4);
+              END;
+         WRITELN(' cchSeq:',cchSeq:3);
+         IF fTstFf THEN WRITELN('ofbcMacPgff:', ofbcMacPgff:4);
+         IF irun = pgff^.trailer.irunChFst THEN PxPgff(pgff);
+         END;
+
+     WITH lpd^ DO
+         BEGIN
+         rce := @arce;
+         arce := arceStd;
+         IF irun = irunChLst THEN
+              BEGIN
+              arce.fVan := TRUE;
+              END
+         ELSE BEGIN
+              ofbcOrFs.ofbc := pgff^.argRun[irun].ofbc;
+              IF ofbcOrFs.ofbc < ofbcLitMin THEN
+                   BEGIN
+                   IF ofbcOrFs.ofbc >= ofbcMacPgff THEN
+                        BEGIN
+                        IF fTstFf THEN WRITELN('ofbcCh:', ofbcOrFs.ofbc:4);
+                        Break(102);
+                        PxPgff(pgff);
+                        END;
+                   IF ffVer < ffVerNewRgfbcs THEN
+                        rgFbc := POINTER(ORD(pgff) + ichLimPgff + ofbcOrFs.ofbc)
+                   ELSE rgFbc := POINTER(ORD(pgff) + (pgff^.trailer.irunParFst * 2)
+                                   - ofbcOrFs.ofbc);
+                   IF fTstFf THEN PxRgfbc(rgFbc);
+                   ifbcLst := IfbcLstApplyRgfbc(rgFbc, NIL, rce);
+                   IF arce.lpFig <> lpNil THEN arce.icsFig := hcsff^^.icsFig;
+                   END
+              ELSE BEGIN
+                   IF NOT ofbcOrFs.fs.fStd THEN
+                        BEGIN
+                         { little kludgey yet - need to coordinate arce and fs }
+                        arce.fVan := ofbcOrFs.fs.fVan;
+                        arce.fBold := ofbcOrFs.fs.fBold;
+                        arce.fItalic := ofbcOrFs.fs.fItalic;
+                        arce.fUnderline := ofbcOrFs.fs.fUnderline;
+                        arce.fShadow := false;
+                        arce.fOutline := false;
+                        END;
+                   END;
+              END;
+         END;
+     WITH pgff^, pgff^.trailer, lpd^ DO
+         BEGIN
+         irun := IrunFindIch(fp.ich, argRun, irunParFst, irunChFst-1);
+         lpFstPar := lpPgff;
+         lpLimPar := lpFstPar;
+         IF irun = iRunChFst - 1
+              THEN lpLimPar := LpMinP(lpLimFf, lpLimPar + SIZEOF(TAPgff) + clpNxt)
+              ELSE lpLimPar := lpLimPar + argRun[irun+1].ichFst;
+         IF irun = irunParFst
+              THEN lpFstPar := lpPgff - clpPrv
+              ELSE lpFstPar := lpPgff + argRun[irun].ichFst;
+         IF fTstFf THEN WRITELN('lp, [lpFstPar lpLimPar] = ', lp:1,
+                                  ', [', lpFstPar:1, ' ', lpLimPar:1, ']');
+         IF tyset.fParBnds THEN
+              IF (lpLimPar - lp) < cchSeq THEN cchSeq := lpLimPar - lp;
+         IF fTstFf THEN WRITELN('tyset.fParBnds: ', tyset.fParBnds,
+                                '; cchSeq:', cchSeq:4);
+         IF tyset.fRpe THEN
+              BEGIN
+              fParSt := (lp = lpFstPar);
+              rpe := @arpe;
+              arpe := arpeStd;
+              ofbcPar := argRun[irun].ofbc;
+              IF (ofbcPar = ofbcParLstDummy)
+                AND ((lpFstPar + cbPgff) < lpLimFf) THEN
+                   BEGIN
+                   pgffNxt := PgffMapIpg(fp.ipg + 1, hcsff^^.ifil, FALSE, hzFf);
+                   IF pgffNxt = NIL THEN
+                        GOTO 117
+                   ELSE BEGIN
+                        irunPF := pgffNxt^.trailer.irunParFst;
+                        ofbcPar := pgffNxt^.argRun[irunPF].ofbc;
+                        IF ofbcPar >= ofbcLitMin THEN GOTO 117;
+                        ichLimNxt := pgffNxt^.argRun[irunChLst].ichFst;
+                        IF ffVer < ffVerNewRgfbcs THEN
+                             rgFbc := POINTER(ORD(pgffNxt) + (irunPF * 2) - ofbcPar)
+                        ELSE rgFbc := POINTER(ORD(pgffNxt) + ichLimNxt + ofbcPar);
+                        END;
+                   END
+              ELSE BEGIN
+                   IF ofbcPar >= ofbcLitMin THEN GOTO 117;
+                   IF ffVer < ffVerNewRgfbcs THEN
+                        rgFbc := POINTER(ORD(pgff) + (irunParFst * 2) - ofbcPar)
+                   ELSE rgFbc := POINTER(ORD(pgff) + ichLimPgff + ofbcPar);
+                   END;
+              IF fTstFf THEN PxRgfbc(rgFbc);
+              ifbcLst := IfbcLstApplyRgfbc(rgFbc, rpe, NIL);
+              IF ffVer < ffVerCommaDecimal THEN
+                 BEGIN
+                 itbLim := rpe^.itbLim;
+                 IF itbLim > 0 THEN
+                    BEGIN
+                    rgtbd := POINTER(ORD(rpe) + ibRgtbd);
+                    FOR itb := 0 TO itbLim - 1 DO
+                       rgtbd^[itb].fDecimalComma := FALSE;
+                    END;
+                 END;
+              END;
+        117:
+        pgff := PgffMapIpg(fp.ipg, hcsff^^.ifil, FALSE, hzFf);
+        IF (pgff = NIL) AND (ifilFfMsg <> ifilNil) THEN
+             pgff := PgffMapIpg(0, ifilFfMsg, FALSE, hzFf);
+        END;
+
+     IF pgff = NIL THEN
+          ReturnVanishPage
+     ELSE BEGIN
+          WITH achad DO ichLim := ichFst + cchSeq;
+          achadSrc.rgch := @pgff^.argch;
+          achadSrc.ichFst := fp.ich;
+          IF achad.rgch = NIL THEN
+              BEGIN
+              achad := achadSrc;
+              achad.ichLim := achad.ichFst+cchSeq;
+              END
+          ELSE MoveAchad(achad, achadSrc);
+          END;
+     END;
+IF fTstFf THEN
+    BEGIN
+    WRITE(' "');
+    WITH achad DO FOR i:=ichFst TO ichLim-1 DO WRITE(CHR(rgch^[i]));
+    WRITELN('"');
+    END;
+99:
+WITH lpd^ DO lpLim := lp + cchSeq;
+END;
+
+{$S SUcold}
+{---------------------------------}
+PROCEDURE FreeFfIcs { (icsFf: TB) };
+{---------------------------------}
+VAR rgh: TRgh;
+    hcs: THcs;
+    hcsff: THcsff;
+    cError: TC;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hcs := rghcs^[icsFf];
+hcsff := POINTER(ORD(hcs));
+IF hcsff^^.icsFig <> icsNil THEN FreeIcs(hcsff^^.icsFig);
+CleanIfil(cError, rghcs^[icsFf]^^.hz, hcsff^^.ifil, FALSE);
+IF cError > 0 THEN
+     { Because ff's are currently read only, CleanIfil should always
+       return 0 }
+     Break(1800);
+CloseIfil(cError, hcsff^^.ifil);
+IF cError > 0 THEN Break(1801);
+FreeBk(hcs^^.hz, POINTER(ORD(hcs)), tybkStd);
+rgh := POINTER(ORD(rghcs));
+rgh^[icsFf] := hNil;
+END;
+
+{$S SUlwop1}
+{------------------------------------------------------------------------}
+FUNCTION IcsFfCreate { (ifil: TC; icsFig: TB; hz: THz;
+                        VAR ffleader: TFfleader) : TB };
+{------------------------------------------------------------------------}
+VAR pLdr: ^TFfLeader;
+   hcsff: THcsff;
+   ics: TB;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF fTstFf THEN WRITELN('IcsFfCreate');
+cbPgffLong := SIZEOF(TAPgff);
+ics := IcsCreate(tycsFf, SIZEOF(TCsff), hz);
+rghcs^[ics]^^.cspd := cspdFf;
+(*
+   pLdr := POINTER(ORD(PMapN(hz, NFromIFilIb(ifil, 0))));
+   hcsff^^.leader := pLdr^;
+*)
+hcsff := POINTER(ORD(rghcs^[ics]));
+hcsff^^.ifil := ifil;
+hcsff^^.icsFig := icsFig;
+SetLeaderOfIcsFfFromIFil(ics, ifil, hz);
+ffleader := hcsff^^.leader;
+IcsFfCreate := ics;
+IF fTstFf THEN PxCs(ics);
+END;
+
+{$S SUlwop1}
+{------------------------------------------------------------------}
+PROCEDURE SetLeaderOfIcsFfFromIFil { (ics: TB; ifil: TC; hz: THz) };
+{------------------------------------------------------------------}
+VAR pLdr: ^TFfLeader;
+    hcsff: THcsff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hcsff := POINTER(ORD(rghcs^[ics]));
+pLdr := POINTER(ORD(PMapN(hz, NFromIFilIb(ifil, 0))));
+IF pLdr = NIL THEN
+     BEGIN
+     hcsff^^.leader.password := pwNotFf;
+     hcsff^^.lpLim := 0;
+     END
+ELSE BEGIN
+     hcsff^^.leader := pLdr^;
+     hcsff^^.lpLim := ORD4(CblkOfIfil(ifil) - 1) * cbPgFf;
+     END;
+END;
+
+{$S SUcold}
+{---------------------------------------------------------}
+FUNCTION FFindDuplicateBad(badFbc: TBad; VAR ofbc: TC): TF;
+{---------------------------------------------------------}
+LABEL 99;
+VAR ichLimScan, i, j: TC;
+   rgchScan: TRgCHAR;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+FFindDuplicateBad := FALSE;
+WITH badFbc^ DO
+    BEGIN
+    IF ichFst > 0 THEN
+         BEGIN
+         i := 0;
+         ichLimScan := ichFst - (ichLim - ichFst);
+         WHILE i <= ichLimScan DO
+              BEGIN
+              rgchScan := @rgb^[i];
+              i := i + SCANEQ(ichLimScan - i + 1, CHR(rgb^[ichFst]), rgchScan^);
+              IF i > ichLimScan THEN GOTO 99;
+              j := 0;
+              WHILE rgb^[ichFst+j] = rgb^[i+j] DO
+                   BEGIN
+                   j := j + 1;
+                   IF ichFst+j = ichLim THEN
+                        BEGIN
+                        ofbc := i;
+                        FFindDuplicateBad := TRUE;
+                        IF fTstFf THEN WRITELN('Duplicated run!');
+                        GOTO 99;
+                        END;
+                   END;
+              i := i + 1;
+              END;
+         END;
+    END;
+99:
+END;
+
+{$S SUcold}
+{------------------}
+PROCEDURE StartPgff;
+{------------------}
+VAR pRun: ^TRun;
+   rgchFill: TRgCHAR;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+rgchFill := @chadPg^.rgch^;
+FILLCHAR(rgchFill^, SIZEOF(TAPgff), CHR(0));
+WITH chadPg^    DO BEGIN ichFst := 0; ichLim := ichMaxPg; END;
+WITH badFbcPar^ DO BEGIN ichFst := 0; ichLim := 0; END;
+WITH badFbcCh^  DO BEGIN ichFst := 0; ichLim := 0; END;
+WITH wadRunPar^ DO BEGIN iwFst  := 0; iwLim  := 0; END;
+WITH wadRunCh^  DO BEGIN iwFst  := 0; iwLim  := 0; END;
+END;
+
+{$S SUcold}
+{------------------------------------------------------------}
+PROCEDURE SetParClps(pgff: TPgff; ipg: TC; ich: TC; ifil: TC; hz: THz);
+{------------------------------------------------------------}
+VAR ipgT: TC;
+   pgffT: TPgff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF fTstFf THEN WRITELN('SetParClps.');
+IF fpParPrv.ipg < ipg THEN
+    BEGIN
+    pgff^.trailer.clpPrv := (ipg - fpParPrv.ipg) * cbPgffLong - fpParPrv.ich;
+    FOR ipgT := ipg - 1 DOWNTO fpParPrv.ipg DO
+         BEGIN
+         pgffT := PgffMapIpg(ipgT, ifil, TRUE, hz);
+         IF pgffT <> NIL THEN
+              BEGIN
+              pgffT^.trailer.clpNxt :=(ipg - ipgT - 1) * cbPgffLong + ich;
+              IF ipgT <> fpParPrv.ipg THEN
+                   pgffT^.trailer.clpPrv := (ipgT - fpParPrv.ipg) * cbPgffLong -
+                                               fpParPrv.ich;
+              END;
+         END;
+    fpParPrv.ipg := ipg;
+    END;
+fpParPrv.ich := ich;
+END;
+
+{$S SUcold}
+{----------------------------------------------------------------------------}
+FUNCTION FBuildPgff(ipg: TC; ifil: TC; VAR dch: TC;
+                    VAR fVanishBeginsPar: TF; hz: THz) : TF;
+{----------------------------------------------------------------------------}
+{Note: In each descriptor, iFst..iLim-1 is the portion which caused the
+       page to overflow.  Fits as much as possible on this page, and
+       sets dch to the number of chars written to this page from the overflow
+       portion.}
+VAR pgff: TPgff;
+   ifbcChFst, ifbcParFst: TC;
+   pRun: ^TRun;
+   i: TC;
+   cbPg, cbSlop, cbOvfl, cbFbcCh: TC;
+   pT: TP;
+   pn: TPn;
+   fd: TFd;
+   ipgT: TC;
+   ichLimPg: TC;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF fTstFf THEN WRITELN('BuildPgff: ');
+pgff := @chadPg^.rgch^;
+ichLimPg := chadPg^.ichFst;
+
+ { Figure how much space is to be used. }
+cbPg := ichLimPg + badFbcCh^.ichFst + badFbcPar^.ichFst
+       + (wadRunCh^.iwFst + wadRunPar^.iwFst + 2) * 2;
+cbSlop := cbFreePg - cbPg;
+IF cbSlop < 0 THEN Break(103);
+cbOvfl := (badFbcCh^.ichLim - badFbcCh^.ichFst)
+       + (badFbcPar^.ichLim - badFbcPar^.ichFst)
+       + (wadRunCh^.iwLim - wadRunCh^.iwFst)*2
+       + (wadRunPar^.iwLim - wadRunPar^.iwFst)*2;
+dch := 0;
+
+ { Try to fit some of the current run. }
+IF (cbSlop > cbOvfl) AND (badFbcCh^.ichLim < ofbcLitMin)
+  AND (badFbcPar^.ichFst < ofbcLitMin) THEN
+    BEGIN
+    badFbcCh^.ichFst := badFbcCh^.ichLim;
+    badFbcPar^.ichFst := badFbcPar^.ichLim;
+    wadRunCh^.iwFst := wadRunCh^.iwLim;
+    wadRunPar^.iwFst := wadRunPar^.iwLim;
+    dch := cbSlop - cbOvfl;
+    IF ichLimPg + dch > chadPg^.ichLim THEN dch := chadPg^.ichLim - ichLimPg;
+    ichLimPg := ichLimPg + dch;
+    chadPg^.ichFst := ichLimPg;
+    cbPg := cbPg + (cbOvfl + dch);
+    cbSlop := 0;
+    END;
+
+IF ichLimPg > 0 THEN
+     BEGIN
+      { If the last character on page is end of paragraph we need }
+      { a dummy entry to begin next paragraph in vanish area. }
+     IF chadPg^.rgch^[ichLimPg - 1] = chCr THEN
+         BEGIN
+         fVanishBeginsPar := TRUE;
+         pRun := @wadRunPar^.rgw^[wadRunPar^.iwFst];
+         pRun^.ofbc := ofbcParLstDummy;
+         pRun^.ichFst := ichLimPg;
+          { We took care of this extra run in cbPg. }
+         wadRunPar^.iwFst := wadRunPar^.iwFst + 1;
+         SetParClps(pgff, ipg, ichLimPg, ifil, hz);
+         END
+     ELSE fVanishBeginsPar := FALSE;
+
+      { Compute where the tables start. }
+     WITH pgff^.trailer DO
+         BEGIN irunChFst := irunChLst - wadRunCh^.iwFst;
+         irunParFst := irunChFst - wadRunPar^.iwFst;
+         cbFbcCh := badFbcCh^.ichFst;
+         ifbcChFst := (irunParFst * 2) - cbFbcCh;
+         ifbcParFst := ichLimPg;
+         END;
+
+     IF fTstFf THEN
+         BEGIN
+         WRITELN(' cbPg:', cbPg:4, '; cbSlop:' ,cbSlop:4, '; dch:', dch:3);
+         WRITELN(' ifbcChFst:', ifbcChFst:4, '; ifbcParFst:', ifbcParFst:4);
+         WRITELN(' irunChFst:', pgff^.trailer.irunChFst:4,
+                 '; irunParFst:', pgff^.trailer.irunParFst:4);
+         WRITELN;
+         END;
+
+      { Refigure the negative offsets for ofbcPar's. }
+     FOR i := 0 TO wadRunCh^.iwFst-1 DO
+         BEGIN
+         pRun := @wadRunCh^.rgw^[i];
+         IF pRun^.ofbc < ofbcLitMin THEN pRun^.ofbc := cbFbcCh - pRun^.ofbc;
+         END;
+
+      { Move the tables in. }
+     WITH badFbcCh^ DO MoveRgch(@pgff^.argch[ifbcChFst], @rgb^, ichFst);
+     WITH badFbcPar^ DO MoveRgch(@pgff^.argch[ifbcParFst], @rgb^, ichFst);
+     WITH wadRunPar^ DO
+         MoveRgch(@pgff^.argRun[pgff^.trailer.irunParFst], @rgw^, iwFst*2);
+     WITH wadRunCh^ DO
+         MoveRgch(@pgff^.argRun[pgff^.trailer.irunChFst], @rgw^, iwFst*2);
+     WITH pgff^.argRun[irunChLst] DO
+         BEGIN
+         ichFst := chadPg^.ichFst;
+         ofbc := ofbcVan;
+         END;
+
+     IF fTstFf THEN PxPgff(pgff);
+
+      { Create the page in the file. }
+     pT := POINTER(ORD(PCreateNob(hz, NFromIFilIb(ifil, (ipg + 1) * cbPgffLong),
+       cbPgff)));
+     MoveRgch(@pT^, @pgff^, SIZEOF(TAPgff));
+     SetFDirty(hz, NFromIFilIb(ifil, (ipg + 1) * cbPgffLong), TRUE);
+
+     StartPgff;
+     FBuildPgff := TRUE;
+     END
+ELSE FBuildPgff := FALSE;
+END;
+
+{$S SUcold}
+{--------------------------------}
+PROCEDURE BuildRun(tydst: TTydst; hz: THz);
+{--------------------------------}
+LABEL 999;
+VAR pRun,pRunPrv: ^TRun;
+   wadRun: TWad;
+   badFbc: TBad;
+   difbc, ofbcT: TC;
+   i: TC;
+   fStd: TF;
+   ofbcOrFs: TOfbcOrFs;
+   rcpe, rcpeStd: TP;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF tydst = tydstRce THEN
+    BEGIN
+    rcpe := POINTER(ORD(lpdStd^.rce));
+    rcpeStd := @arceStd;
+    wadRun := wadRunCh;
+    badFbc := badFbcCh;
+    END
+ELSE BEGIN
+    rcpe := POINTER(ORD(lpdStd^.rpe));
+    rcpeStd := @arpeStd;
+    wadRun := wadRunPar;
+    badFbc := badFbcPar;
+    END;
+IF (wadRun^.iwLim > 0) THEN
+    BEGIN
+    pRunPrv := @wadRun^.rgw^[wadRun^.iwLim - 1];
+    IF pRunPrv^.ichFst = chadPg^.ichFst THEN GOTO 999;
+    END;
+GenFopsDiff(hfccFf, tydst, rcpeStd, rcpe, hz);
+difbc := IfbcLstApplyRgfbc(@hfccFf^^.argfbc, NIL, NIL) + 1;
+IF difbc = 1 THEN
+    fStd := TRUE
+ELSE BEGIN
+    IF badFbc^.ichLim + difbc > cbFbcMax THEN
+         BEGIN
+         IF fTstFf THEN WRITELN(CHR(7), 'badFbc overflow.');
+         GOTO 999;
+         END;
+    MoveRgch(@badFbc^.rgb^[badFbc^.ichLim], @hfccFf^^.argfbc, difbc);
+    badFbc^.ichLim := badFbc^.ichLim + difbc;
+    fStd := FALSE;
+    END;
+pRun := @wadRun^.rgw^[wadRun^.iwLim];
+wadRun^.iwLim := wadRun^.iwLim + 1;
+WITH pRun^ DO
+    BEGIN
+    ichFst := chadPg^.ichFst;
+    IF fStd THEN
+         ofbc := ofbcStd
+    ELSE BEGIN
+         IF FFindDuplicateBad(badFbc, ofbcT) THEN
+              BEGIN
+              ofbc := ofbcT;
+              badFbc^.ichLim := badFbc^.ichFst;
+              END
+         ELSE ofbc := badFbc^.ichFst;
+         END;
+    END;
+IF (wadRun^.iwFst > 0) AND (tydst = tydstRce) THEN
+    BEGIN
+    pRunPrv := @wadRun^.rgw^[wadRun^.iwFst - 1];
+    IF pRunPrv^.ofbc = pRun^.ofbc THEN wadRun^.iwLim := wadRun^.iwFst;
+    END;
+IF fTstFf THEN
+    BEGIN
+    WRITELN('BuildRun -- from ich ', chadPg^.ichFst:1,
+                         ' to ich ', chadPg^.ichLim:1, '. rgfbc:');
+    IF NOT fStd THEN PxRgfbc(@badFbc^.rgb^[badFbc^.ichFst]);
+    WITH wadRun^ DO WRITELN(' wadRun: (',iwFst,',',iwLim,')');
+    END;
+999:
+END;
+
+{$S SUcold}
+{-----------------------------------------------------------------------}
+PROCEDURE WriteIcsFf { (icsDoc: TB; pglp: TPglp; tyrluFf: TTyRlU;
+                        ifil: TB; ifilFig: TB; hzDoc: THz) };
+{-----------------------------------------------------------------------}
+VAR achadPg: TAchad;
+   abadFbcCh, abadFbcPar: TABad;
+   awadRunCh, awadRunPar:   TAWad;
+   lpTxtLim, lpHdrLim, lpFtrLim: TLp;
+   apgff: TAPgff;
+   pgff: TPgff;
+   argFbcPar, argFbcCh: PACKED ARRAY [0..cbFbcMax] OF TB;
+   argRunPar, argRunCh: ARRAY [0..cRunMax] OF TRun;
+   dch: TC;
+   cbUsed: TC;
+   fpCur: TFp;
+   pLeader: ^TFfLeader;
+   tyset: TTyset;
+   pn: TPn;
+   fd: TFd;
+   fBegunPar: TF;
+   h: TH; cbT: TC; n: TN;
+   achadT: TAchad; argchT: TArgch; lpdSon: TLpd;
+{$S SUcold}
+FUNCTION LpLimFfWriteIcs(ics: TB) : TLp;
+    VAR ipgT: TC;
+        fBeginsPar: TF;
+        icsFigSrc: TB;
+        hzFigSrc: THz;
+    BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+    IF fTstFf THEN WRITELN('LpLimFfWriteIcs -- ics:', ics:3);
+    achadPg.ichLim := ichMaxPg;
+    fBeginsPar := TRUE;
+    fBegunPar := FALSE;
+    tyset.fRce := TRUE; tyset.fRpe := TRUE; tyset.fParBnds := TRUE;
+    SetLpd(lpdStd, ics, 0, tyset, achadPg);
+    WHILE achadPg.ichFst <> achadPg.ichLim DO
+         BEGIN
+
+          { Any of several consecutive vanished runs could begin a par. }
+         fBeginsPar := (fBeginsPar OR(lpdStd^.lp = lpdStd^.lpFstPar)) AND
+                                     (NOT fBegunPar);
+         IF lpdStd^.rce^.fVan THEN
+              achadPg.ichLim := achadPg.ichFst
+         ELSE BEGIN
+              icsFigSrc := lpdStd^.rce^.icsFig;
+              IF icsFigSrc <> icsNil THEN
+                   BEGIN
+                   IF ifilFig <> ifilNil THEN
+                        BEGIN
+                        hzFigSrc := rghcs^[icsFigSrc]^^.hz;
+                        lpdSon := arglpd[lpdStd^.ilpd + 1];
+                        achadT.rgch := @argchT;
+                        achadT.ichFst := 0; achadT.ichFst := 1;
+                        SetLpd(lpdSon, icsFigSrc, lpdStd^.rce^.lpFig,
+                               tyset, achadT);
+                        n := lpdSon^.figd.n;
+                        h := HLockN(hzFigSrc, n, TRUE);
+                        cbT := CbDataOfH(hzFigSrc, h);
+                        lpdStd^.rce^.lpFig := IvodAdd(ifilFig, h, cbT);
+                        UnlockN(hzFigSrc, n);
+                        END
+                   ELSE lpdStd^.rce^.lpFig := lpNil;
+                   lpdStd^.rce^.icsFig := icsNil;
+                   END;
+              BuildRun(tydstRce, hzDoc);
+              IF fBeginsPar THEN
+                   BEGIN
+                   fBeginsPar := FALSE;
+                   BuildRun(tydstRpe, hzDoc);
+                   SetParClps(pgff, fpCur.ipg, fpCur.ich, ifil, hzDoc);
+                   END;
+              END;
+
+          { Have we filled up a page or overflowed tables? }
+         cbUsed := achadPg.ichLim + abadFbcPar.ichLim +  abadFbcCh.ichLim +
+                    (awadRunPar.iwLim + awadRunCh.iwLim + 2) * 2;
+         IF (NOT lpdStd^.rce^.fVan) AND
+           ((cbUsed >= cbFreePg) OR (abadFbcPar.ichFst >= ofbcLitMin) OR
+            (abadFbcCh.ichLim >= ofbcLitMin)) THEN
+              BEGIN
+               { Write the page out. }
+              IF FBuildPgff(fpCur.ipg, ifil, dch, fBegunPar, hzDoc) THEN
+                   BEGIN
+                   fpCur.ipg := fpCur.ipg + 1;
+                   END;
+               { Copy paragraph run onto this page, too. }
+              IF fTstFf THEN WRITELN('---fBegunPar---', fBegunPar, '---');
+              tyset.fRce := TRUE; tyset.fRpe := TRUE; tyset.fParBnds := TRUE;
+              SetLpd(lpdStd, ics, lpdStd^.lp + dch, tyset, achadPg);
+              BuildRun(tydstRpe, hzDoc);
+              END
+         ELSE BEGIN
+               { Assimilate this run into awads and abads. }
+              fBegunPar := FALSE;
+              achadPg.ichFst := achadPg.ichLim;
+              achadPg.ichLim := ichMaxPg;
+              abadFbcCh.ichFst := abadFbcCh.ichLim;
+              abadFbcPar.ichFst := abadFbcPar.ichLim;
+              awadRunCh.iwFst := awadRunCh.iwLim;
+              awadRunPar.iwFst := awadRunPar.iwLim;
+              tyset.fRce := TRUE; tyset.fRpe := TRUE; tyset.fParBnds := TRUE;
+              SeqLpd(lpdStd, achadPg);
+              END;
+
+         fpCur.ich := achadPg.ichFst;
+         END;
+    LpLimFfWriteIcs := (fpCur.ipg * cbPgffLong) + fpCur.ich;
+    END;
+{$S SUcold}
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hfccFf := POINTER(ORD(HAllocate(hzDoc, 20)));
+cbPgffLong := SIZEOF(TAPgff);
+pgff := @apgff;
+
+ { Set up the global arrays. }
+chadPg := @achadPg;             achadPg.rgch := @apgff.argch;
+badFbcCh := @abadFbcCh;         abadFbcCh.rgb := @argFbcCh;
+badFbcPar := @abadFbcPar;       abadFbcPar.rgb := @argFbcPar;
+wadRunCh := @awadRunCh;         awadRunCh.rgw := @argRunCh;
+wadRunPar := @awadRunPar;       awadRunPar.rgw := @argRunPar;
+
+StartPgff;
+
+fpCur.ipg := 0; fpCur.ich := 0;
+fpParPrv := fpCur;
+pgff^.trailer.clpPrv := 0;
+
+IF pglp.icsHdr = icsNil THEN lpHdrLim := 0
+                        ELSE lpHdrLim := LpLimFfWriteIcs(pglp.icsHdr);
+IF pglp.icsFtr = icsNil THEN lpFtrLim := lpHdrLim
+                        ELSE lpFtrLim := LpLimFfWriteIcs(pglp.icsFtr);
+lpTxtLim := LpLimFfWriteIcs(icsDoc);
+
+ { Finish the paragraphing. }
+SetParClps(@apgff, fpCur.ipg, fpCur.ich, ifil, hzDoc);
+apgff.trailer.clpNxt := 0;
+
+IF FBuildPgff(fpCur.ipg, ifil, dch, fBegunPar, hzDoc) THEN
+     fpCur.ipg := fpCur.ipg + 1;
+
+{Write leader page:}
+pLeader := POINTER(ORD(PCreateNob(hzDoc, NFromIFilIb(ifil, 0), cbPgff)));
+WITH pLeader^ DO
+    BEGIN
+    lpHdrFst := 0;
+    lpFtrFst := lpHdrLim;
+    lpTxtFst := lpFtrLim;
+     (* dummyLpLimFf := lpTxtLim; *) { Not used any more; but might as well
+                                try to keep it right }
+    password := pwFf;
+    version := ffVersion;
+    prprf := rghcs^[icsDoc]^^.prprf;
+    tyrlu := tyrluFf;
+    END;
+pLeader^.pglp := pglp;
+IF fTstFf THEN BEGIN WRITELN('WriteIcsFf -- ffleader:'); PxLeader(pLeader^); END;
+SetFDirty(hzDoc, NFromIFilIb(ifil, 0), TRUE);
+SetIbLimOfIfil(ifil, cbPgff {i.e. leader page } + (ORD4(fpCur.ipg) * cbPgff));
+FreeBk(hzDoc, POINTER(ORD(hfccFf)), tybkStd);
+END;
+
+
+{$S SUcold}
+{---------------------------------}
+FUNCTION IfilOfFf {(icsFf: TB):TB};
+{---------------------------------}
+VAR
+  hcsff: THcsff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+IF icsFf<>icsNil THEN
+   IF rghcs^[icsFf]^^.tycs=tycsFf THEN BEGIN
+      hcsff := POINTER(ORD(rghcs^[icsFf]));
+      IfilOfFf := hcsff^^.ifil;
+      END
+   ELSE BEGIN
+      break(1630);
+      IfilOfFf := 0;
+      END
+ELSE BEGIN
+   break(1631);
+   IfilOfFf := 0;
+   END;
+END;  {IfilOfFf}
+
+
+{$S SUcold}
+{--------------------------------------------------------------------}
+PROCEDURE GetLeaderOfIcsFf (* (icsFf: TB; VAR ffleader: TFfLeader) *);
+{--------------------------------------------------------------------}
+VAR
+hcsff: THcsff;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+hcsff := POINTER(ORD(rghcs^[icsFf]));
+ffleader := hcsff^^.leader;
+END;
+
+
+END.
+
+
+
+ÿ

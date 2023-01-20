@@ -1,0 +1,721 @@
+{******************************************************************************}
+{*                                                                            *}
+{*       LisaGuide - imlib unit : Copyright 1983, Apple Computer Inc.         *}
+{*                                                                            *}
+{******************************************************************************}
+
+UNIT IFEntry;
+
+{ This UNIT manages entry creation, storage, and retrieval. An entry might
+  describe a document, a tool, or a volume (disk). Because of the clumsiness
+  of circumventing the type constraints, separate but identical interfaces are
+  provided for each type of entry. Other special purpose operations are
+  provided for each type of entry as required.
+
+  Non-user-sensible entries are also maintained for tool names and devices.
+
+  Storage is allocated from the heap. Each entry is stored as an individual
+  unit and the entries linked together.  }
+
+{ The system error number range for this module is 200-299.
+  The highest number used is 204.  }
+
+INTERFACE
+
+USES {$U libos/SysCall  } SysCall,
+     {$U libos/PSysCall } PSysCall,
+     {$U UnitStd  } UnitStd,
+     {$U UnitHz   } UnitHz,
+     {$U Storage  } Storage,
+     {$U QuickDraw} QuickDraw,
+     {$U FontMgr  } FontMgr,
+     {$U PmDecl   } PmDecl,
+     {$U PMM      } PMM,
+     {$U WM.Events} Events,
+     {$U WM.Menus } Menus,
+     {$U AlertMgr } AlertMgr,
+     {$U apim/TFGlobals} IFGlobals;
+
+
+CONST
+
+      { user names for devices }
+    nameUpperSlot    = 'upper diskette';
+    nameLowerSlot    = 'lower diskette';
+
+    upperDrive   = serialA; { additional TDeviceTypes until defined by PMM }
+    lowerDrive   = serialB;
+
+      { subProc events }
+
+    evContinue = Private2;     { msg to sub process to proceed         }
+    evReply    = Private1;     { msg from sub process to the Filer     }
+    evStart    = Private1;     { msg to sub proc telling it what to do }
+
+
+TYPE
+
+   TentryHdl =  ^TentryPtr;
+
+   TspEvType  = (spDiskEvent);
+
+   TdiskOps   = (opInit,        { Disk initialization                     }
+                 opCopy,        { Dup disk - backup between same kind disk}
+                 opBackup);     { Backup between different kinds of disks }
+
+   TspEvHdl   = ^TspEvPtr;      { Placed in eventRec.userData             }
+   TspEvPtr   = ^TspEvent;
+   TspEvent   =  RECORD                     { Info for sub process        }
+                 CASE whichSpEvent : TspEvType OF
+                 spDiskEvent: (
+                     diskOp:   TdiskOps;    { Init, copy, backup...       }
+                     disk1:    E_Name;      { Device name of source disk  }
+                     disk2:    E_Name);     { Device name of dest volume  }
+                 END;
+
+   TspReplyPtr= ^TspStates;     { msgs from sub proc to Filer             }
+
+   TspStates  = (spStarting,    { Starting sub proc, wm event not yet sent}
+                 spRunning,     { sub proc in progress                    }
+                 spDone,        { Successfully completed, terminating     }
+                 spFailed,      { Generic failure                         }
+                 spAborting,    { User requested abort, terminating       }
+                 spProblems,    { Sub proc internal problems, terminating }
+                 spNextDisk);   { opBackup - eject current, insert another}
+
+   TsubProcs  = (diskSubProc);  { For manipulating whole disks            }
+
+   TsProcHdl  = ^TsProcPtr;
+   TsProcPtr  = ^TsProcRec;
+   TsProcRec  =  RECORD
+                 spState:  TspStates;       { running, aborting, finished..}
+                 CASE whichSubProc : TsubProcs OF
+                 diskSubProc: (
+                     diskOp:   TdiskOps;    { Init, copy, backup...        }
+                     disk1:    TentryHdl;   { device handle of source      }
+                     disk2:    TentryHdl);  { devHdl of dest, maybe NIL    }
+                 END;
+
+   TDevice    =  TPorts;
+
+   TdevState  = (devEmpty,          { Nothing mounted, awaiting disk       }
+                 devMounting,       { Attempting to mount a disk           }
+                 devOnline,         { Disk in place                        }
+                 devDismounting,    { Shutting down, preparing to eject it }
+                 devBackingup,      { Duplicating contents                 }
+                 devTempDest);      { Off-line disk mounted to take doc copy}
+
+   TdocState  = (blank,             { Doc never opened, e.g. disk just inserted}
+                 noDisk,            { Need space on doc disk               }
+                 badTool,           { Invalid code file                    }
+                 noTool,            { Tool not found, system too busy to run}
+                 toolCrashed,       { Process crashed with doc open        }
+                 tooBusy,           { Insufficient system resources to run }
+                 deadDoc,           { Suspect doc structure is inconsistent}
+                 docReqd,           { can't pull the tool directly         }
+                 subProc,
+                 opening,           { fcOpen sent to tool, awaiting reply  }
+                 pullingTool,       { fcNone sent to tool,   "        "    }
+                 opened,            { Doc opened by tool, in use           }
+                 closingFolder,     { fcClose sent to tool,    "      "    }
+                 closing);          { fcSuspend sent to tool,   "     "    }
+
+   TtoolState = (sBadCode,          { Could not execute, invalid code file }
+                 sIniting,          { Tool was initializing but failed     }
+                 sNoCode,           { No code file                         }
+                 sRunning,          { Tool running                         }
+                 sTerminating);     { fcTerminate sent, awaiting son-term event}
+
+   TvolState  = (sNoDisk,           { No media                             }
+                 sMounting,         { Trying to O/S mount a volume         }
+                 sMounted,          { Disk is on-line and ready for use    }
+                 sDismounting,      { O/S dismounting to backup, erase, etc}
+                 sEjecting);        { Dismounting and releasing media      }
+
+   TtoolID    = LONGINT;
+
+   Tentry    =  (doc, tool, vol, dev);
+
+   TentryPtr =  ^TentryRec;
+   TentryRec =   RECORD
+                 nextHdl:  TentryHdl;       { Link to next entry of same kind}
+                 nameHdl:  FmaxStrHdl;      { Coersed name of the object   }
+                 volHdl:   TentryHdl;       { Volume of object, NIL if vol }
+                 CASE Tentry OF
+                 doc: (
+                    catRID:     TcatRID;    { The doc's catalog entry id   }
+                    fWindow:    WindowPtr;  { Handle for the screen window }
+                    toolHdl:    TentryHdl;  { Handle to the tool if open   }
+                    toolID:     TtoolID;    { UID of the required tool     }
+                    state:      TdocState); { Current state of the doc     }
+                 tool: (
+                    docsOpen:   INTEGER;    { Docs opened by this tool     }
+                    id:         TtoolID;    { UID of this tool             }
+                    moreDocs:   BOOLEAN;    { TRUE: tool might take another}
+                    procId:     LONGINT;    { Assigned by O/S              }
+                    toolState:  TtoolState);{ Current state of the tool    }
+                 vol: (
+                    devHdl:     TentryHdl;  { The peripheral vol mounted on}
+                    catOpen:    BOOLEAN;    { TRUE: the catalog is open    }
+                    catScanId:  INTEGER;    { DB scan id for catalog       }
+                    saveRefnum: LONGINT;    { For the !SaveDesktop diskfile}
+                    volState:   TvolState); { Current state of the volume  }
+                 dev: (
+                    device:     Tdevice;    { The location of the device   }
+                    userNmHdl:  FMaxStrHdl; { User's name used in messages }
+                    devState:   TdevState); { Current state of the device  }
+                 END;
+
+
+       TentryField = (fNone, fNextHdl, fNameHdl, fVolHdl, { universal fields }
+                     dcatRID, dFWindow, dToolID, dState, dToolHdl, { doc entry fields }
+                     tProcId, tDocsOpen, tMoreDocs, tID,  { tool entry fields}
+                     tTlState,
+                     vDevHdl, vCatOpen, vVolState,        { vol fields }
+                     dDevice);                            { dev entry fields }
+       TfieldVar =   RECORD                    { Param for Get...Doc procs   }
+                     CASE fieldType: TentryField OF
+                     fNone:       ();
+                     fNextHdl:    (nextHdl:      TentryHdl);
+                     fNameHdl:    (nameHdl:      FmaxStrHdl);
+                     fVolHdl:     (volHdl:       TentryHdl);
+                     dCatRID:     (catRID:       TcatRID);
+                     dFWindow:    (fWindow:      WindowPtr);
+                     dToolID:     (toolID:       LONGINT);
+                     dState:      (state:        TdocState);
+                     dToolHdl:    (toolHdl:      TentryHdl);
+                     tProcId:     (procId:       LONGINT);
+                     tID:         (id:           TtoolID);
+                     tDocsOpen:   (docsOpen:     INTEGER);
+                     tMoreDocs:   (moreDocs:     BOOLEAN);
+                     tTlState:    (toolState:    TtoolState);
+                     vDevHdl:     (devHdl:       TentryHdl);
+                     vCatOpen:    (catOpen:      BOOLEAN);
+                     vVolState:   (volState:     TvolState);
+                     dDevice:     (device:       TDevice);
+                     END;
+
+
+VAR
+       nilField:     TfieldVar;       { The NIL field param for GetEntry }
+       bootVol:      TentryHdl;       { The boot disk volume entry handle}
+
+       firstDoc:     TentryHdl;       { The entry list pointers          }
+       firstTool:    TentryHdl;
+       firstVol:     TentryHdl;
+       firstDev:     TentryHdl;
+
+
+PROCEDURE CreateEntry  (kind: Tentry; NamePtr: FmaxStrPtr;
+                        VAR entryHdl: TentryHdl);
+
+{  This proc creates a new entry. If a namePtr is provided, the entries are
+   sorted alphabetically. (Volume and document entries only.) Each field of
+   a new entry has been initialized to the appropriate nil value.
+
+   There are no error conditions. }
+
+PROCEDURE GetEntry (kind: Tentry; volume, current: TentryHdl;
+                        field: TfieldVar; VAR nextHdl: TentryHdl);
+
+{  This proc gets a valid handle to the next entry. If a volume is provided,
+   the next entry will be on that volume.  If a field is provided, the entry
+   returned will match on that field; if no field test is wanted, pass
+   'nilField'. All entries will be returned just once. If there are no more
+   entries, entryHdl is set to NIL.
+
+   There are no error conditions. }
+
+PROCEDURE InitFEntry;
+
+{  This proc initializes the UNIT. It should be called first.  }
+
+PROCEDURE KillEntry (kind: Tentry; entryHdl: TentryHdl);
+
+{  This proc destroys the entry. If the entry specified by entryHdl is
+   not valid, the call is treated as a no-op. }
+
+PROCEDURE PrintEntry (kind: Tentry; entryHdl: TentryHdl);
+
+{ This proc prints an entry at entryHdl of type 'kind'. If entryHdl is NIL
+  the entire table is printed. This proc is compiled out of the release.  }
+
+FUNCTION WindowToDocEntry (window: WindowPtr) : TentryHdl;
+
+{  This specialized function is provided because of the number of times it
+   is used. Given a window pointer, it returns the doc entry for that window.
+   If an entry cannot be found, NIL is returned.  }
+
+IMPLEMENTATION
+
+{$S Catalog }
+
+VAR
+       blankDoc:     TentryRec;       { Null entry used for create       }
+       blankTool:    TentryRec;
+       blankVol:     TentryRec;
+       blankDev:     TentryRec;
+
+{**************************************************************************}
+{                     Internal    Procedures                               }
+{**************************************************************************}
+
+PROCEDURE InsertEntry (entryHdl: TentryHdl; namePtr: FmaxStrPtr;
+                       VAR firstHdl: TentryHdl);
+LABEL  88;
+
+VAR
+     thisHdl:  TentryHdl;
+     tempP1:   FMaxStrHdl;
+
+BEGIN
+IF trcFEntry THEN WRITELN ('InsertEntry: entryHdl = ', ORD(entryHdl),
+                           ', name = ', namePtr^);
+
+tempP1 := POINTER(ORD(NewHandle(SIZEOF(namePtr^)))); { Save the name       }
+entryHdl^^.nameHdl := tempP1;
+entryHdl^^.nameHdl^^ := namePtr^;
+
+IF firstHdl = NIL                      { Alphabetize the entry             }
+THEN BEGIN
+  firstHdl := entryHdl;                { This is the first entry           }
+  IF trcFEntry THEN WRITELN ('   first entry');
+  END
+ELSE BEGIN
+  IF namePtr^ <= firstHdl^^.nameHdl^^
+  THEN BEGIN                           { Sorts before the first entry       }
+    entryHdl^^.nextHdl := firstHdl;
+    firstHdl := entryHdl;
+    IF trcFEntry THEN WRITELN ('   sorts first, next entry = ',
+                               ORD(firstHdl^^.nextHdl));
+    END
+  ELSE BEGIN                           { Sorts between two entries or at end}
+    thisHdl := firstHdl;               { Find entry that new entry follows  }
+    WHILE (thisHdl^^.nextHdl <> NIL)   { If there is an entry after this one}
+    DO BEGIN
+      IF trcFEntry THEN WRITELN ('   thisHdl = ', ORD(thisHdl),
+                               ', nextHdl = ', ORD(thisHdl^^.nextHdl),
+                               ', nameHdl = ',ORD(thisHdl^^.nextHdl^^.nameHdl));
+      IF namePtr^ > thisHdl^^.nextHdl^^.nameHdl^^ { and newEntry is after it}
+      THEN thisHdl := thisHdl^^.nextHdl{ get the next entry                 }
+      ELSE GOTO 88;                    { Found insertion point, exit loop   }
+      END;
+88:
+    entryHdl^^.nextHdl := thisHdl^^.nextHdl; { Link in after thisHdl       }
+    thisHdl^^.nextHdl := entryHdl;
+    IF trcFEntry THEN WRITELN ('   inserted between ', ORD(thisHdl),' and ',
+                                ORD(thisHdl^^.nextHdl^^.nextHdl));
+    END;
+  END;
+
+IF trcFEntry THEN WRITELN ('   exit InsertEntry');
+END;
+
+{**************************************************************************}
+{                      External   Procedures                               }
+{**************************************************************************}
+
+PROCEDURE CreateEntry {kind: Tentry; namePtr: FmaxStrPtr;
+                       VAR entryHdl: TentryHdl};
+
+
+BEGIN
+IF trcFEntry THEN WRITELN ('CreateEntry: name = ', namePtr^);
+
+entryHdl := POINTER(ORD(NewHandle(SIZEOF(TentryRec))));
+IF trcFEntry THEN WRITELN ('   new entry at ',ORD(entryHdl));
+CASE kind OF
+  doc: BEGIN
+       IF trcFEntry THEN WRITELN ('   doc entry');
+       entryHdl^^ := blankDoc;
+       InsertEntry (entryHdl, namePtr, firstDoc);
+       END;
+  tool: BEGIN
+       IF trcFEntry THEN WRITELN ('   tool entry');
+       entryHdl^^ := blankTool;
+       InsertEntry (entryHdl, namePtr, firstTool);
+       END;
+  vol: BEGIN
+       IF trcFEntry THEN WRITELN ('   vol entry');
+       entryHdl^^ := blankVol;
+       entryHdl^^.volHdl := entryHdl;
+       InsertEntry (entryHdl, namePtr, firstVol);
+       END;
+  dev: BEGIN
+       IF trcFEntry THEN WRITELN ('   dev entry');
+       entryHdl^^ := blankDev;
+       InsertEntry (entryHdl, namePtr, firstDev);
+       END
+  END;
+
+
+IF trcFEntry THEN WRITELN ('   exit CreateEntry: entryHdl = ', ORD(entryHdl));
+END;
+
+{**************************************************************************}
+
+PROCEDURE GetEntry {kind: Tentry; volume, current: TentryHdl; field: TdocVar;
+                        VAR nextHdl: TentryHdl};
+LABEL  88;
+VAR
+    firstHdl:   TentryHdl;
+
+  PROCEDURE NextOnVol;                    { Uses nextHdl and volume          }
+  LABEL 77;
+  BEGIN
+  IF volume = NIL THEN EXIT (NextOnVol);
+
+  IF trcFEntry THEN WRITELN ('NextOnVol: nextHdl = ',ORD(nextHdl):1,
+                             ', volume = ',ORD(volume):1);
+
+  WHILE nextHdl <> NIL
+  DO BEGIN
+    IF volume = nextHdl^^.volHdl THEN GOTO 77;
+    nextHdl := nextHdl^^.nextHdl;
+    END;
+
+  77:
+  IF trcFEntry THEN WRITELN ('   exit NextOnVol: nextHdl = ',ORD(nextHdl):1);
+  END;
+
+
+BEGIN
+IF trcFEntry THEN WRITELN ('GetEntry: volume = ',ORD(volume):1, ', current = ',
+                       ORD(current));
+
+IF current = NIL                   { Set starting point               }
+THEN CASE kind OF                  { start at the beginning           }
+  doc:  nextHdl := firstDoc;
+  tool: nextHdl := firstTool;
+  vol:  nextHdl := firstVol;
+  dev:  nextHdl := firstDev;
+  END
+ELSE BEGIN
+  nextHdl := current^^.nextHdl;    { start with the one after current }
+  IF nextHdl = NIL THEN GOTO 88;
+  END;
+IF trcFEntry THEN WRITELN ('   starting point (nextHdl) = ',ORD(nextHdl):1);
+
+NextOnVol;
+IF trcFEntry THEN WRITELN ('   do field test on ',ORD(field.fieldType):1);
+WHILE nextHdl <> NIL                    { Loop through rest of the entries }
+DO BEGIN
+  WITH nextHdl^^ DO
+  CASE field.fieldType OF               { Check field constraint, if any   }
+      fNone:       GOTO 88;
+      fNextHdl:    IF field.nextHdl = nextHdl THEN GOTO 88;
+      fNameHdl:    IF field.nameHdl = nameHdl THEN GOTO 88;
+      fVolHdl:     IF field.volHdl = volHdl THEN GOTO 88;
+      dCatRID:     IF field.catRID.uniqueID = catRID.uniqueID THEN GOTO 88;
+      dFWindow:    IF field.fWindow = fWindow THEN GOTO 88;
+      dState:      IF field.state = state THEN GOTO 88;
+      dToolID:     IF field.toolID = toolID THEN GOTO 88;
+      dToolHdl:    IF field.toolHdl = toolHdl THEN GOTO 88;
+      tProcId:     IF field.procId = procId THEN GOTO 88;
+      tDocsOpen:   IF field.docsOpen = docsOpen THEN GOTO 88;
+      tID:         IF field.id = id THEN GOTO 88;
+      tMoreDocs:   IF field.moreDocs = moreDocs THEN GOTO 88;
+      tTlState:    IF field.toolState = toolState THEN GOTO 88;
+      vDevHdl:     IF field.devHdl = devHdl THEN GOTO 88;
+      vCatOpen:    IF field.catOpen = catOpen THEN GOTO 88;
+      vVolState:   IF field.volState = volState THEN GOTO 88;
+      dDevice:     IF field.device = device THEN GOTO 88;
+      OTHERWISE    IF dbgFiler THEN WRITELN ('ERROR in GetEntry: no test for field ',
+                                              ORD(field.fieldType):1);
+      END;
+  IF trcFEntry THEN WRITELN ('   field test failed on entry ',ORD(nextHdl):1);
+  nextHdl := nextHdl^^.nextHdl;           { not found, try the next one     }
+  NextOnVol;
+  END;
+
+88:
+IF trcFEntry THEN WRITELN ('   exit GetEntry: nextHdl = ', ORD(nextHdl));
+END;
+
+
+{$S FInit}
+
+{**************************************************************************}
+
+PROCEDURE InitFEntry;
+
+VAR bootDev:      TPorts;
+  {$IFC R}
+    bootDevPtr:  ^Boot_TPorts;      { Used for type coersion }
+  {$ENDC }
+    bootVolName:  Pathname;
+    devHdl:       TentryHdl;
+    devInfo:      INTEGER;
+    devKind:      TDeviceType;
+    devName:      E_name;
+    err:          INTEGER;
+    field:        TfieldVar;
+    i:            TPorts;
+    tempHdl:      FMaxStrHdl;
+    workingDir:   Pathname;
+
+
+BEGIN
+IF trcFEntry THEN WRITELN ('InitFEntry');
+
+{ Init the global vars }
+bootVol := NIL;
+nilField.fieldType := fNone;
+
+{ Init the entry pointers }
+IF trcFEntry THEN WRITELN ('   initializing entry list heads');
+firstDoc := NIL;
+firstTool := NIL;
+firstVol := NIL;
+firstDev := NIL;
+
+{ Initialize the blank entries }
+IF trcFEntry THEN WRITELN ('   initializing blank entries');
+WITH blankDoc
+DO BEGIN
+  nextHdl := NIL;
+  nameHdl := NIL;
+  volHdl := NIL;
+  state := blank;
+  toolHdl := NIL;
+  END;
+WITH blankTool
+DO BEGIN
+  nextHdl := NIL;
+  nameHdl := NIL;
+  volHdl := NIL;
+  procId := MAXINT;
+  docsOpen := 0;
+  moreDocs := TRUE;
+  toolState := sNoCode;
+  END;
+WITH blankVol
+DO BEGIN
+  nextHdl := NIL;
+  nameHdl := NIL;
+  volHdl := NIL;
+  catOpen := FALSE;
+  devHdl := NIL;
+  catScanId := -1;
+  saveRefnum := -1;
+  volState := sNoDisk;
+  END;
+WITH blankDev
+DO BEGIN
+  nextHdl := NIL;
+  nameHdl := NIL;
+  volHdl := NIL;
+  devState := devEmpty;
+  END;
+
+devName := 'UPPER';
+CreateEntry (dev, @devName, devHdl);
+devHdl^^.device := upperDrive;
+tempHdl := POINTER(ORD(NewHandle(SIZEOF(FMaxStr))));
+devHdl^^.userNmHdl := tempHdl;
+devHdl^^.userNmHdl^^ := nameUpperSlot;
+
+devName := 'LOWER';
+CreateEntry (dev, @devName, devHdl);
+devHdl^^.device := lowerDrive;
+tempHdl := POINTER(ORD(NewHandle(SIZEOF(FMaxStr))));
+devHdl^^.userNmHdl := tempHdl;
+devHdl^^.userNmHdl^^ := nameLowerSlot;
+
+    devName := 'PROFILE';
+    CreateEntry (dev, @devName, devHdl);
+    devHdl^^.device := i;
+    tempHdl := POINTER(ORD(NewHandle(SIZEOF(FMaxStr))));
+    devHdl^^.userNmHdl := tempHdl;
+    devHdl^^.userNmHdl^^ := 'Profile disk';
+
+
+  { create boot device handle separate from any previous device. Home for trash, scrap, etc }
+    devName := 'BOOT';
+    CreateEntry (dev, @devName, devHdl);
+    devHdl^^.device := i;
+    tempHdl := POINTER(ORD(NewHandle(SIZEOF(FMaxStr))));
+    devHdl^^.userNmHdl := tempHdl;
+    devHdl^^.userNmHdl^^ := 'boot device';
+
+IF trcFEntry THEN WRITELN ('   exit InitFEntry');
+END;
+
+
+{$S Catalog }
+
+{**************************************************************************}
+
+PROCEDURE KillEntry {kind: Tentry; entryHdl: TentryHdl};
+VAR
+    found:    BOOLEAN;            { bullet proofing                      }
+    killName: BOOLEAN;
+    thisHdl:  TentryHdl;
+
+BEGIN
+IF trcFEntry THEN WRITELN ('KillEntry: ',entryHdl^^.nameHdl^^);
+
+IF entryHdl = NIL THEN EXIT (KillEntry);
+
+found := FALSE;
+killName := TRUE;
+CASE kind OF                       { Start from front of the list         }
+  doc:  thisHdl := firstDoc;
+  tool: BEGIN
+        thisHdl := firstTool;
+        killName := FALSE;
+        END;
+  vol:  BEGIN
+        thisHdl := firstVol;
+        entryHdl^^.devHdl^^.volHdl := NIL;  { Delink the vol and dev entries }
+        END;
+  dev:  BEGIN
+        IF entryHdl^^.volHdl <> NIL
+        THEN SysErr (203, nullErr);
+        thisHdl := firstDev;
+        END;
+  END;
+
+IF entryHdl = thisHdl
+THEN BEGIN                         { Its the first entry, reset list head }
+  IF trcFEntry THEN WRITELN ('   deleting first entry on list');
+  found := TRUE;
+  CASE kind OF
+    doc:  firstDoc := entryHdl^^.nextHdl;
+    tool: firstTool := entryHdl^^.nextHdl;
+    vol:  firstVol := entryHdl^^.nextHdl;
+    dev:  firstDev := entryHdl^^.nextHdl;
+    END;
+  END
+ELSE WHILE (thisHdl <> NIL) AND (NOT found)      { Search the list        }
+  DO BEGIN
+    IF thisHdl^^.nextHdl = entryHdl
+    THEN BEGIN                                   { Found, delink entry    }
+      found := TRUE;
+      thisHdl^^.nextHdl := entryHdl^^.nextHdl;
+      END
+    ELSE thisHdl := thisHdl^^.nextHdl;           { Not found, check next  }
+  END;
+
+IF found
+THEN BEGIN
+  IF killName THEN DisposeHandle (POINTER(ORD(entryHdl^^.nameHdl)));
+  DisposeHandle (POINTER(ORD(entryHdl)));
+  IF trcFEntry THEN WRITELN ('   deleted entry');
+  END;
+
+IF trcFEntry THEN WRITELN ('   exit KillEntry');
+END;
+
+{**************************************************************************}
+
+
+PROCEDURE PrintEntry {kind: Tentry: entryHdl: TentryHdl};
+VAR
+    printAll:   BOOLEAN;
+
+BEGIN
+printAll := FALSE;
+CASE kind OF
+  doc: BEGIN
+       WRITELN ('                     Document (Window) Entries');
+       WRITELN (' Handle   NxtHdl   VolHdl  toolID toolHdl state window  docID Name');
+       IF entryHdl <> NIL
+       THEN WITH entryHdl^^ DO
+         WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(toolID):5,
+                  ORD(toolHdl):10,ORD(state):4,ORD(fWindow):10,ORD(catRID.uniqueID):5,
+                  '  ',nameHdl^^)
+       ELSE BEGIN
+         entryHdl := firstDoc;
+         WHILE entryHdl <> NIL
+         DO BEGIN
+           WITH entryHdl^^ DO
+           WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(toolID):5,
+                    ORD(toolHdl):10,ORD(state):4,ORD(fWindow):10,ORD(catRID.uniqueID):5,
+                    '  ',nameHdl^^);
+           entryHdl := entryHdl^^.nextHdl;
+           END;
+         END;
+       END;
+  vol: BEGIN
+       WRITELN ('                       Volume (Diskette) Entries');
+       WRITELN ('  Handle   NxtHdl   VolHdl   DevHdl State CatOpen CatScan Name');
+       IF entryHdl <> NIL
+       THEN WITH entryHdl^^ DO
+         WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(devHdl):9,
+                  ORD(volState):4,ORD(catOpen):7,ORD(catScanID):8,'    ',nameHdl^^)
+       ELSE BEGIN
+         entryHdl := firstVol;
+         WHILE entryHdl <> NIL
+         DO BEGIN
+           WITH entryHdl^^ DO
+             WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(devHdl):9,
+                 ORD(volState):4,ORD(catOpen):7,ORD(catScanID):8,'    ',nameHdl^^);
+           entryHdl := entryHdl^^.nextHdl;
+           END;
+         END;
+       END;
+  dev: BEGIN
+       WRITELN ('       Device (Hardware) Entries');
+       WRITELN ('  Handle   NxtHdl   VolHdl Device Name');
+       IF entryHdl <> NIL
+       THEN WITH entryHdl^^ DO
+         WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(device):5,
+                  '   ',nameHdl^^)
+       ELSE BEGIN
+         entryHdl := firstDev;
+         WHILE entryHdl <> NIL
+         DO BEGIN
+           WITH entryHdl^^ DO
+           WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,ORD(device):5,
+                    '   ',nameHdl^^);
+           entryHdl := entryHdl^^.nextHdl;
+           END;
+         END;
+       END;
+  tool: BEGIN
+       WRITELN ('                 Tool (Program/Process) Entries');
+       WRITELN ('  Handle   NxtHdl   VolHdl ProcID State Docs MoreDocs ID Name');
+       IF entryHdl <> NIL
+       THEN WITH entryHdl^^ DO
+           WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,procID:6,
+                    ORD(toolState):5,docsOpen:6,'   ',moreDocs,id:5,' ',nameHdl^^)
+       ELSE BEGIN
+         entryHdl := firstTool;
+         WHILE entryHdl <> NIL
+         DO BEGIN
+           WITH entryHdl^^ DO
+           WRITELN (ORD(entryHdl):8,ORD(nextHdl):9,ORD(volHdl):9,procID:6,
+                    ORD(toolState):5,docsOpen:6,'   ',moreDocs,id:5,' ',nameHdl^^);
+           entryHdl := entryHdl^^.nextHdl;
+           END;
+         END;
+       END;
+  END;
+  WRITELN;
+END;
+
+
+{**************************************************************************}
+
+FUNCTION WindowToDocEntry {window: WindowPtr) : TentryHdl};
+
+VAR
+    docHdl: TentryHdl;
+    field:  TfieldVar;
+
+BEGIN
+IF trcFEntry THEN WRITELN ('WindowToDocEntry');
+
+field.fieldType := dFWindow;
+field.fWindow := window;
+docHdl := NIL;
+GetEntry (doc, NIL, docHdl, field, docHdl);
+WindowToDocEntry := docHdl;
+
+IF trcFEntry THEN WRITELN ('   exit WindowToDocEntry: docEntry = ', ORD(docHdl):1);
+END;
+
+END.
+
+ÿ

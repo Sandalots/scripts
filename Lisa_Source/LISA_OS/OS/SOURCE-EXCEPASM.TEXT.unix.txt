@@ -1,0 +1,739 @@
+;-----------------------------------------------------------------------------;
+;                                                                             ;
+;               Copyright 1983, 1984, Apple Computer Inc.                     ;
+;                                                                             ;
+;-----------------------------------------------------------------------------;
+
+        .proc   excepasm,0
+        .def    excep_prolog    ; entry point for excep_prolog
+        .def    launchdl        ; entry point for launchdl
+        .def    return_excep    ; entry point for return_excep
+        .def    retn_main       ; entry point for retn_main
+
+        .def    divzero_trap    ; zero divide trap handler
+        .def    overflow_trap   ; overflow trap handler
+        .def    valueoob_trap   ; chk instruction trap handler
+        .def    addrerror_trap  ; address error trap handler
+        .def    illginst_trap   ; illegal instruction trap handler
+        .def    priviolation_trap       ; privilege violation trap handler
+        .def    line1010_trap   ; line 1010 emulator trap handler
+        .def    line1111_trap   ; line 1111 emulator trap handler
+        .def    spurintr_trap   ; spurious interrupt handler
+        .def    trapEhandler    ; trap E handler
+        .def    unexp_trap      ; unexpected trap handler
+
+        .def    get_caller      ; entry point for get_caller
+
+        .ref    hard_excep      ; pascal routine to signal hardware exception
+        .ref    enter_scheduler ; external routine to enter the scheduler
+        .ref    returnuser      ; exit routine to user code
+        .ref    send_softint    ; soft interrupt routine
+        .ref    exit_syscall    ; exit system call routine
+        .ref    Pexcep_prolog   ; the pacal excep_prolog
+        .ref    system_error    ; system error handling routine
+
+        .DEF     BUS_ERR        ; bus error trap handler
+        .REF     CHECK_CS       ; CHECK_CS
+        .REF     CHECK_STACK    ; Check_Stack
+
+        .DEF    VALID_AD        ; VALID_ADDR
+        .REF    SYS_CALL        ; SYS_CALLED
+        .REF    ABORTPROCESS    ; AbortProcess
+
+        .include source/pascaldefs.text
+
+                                ; exception kind definitions for abnormal termination
+bus_error       .equ    21              ; bus error occurred
+addr_error      .equ    22              ; address error occurred
+illg_inst       .equ    23              ; illegal instruction trap occurred
+priv_violation  .equ    24              ; privilege violation trap occurred
+line_1010       .equ    26              ; line 1010 emulator trap occurred
+line_1111       .equ    27              ; line 1111 emulator trap occurred
+spur_intr       .equ    28              ; spurrious interrupt occurred
+unexpected_ex   .equ    29              ; unexpected exception occurred
+
+div_zero        .equ    31      ; exception kind definitions for hardware exception
+value_oob       .equ    32
+ovfw            .equ    33
+
+flineoffset     .equ    56      ; location of f-line inst - offset from A5
+e_flinesyscode  .equ    10204   ; system error number for f-line in system code
+
+exdatasize      .equ    48      ; exception data blk size, must be the same as
+                                ; size of t_ex_data in exceprim module
+;
+;-----------------------------------------------------------------------;
+; procedure excep_prolog;                                               ;
+;                                                                       ;
+; DESCRIPTION :                                                         ;
+;   This routine is called by the scheduler whenever there is exception ;
+;   pending for a process. This routine will set up the necessary       ;
+;   parameters on stack for user's exception handler, and call the      ;
+;   pascal part Pexcep_prolog to search for the exception and then call ;
+;   launchdl to call user's handler. The parameters are exception       ;
+;   environment block, exception data block, terminate flag, env_ptr,   ;
+;   and data_ptr. This asm routine is needed so that we don't have to   ;
+;   rely on the compiler for the stack setup.                           ;
+;                                                                       ;
+; INPUT PARAMETERS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+; OUTPUT PARAMETERS :                                                   ;
+;   None.                                                               ;
+;                                                                       ;
+; SIDE EFFECTS :                                                        ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SPECIAL CONDITIONS OF USE :                                           ;
+;   CALLED BY the scheduler ONLY.                                       ;
+;                                                                       ;
+; ERROR CONDITIONS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+;-----------------------------------------------------------------------;
+;
+excep_prolog
+        link    a6,#0           ; set up link
+        move.l  #envsize,d0     ; environment block size
+        suba.l  d0,sp           ; set up the space for it on stack
+        move.l  sp,a0           ; save the env_ptr
+        move.l  #exdatasize,d1  ; exception data block size
+        suba.l  d1,sp           ; set sup space for it on stack
+        move.l  sp,a1           ; save the data_ptr
+        clr.w   -(sp)           ; space for terminate_f on stack
+        clr.l   -(sp)           ; space for pc when return_excep is entered
+        move.l  a0,-(sp)        ; set up env_ptr, also as par to pexcep_prolog
+        move.l  a1,-(sp)        ; set up data_ptr, also as par to Pexcep_prolog
+        pea     12(sp)          ; address of terminate_f, par to Pexcep_prolog
+        move.l  4(a6),-(sp)     ; user pc on top of link, par to Pexcep_prolog
+        jsr     Pexcep_prolog   ; go to the pascal excep_prolog, no return here
+
+
+;
+;-----------------------------------------------------------------------;
+; PROCEDURE LAUNCHDL (NEW_SP : LONGINT; HDL_ADR : LONGADR;              ;
+;              ADR_RETURN_EXCEP : LONGINT; KIND_EXCEP : INTEGER);       ;
+; DESCRIPTION :                                                         ;
+;   LAUNCH THE USER EXCEPTION HANDLER, OR THE SYSTEM EXCEPTION HANDLER, ;
+;   GET RID OF EXTRA LOCAL VARIABLES ON STACK AND EXIT TO USER VIA      ;
+;   RETURNUSER ROUTINE IF USER EXCEPTION. THE ADDRESS OF RETURN_EXCEP   ;
+;   PROCEDURE IS ALSO PUSHED ON TOP OF STACK BEFORE EXIT TO USER HANDLER;
+;   SO THAT IT IS AS IF RETURN_EXCEP HAS CALLED THE USER HANDLER, AND   ;
+;   USER HANDLER SHOULD RETURN TO IT AT THE END OF THE HANDLER.         ;
+;   FOR USER EXCEPTION, THIS RETURN_EXCEP IS THE ONE IN THE OSLIB IN THE;
+;   USER DOMAIN.                                                        ;
+;                                                                       ;
+; INPUT PARAMETERS :                                                    ;
+;   new_sp : the new sp value when calling exception handler            ;
+;   HDL_ADR : USER HANDLER ADDRESS.                                     ;
+;   ADR_RETURN_EXCEP : ADDRESS OF RETURN_EXCEP PROCEDURE IN OSLIB.      ;
+;   KIND_EXCEP : 1 IF SYSTEM EXCEPTION, ELSE, 2.                        ;
+;                                                                       ;
+; OUTPUT PARAMETERS :                                                   ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SIDE EFFECTS :                                                        ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SPECIAL CONDITIONS OF USE :                                           ;
+;   CALLED BY EXCEP_PROLOG (in PASCAL) ONLY.                            ;
+;                                                                       ;
+; ERROR CONDITIONS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+;-----------------------------------------------------------------------;
+;
+hdlexitcode     .equ     1      ; exit code for returnuser to go to exception handler
+
+LAUNCHDL
+                                ; NO LINK NEEDED
+        MOVE.L  (A6),A6         ; TO RESTORE THE LINK BEFORE CALLING PEXCEP_PROLOG
+        move.l  (sp)+,a1        ; pop the return pc from user stack
+        move.w  (sp)+,d1        ; get kind_excep to d1
+        move.l  (sp)+,d2        ; get adr_return_excep
+        move.l  (sp)+,a1        ; handler adr to a1
+        move.l  (sp)+,sp        ; move the new sp to sp
+                                ; now stack has all the needed pars to call handler
+        cmpi.w  #1,d1           ; to be executed in system code ?
+        beq     call_syshdl     ; yes, don't exit to user domain,
+                                ; call handler in system mode
+                                ; here for user exception
+        move.l  d2,-(sp)        ; put adr of user's return_excep on top of stack
+                                ; for return
+        move.l  a1,-(sp)        ; put handler on top of stack for exit
+        move.w  #hdlexitcode,-(sp)      ; handler exit code
+
+        move    sr,d0           ; move sr to d0 and use trap 7 to get on to
+                                ; supervisor stack
+        ori.w   #$2000,d0       ; set supervisor bit
+        lea     getonsup,a0     ; Dave's new fashion
+        trap    #7
+getonsup                        ; now we are on supervisor stack
+        clr.l   -(sp)           ; put pc and sr on top of sup stack to fake trap
+        clr.w   -(sp)
+        jmp     returnuser      ; exit to user domain
+
+call_syshdl                     ; call system handler in system code
+        pea     return_excep    ; get the adr of return_excep procedure on stack
+        jmp     (a1)            ; jump to handler, this is recoverable
+
+;
+;-----------------------------------------------------------------------;
+; PROCEDURE RETURN_EXCEP;                                               ;
+;                                                                       ;
+; DESCRIPTION :                                                         ;
+;   This is the routine the exception handler will call (implicitly) at ;
+;   the end of the handler. It is entered via trap 1 if from user mode. ;
+;   It checks the flag saved on top of stack by excep_prolog first.     ;
+;   If the flag is 0, the process is not to be terminated, it is a      ;
+;   normal return from exception handler. It restores the user's        ;
+;   environment, replaces the pc by the pc on top of link field, and    ;
+;   returns to the main line. It copies the environment to syslocal and ;
+;   exit to user mode via returnuser routine.                           ;
+;   If the saved flag is 1, the process is to be terminated (terming in ;
+;   pcb was set and sys_terminate exception was signalled), send softint;
+;   to terminate the process and call exit_syscall to let softint take  ;
+;   effect. (But if terminate exception is recursively signalled, return;
+;   from the most nested handler will cause the process to be terminated.);
+;                                                                       ;
+; INPUT PARAMETERS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+; OUTPUT PARAMETERS :                                                   ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SIDE EFFECTS :                                                        ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SPECIAL CONDITIONS OF USE :                                           ;
+;   called implicitly by handler only, set up in launchdl routine.      ;
+;                                                                       ;
+; ERROR CONDITIONS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+;-----------------------------------------------------------------------;
+;
+chgenvcode      .equ    2               ; exit code for returnuser call to change env
+
+return_excep
+                                        ; no link is needed
+        tst.w   4(sp)                   ; is terminate_f saved at excep_prolog true?
+                                        ; skip 4 bytes of pc when enter return_excep
+        bne     term_proc               ; yes true, to terminate
+                                        ; false, normal return to main line
+retn1
+        move.l  a6,sp                   ; sp now points to the link on top of env block
+        move.l  4(sp),a0                ; move pc on top of link to a0
+        lea     8(sp),a2                ; get the sp before the exception
+        move.l  #envsize,d0             ; size of env block
+        suba.l  d0,sp                   ; sub it from sp, so it points
+                                        ; to env block on stack.
+        move.l  a0,pc_field(sp)         ; replace pc in env block, pc is the
+                                        ; first field in env block.
+        move.w  sr_field(sp),d1         ; check if sr being changed to sup.stack
+        bclr    #13,d1                  ; disallow the change
+        move.w  d1,sr_field(sp)         ; put sr back
+        move.l  a2,a7_field(sp)         ; replace sp in env block.
+        move.l  sglobal,a1              ; get base of sysglobal
+        move.l  b_syslocal_ptr(a1),a2   ; get base of syslocal
+        adda.l  #env_save_area,a2       ; a2 now points to env_save_area in syslocal
+        lea     -2(a6),a0               ; get the end marker for copy
+copyenv
+        move.l  (sp)+,(a2)+             ; copy env on stack to syslocal
+        cmpa.l  sp,a0
+        bne     copyenv
+        move.w  (sp)+,(a2)+             ; copy the last word
+        move.w  #chgenvcode,d0          ; exit code to change environment
+exituser
+        clr.l   -(sp)                   ; dummy pc to satisfy returnuser
+        move.w  d0,-(sp)                ; exit code to returnuser
+
+                                        ; currently it comes in via trap 1, then has
+                                        ; to get onto supervisor stack again via trap 7
+        move    sr,d0                   ; move sr to d0 and use trap 7 to get on to
+                                        ; supervisor stack
+        ori.w   #$2000,d0               ; set supervisor bit
+        lea     rgetonsup,a0            ; Dave's new fashion
+        trap    #7
+rgetonsup                               ; now we are on supervisor stack
+        clr.l   -(sp)                   ; put pc and sr on top of stack to fake trap
+        clr.w   -(sp)
+        jmp     returnuser              ; exit to user code
+
+term_proc
+        move.l  sglobal,a1              ; get base of sysglobal
+        move.l  c_pcb_ptr(a1),-(sp)     ; push pcb_ptr
+        clr.b   -(sp)                   ; die parameter
+        jsr     send_softint            ; go to terminate
+        move.w  #0,d0                   ; exit code for this case - normal return
+        bra     exituser                ; follow the same exit to user code to let
+                                        ; the terminate take effect
+
+retn_main
+                                        ; This entry point is for Pexcep_prolog
+                                        ; when there is no exception to signal
+        MOVE.L  (A6),A6                 ; TO RESTORE THE LINK BEFORE CALLING
+                                        ; Pexcep_prolog
+        bra     retn1
+
+;
+;
+;-----------------------------------------------------------------------;
+; Hardware exception trap handlers : divzero_trap, valueoob_trap,       ;
+;                                    overflow_trap, bus_err etc.        ;
+; DESCRIPTION :                                                         ;
+;   Save all registers and push proper parameters to call hard_excep    ;
+;   to queue an info block into ecb and raise excep_pending.            ;
+;   Then restore the registers saved and go to the                      ;
+;   scheduler. The scheduler will reschedule the process in excep_prolog;
+;   and the exception handler will be executed.                         ;
+;                                                                       ;
+; INPUT PARAMETERS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+; OUTPUT PARAMETERS :                                                   ;
+;   None.                                                               ;
+;                                                                       ;
+; SIDE EFFECTS :                                                        ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SPECIAL CONDITIONS OF USE :                                           ;
+;   Entered via hardware exception traps only. It executes on supervisor;
+;   stack.                                                              ;
+;                                                                       ;
+; ERROR CONDITIONS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+;-----------------------------------------------------------------------;
+;
+regs_s  .equ    15*4                    ; saved registers size
+
+divzero_trap
+        movem.l d0-d7/a0-a6,-(sp)       ; save all the registers on stack
+        move.w  #div_zero,d0            ; save excep_kind for div zero trap
+he_trap                                 ; common handler starts here
+        move.w  regs_s(sp),d1           ; get the status register under the registers
+        btst    #13,d1                  ; see if it was in supervisor state before
+        bne     superstate              ; yes
+        clr.w   -(sp)                   ; was user stack, push false for stack
+he1
+        move.w  d0,-(sp)                ; push excep_kind on stack
+        move.l  sglobal,a0              ; get b_sysglobal_ptr
+        move.l  sysa5(a0),a5            ; set up a5 for system code
+        pea     regs_s+4(sp)            ; get pointer to sr (+ 4 bytes pars)
+        jsr     hard_excep              ; hard_excep (stack, excep_kind, save_info_ptr)
+                                        ; routine to queue an info block and
+                                        ; raise excep_pending
+        movem.l (sp)+,d0-d7/a0-a6       ; restore all the registers
+        jsr     enter_scheduler         ; go to scheduler
+;
+superstate
+        move.b  #1,-(sp)                ; if it was supervisor state, stack = true
+        bra     he1                     ; back to main line
+;
+valueoob_trap
+        movem.l d0-d7/a0-a6,-(sp)       ; save all the registers on stack
+        move.w  #value_oob,d0           ; excep_kind  for chk inst trap
+        bra     he_trap
+;
+overflow_trap
+        movem.l d0-d7/a0-a6,-(sp)       ; save all the registers on stack
+        move.w  #ovfw,d0                ; excep_kind for overflow trap
+        bra     he_trap
+
+
+illginst_trap                           ; illegal instruction trap handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #illg_inst,d0           ; excep_kind
+        bra     he_trap
+
+priviolation_trap                       ; privilege violation trap
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #priv_violation,d0      ; excep_kind
+        bra     he_trap
+
+line1010_trap                           ; line 1010 emulator trap handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #line_1010,d0           ; excep_kind
+        bra     he_trap
+
+
+line1111_trap                           ; line 1111 emulator trap handler
+        btst    #13,(sp)                ; see if it was on supervisor stack
+        bne     in_syscode              ; yes, in system code
+        move.l  sglobal,a0
+        move.l  c_pcb_ptr(a0),a0        ; get c_pcb_ptr
+        tst.b   domain(a0)              ; c_pcb_ptr^.domain = 0 ?
+        beq     in_syscode              ; yes, in system code
+                                        ; the following is from Dave Hough
+        move.l  2(sp),a0                ; save user's pc in a0
+        pea     flineoffset(a5)         ; get address of reserved f-line inst
+        move.l  (sp)+,2(sp)             ; replace the pc on stack
+        rte                             ; go to the f-line inst on user's stack
+in_syscode
+        move.w  #e_flinesyscode,-(sp)   ; system error 10204 for f-line in system
+        jsr     system_error            ; code
+
+
+spurintr_trap                           ; spurious interrupt handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #spur_intr,d0           ; excep_kind
+        bra     he_trap
+
+trapEhandler                            ; trap E handler for stand alone OS
+unexp_trap                              ; unexpected exception trap handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #unexpected_ex,d0       ; for excep_kind
+        bra     he_trap                 ; now treat this same as illegal instruction
+                                        ; trap
+
+
+
+; Bus error trap handler
+
+PCX            .EQU     42             ; PC at time of error
+SRX            .EQU     40             ; SR at time of failure
+B1             .EQU     38             ; byte 1 of failing instruction
+B2             .EQU     39             ; byte 2 of failing instruction
+BADADDR        .EQU     34             ; address causing bus error
+TSTOP          .EQU     $4A            ; opcode for TST instruction
+OPCODE         .EQU     $4E            ; opcode for recoverable instructions
+MASK_SUB       .EQU     $F8            ; sub_code mask to eliminate register used
+RTS_SUB        .EQU     $75            ; subcode for RTS
+RTE_SUB        .EQU     $73            ; subcode for RTE
+JMPL_SUB       .EQU     $F9            ; subcode for JMP.L
+JSRL_SUB       .EQU     $B9            ; subcode for JSR.L
+JMPA_SUB       .EQU     $D0            ; subcode for JMP (An)
+JSRA_SUB       .EQU     $A8            ; subcode for JSR e(An)
+JSRB_SUB       .EQU     $90            ; subcode for JSR (An)
+ILFAULT        .EQU     $2211          ; IL faulting instruction - MOVE.L (A1),D1
+;
+;   Subroutine to validate that the address causing the bus error is, in fact, for
+;   a code segment that the current process has as part of its address space and
+;   that the offset within the segment is within the bounds of the segment.
+;
+CODE_CHK       MOVE.L   BADADDR+4(SP),D0 ; get bad address into D0
+               MOVE.L   D0,D1          ; bad address to D1
+               ANDI.L   #$1FFFF,D1     ; extract offset
+               SWAP     D0             ; get seg part of address in lower reg half
+               LSR.B    #1,D0          ; get seg # in lower register byte
+               ANDI.W   #$7F,D0        ; allow only 7 bits of seg # to be passed
+               MOVE.L   SGLOBAL,A5     ; get b_sysglobal_ptr
+               MOVE.L   SYSA5(A5),A5   ; get system A5
+; call CHECK_CS to determine if required segment is truly absent
+               CLR.W    -(SP)          ; return from CHECK_CS
+               MOVE.W   D0,-(SP)       ; segment that is absent
+               MOVE.L   D1,-(SP)       ; offset within segment
+               JSR      CHECK_CS       ; call CHECK_CS
+               TST.W    (SP)+          ; set return condition code
+; do nothing else that could change condition code
+               RTS                     ; return
+;
+;
+;   Bus error handling starts here
+;
+BUS_ERR        MOVEM.L  D0-D3/A0-A2/A5,-(SP) ; save user's registers
+               MOVE.W   SRX(SP),D0     ; get SR at time of failure
+               ANDI.W   #ALLINTS,D0    ; test interrupts
+               BNE      BUSERR         ; non-recoverable if on
+               MOVE.B   B1(SP),D1      ; first byte of failing instruction
+               MOVE.B   B2(SP),D0      ; second byte of recoverable instruction
+;
+; check for general segment transfer fault
+;
+               CMPI.B   #OPCODE,D1     ; recoverable instruction?
+               BNE      @9             ; branch if no
+               CMPI.B   #RTS_SUB,D0    ; RTS ?
+               BNE.S    @2             ; skip if not RTS
+;      instruction is RTS
+               MOVE     USP,A0         ; get user's stack ptr
+               SUBQ     #4,A0          ; back it up for retrying the RTS
+               MOVE     A0,USP         ; set user's stack ptr back
+               BRA.S    @6             ; branch if yes
+@2             CMPI.B   #RTE_SUB,D0    ; RTE ?
+               BNE.S    @3             ; branch if no
+;      instruction is RTE
+               MOVE.L   BADADDR(SP),PCX(SP)  ; PC = badaddr
+               BRA.S    @65            ; go complete bus error processing
+@3             CMPI.B   #JMPL_SUB,D0   ; JMP.L ?
+               BEQ.S    @6             ; branch if yes
+               CMPI.B   #JSRL_SUB,D0   ; JSR.L ?
+               BNE.S    @4             ; branch if no
+;      instruction is JSR.L
+               SUBQ.L   #6,PCX(SP)     ; PC = PC - 6
+               BRA.S    @65            ; go complete bus error processing
+;      check for other forms of JSR and JMP
+@4             ANDI.B   #MASK_SUB,D0   ; eliminate register numb from subcode
+               CMPI.B   #JMPA_SUB,D0   ; JMP (An) ?
+               BEQ.S    @6             ; branch if yes
+               CMPI.B   #JSRA_SUB,D0   ; JSR e(An) ?
+               BNE.S    @5             ; branch if no
+               SUBQ.L   #4,PCX(SP)     ; PC = PC - 4
+               BRA.S    @65            ; go complete bus error processing
+@5             CMPI.B   #JSRB_SUB,D0   ; JSR (An) ?
+               BNE      BUSERR         ; branch if no - instr is not recoverable
+@6             SUBQ.L   #2,PCX(SP)     ; PC = PC - 2
+;
+; complete the processing of a recoverable bus error
+;
+@65            BSR      CODE_CHK       ; validate code fault
+               BEQ.S    @8             ; branch if supposed to RTE to user
+               BMI      BUSERR         ; invalid absence trap
+;
+; restore user's registers and ENTER_SCHEDULER so memory manager can execute
+@7             MOVEM.L  (SP)+,D0-D3/A0-A2/A5    ; restore registers
+               ADDQ     #8,A7          ; pop bus error data - leave SR and PC
+               JSR      ENTER_SC       ; call ENTER_SCHEDULER (will not return)
+;
+; restore user's registers and return to the user
+@8             MOVEM.L  (SP)+,D0-D3/A0-A2/A5    ; restore registers
+               ADDQ     #8,A7          ; pop bus error data - leave SR and PC
+               RTE                     ; return to user
+;
+; check for TST instruction in either code segment or stack
+;
+@9             CMPI.B   #TSTOP,D1      ; TST instruction?
+               BNE.S    BUSERR         ; branch if no
+;
+               SUBQ.L   #2,PCX(SP)     ; PC = PC - 2
+               BSR      CODE_CHK       ; check if error due to code fault
+               BEQ.S    @8             ; branch if supposed to RTE to user
+               BPL.S    @7             ; branch if supposed to enter scheduler
+;
+;      Bus error not due to code fault - possibly stack overflow
+;
+               MOVE.L   BADADDR(SP),D0 ; get failing address again
+               MOVE.L   D0,D1          ; and another copy in D1
+               SWAP     D0             ; get seg part of address in lower reg half
+               LSR.B    #1,D0          ; get seg # in lower register byte
+               CMPI.B   #STACKMMU,D0   ; if seg # <> stack seg # then
+               BNE.S    BUSERR         ;   go handle true bus error
+;
+;      A true stack overflow has occurred (PC is already backed up)
+;
+               CLR.B    -(SP)          ; make space for Check_Stack return
+               ANDI.L   #$FFFFFF,D1    ; allow only 24 bits in the address?
+               MOVE.L   D1,-(SP)       ; push stack overflow address
+               JSR      CHECK_ST       ; call Check_Stack
+               TST.B    (SP)+          ; if stack can be expanded then
+               BNE      @7             ;   go call Enter_Scheduler
+;
+;
+; the user has a non-recoverable bus error - prepare to abort process
+;
+XTRAREGS       EQU      28             ; space on stk for 7 extra saved registers
+;
+BUSERR  MOVEM.L (SP)+,D0-D3/A0-A2/A5    ; restore registers used before
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers for error handling
+        move.w  #bus_error,d0           ; excep_kind for bus error
+er_trap
+        move.w  regs_s+8(sp),d1         ; get sr under registers and fc, ac, ir
+        clr.b   -(sp)                   ; push false
+        btst    #13,d1                  ; see if it was in supervisor state before
+        beq     buser1                  ; if not, go on
+;
+        bset   #0,(sp)                  ; it was supervisor state, stack = true
+buser1
+        move.w  d0,-(sp)                ; push excep_kind on stack
+        move    d0,d7                   ; so excep_kind will get restored
+        move.l  sglobal,a5              ; get b_sysglobal_ptr
+        move.l  sysa5(a5),a5            ; set up a5 for system code
+        pea     regs_s+4(sp)            ; get pointer to sr (+ 4 bytes pars)
+        jsr     hard_excep              ; hard_excep (stack, excep_kind, save_info_ptr)
+                                        ; routine to queue an info block and
+                                        ; raise excep_pending
+;
+;      additional work if a true bus error occurred in stack segment
+;
+               CMPI     #addr_error,D7 ; if excep_kind = address error then
+               BEQ.S    leave          ;   leave bus/address error handler
+               MOVE.L   BADADDR+XTRAREGS(SP),D0 ; get failing address again
+               MOVE.L   D0,D1          ; and another copy in D1
+               SWAP     D0             ; get seg part of address in lower reg half
+               LSR.B    #1,D0          ; get seg # in lower register byte
+               CMPI.B   #STACKMMU,D0   ; if seg # <> stack seg # then
+               BNE.S    leave          ;   leave bus error handler
+;
+               MOVE.B   B1+XTRAREGS(SP),D0   ; 1st byte of failing instruction
+               CMPI.B   #TSTOP,D0      ; if op code = TST then
+               BEQ.S    leave          ;   leave handler   { already fixed stack }
+;
+               CLR.B    -(SP)          ; make space for Check_Stack return
+               ANDI.L   #$FFFFFF,D1    ; allow only 24 bits in the address?
+               MOVE.L   D1,-(SP)       ; push stack overflow address
+               JSR      CHECK_ST       ; call Check_Stack
+               ADDQ     #2,SP          ; pop Check_Stack return
+;
+leave   movem.l (sp)+,d0-d7/a0-a6       ; restore all the registers
+        adda.l  #8,sp                   ; pop bus error data except sr and pc
+        jsr     enter_scheduler         ; go to scheduler
+;
+
+
+addrerror_trap                          ; address error trap handler
+        movem.l d0-d7/a0-a6,-(sp)       ; save all registers
+        move.w  #addr_error,d0          ; excep_kind for address error
+        bra     er_trap
+
+
+;
+;-----------------------------------------------------------------------;
+; procedure get_caller (var caller_pc, caller_a6 : longint);            ;
+; DESCRIPTION :                                                         ;
+;   Get the infomation of the caller of rangeerror procedure, execution ;
+;   stack, return pc and link address.                                  ;
+;                                                                       ;
+; INPUT PARAMETERS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+; OUTPUT PARAMETERS :                                                   ;
+;   caller_pc : return pc when calling rangeerror.                      ;
+;   caller_a6 : link address when calling rangeerror.                   ;
+;                                                                       ;
+; SIDE EFFECTS :                                                        ;
+;   NONE.                                                               ;
+;                                                                       ;
+; SPECIAL CONDITIONS OF USE :                                           ;
+;   Called by rangeerror procedure only.                                ;
+;                                                                       ;
+; ERROR CONDITIONS :                                                    ;
+;   NONE.                                                               ;
+;                                                                       ;
+;-----------------------------------------------------------------------;
+;
+get_caller                              ; no link needed
+        move.l  (sp)+,a0                ; return pc
+        move.l  (sp)+,a1                ; @caller_a6
+        move.l  (a6),(a1)               ; get caller a6
+        move.l  (sp)+,a1                ; @caller_pc
+        move.l  15*4+8+8(a6),(a1)       ; get caller (of %_RCHCK, %_SRCHK) pc
+                                        ; Note this depends heavily on the set up in
+                                        ; PASRANGE
+        jmp     (a0)                    ; return
+
+
+
+
+;
+;---------------------------------------------------------------------
+;
+;  function VALID_ADDR(var errnum: int2; pcheck: parmcheck): boolean;
+;
+;      pchk = record
+;               addr: absptr;
+;               readwrite: boolean;
+;             end;
+;      parmcheck = record
+;                    numcheck: int2;
+;                    parms: array[0..n] of pchk;
+;                  end;
+;     (* validates addr and the access to addr *)
+;     (* returns false if any address is invalid *)
+;     (* also calls AbortProcess if errnum address is invalid *)
+;     (* calls system_error if invalid address from system code *)
+;---------------------------------------------------------------------
+;
+SEGNSHFT    .EQU     17                 ; shift count to extract seg number
+PGSZSHFT    .EQU     9                  ; shift count to div by mempgsize
+OFSETMSK    .EQU     $1FFFF             ; mask to extract offset from addr
+                                        ; also value used to adjust stack offset
+E_BADADR    .EQU     1998               ; error returned for bad parm addr
+E_BADERRNUM .EQU     6                  ; error to AbortProcess
+RTN         .EQU     12                 ; offset in stack frame for function rtn
+ERRNUM      .EQU     8                  ; offset in stack frame to errnum addr
+ARR         .EQU     4                  ; offset in stack frame to check array
+;
+VALID_AD    MOVE.B   #1,RTN(SP)         ; return true
+            MOVE.L   D4,-(SP)           ; Save D4
+            MOVE.W   #-1,D4             ; D4 = -1 (first pass flag)
+            CLR.W    -(SP)              ; return value for SYS_CALLED
+            JSR      SYS_CALL           ; call SYS_CALLED
+            MOVE.L   ERRNUM+6(SP),A1    ; get address of errnum
+            MOVEQ    #1,D3              ; set readwrite flag = true
+;  head of processing loop
+@100        MOVE.L   A1,D1              ; get addr to be validated
+            MOVEQ    #SEGNSHFT,D2       ; shift count
+            LSR.L    D2,D1              ; shift segment number down
+            ANDI.W   #$7F,D1            ; extract segment number
+            MOVE.W   D1,D2              ; save seg number
+            MOVE.W   (SP),D0            ; get return value from SYS_CALLED
+            BNE      @1                 ; branch if SYS_CALLED = true - all
+                                        ; segment numbers are valid
+;  Caller of Valid_Addr was called by normal user -
+;  addr must be in the range of segments LDSN1 to SHRSEG
+            CMPI.W   #LDSN1MMU,D1       ; compare seg number with ldsn1mmu
+            BMI      @10                ; branch if invalid
+            CMPI.W   #SHRSEGMMU,D1      ; compare seg number with shrsegmmu
+            BGT      @10                ; branch if invalid
+;
+;  Segment number is valid - now check access rights
+;
+@1          MOVE.L   SGLOBAL,A2         ; get b_sysglobal_ptr
+            MOVE.L   SMT_ADDR(A2),A2    ; get smt_addr
+            LSL.W    #SMTESIZE,D1       ; seg number * 4 = displacement into smt
+            CMPI.B   #MMUABSENT,2(A2,D1.W) ; compare smt.access with mmuabsent
+            BEQ      @10                ; seg is absent - invalid access
+            CMPI.B   #MMUREADO,2(A2,D1.W) ; compare smt.access with mmureadonly
+            BNE      @2                 ; branch if segment not read only
+            CMPI.B   #0,D3              ; test readwrite flag
+            BNE      @10                ; readonly seg but want readwrite - invalid
+;
+;  Segment access is valid - now check offset into segment
+;
+@2          MOVE.L   A1,D0              ; get addr to be validated
+            ANDI.L   #OFSETMSK,D0       ; extract offset
+            CMPI.W   #STACKMMU,D2       ; compare seg number with stackmmu
+            BNE      @3                 ; branch if not stack access - otherwise
+                                        ; offset in stack must be adjusted
+            SUBI.L   #OFSETMSK,D0       ; offset - $1FFFF
+            NOT.L    D0                 ; $1FFFF - offset
+;
+;  D0 now contains a valid offset
+;
+@3          MOVEQ    #PGSZSHFT,D2       ; get shift count
+            LSR.L    D2,D0              ; offset div mempgsize
+            MOVE.W   2(A2,D1.W),D2      ; access,limit
+            ANDI.W   #$00FF,D2          ; extract limit
+            BNE      @31                ; jump if limit <> 0
+            MOVE.W   #$100,D2           ; set limit = 128K
+@31         CMP.W    D2,D0              ; compare offset to segment limit
+            BGE      @10                ; offset greater than limit - invalid
+            CMPI.W   #-1,D4             ; first pass flag set?
+            BNE      @4                 ; branch if no
+;  end of first pass (checked errnum) - now check other parm addresses
+            MOVE.L   ARR+6(SP),A0       ; address of parm array
+            MOVE.W   (A0),D4            ; number of parm addr to check
+@4          SUBQ.W   #1,D4              ; D4=D4-1
+            BMI      @20                ; done
+            MOVE.W   D4,D2
+            MULS     #6,D2              ; mult by size of parm check entry
+            MOVE.L   2(A0,D2.W),A1      ; get addr to check
+            MOVE.B   6(A0,D2.W),D3      ; get readwrite flag
+            BRA      @100               ; go thru test loop again
+;  error exit - one of the parameters is bad
+@10         MOVE     #E_BADADR,D0       ; error code
+            CMPI.W   #-1,D4             ; first pass flag set?
+            BNE      @21                ; branch if no
+;  address of errnum is bad - cannot return error - abort process
+            MOVE.L   SGLOBAL,A2         ; get b_sysglobal_ptr
+            MOVE.L   C_PCB_PTR(A2),-(SP); pcb_ptr
+            MOVE.B   #1,-(SP)           ; true
+            MOVE.W   #E_BADERRNUM,-(SP) ; invalid errnum address
+            JSR      ABORTPROCESS       ; call AbortProcess
+            BRA      @22                ; return without storing in errnum
+;  return error value in errnum
+;  return to caller
+@20         CLR.W    D0                 ; ok code
+@21         MOVE.L   ERRNUM+6(SP),A0    ; get addr of errnum
+            MOVE.W   D0,(A0)            ; errnum = code
+            BEQ      @23                ; jump if error = 0
+@22         CLR.W    RTN+6(SP)          ; return false
+@23         MOVE.W   (SP)+,A0           ; pop SYS_CALL return
+            MOVE.L   (SP)+,D4           ; restore D4
+            MOVE.L   (SP)+,A0           ; get return addr
+            ADDQ.L   #8,SP              ; pop parameter
+            JMP      (A0)               ; return
+;
+            .END
+
+ÿ

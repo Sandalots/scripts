@@ -1,0 +1,561 @@
+{ Copyright 1983, Apple Computer, Inc. }
+{$S SegTEIdle}
+function CheckReceive (TheEvent: EventRecord; var GotEvent: Boolean): Boolean;
+  {CheckReceive returns true if a character is ready at the scrap for pasting,}
+  {the keyboard, terminal reply, or the UART of any terminal on TermList.}
+
+  var
+    HTerm: THTerm;
+    Ch: Char;
+    eCode: Integer;
+    NrRead: LongInt;
+
+  {$S SegTEIdle}
+  begin {CheckReceive}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    CheckReceive:=False;                       {Assume nothing is ready.}
+    HTerm:=TermList;
+    while HTerm<>NIL do begin
+      with HTerm^^, Setup do begin
+        if ReplyLen<>0 then                    {Any replies?}
+          CheckReceive:=True;
+
+        if HTerm=PasteTerm then                {Any pastes?}
+          CheckReceive:=True;
+
+        if KbdReady then
+          CheckReceive:=True
+
+        else
+          with TheEvent do
+            if GotEvent and (Who=Folder) and
+               (What=KeyDown) and (not Answering) then begin
+              GotEvent:=False;
+              KbdReady:=True;
+              KbdEvent:=TheEvent;
+              CheckReceive:=True;
+            end;
+
+        if RecUartLen<>0 then                  {Any UART receives?}
+          CheckReceive:=True
+
+        else
+          if OnLine then begin
+            Read_Data (eCode, RefNum, Ord (@RecUartSeq), PaocSize, NrRead, Sequential, 0);
+            if eCode <> 0 then begin
+              if eCode = 643 then begin  {input missed}
+                RecUartSeq [NrRead+1] := Chr(ParityChar);
+                NrRead := NrRead + 1;
+              end else begin
+                Close_Object (eCode, RefNum);
+                Unmount (eCode, UartPath [PortA]);
+                UartOpen:=False;
+                OnLine:=False;
+
+                GiveAlert (HTerm, AlrtNote, ALUart, SerialName [PortA], TheTitle, '');
+                NrRead:=0;
+              end;
+            end;
+
+
+            RecUartLen:=NrRead;
+            if NrRead>0 then
+              CheckReceive:=True;
+          end;
+      end;
+
+      HTerm:=HTerm^^.Next;
+    end;
+
+    with TheEvent do
+      if GotEvent and (What=KeyDown) and (not Answering) then
+        GotEvent:=False;
+  end; {CheckReceive}
+
+
+procedure Receive;
+  {Receive routes characters from the scrap (paste), the keyboard, and the }
+  {UARTs to their appropriate destinations.}
+
+  var
+    UartSeq: Paoc;            {Char's to route to the UART.}
+    UartLen: Integer;         {Length of UartSeq.}
+    PUartSeq: PPaoc;          {Pointer to UartSeq}
+    ScreenSeq: Paoc;          {Char's to route to the screen.}
+    ScreenLen: Integer;       {Length of ScreenSeq.}
+    PScreenSeq: PPaoc;        {Pointer to Screen Seq}
+
+    I: Integer;
+    HTerm: THTerm;
+    eCode: Integer;
+    eCode1: Integer;
+    NrWritten: LongInt;
+    EchoOK: Boolean;
+    AlertNr: Integer;
+
+
+  procedure RecReply;
+    {RecReply gets the info for a reply (from SendToScreen) into UartSeq.}
+
+    {$S SegTEMain}
+    begin {RecReply}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      with HTerm^^ do begin
+        PUartSeq:=@ReplySeq;
+        UartLen:=ReplyLen;
+        ReplyLen:=0;
+      end;
+    end; {RecReply}
+
+
+    PROCEDURE RecPaste;                                                         {BEGIN RecPaste [JS]}
+    {RecPaste gets info for a paste into UartSeq.}
+
+    VAR
+        AChad:      TAChad;
+        ICs:        TB;
+        TySet:      TTySet;
+        Retry:      BOOLEAN;
+        ITo:        INTEGER;
+        IFrom:      INTEGER;
+        eCode:      INTEGER;
+        ScrapSeq:   PAOC;
+        Language:   INTEGER;
+        rightSide:  INTEGER;
+        firstTime:  BOOLEAN;
+
+
+        FUNCTION  TimeToWrap: BOOLEAN;
+        {Looks ahead and finds the next space in the Paste buffer and compares with the number of}
+        {characters remaining on the line (WrapPoint - CharsSinceCR).}
+
+        VAR range:          INTEGER;
+            i:              INTEGER;
+            lookahead:      INTEGER;
+            oldLpd:         TAlpd;
+            oldAchad:       TAchad;
+            iBuffer:        INTEGER;
+            ch:             CHAR;
+
+        {$S SegTEMain}
+        BEGIN {TimeToWrap}
+            {$IFC SampCalls}   ALogCall;   {$ENDC}
+
+            {$IFC WrapDebug}
+            IF WrapDebug THEN
+                WRITELN('TimeToWrap');
+            {$ENDC}
+
+            oldLpd := ALpd;                             {Save a copy just in case we have to restore}
+            oldAchad := Achad;
+            TimeToWrap := FALSE;                        {Assume there is still space left}
+            range := PWrapPoint - CharsSinceCR + 1;     {Distance to wrap point}
+            iBuffer := IFrom;                           {Current position in paste buffer}
+
+            {$IFC WrapDebug}
+            IF WrapDebug THEN
+                BEGIN
+                WRITELN('    range       = ', range :0);
+                WRITELN('    iBuffer     = ', iBuffer :0);
+                END;
+            {$ENDC}
+
+            REPEAT
+                lookahead := CMin(range, (AChad.IChLim - 1) - iBuffer);
+                                                        {Does the buffer end before the wrap point?}
+
+                {$IFC WrapDebug}
+                IF WrapDebug THEN
+                    WRITELN('    lookahead   = ', lookahead :0);
+                {$ENDC}
+
+                IF (lookahead <= 0) AND (range > 0) THEN    {Time to read some more into the buffer}
+                    BEGIN
+                    REPEAT                                  {Try until run not vanished.}
+                        AChad.RgCh := NIL;                  {Whe don't need to move the buffer}
+                        SeqLpd (@ALpd, AChad);
+                    UNTIL (NOT ALpd.Rce^.fVan) OR (AChad.IChLim = AChad.IChFst);
+                    iBuffer := AChad.iChFst;                {Point to the begining}
+
+                    lookahead := CMin(range, (AChad.IChLim - 1) - iBuffer);
+                    IF lookahead <= 0 THEN                  {Did we reach the end of paste}
+                        BEGIN
+                        ALpd := oldLpd;                     {Restore Alpd & Achad}
+                        Achad := oldAchad;
+
+                        {$IFC WrapDebug}
+                        IF WrapDebug THEN
+                            BEGIN
+                            WRITELN('End of paste buffer: TimeToWrap = FALSE');
+                            WRITELN;
+                            END;
+                        {$ENDC}
+
+                        EXIT(TimeToWrap);                   {And return FALSE}
+                        END;
+
+                    {$IFC WrapDebug}
+                    IF WrapDebug THEN
+                        BEGIN
+                        WRITELN('    AChad.IChLim = ', AChad.IChLim :0);
+                        WRITELN('    AChad.IChFst = ', AChad.IChFst :0);
+                        WRITELN('    lookahead    = ', lookahead :0);
+                        WRITELN('    range        = ', range :0);
+                        END;
+                    {$ENDC}
+
+                    END;
+
+                FOR i := iBuffer + 1 TO ibuffer + lookahead DO  {Scan characters remaining in buffer}
+                    BEGIN
+                    {$R- }
+                    ch := CHR(AChad.rgCh^[i]);
+                    {$IFC RangeCheck }
+                        {$R+}
+                    {$ENDC }
+
+                    IF (ch = ' ') OR (ch = CR) OR (ch = HT) THEN
+                        BEGIN
+                        ALpd := oldLpd;                     {Restore Alpd & Achad}
+                        Achad := oldAchad;
+
+                        {$IFC WrapDebug}
+                        IF WrapDebug THEN
+                            BEGIN
+                            WRITELN('Found a space: TimeToWrap = FALSE');
+                            WRITELN;
+                            END;
+                        {$ENDC}
+
+                        EXIT(TimeToWrap);                   {Found a space, don't wrap yet}
+                        END;
+                    END;
+
+                ibuffer := ibuffer + lookahead;
+                range := range - lookahead;                 {Decrease by the amount we have scanned so far}
+
+                {$IFC WrapDebug}
+                IF WrapDebug THEN
+                    WRITELN('    range       = ', range :0);
+                {$ENDC}
+
+            UNTIL (range <= 0);                             {Scanned far enough?}
+
+            ALpd := oldLpd;                                 {Restore Alpd & Achad}
+            Achad := oldAchad;
+
+            TimeToWrap := TRUE;                             {Time to wrap, couldn't find a space}
+
+            {$IFC WrapDebug}
+            IF WrapDebug THEN
+                BEGIN
+                WRITELN('Couldn''t find a space: TimeToWrap = TRUE');
+                WRITELN;
+                END;
+            {$ENDC}
+        END; {TimeToWrap}
+
+
+
+        PROCEDURE EvaluateWrap;
+        BEGIN{EvaluateWrap}
+            {$IFC SampCalls}   ALogCall;   {$ENDC}
+            IF HTerm^^.SetUp.WordWrap THEN                              {Test if WordWrap is ON}
+                IF (UartSeq[ITo] = ' ') OR (UartSeq[ITo] = HT) OR firstTime THEN
+                                                                        {Is the char space or tab?}
+                    IF TimeToWrap THEN                                  {Is the next word too long?}
+                        UartSeq[ITo] := CR;                             {It's time to end the line}
+
+            IF (CharsSinceCR >= rightSide) AND HTerm^^.SetUp.wraparound THEN
+                CharsSinceCR := CharsSinceCR - rightSide;               {Recognize line wrap}
+
+            IF UartSeq[ITo] >= ' ' THEN                                 {Don't count CTRL chars}
+                CharsSinceCR := CharsSinceCR + 1;
+
+            ITo := ITo + 1;
+            IF UartSeq[ITo - 1] = CR THEN
+                BEGIN
+                CharsSinceCR := WrapStart;                              {Reset counter at CR}
+                IF (HTerm^^.Setup.AutoLF OR NOT HTerm^^.Setup.OnLine) THEN
+                    BEGIN                                       {Test if a LF should be added}
+                    UartSeq[ITo] := LF;
+                    ITo := ITo + 1;
+                    END;
+                END;
+        END;{EvaluateWrap}
+
+
+    {$S SegTEMain}
+    BEGIN {RecPaste}
+        {$IFC SampCalls}   ALogCall;   {$ENDC}
+        firstTime := StartPaste;
+
+        IF HTerm^^.Setup.Cols80 THEN
+            rightSide := 80
+        ELSE
+            rightSide := 132;
+
+        IF StartPaste THEN
+            BEGIN                               {This is the first time for this paste.}
+            CharsSinceCR := HTerm^^.Cursor.Ch;
+            PWrapPoint := CMin(HTerm^^.SetUp.WrapPoint, rightSide);
+            WrapStart := CMin(MinCol, PWrapPoint - 1);
+
+            WITH TySet DO
+                BEGIN                           {Get character-wise from the scrap.}
+                fRce := FALSE;
+                fParBnds := TRUE;
+                fRpe := FALSE;
+                END;
+
+            GetCsScrap(ICs);
+            IF ICs = ICsNIL THEN
+                BEGIN
+                GiveAlert(PasteTerm, AlrtStop, ALNilPaste, '', '', '');
+
+                PasteTerm := NIL;
+                UartLen := 0;
+                StartPaste := FALSE;
+
+                Exit(RecPaste);
+                END;
+
+            BindUTDSeg(eCode);
+
+            WITH AChad DO
+                BEGIN
+                RgCh := @ScrapSeq;
+                IChFst := 0;
+                IChLim := PaocSize DIV 2;
+                END;
+
+            SetLpd(@ALpd, ICs, 0, TySet, AChad);        {Start from beginning.}
+            Retry := ALpd.Rce^.fVan;
+
+            DisableItem(TheMenus [EditMenu], EditPaste);
+
+            StartPaste := FALSE;
+
+            END
+        ELSE
+            Retry := TRUE;                              {Continuing paste.}
+
+        WHILE Retry DO
+            BEGIN                                       {Try until run not vanished.}
+            WITH AChad DO
+                BEGIN
+                RgCh := @ScrapSeq;
+                IChFst := 0;
+                IChLim := PaocSize DIV 2;
+                END;
+
+            SeqLpd(@ALpd, AChad);
+            Retry := ALpd.Rce^.fVan AND (AChad.IChLim <> AChad.IChFst);
+            END;
+
+        IF AChad.IChLim = AChad.IChFst THEN
+            BEGIN
+            EnableItem(TheMenus [EditMenu], EditPaste);
+            UnbindUTDSeg(eCode);
+
+            {$IFC DbgCursor}
+            IF DbgCursor THEN
+                WRITELN('Paste done: HourGlass = ',HourGlass);
+            {$ENDC}
+
+            HourGlass := FALSE;
+
+            {$IFC DbgCursor}
+            IF DbgCursor THEN
+                WRITELN('            HourGlass = ',HourGlass);
+            {$ENDC}
+
+            PasteTerm := NIL;
+            UartLen := 0;
+            END
+        ELSE
+            BEGIN
+            ITo := 1;
+
+            IF firstTime THEN
+                BEGIN
+                UartSeq[ITo] := CHR(0);
+                IFrom := AChad.IChFst - 1;                                  {Fake an index}
+                EvaluateWrap;
+                firstTime := FALSE;
+                END;
+
+            FOR IFrom := AChad.IChFst TO AChad.IChLim - 1 DO
+                BEGIN
+                {$R- }
+                UartSeq[ITo] := CHR(AChad.RgCh^[IFrom]);
+                {$IFC RangeCheck }
+                    {$R+}
+                {$ENDC }
+
+                language := ORD(HTerm^^.CharSet[HTerm^^.CharGroup]) - 2;
+                IF language < 0 THEN                                        {Test for the GraphCharSet}
+                    language := 0;
+
+                UartSeq[ITo] := ConvertLanguage(UartSeq[Ito], language);
+                IF UartSeq[ITo] <> Chr(255) THEN
+                    BEGIN                          {FF means character is not in international charset}
+
+                    {$IFC WrapDebug}
+                    IF WrapDebug THEN
+                        BEGIN
+                        WRITELN('PWrapPoint   = ', PWrapPoint :0);
+                        WRITELN('WrapStart    = ', WrapStart :0);
+                        WRITELN('CharsSinceCR = ', CharsSinceCR :0);
+                        WRITELN('UartSeq[ITo] = ', UartSeq[ITo] :0);
+                        WRITELN;
+                        END;
+                    {$ENDC}
+
+                    EvaluateWrap;
+                    END;
+                END;
+
+            UartLen := ITo-1;
+            PUartSeq := @UartSeq;
+            END;
+    END; {RecPaste}
+
+
+  procedure RecKbd;
+    {RecKbd gets the info from the keyboard into UartSeq.}
+
+    {$S SegTEIdle}
+    begin {RecKbd}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      with HTerm^^ do begin
+        KbdReady:=False;
+        EventToSeq (HTerm, KbdEvent, UartSeq, UartLen);
+        PUartSeq:=@UartSeq;
+      end;
+    end; {RecKbd}
+
+
+  procedure RecEcho;
+    {RecEcho gets the info from UartSeq into ScreenSeq.}
+
+    {$S SegTEMain}
+    begin {RecEcho}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      PScreenSeq:=@UartSeq;
+      ScreenLen:=UartLen;
+    end; {RecEcho}
+
+
+  procedure RecUart;
+    {RecUart gets the info from the Uart into ScreenSeq.}
+
+    {$S SegTEMain}
+    begin {RecUart}
+      {$IFC SampCalls}   ALogCall;   {$ENDC}
+      with HTerm^^ do begin
+        PScreenSeq:=@RecUartSeq;
+        ScreenLen:=RecUartLen;
+        RecUartLen:=0;
+      end;
+    end; {RecUart}
+
+  {$S SegTEIdle}
+  begin {Receive}
+    {$IFC SampCalls}   ALogCall;   {$ENDC}
+    PScreenSeq:=NIL;
+    PUartSeq:=NIL;
+    HTerm:=TermList;
+    while HTerm<>NIL do begin
+      {$IFC FindDecr }
+        PrintRgns (HTerm, 'Receive 1');
+      {$ENDC }
+
+      EchoOK:=True;
+      with HTerm^^ do                        {Find what goes to the UART-out.}
+        if ReplyLen<>0 then begin            {The terminal replied to host.}
+          RecReply;
+          EchoOK:=False;                     {Replies aren't echoed.}
+
+        end else if HTerm=PasteTerm then     {Paste from the scrap.}
+          RecPaste
+
+        else if KbdReady then                {Send stuff from the keyboard.}
+          RecKbd
+
+        else                                 {Nothing routed to the UART-out.}
+          UartLen:=0;
+
+      {$IFC FindDecr }
+        PrintRgns (HTerm, 'Receive 2');
+      {$ENDC }
+
+      with HTerm^^, Setup do                 {Find what goes to the screen.}
+        if (UartLen<>0) and                    {Is there anything to echo?}
+            EchoOK      and                    {And is it OK to echo?}
+          ((not OnLine) or                     {And are we in Local ...}
+           (not FullDuplex)) then              {... or Half Duplex?}
+          RecEcho                            {Echo stuff going to the UART-out.}
+
+        else if RecUartLen<>0 then           {Paint stuff coming from UART-in.}
+          RecUart
+
+        else                                 {Nothing routed to the screen.}
+          ScreenLen:=0;
+
+      {$IFC FindDecr }
+        PrintRgns (HTerm, 'Receive 3');
+      {$ENDC }
+
+      if UartLen<>0 then                     {Send stuff to the UART-out.}
+        if HTerm^^.Setup.OnLine then begin
+          Write_Data (eCode, HTerm^^.RefNum, Ord (PUartSeq), UartLen,
+                      NrWritten, Sequential, 0);
+
+          with HTerm^^, Setup do
+            if (eCode>0) and XOnXOff then begin
+              Device_Control (eCode1, UartName [PortA], GroupB [True]);
+              Device_Control (eCode1, UartName [PortA], GroupHRetry);
+
+              Write_Data (eCode, RefNum, Ord (PUartSeq), UartLen,
+                          NrWritten, Sequential, 0);
+
+              Device_Control (eCode1, UartName [PortA], GroupH);
+
+              if eCode<=0 then
+                GiveAlert (HTerm, AlrtNote, ALForceXOn, SerialName [PortA], TheTitle, '');
+            end;
+
+          with HTerm^^, Setup do
+            if eCode>0 then begin
+              Close_Object (eCode1, RefNum);
+              Unmount (eCode1, UartPath [PortA]);
+              UartOpen:=False;
+
+              OnLine:=False;
+
+              if eCode=647 then
+                AlertNr:=ALXOff
+              else
+                AlertNr:=ALUart;
+
+              GiveAlert (HTerm, AlrtNote, AlertNr, SerialName [PortA], TheTitle, '');
+            end;
+        end;
+
+      {$IFC FindDecr }
+        PrintRgns (HTerm, 'Receive 4');
+      {$ENDC }
+
+      for I:=1 to ScreenLen do               {Send stuff to the screen.}
+        SendToScreen (PScreenSeq^[I], HTerm);
+
+      {$IFC FindDecr }
+        PrintRgns (HTerm, 'Receive 5');
+      {$ENDC }
+
+      HTerm:=HTerm^^.Next;
+    end;
+  end; {Receive}
+
+ÿ

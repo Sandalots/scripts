@@ -1,0 +1,3152 @@
+{
+  Copyright 1983, 1984, Apple Computer Inc.
+
+  This unit primarily serves as a cover for the database intrinsics.  Most
+  routines simply provide a more convenient interface for the same DB function.
+
+  There is one catalog per volume.  The catalog is a table of records describing
+  all the high level objects on a disk (e.g., folders, documents, tools).  The
+  table is kept sorted first by parentID and then alphabetically by name.  Every
+  object record also contains an id which is unique on a volume.
+
+  Example catalog:
+
+
+     ParentId   Name          UniqueId   Kind     Tool Used  ... (other attributes)
+     --------   ----          --------   ----     ---------
+        0       My Disk           1      Disk       N/A
+        1       LisaWrite       101      Tool        1
+        1       Document        102      Doc         1
+        1       Document        103      Doc         3
+        1       Folder 1        104      Folder     N/A
+      104       a Doc           105      Doc         4
+      104       b Doc           106      Doc         2
+      104       Folder 1.1      107      Folder     N/A
+      107       LisaCalc        108      Tool        3
+      107       Doc             109      Doc         3
+
+  All of the catalog access routines require a volume identifier, "volHdl", and a
+  catalog record Id, "catRID."  The catRID type is defined in unit "FGlobals."  It
+  is a record that contains a parentID and a uniqueID.  The uniqueID alone is
+  enough to identifiy the object; however, having the parentId allows faster access
+  given the catalog structure.  The access routines also provide sequential access
+  by using the catRID positioning constants defined below.  These allow positioning
+  to the first, next, and current records.  Also provided is the ability to
+  position to the first record with a given parentID.
+
+
+
+  last system error used = 325
+
+}
+
+UNIT DmCat;
+
+{$SETC newDBLib   := TRUE }       { set to TRUE for international release }
+
+INTERFACE
+
+USES
+   {$U HWInt     } HWInt,
+   {$U LibOS/SysCall   } SysCall,
+   {$U LibOS/PSysCall  } PSysCall,
+
+      { database modules }
+
+   {$U UnitStd   } UnitStd,
+   {$U IntrLib   } International,
+   {$U dbenv     } dbenv,
+   {$U dbdecl1   } dbdecl1,
+   {$U lowlevel  } lowlevel,
+   {$U pooler    } pooler,
+   {$U heap      } heap,
+   {$U czCompact } czCompact,
+   {$U vltree    } vltree,
+   {$U scan      } scan,
+   {$U labscan   } labscan,
+   {$U schema    } schema,
+   {$U recovery  } recovery,
+
+      { other library modules }
+
+   {$U UnitHz    } UnitHz,
+   {$U Storage   } Storage,
+   {$U QuickDraw } QuickDraw,
+   {$U FontMgr   } FontMgr,
+   {$U WM.Events } Events,
+   {$U WM.Menus  } Menus,
+   {$U AlertMgr  } AlertMgr,
+   {$U FilerComm } FilerComm,
+
+      { Filer modules }
+
+   {$U ApDm/Globals  } DmGlobals,
+   {$IFC flrDebug}
+   {$U apdm/tracecalls.obj} tracecalls,
+   {$ENDC}
+   {$U ApDm/Entry    } DmEntry;
+
+CONST
+
+      { types of views a container can be in.  Recorded in the catalog record }
+
+   spatialView = 0;    { icons }
+   alphaView   = 1;    { alphabetical list by name }
+   chronView   = 2;    { chronological list by date modified }
+
+      { indicies into "props" boolean array }
+
+   manyDocs    = 0;    { TRUE => tool can handle more than one doc at a time }
+   noDocs      = 1;    { TRUE => tool doesn't use stationery pads }
+   iconPassWd  = 2;    { TRUE => obj is password protected }
+   forMac      = 3;    { TRUE => obj is a macintosh object (sony/doc/tool) }  {**** KK ****}
+
+      { Reserved catalog id numbers.  Newly created catalogs have some records
+        created with these reserved unique id's
+      }
+
+   idNil          = 0;
+   idDisk         = 1;
+   idTrash        = 2;
+   idScrap        = 3;
+   idComputer     = 4;
+   idPrinter      = 5;
+   idFolderPad    = 7;
+   idLetterPad    = 8;
+   idInBox        = 9;
+   idOutBox       = 10;
+   idLastReserved = 100;
+
+   idFirst     = -1;         { positioning id numbers }
+   idNext      = -2;
+   idCurrent   = -3;
+   idAny       = -4;         { used to position to first record in a container }
+
+   catBadVersion  =  -9999;  { version mismatch }
+   endOfCat       =  3;      { DB end of scan redefinition, save units importing DB }
+
+   desktopFile    = '{!SaveDesktop}';     { holds saved desktop state }
+   catOverhead    = 10;                   { number of disk blocks used by a new catalog }
+
+
+
+
+TYPE
+
+   KindSet      = SET OF ObjectKind;
+
+   PropFlags  = PACKED ARRAY [0..15] OF BOOLEAN;
+   VarLenData = PACKED ARRAY [0..fMaxStrLen] OF CHAR;
+
+
+   errTypes   = (fatalError,     { restart the filer }
+                 askError,       { ask if should restart or continue }
+                 warnError);     { error msg only }
+
+
+      { Catalog record definition }
+
+
+   TcatRec =
+      RECORD
+      parentId   : IdType;      { Id of parent }
+      nameDesc   : Vfld;        { length & offset of name of the object }
+      selfId     : IdType;      { unique id of the object }
+      objKind    : INTEGER;     { the type of object }
+      objState   : Byte;        { state information.  currently unused }
+      view       : Byte;        { view mode (for containers only) }
+      props      : PropFlags;   { various boolean properties; see 'props' constants above }
+      openRect   : Rect;        { last open location and size }
+      closedPt   : Point;       { closed location in container }
+      created    : LongInt;     { date & time created }
+      modified   : LongInt;     { date & time modified }
+      objSize    : LongInt;     { diskSize in blocks }
+      toolId     : TtoolId;     { program to run }
+      split      : INTEGER;     { if <> nullInt2, an obj is split across disks; piece num }
+      unused2    : LongInt;     { spare }
+      extraDesc  : Vfld;        { length & offset of future object data }
+      varLenPart : VarLenData   { data for variable length fields }
+      END;
+
+   PtrCatRec = ^TcatRec;
+
+
+
+VAR
+
+      { Positioning constants.  These can be passed in to the access routines
+        for accessing records based on position in the file }
+
+   posFirst   : TcatRID;  { positions to the first record }
+   posNext    : TcatRID;  { positions to the next record, useful for iterating  }
+   posCurrent : TcatRID;  { positions to the current record }
+   posApprox  : TcatRID;  { used to position to first record with a given parentID
+                            set posApprox.parentID to the parentID desired }
+
+
+      { Predefined record id's.  These are constants which can be passed in to
+        any catalog routine. }
+
+   diskCatRID  : TcatRID;
+   trashCatRID : TcatRID;
+
+   blankCatRec: TcatRec;   { constant with all fields initialized }
+
+
+FUNCTION  CatRecSize  (VAR catRec : TcatRec) : INTEGER;
+PROCEDURE CloseCat    (VAR err : INTEGER; VAR volHdl : TentryHdl);
+PROCEDURE CreateCat   (VAR err : INTEGER; devHdl : TentryHdl);
+PROCEDURE DBError     (err : INTEGER);
+PROCEDURE DestroyCat  (VAR err : INTEGER; devHdl : TentryHdl);
+PROCEDURE DisplayError(flrErr,err: INTEGER; devHdl: TentryHdl);
+FUNCTION  ErrorFound  (errKind: errTypes; flrErr,err: INTEGER;
+                       devHdl: TentryHdl): BOOLEAN;
+PROCEDURE ExtObjName  (VAR catRec : TcatRec; VAR objName : FMaxStr);
+PROCEDURE FixPassword (volHdl: TentryHdl; catRID: TcatRID);
+PROCEDURE FlushCat    (volHdl: TentryHdl);
+PROCEDURE GetDefName  (kind: INTEGER; VAR name: FmaxStr);
+PROCEDURE GetObjName  (volHdl: TentryHdl; catRID: TcatRID; VAR name : FMaxStr);
+PROCEDURE GetObjPathname (volHdl: TentryHdl; catRID: TcatRID; VAR name: Pathname);
+PROCEDURE GetObjPrefix(volHdl: TentryHdl; catRID: TcatRID; VAR prefix: Pathname; fullPath: BOOLEAN);
+PROCEDURE GetToolName (VAR err: INTEGER; toolID: TtoolID; devHdl: TentryHdl;
+                       VAR toolName: FMaxStr);
+PROCEDURE InitCat     (VAR err : INTEGER);
+PROCEDURE InsObjName  (VAR catRec : TcatRec; objName : FMaxStr);
+FUNCTION  ObjInCat    (volHdl: TentryHdl; name: FmaxStr; whichKinds: KindSet;
+                       toolId: IdType; VAR pCatRec: PtrCatRec): BOOLEAN;
+PROCEDURE OpenCat     (VAR err: INTEGER; devHdl: TentryHdl);
+PROCEDURE PrefixInCat (VAR err, offset: INTEGER; prefix: Pathname;
+                       VAR volHdl: TentryHdl; VAR catRID: TcatRID);
+PROCEDURE PrefixFromName (VAR err, offset: INTEGER; name: Pathname; VAR prefix: Pathname);
+
+{$IFC flrDebug }
+PROCEDURE PrintCatRec (VAR catRec : TcatRec);
+{$ENDC }
+
+PROCEDURE RecoverCat  (VAR RecovErr : INTEGER; devHdl : TentryHdl);
+PROCEDURE SetObjPwd (VAR Error: INTEGER; volHdl: TEntryHdl; CatRID: TCatRID;
+                       oldPassword, newPassword: E_Name);
+
+PROCEDURE TermCat;
+PROCEDURE TraceDB     (traceStatus : BOOLEAN);
+FUNCTION  VerifyPassword (volHdl: TentryHdl; catRID: TcatRID) : BOOLEAN;
+
+PROCEDURE AddCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                    VAR catRec : TcatRec;
+                        genID  : BOOLEAN;
+                    VAR catRID : TcatRID);
+
+PROCEDURE CheckAncestry(volHdl: TentryHdl;     { should call before AddCatRec...      }
+                    VAR catRec: TcatRec);      { ...may set catrec.parentID to IdDisk }
+
+PROCEDURE DelCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID);
+
+PROCEDURE GetCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR catRec : TcatRec);
+
+PROCEDURE PosCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR pCatRec: PtrCatRec);
+
+PROCEDURE UpdCatRec(VAR err    : INTEGER;
+                        volHdl : TentryHdl;
+                        catRID : TcatRID;
+                    VAR catRec : TcatRec);
+
+{########################################################################}
+
+IMPLEMENTATION
+
+
+{$IFC flrSymbols }
+   {$D+}
+{$ELSEC }
+   {$D-}
+{$ENDC }
+
+{$IFC flrDebug }
+   {$R+}
+{$ELSEC }
+   {$R-}
+{$ENDC }
+
+
+CONST
+   curCatVerision = 0;   { Current version number.  stored in fileDesc }
+
+      { O/S file names for catalog files }
+
+   catDBName      = '{!CATALOG}';   { name of catalog }
+   redundSuffix   = '$R';           { added to catDBname gives copy of schema file}
+   recovSuffix    = '$New';         { added to catDBname for recovery }
+   dbBufName      = '{!DBBUFFER}';  { name of DB bufr data seg }
+
+      { Memory structure parameters }
+
+   halfMegDbBuffs = 3;
+   fullMegDbBuffs = 6;
+   nRecovBuffs    = 50;   { number of DB buffers during recovery }
+   dbPageSize     = 2048; { size of b-tree pages on disk }
+   dbHeapSize     = 3000; { heap space (bytes) for DB intrinsics }
+
+
+      { field numbers for catalog record descriptor }
+
+   fldParent   = 0;    { Parent ID }
+   fldName     = 1;    { object name }
+   fldID       = 2;    { Unique object ID }
+   fldKind     = 3;    { object kind }
+   fldState    = 4;    { state information }
+   fldView     = 5;    { viewMode for containers }
+   fldProps    = 6;    { properties }
+   fldRect     = 7;    { window rect }
+   fldPt       = 8;    { closed position }
+   fldCreated  = 9;    { time & date created }
+   fldModified = 10;   { date & date modified }
+   fldSize     = 11;   { object size in blocks }
+   fldSplit    = 12;   { split obj sequence number }
+   fldX2       = 13;   { extra }
+   fldTool     = 14;   { ID of tool associated with document }
+   fldExtra    = 15;   { future object data }
+
+   fldLast     = fldExtra;
+
+   numFlds     = 16;   { # of fields in record }
+   numKeyFlds  = 3;    { # of fields in key (first "numKeys" fields) }
+   numSortFlds = 1;    { # of fields in key promoted to nonleaves }
+
+
+TYPE
+
+   TRecDesc     =  ARRAY [0..fldLast] OF FldDesc;
+
+
+VAR
+
+   bufrDsRefNum  : INTEGER;
+   heapDsRefNum  : INTEGER;
+   nDBBuffs      : INTEGER;    { number of DB buffers (1 buffer = 1 page) }
+
+
+   { reference into FDocCtrl }
+
+FUNCTION ObjectSize(hVol: TentryHdl; objCatRID: TcatRID;
+                   devInfoPtr: TfsInfoPtr; excludeUnfiled: BOOLEAN;
+                   VAR DTM, DTC: LONGINT) : LONGINT;
+   EXTERNAL;
+
+   { Reference into Filer }
+
+PROCEDURE UpdateAll;
+   EXTERNAL;
+
+   { Forward declarations for internal procedures }
+
+PROCEDURE CreateSchemaFile(VAR err : INTEGER; filename: Pathname);
+   FORWARD;
+PROCEDURE GetNextId(volHdl: TentryHdl; VAR nextId: IdType);
+   FORWARD;
+PROCEDURE InitNewCat(volHdl: TentryHdl);
+   FORWARD;
+PROCEDURE MakeDBSchema(VAR fDesc: FileDesc; VAR recDesc: TRecDesc);
+   FORWARD;
+PROCEDURE SetNextId(volHdl: TentryHdl; nextId: IdType);
+   FORWARD;
+
+
+{---------------------------------------------------------------------------}
+{$S flrDm }
+
+PROCEDURE AddCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                      VAR catRec : TcatRec;
+                          genId  : BOOLEAN;
+                      VAR catRID : TcatRID *};
+
+{ Inserts a record into the object catalog.  If genId is TRUE then the field
+  "selfId" in the catalog record will automatically be filled in with a unique id;
+  otherwise, a check is made to ensure that id generator will not duplicate the
+  id passed in.  If the record is inserted successfully then a catalog record
+  id, "catRID", is returned.  This token can then be used to fetch, update, or
+  delete the record
+}
+
+VAR
+   offendID : INTEGER;
+   pCatRec  : PtrCatRec;
+   nextId   : IdType;
+   objName  : FMaxStr;
+
+BEGIN
+IF trcCatalog THEN
+   BEGIN
+   GetNextId(volHdl,nextId);
+   WRITELN('AddCatRec.  volHdl: ',ORD(volHdl):1,' scanID: ',
+           volHdl^^.catScanID:1,'  genId: ',genID,'  nextID: ',nextId:1);
+   {$IFC flrDebug }
+   PrintCatRec(catRec);
+   {$ENDC }
+   END;
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+EInsert(err,offendID,volHdl^^.catScanID,@catRec,catRecSize(catRec),genId);
+
+IF err = 0 THEN
+   BEGIN
+   {$R-}     { get pointer to newly inserted record }
+   pCatRec := POINTER(ORD(pScanTable^[volHdl^^.catScanId]^.ptrCOS));
+
+   {$IFC flrDebug }
+      {$R+}
+   {$ENDC }
+
+   { if an id was supplied then ensure that next generated id doesn't conflict }
+   IF NOT genID THEN
+      BEGIN
+      GetNextId(volHdl,nextId);         { fetch the next id to be generated }
+      IF catRec.selfID >= nextId THEN
+         SetNextId(volHdl,catRec.selfID+1);
+      END;
+
+   { build the "token" for this record }
+   catRID.fatherID := catRec.parentId;
+   catRID.uniqueId := pCatRec^.selfId;
+   IF trcCatalog THEN WRITELN('   exit AddCatRec.  uniqueID = ',pCatRec^.selfID:1);
+   END;
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrDskOut }
+PROCEDURE CheckAncestry{volHdl: TentryHdl; VAR catRec: TcatRec};
+   { checks to insure I'm not my own ancestor, i.e. no loops in tree,
+     and that I'm rooted, i.e. the disk is my first ancestor.  IF not,
+     then point me at the disk directly.  }
+VAR
+    catRID:   TcatRID;
+    err:      INTEGER;
+    pCatRec:  PtrCatRec;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+catRID.fatherID := idNil;
+catRID.uniqueID := catRec.parentID;
+WHILE catRID.uniqueID > idDisk DO
+   BEGIN
+   PosCatRec (err,volHdl,catRID,pCatRec);
+   IF (err > 0)                                { missing parent, I'm not rooted }
+   OR (pCatRec^.selfID = catRec.selfID) THEN   { I'm my own ancestor, a loop    }
+      BEGIN
+      IF dbgFiler THEN WRITELN ('Error IN Cat.CheckAncestry: err = ',err:1,', selfID is ',catRec.selfID:1);
+      catRec.parentID := idDisk;
+      EXIT(CheckAncestry);
+      END;
+   catRID.uniqueID := pCatRec^.parentID;
+   END;
+
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrAll }
+FUNCTION CatRecSize{* VAR catRec : TcatRec) : INTEGER *};
+   { computes size of catalog record by adding fixed + variable parts }
+VAR
+   fixedSize,
+   recSize : INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+WITH catRec DO
+   BEGIN
+   fixedSize := SIZEOF(catRec) - SIZEOF(varLenPart);
+   recSize := fixedSize + nameDesc.size + extraDesc.size;
+   END;
+
+   { Ensure even length.  (DB intrinsics restriction) }
+IF ODD(recSize) THEN
+   recSize := recSize + 1;
+
+
+IF (recSize < fixedSize) OR (recSize > SIZEOF(catRec)) THEN
+   BEGIN
+
+   {$IFC FlrDebug }
+   WRITELN('Bad size in catRecSize = ',recSize,'  Max used.');
+   {$ENDC }
+
+   recSize := SIZEOF(catRec);
+   END;
+
+catRecSize := recSize;
+
+IF trcCatalog THEN WRITELN('CatRecSize.  size = ',recSize:1);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+
+FUNCTION CatVersion(volHdl: TentryHdl): INTEGER;
+{ Returns the catalog version number of a given catalog }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+{$R-}
+CatVersion := pFileTable^[pScanTable^[volHdl^^.catScanId]^.onFile]^.userVers;
+{$IFC flrDebug }
+   {$R+}
+{$ENDC}
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrClose }
+PROCEDURE CloseCat{* VAR err : INTEGER; VAR volHdl : TentryHdl *};
+
+{ Closes a catalog on a given volume.  Deallocates the volume entry }
+VAR whichVol: TentryHdl;
+BEGIN
+IF trcCatalog THEN WRITELN('CloseCat.  volHdl :',ORD(volHdl):1);
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+whichVol := volHdl;   { copy in case came from heap }
+
+IF NOT whichVol^^.catOpen THEN EXIT(CloseCat);
+
+   { set immediately, so won't try to close again from terminate exception }
+whichVol^^.catOpen := FALSE;
+volHdl := NIL;   { no longer available }
+
+CloseScan(err,whichVol^^.catScanID);
+IF ErrorFound(warnError,301,err,whichVol^^.devHdl) THEN;
+
+KillEntry(whichVol);
+END;
+
+
+{---------------------------------------------------------------------------}
+
+{$S flrDskIn }
+PROCEDURE CreateCat{* VAR err : INTEGER; devHdl: TentryHdl *};
+
+{ Creates a new catalog on a given device.  Adds  an entry for the disk itself
+  and for the "system objects" (scrap, printer, etc) should this be used as a boot
+  disk.
+}
+
+VAR
+   fileName,                  { holds concatenation of devName and DB name }
+   redundFileName: PathName;  { name of file with redundant schema }
+   fDesc    : FileDesc;       { DB file descriptor }
+   volHdl   : TentryHdl;
+   recDesc  : TRecDesc;
+
+BEGIN
+IF trcCatalog THEN WRITELN('CreateCat');
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+   { Delete any remnants of old files }
+fileName := CONCAT('-',devHdl^^.nameHdl^^,'-',desktopFile);  { desktop state }
+Kill_Object(err, fileName);
+fileName := CONCAT('-',devHdl^^.nameHdl^^,'-',catDBname);    { object catalog }
+Kill_Object(err, fileName);
+
+   { Build the schema descriptor }
+MakeDbSchema(fDesc, recDesc);
+
+   { Create the database file }
+MakeDescFile(err,@fileName,@fDesc);
+IF err > 0 THEN EXIT(CreateCat);
+
+   { Create copy of schema file (note: this copy is actually to reserve space.
+     it will be deleted and re-created in "DBRecover" }
+redundFileName := CONCAT(fileName,redundSuffix);             { copy of schema }
+CreateSchemaFile(err,redundFileName);
+
+   { Open the newly created catalog }
+OpenCat(err,devHdl);
+volHdl := devHdl^^.volHdl;
+IF err > 0 THEN EXIT(CreateCat);
+
+   { Add an entry for the disk,trash can, and other "system" objects }
+InitNewCat(volHdl);
+
+SetNextId(volHdl,idLastReserved+1);
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrDskIn }
+PROCEDURE CreateSchemaFile{* VAR err : INTEGER; fileName: PathName *};
+
+{ Creates a db file containing only the catalog schema.  Used by recovery should the schema
+  in the data file be damaged. }
+
+VAR fDesc    : FileDesc;       { DB file descriptor }
+    recDesc  : TRecDesc;
+
+BEGIN
+IF trcCatalog THEN WRITELN('CreateSchemaFile');
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+   { Delete any remnants of old files }
+Kill_Object(err, fileName);
+
+   { Build the schema descriptor }
+MakeDbSchema(fDesc, recDesc);
+
+   { create a copy of redundant schema for recovery }
+MakeDescFile(err,@fileName,@fDesc);
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrDebug }
+PROCEDURE DBError{* err : INTEGER *};
+
+{ displays text message for database errors }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+{$IFC flrDebug }
+
+IF err = noerr THEN EXIT(DBError);
+
+CASE err OF
+   notfound:       WRITE('Not found');
+   duplKey:        WRITE('Duplicate key');
+   eos:            WRITE('End Of Scan');
+   noBuffs:        WRITE('Buffer pool exhausted');
+   ioerr:          WRITE('I/O error');
+   noRoom:         WRITE('No more room on volume');
+   inconsistent:   WRITE('File is inconsistent');
+   badscanid:      WRITE('Scan ID not open');
+   ticketoverflow: WRITE('Ticket dispenser ran out');
+   ticketchanged:  WRITE('User changed ticket on update');
+   nomem:          WRITE('Out of memory');
+   illegalscan:    WRITE('Scan not allowed');
+   rectoobig:      WRITE('Record is too big');
+   notdbfile:      WRITE('File is not a database file');
+   wrongfile:      WRITE('Index file ID does not match that of data file');
+   badversion:     WRITE('Index file version does not match that of data file');
+   END;
+
+WRITELN(' (DB error ',err:1,')');
+{$ENDC }
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+
+PROCEDURE DBRecover(VAR err: INTEGER; deviceName: E_Name);
+{ Calls database "FileRecover" routine for catalog on given device }
+VAR emptyStr: STRING[1];
+    fileName,
+    newFileName,
+    copySchema: Pathname;
+    warnings: elemset;
+    entryName: E_Name;
+
+
+   PROCEDURE ECheck(ec: ecstr; ftype: integer;
+                    VAR check: checkinfo; VAR result: INTEGER);
+      { dummy procedure for database file recovery.  no edit checks }
+   BEGIN
+   result := ioerr;
+   END;
+
+
+   PROCEDURE IndexMake(VAR ddresult: INTEGER;
+                           ifilename,filename,tempdir1,tempdir2: ptrpathname;
+                           temp_ldsn,nisort,nikeys: INTEGER;
+                           piflds: ptridesc; duplok: BOOLEAN);
+      { dummy procedure for database file recovery.  no indexes }
+   BEGIN
+   ddresult := ioerr;
+   END;
+
+
+   PROCEDURE MarksRevenge(VAR result: INTEGER;
+                          VAR warnings: elemset; lsid: INTEGER);
+      { dummy procedure for database file recovery.  no db labels }
+   BEGIN
+   result := noerr;
+   END;
+
+
+BEGIN
+IF dbgFiler THEN WRITELN('DBRecover');
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+emptyStr := '';
+fileName := CONCAT('-',deviceName,'-',catDBname);
+newFileName := CONCAT(fileName,recovSuffix);
+copySchema := CONCAT(fileName,redundSuffix);
+
+    { Create a copy of the schema in case one in data file is bad }
+CreateSchemaFile(err,copySchema);
+IF err > 0 THEN copySchema := emptyStr;   { Unable to create it. }
+
+   { Call DB recover routine to patch things up }
+
+IF dbgFiler THEN WRITELN('FileRecover');
+
+FileRecover(err,warnings,@emptyStr,@emptyStr,@fileName,@newFileName,@copySchema,
+            ECheck,IndexMake,MarksRevenge
+            {$IFC newDBLib } ,mCodeUS   {$ENDC});
+
+IF dbgFiler THEN WRITELN('exit FileRecover');
+
+IF err = noerr THEN
+   BEGIN
+   Kill_Object(err, fileName);                 { delete old damaged file }
+   entryName := catDbName;
+   Rename_Entry(err,newFileName,entryName);    { Rename new recovered file }
+   END;
+
+IF dbgFiler THEN WRITELN('exit DBRecover');
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrCat }
+PROCEDURE DelCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID *};
+
+{ Deleted the catalog record identified by the token "catRID", on the volume
+  identified by "volHdl
+}
+
+VAR
+   pCatRec : PtrCatRec;
+
+BEGIN
+IF trcCatalog THEN WRITELN('DelCatRec');
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN Edelete(err,volHdl^^.catScanID,current,0,NIL);   { delete it }
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrCat }
+PROCEDURE DestroyCat{* VAR err : INTEGER; devHdl : TentryHdl *};
+
+{ Destroys a catalog on a given volume }
+
+VAR
+   fileName : PathName;
+
+BEGIN
+IF trcCatalog THEN WRITELN('DestroyCat: ',devHdl^^.nameHdl^^);
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+fileName := CONCAT('-',devHdl^^.nameHdl^^,'-',catDBName);
+DeleteFile(err,@fileName);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrUtil }
+PROCEDURE DisplayError{* flrErr,err: INTEGER; devHdl: TentryHdl *};
+
+{ Displays an error message based on "err."  Some values of "err" result in
+  specific messages, otherwise just the number is given.  Note: "flrErr" and "err"
+  are always displayed. }
+
+VAR alertNum: INTEGER;
+    flrErrStr,errStr: NumberStr;
+    volName,devName: FmaxStr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+IF err <= 0 THEN EXIT(DisplayError);
+
+   { convert parameters to strings }
+
+IntToStr(ABS(flrErr),flrErrStr);
+ArgAlert(1,flrErrStr);
+
+IF err = nullErr THEN
+   errStr := ''
+ELSE
+   BEGIN
+   IntToStr(err,errStr);
+   errStr := CONCAT('/',errStr);
+   END;
+ArgAlert(2,errStr);
+
+
+   { fetch volume and device names, in case of disk error }
+
+IF devHdl = NIL THEN
+   BEGIN
+   GetString(800,@volName);  { disk }
+   GetString(801,@devName);  { startup disk }
+   END
+ELSE
+   BEGIN
+   GetObjName(devHdl^^.volHdl,diskCatRID,volName);
+   devName := devHdl^^.userNmHdl^^;
+   END;
+ArgAlert(3,volName);
+ArgAlert(4,devName);
+
+
+   { determine which message to give based on error number }
+
+CASE err OF
+
+      { I/O or bad disk structure errors, suggest reparing disk }
+
+   312,     { Unexpected file system error (Make_Dataseg) }
+   606,     { Can't find sector (disk unformatted) }
+   617,     { Checksum error }
+   618,     { Can't format, or write protected }
+   625,     { Scavenger indicated that data is bad }
+   654,     { Hard error status returned from ProFile }
+   659,     { Corrupt file system header chain found in driver }
+   802,     { Asynchronous I/O request not completed successfully }
+   810,     { The requested page could not be read in }
+   829,     { Partial deallocation only (ran into unallocated region) }
+   835,     { s-file number < 0 or > maxfiles }
+   837,     { Unallocated s-file or I/O error }
+   841,     { Unallocated s-file or I/O error }
+   849,     { Invalid page or offset in parameter list }
+   875,     { Invalid s-file ID or s-file control block (Close_SFile) }
+   884,     { Not first auto-allocation, but file was empty }
+   885,     { could not update filesize hints after a write }
+   888,     { Entry not found in catalog }
+   900,     { Invalid page count or FCB pointer argument }
+   966,     { Internal inconsistency of FMARK and LEOF }
+   972,     { Entry not found in specified catalog }
+   1190,    { Attempt to access a page that is not allocated to the pipe }
+   1297,    { Entry name for the object is invalid }
+   1298,    { S-list entry for the object is invalid }
+   1882,    { Bad response from ProFile }
+   1885,    { ProFile timeout error }
+
+        { catalog errors suggesting a bad catalog - needs repair }
+
+   badVersion,        { index file does not match data file }
+   dbVersionMismatch,
+   dbTooOld,
+   dbTooNew,          { code/data version mismatch }
+   duplKey,           { duplicate key }
+   eos,               { end of file }
+   fileEmpty,         { file is empty }
+   inconsistent,      { file is inconsistent }
+   ioerr,             { database I/O error}
+   notDbFile,         { somebody renamed some files }
+   notFound,          { record not found }
+   recTooBig,         { record is too large - should never happen }
+   ticketOverflow,    { ran out of {D... numbers }
+   wrongFile:         { index file not for this data file }
+
+      alertNum := 60;
+
+
+      { out of disk space errors }
+
+   309,     { Insufficient disk space for data segment }
+   826,     { No more room to allocate pages on device }
+   854,     { No free slots in s-list directory (too many s-files) }
+   855,     { No available disk space for file hints }
+   882,     { No space on volume for new page of file }
+   891,     { Catalog is full, or was not catalog }
+   959,     { System resources exhausted }
+   noBuffs, { Database out of memory }
+   noroom:  { Database out of disk space }
+
+      alertNum := 61;    { out of disk space error }
+
+
+      { "technical difficulties", just give error number }
+
+   OTHERWISE
+      alertNum := 50;    { other error }
+   END;
+
+
+   { display the message }
+
+NoteAlert(flrAlert,alertNum);
+UpdateAll;  { repaint under alert now }
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrDm }
+FUNCTION  ErrorFound{* errKind: errTypes; flrErr,err: INTEGER;
+                       devHdl: TentryHdl): BOOLEAN *};
+
+{ This is the general error handler used throughout the filer.  It Returns FALSE
+  if err <= 0, otherwise it presents a message and returns TRUE (unless restarting).
+  "errKind" is used to determine the action to be taken after the error message
+  is given. The errTypes are:
+     fatalError  =>  restart the filer
+     askError    =>  give the user the choice of restarting or continuing
+     warnError   =>  continue
+
+  "flrErr" should be a unique filer internal number for locating the call.
+  "err" is the actual error return to be checked.  Use "nullErr" if no error to check.
+  "devHdl" is the device being accessed, NIL if none or startup.
+}
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF testIOerr THEN   { fake errors if this is true }
+   IF (ABS(Random) MOD 3) = 0 THEN
+      CASE ABS(Random) MOD 3 OF
+         0: err := 802;
+         1: err := 826;
+         2: err := 99;
+         END;
+
+
+IF err <= 0 THEN
+   BEGIN
+   ErrorFound := FALSE;
+   EXIT(ErrorFound);
+   END
+ELSE
+   ErrorFound := TRUE;
+
+
+DisplayError(flrErr,err,devHdl);   { tell the user about the problem }
+
+CASE errKind OF
+   fatalError:
+      BEGIN
+      WaitAlert(flrAlert,207);               { system will restart ... }
+      HALT;
+      END;
+   askError:
+      BEGIN
+      IF AskAlert(flrAlert,52) = 1 THEN     { restart or continue? ... }
+         BEGIN
+         WaitAlert(flrAlert,207);
+         HALT;
+         END;
+      UpdateAll;
+      END;
+   warnError:
+      BEGIN END;                            { will continue }
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrDm1 }
+PROCEDURE ExtObjName{* VAR catRec : TcatRec; VAR objName : FMaxStr *};
+
+{ Extracts the name field from a catalog record and returns it in a string }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+WITH catRec.nameDesc DO
+   BEGIN
+   IF (size < 0) OR (size > SIZEOF(FmaxStr)-1) THEN size := 0;
+   ArrayToStr(POINTER(ORD(@catRec)+offset),@objName,size);
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE FixPassword {* volHdl: TentryHdl; catRID: TcatRID *};
+{Called whenever a password inconsistancy is detected.  Usually either tool
+ returned fceBadPassword or VerifyPassword() returned FALSE.  Resets everything
+ to the non-protected state, tells the user what's going on.}
+
+LABEL 99;
+
+VAR
+   catRec    : TcatRec;
+   err       : INTEGER;
+   nameStr   : FmaxStr;
+   stopMe    : BOOLEAN;
+   theFile   : E_Name;
+   thePath   : Pathname;
+   thePrefix : E_Name;
+   theVolume : Pathname;
+   uParm     : UT_Parmt;
+
+   {+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+   PROCEDURE CheckErr (theError: INTEGER);
+
+   BEGIN
+   IF (theError > 0) THEN
+      EXIT(FixPassword);
+   END; {of PROC CheckErr}
+
+   {+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+GetCatRec (err, volHdl, catRID, catRec);
+IF (err > 0) THEN
+   {bail out, nothing we can do here now}
+   EXIT(FixPassword)
+ELSE
+   {reset the password flag}
+   catRec.props[iconPassWd] := FALSE;
+
+GetObjPrefix(volHdl, catRID, thePath, FALSE{not full pathname});
+IF (thePath = '') THEN
+   {bad volHdl or catRID, abort}
+   BEGIN
+   catRec.props[iconPassWd] := FALSE;
+   GOTO 99;
+   END;
+
+thePrefix := thePath;
+theVolume := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^);
+Reset_Catalog (err, theVolume);
+CheckErr(err);
+
+stopMe := FALSE;
+REPEAT
+   Get_Next_Entry(err, thePrefix, theFile);
+   IF (err > 0) THEN
+      stopMe := TRUE
+   ELSE
+      BEGIN
+      thePath := CONCAT(theVolume,'-',theFile);
+      WITH uParm DO
+         BEGIN
+         gp_parm := 0;
+         command := xfer_passwd;
+         path := thePath;
+         {zero the password}
+         password := '';
+         op := pswWrite;
+         END; {of WITH block}
+      FS_Utilities(err, uParm);
+      CheckErr(err);
+      END; {of IF ELSE block}
+   UNTIL stopMe;
+
+99:
+UpdCatRec(err, volHdl, catRID, catRec);
+
+ExtObjName (catRec, nameStr);
+QuoteName(nameStr);
+ArgAlert (1, nameStr);
+NoteAlert (flrAlert, 370);
+
+END; {of PROC FixPassword}
+
+{---------------------------------------------------------------------------}
+{$S flrDm }
+PROCEDURE FlushCat{* volHdl: TentryHdl *};
+
+{ flushes dirty pages to disk for catalog on given volume }
+
+VAR
+   err: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+IF skipFlushing THEN EXIT(FlushCat);
+IF volHdl = NIL THEN EXIT(FlushCat);
+FlushScan(err,volHdl^^.catScanId);
+IF ErrorFound(warnError,306,err,volHdl^^.devHdl) THEN;
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrAll }
+PROCEDURE GetCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID;
+                      VAR catRec : TcatRec *};
+
+{ Fetches a catalog record on a given volume.  The record to fetch is identified
+  by "catRID" ( see positioning documentation at top ).
+}
+
+VAR
+   pCatRec : PtrCatRec;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('GetCatRec - parent: ',catRID.fatherID:1,
+                                        '  id: ',catRID.uniqueID:1);
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN                         { copy it to "catRec" }
+   MoveLF(Pointer(ORD(pCatRec)),@catRec,CatRecSize(pCatRec^));
+
+{$IFC flrDebug}
+IF trcCatalog THEN
+   IF err = 0 THEN
+      IF catRID.uniqueID <> idCurrent THEN PrintCatRec(pCatRec^)
+   ELSE
+      DBError(err);
+{$ENDC}
+
+IF trcCatalog THEN WRITELN('   exit GetCatRec');
+END;
+
+{---------------------------------------------------------------------------}
+{$S dmMain }
+PROCEDURE GetDefName{* kind: INTEGER; VAR name: FmaxStr *};
+
+{ returns the default name for an object }
+VAR stringNum: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+CASE kind OF
+   folderKind:     stringNum := 720;
+   docKind:        stringNum := 721;
+   trashKind:      stringNum := 722;
+   calcKind:       stringNum := 723;
+   comp2Kind,                           {*** Pepsi ***}
+   computerKind:   stringNum := 724;
+   clipBdKind:      stringNum := 725;
+   clockKind:      stringNum := 726;
+   docPad:         stringNum := 727;
+   folderPad:      stringNum := 728;
+   toolKind:       stringNum := 729;
+   diskKind,
+   disk1Kind,
+   disk2Kind:      stringNum := 730;
+   drawerKind:     stringNum := 735;    {*** Pepsi ***}
+   profileKind:    stringNum := 731;
+   inBox1Kind,
+   inBox2Kind:     stringNum := 732;
+   outBox1Kind,
+   outBox2Kind:    stringNum := 733;
+   letterKind:     stringNum := 734;
+   OTHERWISE       stringNum := 749;
+   END;
+GetString(stringNum,@name);
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE GetNextId{* volHdl: TentryHdl; VAR nextId: IdType *};
+
+{ Returns next id to be used from DB unique id generator for a given volume }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+{$R-}
+WITH pScanTable^[volHdl^^.catScanId]^ DO
+   WITH pFileTable^[onFile]^.tickets DO
+      BEGIN
+      nextId := low;
+      END;
+
+{$IFC flrDebug }
+   {$R+}
+{$ENDC }
+IF trcCatalog THEN WRITELN('GetNextId = ',nextId:1);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrDm }
+PROCEDURE GetObjName{* volHdl : TentryHdl; catRID : TcatRID; VAR name : FMaxStr *};
+
+{ fetches object name, returns the default name if the object is unnamed }
+
+VAR
+   pCatRec : PtrCatRec;
+   err : INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('GetObjName');
+
+IF volHdl = NIL THEN
+   err := 1   { fake err }
+ELSE IF volHdl^^.catOpen THEN
+   PosCatRec(err,volHdl,catRID,pCatRec)
+ELSE
+   err := 1;  { fake err }
+
+{ Note: Can't call std error handler because it uses this routine }
+IF err > 0 THEN
+   BEGIN
+   GetString(755,@name);   { "Unknown" }
+   EXIT(GetObjName);
+   END;
+
+ExtObjName(pCatRec^,name);
+IF name = '' THEN
+   GetDefName(pCatRec^.objKind,name)
+ELSE
+   QuoteName(name);
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE GetObjPathname {volHdl: TentryHdl; catRID: TcatRID; VAR name: Pathname};
+
+LABEL 99;
+
+VAR catRec:  TcatRec;
+    err:     INTEGER;
+    objName: FMaxStr;
+
+BEGIN
+IF trcCatalog THEN WRITELN ('GetObjPathname');
+
+name := '';
+catRID.fatherID := idNil;
+REPEAT
+  GetCatRec (err, volHdl, catRID, catRec);
+  IF err <= 0
+  THEN BEGIN
+    ExtObjName (catRec, objName);
+    name := CONCAT(nameSeperator, objName,name);
+    catRID.uniqueID := catRec.parentID;
+    END;
+  UNTIL (catRec.parentID = idNil) OR (err > 0);
+
+99:
+IF trcCatalog THEN WRITELN ('   exit GetObjPathname: name is ',name);
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE GetObjPrefix {volHdl: TentryHdl; catRID: TcatRID; VAR prefix: Pathname; fullPath: BOOLEAN};
+VAR
+    kind: STRING[1];
+    docNum: NumberStr;
+    toolNum: NumberStr;
+    pCatRec: PtrCatRec;
+    thePath: PathName;
+    err: INTEGER;
+    tee: STRING[1];
+
+BEGIN
+IF trcCatalog THEN WRITELN ('GetObjPrefix');
+
+prefix := '';
+tee := 'T';
+PosCatRec(err, volHdl, catRID, pCatRec);
+IF err > 0 THEN EXIT(GetObjPrefix);
+
+IntToStr (pCatRec^.toolID, toolNum);
+IntToStr (pCatRec^.selfID, docNum);
+
+CASE pCatRec^.objKind OF
+   docKind,
+   docPad:     kind := 'D';
+
+   folderKind,
+   folderPad:  BEGIN
+               kind := 'F';
+               tee  := '';
+               toolNum := '';
+               END;
+
+   toolKind,
+   calcKind,
+   clockKind,
+   computerKind,
+   comp2Kind:  BEGIN
+               kind := '';
+               docNum := '';
+               END;
+
+   OTHERWISE   EXIT(GetObjPrefix);
+   END;
+
+IF fullPath THEN
+   thePath := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^,'-')
+ELSE
+   thePath := '';
+prefix := CONCAT(thePath,'{',kind,docNum,tee,toolNum,'}');
+
+IF trcCatalog THEN WRITELN ('   exit GetObjPrefix: prefix is ',prefix);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrDm }
+PROCEDURE GetToolName {* VAR err: INTEGER; toolID: TtoolID; devHdl: TentryHdl;
+                         VAR toolName: FMaxStr *};
+
+{ GetToolName - returns tool name given toolId }
+
+LABEL 1;
+VAR numStrg: NumberStr;
+    whichDev: TentryHdl;
+
+
+   FUNCTION ReadLabel(hDev: TentryHdl; toolNum: TtoolId;
+                      VAR name: FmaxStr): BOOLEAN;
+   VAR labelRec: LabelFmt;
+       pCatRec:  PtrCatRec;
+   BEGIN
+   IF trcCatalog THEN WRITELN('ReadLabel');
+   ReadLabel := FALSE;
+   IF hDev = NIL THEN EXIT(ReadLabel);
+   IF LabelIO(FALSE,hDev^^.nameHdl^^,toolNum,0,labelRec) THEN
+      BEGIN
+      name := COPY(labelRec.name,1,MIN(LENGTH(labelRec.name),SIZEOF(name)));
+      ReadLabel := TRUE;
+      END
+   ELSE
+      BEGIN                        { try to create a label from the catRec, if any }
+      PosCatRec(err,hDev^^.volHdl,posFirst,pCatRec);
+      WHILE err <= 0 DO            { scan the catalog }
+         BEGIN
+         IF pCatRec^.objKind = toolKind THEN IF pCatRec^.toolID = toolNum THEN
+            BEGIN                  { found the tool entry }
+            LabelDefault(labelRec);
+            ExtObjName(pCatRec^,name);
+            WITH pCatRec^ DO
+               BEGIN
+               labelRec.name     := name;
+               labelRec.kind     := toolKind;
+               labelRec.toolOnly := props[noDocs];
+               labelRec.multiDoc := props[manyDocs];
+               labelRec.parentID := parentID;
+               labelRec.windLoc  := openRect;
+               END;
+            IF LabelIO(TRUE,hDev^^.nameHdl^^,toolNum,0,labelRec) THEN;
+            ReadLabel := TRUE;         { we still found the name }
+            EXIT(ReadLabel);
+            END;
+         PosCatRec(err,hDev^^.volHdl,posNext,pCatRec);
+         END;
+      END;
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN ('GetToolName: toolID = ',toolID);
+err := 0;
+
+IF toolId <= maxKnownTool THEN
+   GetString(1000+toolId,@toolName)
+ELSE
+   BEGIN              { name not in phrase file, look in file label }
+   IF trcCatalog THEN WRITELN('   look for name in file label');
+   IF ReadLabel(devHdl,toolId,toolName) THEN GOTO 1;
+   whichDev := firstDev;
+   WHILE whichDev <> NIL DO    { check all disks }
+      BEGIN
+      IF (whichDev <> devHdl) AND (whichDev^^.volHdl <> NIL) THEN
+         IF ReadLabel(whichDev,toolId,toolName) THEN GOTO 1;
+      whichDev := whichDev^^.nextHdl;
+      END;
+
+   GetString(1000,@toolName);  { "Tool" }
+   IntToStr(toolId,numStrg);
+   toolName := CONCAT(toolName,' ',numStrg);
+   END;
+
+1:
+IF trcCatalog THEN WRITELN ('   exit GetToolName: ',toolname);
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S  }
+PROCEDURE InitCat{* VAR err : INTEGER *};
+
+{ Initializes positioning constants and the database intrinsics }
+
+VAR
+   cheatPtr: ^INTEGER;
+   bufNameStr: Pathname;
+   machineInfo: MInfo;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('InitCat');
+
+WITH posFirst DO
+   BEGIN
+   fatherID := idFirst;
+   uniqueID := idFirst;
+   END;
+
+WITH posCurrent DO
+   BEGIN
+   fatherID := idCurrent;
+   uniqueID := idCurrent;
+   END;
+
+WITH posNext DO
+   BEGIN
+   fatherID := idNext;
+   uniqueID := idNext;
+   END;
+
+WITH posApprox DO
+   BEGIN
+   fatherID := idAny;
+   uniqueID := idAny;
+   END;
+
+WITH diskCatRID DO
+   BEGIN
+   fatherID := idNil;
+   uniqueID := idDisk;
+   END;
+
+WITH trashCatRID DO
+   BEGIN
+   fatherID := idNil;
+   uniqueID := idTrash;
+   END;
+
+WITH blankCatRec DO
+   BEGIN
+   parentID  := idNil;
+   InsObjName(blankCatRec,'');
+   selfID    := idNil;
+   objKind   := nilKind;
+   objState  := nullInt1;
+   view      := spatialView;
+   cheatPtr  := @props;
+   cheatPtr^ := 0;
+   SetRect(openRect,10,40,640,290);
+   SetPt(closedPt,MAXINT,MAXINT);
+   created   := nullInt4;
+   modified  := nullInt4;
+   objSize   := 0;
+   toolId    := nullInt4;
+   split     := nullInt2;
+   unused2   := nullInt4;
+   END;
+
+   { Initialize the DB intrinsics }
+
+Mach_Info(err,machineInfo);
+IF machineInfo.memSize < 600000
+THEN nDbBuffs := halfMegDbBuffs
+ELSE nDbBuffs := fullMegDbBuffs;
+IF dbgFiler THEN WRITELN ('Memory size: ',machineInfo.memSize:1,', db buffers is ',nDbBuffs:1);
+bufNameStr  := dbBufName;
+InitPool(err,TRUE,DBLDSN,nDBBuffs,dbHeapSize,@bufNameStr,ds_shared,dbPageSize);
+
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE InitNewCat{* volHdl: TentryHdl *};
+
+{ creates the initial catalog entries for a new catalog.  Can be called on an
+  old catalog to ensure that initial entries are there. }
+
+VAR catRec: TcatRec;
+    whichStr,whichKind: INTEGER;
+
+
+   PROCEDURE AddRec(pid,sid: IdType; strNum: INTEGER; kind: INTEGER);
+   VAR catRID: TcatRID;
+       nameStr: FmaxStr;
+       pCatRec: PtrCatRec;
+       err: INTEGER;
+   BEGIN
+   catRID.fatherID := pid;
+   catRID.uniqueID := sid;
+   PosCatRec(err,volHdl,catRID,pCatRec);
+   IF err = endOfCat THEN    { Not found }
+      BEGIN
+      WITH catRec DO
+         BEGIN
+         parentID := pid;
+         selfId   := sid;
+         GetString(strNum,@nameStr);
+         InsObjName(catRec,nameStr);
+         objKind := kind;
+         END;
+      AddCatRec(err,volHdl,catRec,FALSE,catRID);
+      IF ErrorFound(askError,303,err,volHdl^^.devHdl) THEN;
+      END;
+   END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+catRec := blankCatRec;
+
+CASE volHdl^^.devHdl^^.device.slot OF
+   13, 14:                     { twiggy, internal micro diskette }
+      BEGIN
+      whichStr := 710;
+      whichKind := diskKind;
+      END;
+   12:                         { built-in hard disk }
+      BEGIN
+      whichStr := 715;
+      whichKind := profileKind;
+      END;
+   OTHERWISE
+      BEGIN
+      whichStr := 711;
+      whichKind  := profileKind;
+      END;
+   END;
+
+AddRec(idNil,idDisk,whichStr,whichKind);
+AddRec(idNil,idTrash,713,trashKind);
+AddRec(idDisk,idFolderPad,753,folderPad);
+
+{$IFC NetWork }
+AddRec(idNil,idInBox,732,inBox1Kind);
+AddRec(idNil,idOutBox,733,outBox1Kind);
+AddRec(idDisk,idLetterPad,754,letterPad);
+{$ENDC }
+
+SetRect(catRec.openRect,10,315,640,360);
+AddRec(idNil,idScrap,714,clipBdKind);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrAll }
+PROCEDURE InsObjName{* VAR catRec : TcatRec; VAR objName : FMaxStr *};
+
+{ Inserts object name into catalog record, setting appropriate fields }
+{*** must be modified when "extra" field is used ***}
+
+VAR srcPtr: PtrCharArray;
+    numChars: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('InsObjName: "',objName,'"');
+WITH catRec DO
+   BEGIN
+   numChars := MIN(LENGTH(objName),SIZEOF(varLenPart));
+   srcPtr := Pointer(ORD(@objName)+1);
+   MoveLeft(srcPtr^,varLenPart,numChars);
+   WITH nameDesc DO
+      BEGIN
+      offset := ORD(@catRec.varLenPart) - ORD(@catRec);
+      size := numChars;
+      END;
+   WITH extraDesc DO
+      BEGIN
+      offset := nameDesc.offset + nameDesc.size;
+      size := 0;
+      END;
+   END;
+END;
+
+{---------------------------------------------------------------------------}
+
+{$S flrDskIn }
+PROCEDURE MakeDBSchema{* VAR fDesc: FileDesc; VAR recDesc: TRecDesc *};
+
+{ Creates a new catalog on a given device.  Adds  an entry for the disk itself
+  and for the "system objects" (scrap, printer, etc) should this be used as a boot
+  disk.
+}
+
+VAR
+   catRec  : TcatRec;          { used to determine offset of each field }
+
+
+   PROCEDURE BuildRecDesc;
+
+   { builds the record descriptor reqired by the database intrinsics.  Specifies
+     each field's location, sort order, type, and size }
+
+   BEGIN
+   WITH catRec DO
+      BEGIN
+
+         { parentId  - ID of parent record for this object }
+      WITH recDesc[fldParent] DO
+         BEGIN
+         offset    := ORD(@parentId) - ORD(@catRec);
+         direction := ascending;
+         fType     := ftypInt4;
+         size      := SIZEOF(parentId);
+         END;
+
+         { object Name - variable length field }
+      WITH recDesc[fldName] DO
+         BEGIN
+         offset    := ORD(@nameDesc) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypVStr;
+         size      := SIZEOF(nameDesc);
+         END;
+
+         { selfId - unique identifier (on a volume) for this object }
+      WITH recDesc[fldID] DO
+         BEGIN
+         offset    := ORD(@selfID) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypTick;       { this type is used for unique id generation}
+         size      := SIZEOF(selfID);
+         END;
+
+         { kind - what kind of object }
+      WITH recDesc[fldKind] DO
+         BEGIN
+         offset    := ORD(@objKind) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt2;
+         size      := SIZEOF(objKind);
+         END;
+
+         { state - state info about the object }
+      WITH recDesc[fldState] DO
+         BEGIN
+         offset    := ORD(@objState) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt1;
+         size      := SIZEOF(objState);
+         END;
+
+         { view - which type of view for containers }
+      WITH recDesc[fldView] DO
+         BEGIN
+         offset    := ORD(@view) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt1;
+         size      := SIZEOF(view);
+         END;
+
+         { props - boolean properties }
+      WITH recDesc[fldProps] DO
+         BEGIN
+         offset    := ORD(@props) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypNull;
+         size      := SIZEOF(props);
+         END;
+
+         { openRect - screen loc and size last time out }
+      WITH recDesc[fldRect] DO
+         BEGIN
+         offset    := ORD(@openRect) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypNull;
+         size      := SIZEOF(openRect);
+         END;
+
+         { closed pt - closed screen location last time out }
+      WITH recDesc[fldPt] DO
+         BEGIN
+         offset    := ORD(@closedPt) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypNull;
+         size      := SIZEOF(closedPt);
+         END;
+
+         { creation date  }
+      WITH recDesc[fldcreated] DO
+         BEGIN
+         offset    := ORD(@created) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(created);
+         END;
+
+         { modified date }
+      WITH recDesc[fldModified] DO
+         BEGIN
+         offset    := ORD(@modified) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(modified);
+         END;
+
+         { size }
+      WITH recDesc[fldSize] DO
+         BEGIN
+         offset    := ORD(@objSize) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(objSize);
+         END;
+
+         { toolID - Id of program to run when this document is pulled }
+      WITH recDesc[fldTool] DO
+         BEGIN
+         offset    := ORD(@toolID) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(toolID);
+         END;
+
+         { split - sequence num for multi-disk objects }
+      WITH recDesc[fldSplit] DO
+         BEGIN
+         offset    := ORD(@split) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt2;
+         size      := SIZEOF(split);
+         END;
+
+         { extra - variable length field for any future document data }
+      WITH recDesc[fldX2] DO
+         BEGIN
+         offset    := ORD(@unused2) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypInt4;
+         size      := SIZEOF(unused2);
+         END;
+
+         { extra - variable length field for any future document data }
+      WITH recDesc[fldExtra] DO
+         BEGIN
+         offset    := ORD(@extraDesc) - ORD(@catRec);
+         direction := ascending;
+         fType     := fTypVNull;
+         size      := SIZEOF(extraDesc);
+         END;
+
+      END;
+   END;
+
+
+
+   PROCEDURE BuildFDesc;
+
+   { Builds the catalog file descriptor.  Specifies information about the file
+     stucture }
+
+   VAR
+      i : INTEGER;
+
+   BEGIN
+
+   WITH FDesc DO
+      BEGIN
+      flags        := [];
+      nFields      := numFlds;        { # fields in record }
+      nKeys        := numKeyFlds;     { # fields in record key }
+      nSort        := numSortFlds;    { # fields in nonleaves of b-tree }
+      ticketFld    := fldID;          { field to use for unique ids }
+      userVers     := curCatVersion;  { my version number }
+
+         { compute size of record (fixed part) }
+      vFlds        := SIZEOF(catRec) - SIZEOF(catRec.varLenPart);
+
+      kVFlds := 0;     { compute size of non-leaf record (fixed part) }
+      FOR i := 0 TO nSort-1 DO
+         kVFlds := kVFlds + recDesc[i].size;
+
+      pEDesc := @recDesc;
+      END;
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('MakeDBSchema');
+
+   { Build the descriptors }
+
+BuildRecDesc;
+BuildFDesc;
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrOpen }
+FUNCTION ObjInCat{* volHdl: TentryHdl; name: FmaxStr; whichKinds: KindSet;
+                    toolId: IdType; VAR pCatRec: PtrCatRec): BOOLEAN *};
+{ Returns TRUE if the catalog contains an object of this name, kind and toolId.
+  don't care values:   name   = ''
+                       whichKinds   = []
+                       toolId = -1 }
+VAR err: INTEGER;
+    objName: FmaxStr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+PosCatRec(err,volHdl,posFirst,pCatRec);
+WHILE err = 0 DO
+  BEGIN
+  IF (whichKinds = []) OR (pCatRec^.objKind IN whichKinds) THEN
+     IF (toolId = -1) OR (toolId = pCatRec^.toolId) THEN
+        BEGIN
+        ExtObjName(pCatRec^,objName);
+        IF (LENGTH(name) = 0) OR (name = objName) THEN
+           BEGIN
+           ObjInCat := TRUE;
+           EXIT(ObjInCat);
+           END;
+        END;
+  PosCatRec(err,volHdl,posNext,pCatRec);
+  END;
+ObjInCat := FALSE;
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE OpenCat{* VAR err : INTEGER; devHdl : TentryHdl *};
+
+{ opens catalog on the specified device, creates a volume entry }
+
+LABEL 1;
+VAR
+   catRID      : TcatRID;
+   fileName    : PathName;
+   pCatRec     : PtrCatRec;
+   scanID      : INTEGER;
+   volInfo     : Fs_Info;
+   volName     : E_Name;
+   volPathname : Pathname;
+   volHdl      : TentryHdl;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('OpenCat.  Device = ',devHdl^^.nameHdl^^);
+err := 0;
+volHdl := devHdl^^.volHdl;
+
+IF volHdl = NIL THEN
+   BEGIN                               { create a volume entry for this volume }
+   volName := '';
+   CreateEntry(vol,@volName,volHdl);
+   volHdl^^.devHdl := devHdl;
+   devHdl^^.volHdl := volHdl;
+   END
+ELSE
+   IF volHdl^^.catOpen THEN GOTO 1;    { already open }
+
+
+volPathname := CONCAT('-',devHdl^^.nameHdl^^);
+fileName := CONCAT(volPathname,'-',catDbName);
+OpenScan(err,@fileName,@fileName,scanID,update);
+IF trcCatalog THEN DBError(err);
+
+IF err > 0 THEN
+   BEGIN
+   CASE err OF
+     948:      volHdl^^.volState := sNoCatalog;
+     DBVersionMismatch,
+     DBTooNew,
+     DbTooOld: volHdl^^.volState := sOldCatalog;
+     OTHERWISE volHdl^^.volState := sBadCatalog;
+     END;
+   EXIT(OpenCat);
+   END;
+
+   { finish initializing the volume entry }
+
+Lookup(err,volPathname,volInfo);
+WITH volHdl^^ DO
+   BEGIN
+   IF err <= 0 THEN fsVersion := volInfo.fsVersion;
+   catScanID  := scanID;   { remember the scan id for use in database intrinsics }
+   catOpen    := TRUE;
+   volState   := sMounted;
+   END;
+
+1:
+   { check version record for correct version number }
+
+IF CatVersion(volHdl) <> curCatVersion THEN
+   BEGIN
+   err := catBadVersion;   { warning }
+   volHdl^^.volState := sOldCatalog;
+   END;
+
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrAll }
+PROCEDURE PosCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID;
+                      VAR pcatRec: PtrCatRec *};
+
+{ Positions to specified record.  Returns a pointer to the record.
+  NOTE: The record pointer becomes invalid after the next catalog call on this
+        volume.  This routine is primarily intended for internal use.
+}
+LABEL 1,2;
+VAR
+   filter : TcatRec;
+   scanID : INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITE('PosCatRec - ');
+
+IF volHdl = NIL THEN
+   BEGIN
+   err := badScanId;
+   EXIT (PosCatRec);
+   END;
+
+IF NOT volHdl^^.catOpen THEN
+   BEGIN
+   err := badScanId;
+   EXIT (PosCatRec);
+   END;
+
+{$R-}
+scanId := volHdl^^.catScanID;
+
+
+
+CASE catRID.uniqueId OF
+
+   idFirst :    { Position to first record }
+      BEGIN
+      IF trcCatalog THEN WRITELN('Position to "First"');
+      EFetch(err,scanID,first,0,NIL);
+      IF err = eos THEN
+         EFetch(err,scanID,next,0,NIL);
+      END;
+
+   idCurrent :  { Position to current record }
+      BEGIN
+      IF trcCatalog THEN WRITELN('Position to "Current"');
+      EFetch(err,scanID,current,0,NIL);
+      END;
+
+   idNext :     { Position to next record }
+      BEGIN
+      IF trcCatalog THEN WRITELN('Position to "Next"');
+      EFetch(err,scanID,next,0,NIL);
+      END;
+
+   OTHERWISE    { Position to a particular record or to first record in a }
+      BEGIN     { container }
+      IF trcCatalog THEN
+         BEGIN
+         WRITE('Position to  parent: ',catRID.fatherID:1,'  id: ');
+         IF catRID.uniqueId = idAny THEN
+            WRITELN('Any')
+         ELSE
+            WRITELN(catRID.uniqueId:1);
+         END;
+
+         { try using fatherID to minimize access time }
+
+      filter.parentID := catRID.fatherID;
+      EFetch(err,scanID,approx,1,@filter); { postion to first rec with fatherID}
+      pCatRec := POINTER(ORD(pScanTable^[scanID]^.ptrCOS));
+
+      IF catRID.uniqueID = idAny THEN    { will accept any record }
+         BEGIN
+         IF err = notFound THEN err := endOfCat;
+         END
+      ELSE       { now look for record with this father and unique ID }
+         BEGIN
+         REPEAT
+            IF err > 0 THEN
+               IF (err = notFound) OR (err = eos) THEN
+                  GOTO 1
+               ELSE
+                  GOTO 2;
+            IF pCatRec^.parentId <> catRid.fatherID THEN GOTO 1;
+            IF pCatRec^.selfId = catRID.uniqueID THEN GOTO 2;
+            EFetch(err,scanID,next,0,NIL);
+            pCatRec := POINTER(ORD(pScanTable^[scanID]^.ptrCOS));
+         UNTIL FALSE;
+
+         1:
+            { if unsuccessfull using fatherID then use sequential search }
+            { this feature is rarely used.  Usually have fatheID }
+
+         IF trcCatalog THEN WRITELN('   Not found using fatherID.');
+         EFetch(err,scanID,first,0,NIL);
+         IF err = eos THEN
+            REPEAT
+               EFetch(err,scanID,next,0,NIL);
+               pCatRec := POINTER(ORD(pScanTable^[scanID]^.ptrCOS));
+               IF err > 0 THEN GOTO 2;
+               IF pCatRec^.selfID = catRID.uniqueID THEN GOTO 2;
+            UNTIL FALSE;
+
+         2:
+         END;
+      END;
+
+   END;  { CASE }
+
+IF err = 0 THEN
+   pCatRec := POINTER(ORD(pScanTable^[scanID]^.ptrCOS))
+ELSE
+   pCatRec := @blankCatRec;
+
+{$IFC flrDebug }
+   {$R+}
+{$ENDC }
+
+IF trcCatalog THEN WRITELN('   exit PosCatRec');
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE PrefixFromName {VAR err, offset: INTEGER; name: Pathname; VAR prefix: Pathname};
+
+VAR catRec:      TcatRec;
+    curCatRID:   TcatRID;
+    docStr:      NumberStr;
+    nameLgth:    INTEGER;
+    toolStr:     NumberStr;
+    volHdl:      TentryHdl;
+    volName:     FMaxStr;
+
+  PROCEDURE ScanPathname;
+  LABEL 33;
+  VAR curName:  FMaxStr;
+      curPos:   INTEGER;
+      numFound: INTEGER;
+      objName:  FMaxStr;
+      testVol:  TentryHdl;
+
+  BEGIN
+  IF trcCatalog THEN WRITELN ('ScanPathname: offset = ',offset:1);
+
+  IF offset >= nameLgth
+    THEN BEGIN
+    err := 0;
+    IF trcCatalog THEN WRITELN ('   scan complete');
+    EXIT (ScanPathname);
+    END;
+
+  err := 971;                     { OS error for invalid object pathname     }
+  IF name[offset] <> nameSeperator THEN EXIT (ScanPathname);
+
+    { scan off the next name }
+  curPos := offset+1;             { bump past the nameSeperator               }
+33:                               { A DO UNTIL loop to scan off the next name }
+  offset := offset+1;
+  IF offset <= nameLgth THEN IF name[offset] <> nameSeperator THEN GOTO 33;
+                                  { offset points just past the name          }
+  IF curPos = offset THEN EXIT (ScanPathname);   { trailing nameSeperator     }
+  IF offset = nameLgth THEN offset := offset+1;  { assumes positioned to next nameSeperator }
+  curName := COPY(name,curPos,offset-curPos);
+  Downshift (@curName);
+  IF trcCatalog THEN WRITELN ('   curName is ',curName);
+
+    { find the id }
+  numFound := 0;
+  IF curCatRID.fatherID = idNil
+  THEN BEGIN                      { which disk?  Set the volID                }
+    testVol := firstVolHdl;
+    REPEAT
+      GetCatRec (err, testVol, diskCatRID, catRec);
+      ExtObjName (catRec, objName);
+      Downshift (@objName);
+      IF curName = objName
+      THEN BEGIN
+        volHdl := testVol;
+        curCatRID.fatherID := curCatRID.uniqueID;
+        numFound := numFound + 1;
+        END;
+      testVol := testVol^^.nextHdl;
+      UNTIL (testVol = NIL);
+    END
+
+  ELSE BEGIN                      { which folder/object                       }
+    curCatRID.fatherID := curCatRID.uniqueID;
+    posApprox.fatherID := curCatRID.fatherID;
+    numFound := 0;
+    GetCatRec (err, volHdl, posApprox, catRec);
+    WHILE (err <= 0) AND (catRec.parentID = curCatRID.fatherID) DO BEGIN
+      ExtObjName (catRec, objName);
+      Downshift (@objName);
+      IF trcCatalog THEN WRITELN ('      objName is ',objName);
+      IF curName = objName
+      THEN BEGIN
+        curCatRID.uniqueID := catRec.selfID;
+        numFound := numFound + 1;
+        END;
+      GetCatRec (err, volHdl, posNext, catRec);
+      END;
+    END;
+
+      { what did we find? }
+  IF trcCatalog THEN WRITELN ('      numFound = ',numFound:1);
+    IF numFound = 1
+    THEN ScanPathname                    { Go to next name }
+    ELSE BEGIN
+      IF numFound = 0
+      THEN err := 972                    { not found      }
+      ELSE err := 890;                   { duplicate name }
+      EXIT (ScanPathname);
+    END;
+  END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN ('PrefixFromName: name is ',name);
+
+  {find the object catRec }
+err := 0;
+offset := 1;
+curCatRID := diskCatRID;
+nameLgth := LENGTH(name);
+ScanPathname;
+
+  {return the object's prefix}
+prefix := '';
+IF err = 0
+THEN BEGIN
+  GetCatRec (err, volHdl, curCatRID, catRec);
+  IntToStr (catRec.selfID, docStr);
+  IntToStr (catRec.toolID, toolStr);
+  CASE catRec.objKind OF
+    docKind, docPad: prefix := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^,'-{D',docStr,'T',toolStr,'}');
+    toolKind:        prefix := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^,'-{T',toolStr,'}');
+    OTHERWISE        err    := 971;
+    END;
+  END;
+
+IF trcCatalog THEN WRITELN ('   Exit PrefixFromName: err = ',err:1,', offset = ',offset:1,
+                            ', prefix is ',prefix);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE PrefixInCat {VAR err, offset: INTEGER; prefix: Pathname;
+                       VAR volHdl: TentryHdl; VAR catRID: TcatRID};
+
+(* This proc scans a diskfile name prefix of the form '-deviceName-{[Dxxx]Tyyy}' (where the
+  document number is optional), and, using the catalog, builds the icon's pathname
+  in the form '/diskname/foldername/.../docOrToolName'. *)
+
+LABEL 99;
+
+VAR catErr:     INTEGER;
+    catRec:     TcatRec;
+    devHdl:     TentryHdl;
+    docNum:     LONGINT;
+    pCatRec:    PtrCatRec;
+    prefixLgth: INTEGER;
+    scanName:   E_Name;
+    strLgth:    INTEGER;
+    toolNum:    LONGINT;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN ('PrefixInCat: prefix is ',prefix);
+
+  { parse the prefix to device name, doc, and tool numbers }
+prefixLgth := LENGTH(prefix);
+DownShift (@prefix);
+err := 971;
+offset := 1;
+IF prefix[1] <> '-' THEN GOTO 99;        { missing leading '-' for device name }
+
+  { scan off device name }
+prefix[1] := '!';
+offset := POS('-', prefix);
+IF offset = 0
+THEN BEGIN                               { missing trailing '-' for device name }
+  offset := prefixLgth;
+  GOTO 99;
+  END;
+scanName := COPY(prefix, 2, offset-2);
+Downshift (@scanName);
+IF trcCatalog THEN WRITELN ('   disk name is ',scanName);
+
+offset := offset + 1;
+IF prefix[offset] <> '{' THEN GOTO 99;   { missing '{' at start of diskfile prefix }
+
+  { scan off document number }
+offset := offset + 1;
+docNum := 0;
+IF prefix[offset] = 'd'
+THEN BEGIN
+  offset := offset + 1;
+  StrToInt (prefix, offset, docNum, strLgth);
+  IF trcCatalog THEN WRITELN ('   docNum is ',docNum:1);
+  offset := offset + strLgth;
+  END;
+
+  { scan off tool number }
+IF prefix[offset] <> 't' THEN GOTO 99;   { missing 'd' and 't' for doc and tool numbers }
+offset := offset + 1;
+StrToInt (prefix, offset, toolNum, strLgth);
+IF trcCatalog THEN WRITELN ('   toolNum is ',toolNum:1);
+offset := offset + strLgth;
+
+IF offset > prefixLgth THEN GOTO 99;     (* missing '}' at end of prefix *)
+IF prefix[offset] <> '}' THEN GOTO 99;   (* missing '}' at end of prefix *)
+IF offset < prefixLgth THEN GOTO 99;     (* appears to be more characters after '}' *)
+
+
+  { which volume corresponds to the scanName }
+err := 972;
+offset := POS('-', prefix);
+devHdl := firstDev;
+volHdl := NIL;
+WHILE (devHdl <> NIL) AND (volHdl = NIL) DO BEGIN
+  IF scanName = devHdl^^.nameHdl^^ THEN volHdl := devHdl^^.volHdl;
+  devHdl := devHdl^^.nextHdl;
+  END;
+IF volHdl = NIL THEN GOTO 99;           { no volume for that name }
+
+  { build and verify the catRID }
+IF docNum > 0
+THEN BEGIN                              { this is a document prefix }
+  offset := POS('{d', prefix);
+  REPEAT offset := offset+1 UNTIL prefix[offset] = 't';
+  catRID.fatherID := idNil;
+  catRID.uniqueID := docNum;
+  GetCatRec (catErr, volHdl, catRID, catRec);
+  IF (catErr > 0) OR (toolNum <> catRec.toolID) THEN GOTO 99;
+  catRID.fatherID := catRec.selfID;
+  END
+ELSE BEGIN                               { this is a tool prefix }
+  offset := POS('}', prefix);
+  IF NOT ObjInCat (volHdl, '', [toolKind,clockKind,computerKind,comp2Kind,calcKind],
+                   toolNum, pCatRec) THEN GOTO 99;
+  catRID.fatherID := pCatRec^.parentID;
+  catRID.uniqueID := pCatRec^.selfID;
+  END;
+
+err := 0;
+offset := 0;
+
+99:
+IF trcCatalog THEN WRITELN ('   exit PrefixInCat: err = ',err:1,', offset = ',offset:1);
+END;
+
+
+{---------------------------------------------------------------------------}
+
+{$IFC flrDebug }
+{$S flrDebug }
+PROCEDURE PrintCatRec{* VAR catRec : TcatRec *};
+
+{ Debugging routine to display an object record }
+
+VAR
+   objNameStr : fMaxStr;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+ExtObjName(catRec,objNameStr);   { fetch the name in string form }
+
+WITH catRec DO
+   BEGIN
+   WRITELN('   Parent   : ',parentId:1);
+   WRITELN('   Name     : "',objNameStr,'"');
+   WRITELN('   Obj ID   : ',selfId:1);
+   WRITELN('   kind     : ',objKind:1);
+   WRITELN('   state    : ',objState:1);
+   WRITELN('   view     : ',view:1);
+   WRITELN('   noDocs   : ',props[noDocs]);
+   WRITELN('   manyDocs : ',props[manyDocs]);
+   WRITELN('   iconPassWd: ',props[iconPassWd]);
+   WITH openRect DO
+   WRITELN('   openRect : (',left:1,',',top:1,') (',right:1,',',bottom:1,')');
+   WRITELN('   closedPt : ',closedPt.h:1,',',closedPt.v:1);
+   WRITELN('   created  : ',created:1);
+   WRITELN('   modified : ',modified:1);
+   WRITELN('   size     : ',objSize:1);
+   WRITELN('   Tool ID  : ',toolID:1);
+   WRITELN('   split    : ',split:1);
+   END;
+
+END;
+{$ENDC }
+
+{---------------------------------------------------------------------------}
+{$S flrRecov }
+PROCEDURE RecoverCatalog{* VAR recovErr : INTEGER; devHdl : TentryHdl *};
+
+   (*
+     Called whenever the object catalog cannot be successfully opened.
+
+     There are two levels of recovery:
+
+     Level 1.  - The database "FileRecover" procedure is used to try to save the
+                 the catalog which contains the user visible names and the
+                 user created hierarchy.   If this procedure is successful, the
+                 catalog is then checked for internal consistency; otherwise
+                 level 2 recovery is used.
+
+     Level 2.  - Assumes the object catalog is missing or unrepairable.  Any
+                 remnants of the old catalog are deleted.  A new catalog is
+                 created.  The O/S file directory is examined and entries are
+                 made in the object catalog under the name Document xxx for each
+                 document disk file set encountered.
+
+    Assumes O/S filenames belonging to a document have the following syntax:
+
+       {DnTn}a
+
+       Where 'n' is 1 or more digits ('0'..'9') and 'a' is 0 or more characters.
+       The number following 'D' is the document catalog internal Id.
+       The number following 'T' is the id of the tool to use with this document.
+
+    NOTE: The O/S file scavenger should be called prior to calling this routine.
+
+    *)
+
+LABEL 1;
+
+VAR
+   err           : INTEGER;
+   volHdl        : TentryHdl;
+   devPathName   : PathName;
+   deviceName,
+   entryname,
+   prefix        : E_Name;
+   strg          : FMaxStr;
+   nextId,
+   theDocId,
+   theToolId     : IdType;
+   tFldrCatRID,
+   curCatRID,
+   catRID        : TcatRId;
+   maxId,
+   modTime,
+   creatTime,
+   curTime       : LongInt;
+   checkLabel,
+   toolFound,
+   newCatalog    : BOOLEAN;
+   pCatRec       : PtrCatRec;
+   catRec        : TcatRec;
+   volName       : E_Name;
+
+   PROCEDURE AddFolderEntry(aFolderID: IdType);    FORWARD;
+
+   PROCEDURE ChangeDBBuffs(numBuffs: INTEGER);
+      { Alters number of DB buffers }
+   VAR err: INTEGER;
+   BEGIN
+   InitPool(err,FALSE,DBLDSN,numBuffs,dbHeapSize,NIL,ds_shared,dbPageSize);
+   IF dbgFiler THEN IF err <> 0 THEN WRITELN('*** ChangeDBbuffs err = ',err);
+   END;
+
+
+   PROCEDURE CheckError(flrErr,callErr: INTEGER; askToContinue: BOOLEAN);
+      { Recovery error handler.  Warns user of errors and gives chance to abort }
+   BEGIN
+   IF ErrorFound(warnError,flrErr,callErr,devHdl) THEN
+      BEGIN
+      recovErr := callErr;
+      IF askToContinue THEN
+         IF AskAlert(flrAlert,146) = 2 {continue} THEN EXIT(CheckError);
+      ChangeDBbuffs(nDBBuffs);
+      IF devHdl^^.volHdl = NIL THEN
+         BEGIN
+         volName := '';
+         CreateEntry(vol,@volName,volHdl);
+         volHdl^^.devHdl := devHdl;
+         devHdl^^.volHdl := volHdl;
+         END;
+      EXIT(RecoverCatalog);
+      END;
+   END;
+
+
+   FUNCTION GetDocToolId(fname: E_Name; VAR docId,toolId: IdType;
+                                VAR useLabel: BOOLEAN) : BOOLEAN;
+      { Returns TRUE if this is a document entry.  Returns doc & tool id's }
+   VAR
+      numDocDigits,
+      numToolDigits,prefixLen : INTEGER;
+   BEGIN
+   IF trcCatalog THEN WRITELN('GetDocToolId "',fname,'"');
+   docId := 0;
+   GetDocToolId := FALSE;
+   useLabel := FALSE;
+   StrToInt(fname,3,docId,numDocDigits);
+   IF numDocDigits > 0 THEN
+      IF LENGTH(fname) > numDocDigits+3 THEN
+         IF fname[numDocDigits+3] = 't' THEN  { document entry }
+            BEGIN
+            StrToInt(fname,numDocDigits+4,toolId,numToolDigits);
+            IF numToolDigits > 0 THEN
+               BEGIN
+               prefixLen := numDocDigits+numToolDigits+4;
+               IF LENGTH(fname) >= prefixLen THEN
+                  IF fname[numDocDigits+numToolDigits+4] = '}' THEN
+                     BEGIN
+                     GetDocToolId := TRUE;
+                     useLabel := (Length(fname) = prefixLen);
+                     END;
+               END;
+            END;
+   IF trcCatalog THEN WRITELN('   exit GetDocToolId: docID ',docID:1,', toolID ',toolID:1);
+   END;
+
+
+   FUNCTION GetToolId(fname : E_Name; VAR toolId : IdType) : BOOLEAN;
+      { Returns TRUE if this is a tool entry.  Returns tool id }
+   VAR
+      numToolDigits : INTEGER;
+   BEGIN
+   IF trcCatalog THEN WRITELN('GetToolId "',fname,'"');
+   GetToolId := FALSE;
+   StrToInt(fname,3,toolId,numToolDigits);
+   IF numToolDigits > 0 THEN
+      IF COPY(fname,numToolDigits+3,LENGTH(fname)-numToolDigits-2) = '}obj'
+         THEN GetToolId := TRUE;
+   IF trcCatalog THEN WRITELN('   exit GetToolId: toolID is ',toolID:1);
+   END;
+
+
+   PROCEDURE NewCatEntry(VAR newErr:      INTEGER;
+                             toolNumber:  LongInt;
+                             uniqueID:    IdType;
+                             labelRec:    LabelFMT;
+                         VAR madeAnEntry: BOOLEAN;
+                         VAR newCatRID:   TcatRID);
+   { adds catalog entry  }
+
+   VAR catRec:      TcatRec;
+       entryExists: BOOLEAN;
+
+   BEGIN
+   IF trcCatalog THEN WRITELN('NewCatEntry "',labelRec.name,'"');
+
+   madeAnEntry := FALSE;
+   entryExists := FALSE;
+   IF uniqueID <> -1 THEN                { check if entry already exists }
+      BEGIN
+      newCatRID.fatherID := idNil;
+      newCatRID.uniqueID := uniqueId;
+      GetCatRec(newErr,volHdl,newCatRID,catRec);
+      IF newErr <= 0 THEN
+         BEGIN
+         IF trcCatalog THEN WRITELN('   entry already exists');
+         entryExists := TRUE;
+         CheckAncestry(volHdl, catRec);
+         newCatRID.fatherID := catRec.parentID;
+         WITH labelRec DO BEGIN             { Update the object label }
+            parentID := catRec.parentID;
+            kind     := catRec.objKind;
+            windLoc  := catRec.openRect;
+            split    := catRec.split;
+            END;
+         ExtObjName(catRec,labelRec.Name);
+         END;
+      END;
+
+   IF NOT entryExists THEN
+      BEGIN
+      catRec := blankCatRec;
+      WITH catRec DO
+         BEGIN
+         parentId          := labelRec.parentID;
+         selfId            := uniqueId;
+         objKind           := labelRec.kind;
+         toolId            := toolNumber;
+         props[manyDocs]   := labelRec.multiDoc;
+         props[noDocs]     := labelRec.toolOnly;
+         props[iconPassWd] := FALSE;
+         openRect          := labelRec.WindLoc;
+         split             := labelRec.split;
+         END;
+      InsObjName(catRec,labelRec.name);
+
+      CheckAncestry(volHdl, catRec);
+      AddCatRec(newErr,volHdl,catRec,(uniqueId = -1),newCatRID);
+      IF newErr <= 0 THEN
+         BEGIN
+         madeAnEntry := TRUE;
+         labelRec.parentID := catRec.parentID;
+         END
+      ELSE IF newErr = duplKey THEN      { already exists, ignore error }
+         newErr := 0;
+      END;
+
+   IF entryExists OR madeAnEntry THEN
+      BEGIN                              { update/create the label }
+      IF catRec.objKind IN [toolKind,calcKind,clockKind,computerKind,comp2Kind]
+      THEN uniqueID := 0
+      ELSE uniqueID := newCatRID.uniqueID;
+      IF newErr <= 0 THEN IF LabelIO(TRUE,devHdl^^.nameHdl^^,toolNumber,uniqueID,labelRec) THEN;
+      END;
+
+   AddFolderEntry(labelRec.parentID);    { insure the parent exists }
+
+   END;
+
+
+   PROCEDURE AddFolderEntry{aFolderID: IdType};
+      { generates a folder record if it doesn't already exist }
+
+   VAR aToolID:    IdType;
+       catRec:     TcatRec;
+       catRID:     TcatRID;
+       err:        INTEGER;
+       labelRec:   LabelFmt;
+       numStr:     NumberStr;
+       newFolderRec: BOOLEAN;
+       pCatRec:    PtrCatRec;
+
+   BEGIN
+   IF trcCatalog THEN WRITELN('AddFolderEntry: ',aFolderID:1);
+
+   IF (aFolderID <= idLastReserved) AND (aFolderID <> idFolderPad) THEN EXIT(AddFolderEntry);
+
+   { check if entry already exists }
+   catRID.fatherID := idNIL;
+   catRID.uniqueID := aFolderID;
+   GetCatRec(err,volHdl,catRID,catRec);
+   IF err <= 0 THEN
+      BEGIN
+      catRID.fatherID := catRec.parentID;
+      CheckAncestry(volHdl,catRec);
+      IF catRec.parentID <> catRID.fatherID THEN UpdCatRec(err,volHdl,catRID,catRec);
+      EXIT(AddFolderEntry);
+      END;
+
+   { retrieve catalog info or set defaults }
+   aToolID := idNil;
+   IF NOT LabelIO(FALSE,deviceName,aToolId,aFolderID,labelRec) THEN labelRec.kind := nilKind;
+   IF NOT (labelRec.kind IN [folderKind, folderPad, letterKind, letterPad]) THEN
+      BEGIN    { bad/no label, set defaults }
+      LabelDefault (labelRec);
+      WITH labelRec DO
+         BEGIN
+         IntToStr(aFolderID,numStr);
+         GetString(757,@labelRec.name);
+         name := CONCAT(labelRec.name,' ',numStr);  { generate a dummy name }
+         kind := folderKind;
+         SetRect(windLoc,-1,-1,-1,-1);              { flag that label wan't used }
+         END;
+      END;
+
+   WITH labelRec DO
+   NewCatEntry(err,aToolId,aFolderId,labelRec,newFolderRec,catRID);
+   CheckError(311,err,TRUE);
+
+   IF trcCatalog THEN WRITELN('   exit AddFolderEntry');
+   END;
+
+
+   PROCEDURE AddDocEntry(aDocId,aToolId : IdType; useLabel: BOOLEAN);
+      { generates a document record }
+
+   VAR catRID:     TcatRID;
+       err:        INTEGER;
+       labelRec:   LabelFmt;
+       newDocRec:  BOOLEAN;
+       numStr:     NumberStr;
+
+   BEGIN
+   IF trcCatalog THEN WRITELN('AddDocEntry ',aDocId,aToolId);
+
+   { retrieve catalog info or set defaults }
+   IF NOT LabelIO(FALSE,deviceName,aToolId,aDocId,labelRec) THEN labelRec.kind := nilKind;
+   IF NOT (labelRec.kind IN [docKind, docPad]) THEN
+      BEGIN                                         { bad/no label, set defaults }
+      LabelDefault (labelRec);
+      WITH labelRec DO
+         BEGIN
+         IntToStr(aDocId,numStr);
+         GetString(750,@labelRec.name);
+         name := CONCAT(labelRec.name,' ',numStr);  { generate a dummy name }
+         kind := docKind;
+         SetRect(windLoc,-1,-1,-1,-1);              { flag that label wan't used }
+         END;
+      END;
+
+   NewCatEntry(err,aToolId,aDocId,labelRec,newDocRec,catRID);
+   CheckError(311,err,TRUE);
+
+   IF trcCatalog THEN WRITELN('   exit AddDocEntry');
+   END;
+
+
+   PROCEDURE AddToolEntry(aToolId : IdType);
+      { generates tool & stationery records }
+
+   VAR aDocID      : IdType;
+       catRID      : TcatRID;
+       err         : INTEGER;
+       labelRec    : LabelFmt;
+       id          : IdType;
+       newToolRec  : BOOLEAN;
+       numStr      : NumberStr;
+       suffix      : FmaxStr;
+
+   BEGIN
+   IF trcCatalog THEN WRITELN('AddToolEntry ',aToolId);
+   err := 0;
+
+      { set up defaults }
+   id := -1;  { generate a uniqueID }
+
+   { retrieve catalog info or set defaults }
+   aDocID := idNil;
+   IF NOT LabelIO(FALSE,deviceName,aToolId,aDocId,labelRec) THEN labelRec.kind := nilKind;
+   IF NOT (labelRec.kind IN [folderKind, folderPad, letterKind, letterPad]) THEN
+      BEGIN    { bad/no label, set defaults }
+      LabelDefault (labelRec);
+      WITH labelRec DO
+         BEGIN
+         GetToolName(err,aToolId,devHdl,labelRec.name);
+         kind := toolKind;
+         windLoc := blankCatRec.openRect;
+         END;
+      END;
+
+      { force info on known tools }
+   WITH labelRec DO
+      CASE aToolId OF
+         configTool: BEGIN
+                     kind := computerKind;
+                     toolOnly := TRUE;
+                     id := idComputer;
+                     parentID := idNil;
+                     END;
+         calcTool:   BEGIN
+                     kind := calcKind;
+                     toolOnly := TRUE;
+                     END;
+         clockTool:  BEGIN
+                     kind := clockKind;
+                     toolOnly := TRUE;
+                     END;
+         writeTool,
+         drawTool,
+         termEmTool: multiDoc := TRUE;
+         END;
+
+
+   IF NOT ObjInCat(volHdl,'',[labelRec.kind],aToolId,pCatRec) THEN
+      BEGIN
+      NewCatEntry(err,aToolId,id,labelRec,newToolRec,catRID);
+      CheckError(312,err,TRUE);
+      END;
+
+   IF (err = 0) AND (labelRec.kind = toolKind) AND (NOT labelRec.toolOnly) THEN
+      BEGIN   { add the stationery for this tool }
+      GetString(751,@suffix);                      { paper }
+      labelRec.name := CONCAT(labelRec.name,' ',suffix);
+      IF NOT ObjInCat(volHdl,labelRec.name,[docPad],aToolId,pCatRec) THEN WITH labelRec DO
+         BEGIN
+         SetRect(windLoc,2,33,716,314);
+         multiDoc := FALSE;
+         parentID := idDisk;
+         kind     := docPad;
+         NewCatEntry(err,aToolId,-1,labelRec,newToolRec,catRID);
+         CheckError(324,err,TRUE);
+         END;
+      END;
+
+   IF trcCatalog THEN WRITELN('   exit AddToolEntry');
+   END;
+
+
+   PROCEDURE ComputeAttributes(whichKinds: KindSet);
+   { computes sizes, & dates for all catalog objects in whichKinds set }
+   VAR err: INTEGER;
+       catRID: TcatRID;
+       modified,creatTIme: LongInt;
+       catRec: TcatRec;
+   BEGIN
+   IF trcCatalog THEN WRITELN('ComputeAttributes');
+   posApprox.fatherID := idDisk;     { position to disk contents }
+   GetCatRec(err,volHdl,posApprox,catRec);
+
+   WHILE err = 0 DO
+      BEGIN
+      WITH catRec DO
+         IF objKind IN whichKinds THEN
+            BEGIN
+            catRID.fatherID := parentID;
+            catRID.uniqueID := selfID;
+            objSize := ObjectSize(volHdl,catRID,NIL,FALSE,modified,creatTime);
+            IF created  = nullInt4 THEN        { no current value }
+               IF creatTime = nullInt4 THEN
+                  created  := curTime
+               ELSE
+                  created := creatTime;
+            UpdCatRec(err,volHdl,catRID,catRec);
+            END;
+      IF err = 0 THEN GetCatRec(err,volHdl,posNext,catRec);
+      END;
+   IF err <> eos THEN CheckError(316,err,TRUE);
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('RecoverCat.  Device = "',devHdl^^.nameHdl^^,'"');
+recovErr := 0;
+
+{ temporarily increase number of buffers to speed recovery }
+ChangeDBbuffs(nRecovBuffs);
+
+deviceName := COPY(devHdl^^.nameHdl^^,1,
+                   MIN(SIZEOF(deviceName)-1,LENGTH(devHdl^^.nameHdl^^)));
+
+devPathName := CONCAT('-',deviceName);
+newCatalog := FALSE;
+
+   { Try to open the catalog }
+
+OpenCat(err,devHdl);
+IF err > 0 THEN
+   BEGIN
+   IF dbgFiler THEN WRITELN('RecoverCat: OpenCat error = ',err:1);
+
+   IF err = catBadVersion THEN GOTO 1;
+
+      { couldn't open it.  Call DB recover routine to patch things up }
+
+   DBRecover(err,deviceName);
+   IF err = noerr THEN
+      BEGIN
+      OpenCat(err,devHdl);                        { Open the recovered catalog }
+      CheckError(317,err,FALSE);
+      END
+   ELSE
+      BEGIN
+      IF dbgFiler THEN WRITELN('RecoverCat: FileRecover error = ',err:1);
+
+         { DB recovery failed.  Construct a new empty catalog, deletes old first }
+
+      CreateCat (err, devHdl);
+
+      CheckError(318,err,FALSE);
+      newCatalog := TRUE;
+      END;
+   END;
+
+
+volHdl := devHdl^^.volHdl;
+curTime := TimeStamp;
+
+
+IF NOT newCatalog THEN
+   BEGIN
+   InitNewCat(volHdl);   { ensure that initial objects are still there }
+
+   { make sure no two records have same unique id }
+
+   PosCatRec(err,volHdl,posFirst,pCatRec);
+   CheckError(323,err,TRUE);
+   maxId := 1;
+
+   REPEAT
+      IF pCatRec^.selfId > maxId THEN maxId := pCatRec^.selfId;
+      curCatRID.uniqueID := pCatRec^.selfID;
+      curCatRID.fatherID := pCatRec^.parentID;
+
+      REPEAT   { scan entire catalog deleting records with same unique id }
+         PosCatRec(err,volHdl,posNext,pCatRec);
+         IF err = 0 THEN
+            IF pCatRec^.selfID = curCatRID.uniqueID THEN
+               BEGIN
+               {$IFC flrDebug}
+                  WRITELN('*** Duplicate uniqueIDs found = ',curCatRID.uniqueID);
+                  PrintCatRec(pCatRec^);
+               {$ENDC }
+               DelCatRec(err,volHdl,posCurrent);
+               err := 0;
+               END;
+      UNTIL err > 0;
+
+      IF err = eos THEN err := 0;   { end of file, reset for next run }
+
+      IF err = 0 THEN
+         PosCatRec(err,volHdl,curCatRID,pCatRec); { reposition to current test pt }
+      IF err = 0 THEN
+         PosCatRec(err,volHdl,posNext,pCatRec);   { bump test pt to next record }
+  UNTIL err > 0;
+
+  IF (err <> eos) THEN CheckError(319,err,TRUE);
+
+     { ensure that id generator is greater than any ids currently allocated }
+  GetNextId(volHdl,nextId);
+  IF maxId >= nextId THEN SetNextId(volHdl,maxId+1);
+  END;
+
+maxId := 1;
+
+   { Prepare to scan the O/S directory for files with the folder prefix }
+
+IF trcCatalog THEN WRITELN('   recovering folders');
+Reset_Catalog(err,devPathName);
+CheckError(325,err,TRUE);
+prefix := '{F';      { all document diskfiles begin with this }
+Get_Next_Entry(err,prefix,entryName);
+
+WHILE err = 0 DO
+   BEGIN
+   DownShift(@entryName);
+   IF GetToolId(entryName,theToolId) THEN;      { folder names look like tool names }
+   AddFolderEntry(theToolId);
+   IF theToolId > maxId THEN maxId := theToolId;{ determine the max id allocated }
+   Get_Next_Entry(err,prefix,entryName);        { look for more }
+   END;
+IF err <> 848 { end of list } THEN CheckError(326,err,TRUE);
+
+
+   { Prepare to scan the O/S directory for files with the document prefix }
+
+IF trcCatalog THEN WRITELN('   recovering documents');
+
+Reset_Catalog(err,devPathName);
+CheckError(308,err,TRUE);
+prefix := '{D';      { all document diskfiles begin with this }
+Get_Next_Entry(err,prefix,entryName);
+
+WHILE err = 0 DO
+   BEGIN
+   DownShift(@entryName);
+   IF GetDocToolId(entryName,theDocID,theToolId,checkLabel) THEN
+      AddDocEntry(theDocId,theToolId,checkLabel);
+   IF theDocId > maxId THEN maxId := theDocId;  { determine the max id allocated }
+   Get_Next_Entry(err,prefix,entryName);        { look for more }
+   END;
+IF err <> 848 { end of list } THEN CheckError(320,err,TRUE);
+
+GetNextId(volHdl,nextId);                       { set the DB id }
+IF maxId >= nextId THEN SetNextId(volHdl,maxId+1);
+
+
+   { Prepare to scan the O/S directory for files with the tool prefix }
+
+IF trcCatalog THEN WRITELN('   recovering tools');
+
+Reset_Catalog(err,devPathName);
+CheckError(309,err,TRUE);
+
+prefix := '{T';      { all tool diskfiles begin with this }
+Get_Next_Entry(err,prefix,entryName);
+
+WHILE err = 0 DO
+   BEGIN
+   DownShift(@entryName);
+   IF GetToolId(entryName,theToolId) THEN
+      BEGIN
+      toolFound := TRUE;
+      AddToolEntry(theToolId);
+      END;
+   Get_Next_Entry(err,prefix,entryName);   { look for more }
+   END;
+
+IF err <> 848 { end of list } THEN CheckError(322,err,TRUE);
+
+
+   { set the size & created/modified times for all objects }
+
+IF trcCatalog THEN WRITELN('   setting sizes and times');
+
+{ do tree leaves first so that will get right answer when doing folders }
+ComputeAttributes([docKind,docPad,toolKind,calcKind,clockKind]);
+ComputeAttributes([folderKind,folderPad]);
+
+
+FlushCat(volHdl);
+recovErr := 0;  { Report all is well if made it this far }
+
+1:
+ChangeDBbuffs(nDBBuffs);
+IF devHdl^^.volHdl = NIL THEN
+   BEGIN
+   volName := '';
+   CreateEntry(vol,@volName,volHdl);
+   volHdl^^.devHdl := devHdl;
+   devHdl^^.volHdl := volHdl;
+   END;
+IF trcCatalog THEN WRITELN('   exit RecoverCatalog');
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE SetNextId{* volHdl: TentryHdl; nextId: IdType *};
+
+{ Sets DB uniqueid generator to the given value }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+{$R-}
+WITH pScanTable^[volHdl^^.catScanId]^ DO
+   WITH pFileTable^[onFile]^.tickets DO
+      BEGIN
+      high := 0;
+      low := nextId;
+      END;
+
+{$IFC flrDebug }
+   {$R+}
+{$ENDC }
+IF trcCatalog THEN WRITELN('SetNextId to: ',nextId:1);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+PROCEDURE SetObjPwd {* VAR error: INTEGER; volHdl: TEntryHdl; CatRID: TCatRID;
+                         oldPassword, newPassword: E_Name *};
+{attempts to set newPassword on all the files associated with obj (a document or tool).  Does a
+ Change_Password OS call.  Possible errors are (wrong object type), (bad oldPassword).}
+
+LABEL 99;
+
+VAR
+   catRec   : TcatRec;
+   err      : INTEGER;
+   nullPrefix : Pathname;
+   numStr   : NumberStr;
+   volName  : PathName;
+   prefix   : E_Name;
+   tempStr  : FmaxStr;
+   toolName : NumberStr;
+
+   {----------------------------------------------------------------------------------------}
+   PROCEDURE CheckError (err: INTEGER);
+
+   BEGIN
+   IF (err > 0) THEN
+      BEGIN
+      error := err;
+      IF (NOT VerifyPassword(volHdl, catRID)) THEN
+         FixPassword(volHdl, catRID);
+      EXIT (SetObjPwd);
+      END; {of IF THEN block}
+   END; {of PROC CheckError}
+
+   {---------------------------------------------------------------------------------------}
+   PROCEDURE SetFilePassword;
+
+   VAR
+      fileName    : E_Name;
+      moreFiles   : BOOLEAN;
+      path        : PathName;
+
+   BEGIN
+   moreFiles := TRUE;
+   WHILE moreFiles DO
+      BEGIN
+      Get_Next_Entry (err, prefix, fileName);
+      IF (err > 0) THEN
+         IF (err = 848) THEN
+            moreFiles := FALSE
+         ELSE
+            CheckError(err)
+      ELSE
+         BEGIN
+         {we have a valid entry, go for it}
+         DownShift(@fileName);
+         path := CONCAT(volName,'-',fileName);
+         IF (POS('phrase', fileName) = 0) THEN
+            BEGIN
+            {not the phrase file, so do the password set on it}
+            Change_Password(err, path, oldPassword, newPassword);
+            CheckErr(err);
+            END;
+         END;
+      END;
+
+   END; {of PROC SetFilePassword}
+
+   {-----------------------------------------------------------------------------------------------}
+
+BEGIN
+IF trcAttribute THEN WRITELN ('[SetObjPwd], entry');
+
+error := 0;
+GetCatRec (err, volHdl, catRID, catRec);
+CheckError (err);
+
+IF NOT (catRec.objKind IN [docKind, folderKind, toolKind, calcKind, clockKind]) THEN
+   BEGIN
+   IF trcAttribute THEN WRITELN ('   Wrong object kind, kind = ',ORD(catRec.objKind));
+   error := PassWrongType;
+   GOTO 99;
+   END; {of IF THEN block}
+
+{get the prefix name '(DxxxTxx)'}
+GetObjPrefix(volHdl, catRID, nullPrefix, FALSE{just prefix});
+prefix := nullPrefix;
+IF trcAttribute THEN WRITELN ('   prefix = ',prefix);
+
+volName := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^);
+RESET_CATALOG (err, volName);
+CheckError (err);
+
+IF (newPassword = '') THEN
+   BEGIN                               {protected -> unprotected}
+   catRec.props[iconPassWd] := FALSE;
+   END {of IF THEN block}
+ELSE
+   BEGIN                               {unprotected/protected -> protected}
+   catRec.props[iconPassWd] := TRUE;
+   END; {of ELSE block}
+
+SetFilePassword;
+
+{write out the updated catalog record}
+UpdCatRec (err, volHdl, catRID, catRec);
+CheckError (err);
+
+99:
+IF trcAttribute THEN WRITELN ('   [SetObjPwd], exit: error = ',err:1);
+END; {of PROC SetObjPwd}
+
+{---------------------------------------------------------------------------}
+{$S flrCold }
+PROCEDURE TermCat;
+
+{ Call when powering off, closes database data segments }
+
+VAR
+    err : INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('TermCat');
+Close_DataSeg(err, bufrDsRefNum);
+Close_DataSeg(err, heapDsRefNum);
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrDebug }
+PROCEDURE TraceDB{* traceStatus : BOOLEAN *};
+
+{ sets DB intrinsic tracing flags }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+(***
+pDebug    := traceStatus;
+scanDebug := traceStatus;
+labdebug  := traceStatus;
+bDebug    := traceStatus;
+dbDebug   := traceStatus;
+debug_Compact := traceStatus;
+***)
+END;
+
+
+{---------------------------------------------------------------------------}
+{$S flrAll }
+PROCEDURE UpdCatRec{* VAR err    : INTEGER;
+                          volHdl : TentryHdl;
+                          catRID : TcatRID;
+                      VAR catRec : TcatRec *};
+
+{ updates selected catalog record }
+
+VAR
+   offendID : INTEGER;
+   pCatRec  : PtrCatRec;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcCatalog THEN WRITELN('UpdCatRec');
+
+{$IFC flrDebug}
+IF trcCatalog THEN
+   IF err = 0 THEN
+      PrintCatRec(catRec)
+   ELSE
+      DBError(err);
+{$ENDC}
+
+PosCatRec(err,volHdl,catRID,pCatRec);   { position to the record }
+IF err = 0 THEN
+   Eupdate(err,offendID,volHdl^^.catScanID,current,0,NIL,@catRec,CatRecSize(catRec));
+END;
+
+{---------------------------------------------------------------------------}
+{$S flrCat }
+FUNCTION  VerifyPassword {* volHdl: TentryHdl; catRID: TcatRID) : BOOLEAN *};
+{makes sure catalog and file password flags agree for files associated with the
+ input catalog record (iconic object), also all file passwords are the same.}
+
+LABEL 33;
+
+VAR
+   catRec    : TcatRec;
+   err       : INTEGER;
+   fileInfo  : Fs_Info;
+   firstTime : BOOLEAN;
+   hasPasswd : BOOLEAN;
+   nullPrefix: Pathname;
+   passwd    : E_Name;
+   stopMe    : BOOLEAN;
+   theFile   : E_Name;
+   thePath   : Pathname;
+   thePrefix : E_Name;
+   theVolume : Pathname;
+   uParm     : UT_Parmt;
+
+   {+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+   PROCEDURE CheckErr (theError: INTEGER);
+
+   BEGIN
+   IF (theError > 0) THEN
+      EXIT(VerifyPassword);
+   END; {of PROC CheckErr}
+
+   {+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++}
+
+BEGIN
+VerifyPassword := FALSE;
+GetCatRec (err, volHdl, catRID, catRec);
+IF (err > 0) THEN
+   EXIT(VerifyPassword);
+
+GetObjPrefix(volHdl, catRID, nullPrefix, FALSE{prefix only});
+IF (nullPrefix = '') THEN
+   {bad volHdl or catRID, abort}
+   EXIT(VerifyPassword);
+
+thePrefix := nullPrefix;
+theVolume := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^);
+Reset_Catalog (err, theVolume);
+CheckErr(err);
+
+passwd := '';
+firstTime := TRUE;
+stopMe := FALSE;
+hasPasswd := catRec.props[iconPassWd];
+REPEAT
+   Get_Next_Entry(err, thePrefix, theFile);
+   IF (err > 0) THEN
+      stopMe := TRUE
+   ELSE
+      BEGIN
+      DownShift(@theFile);
+      IF (POS('phrase', theFile) <> 0) THEN
+         {skip the phrase files}
+         GOTO 33;
+      thePath := CONCAT(theVolume,'-',theFile);
+      LookUp(err, thePath, fileInfo);
+      CheckErr(err);
+      IF (hasPasswd <> fileInfo.passwd_present) THEN
+         EXIT(VerifyPassword);
+      WITH uParm DO
+         BEGIN
+         gp_parm := 0;
+         command := xfer_passwd;
+         path := thePath;
+         op := pswRead;
+         END; {of WITH block}
+      FS_Utilities(err, uParm);
+      CheckErr(err);
+      IF firstTime THEN
+         BEGIN
+         passwd := uParm.password;
+         firstTime := FALSE;
+         END
+      ELSE
+         BEGIN
+         IF (passwd <> uParm.password) THEN
+            EXIT(VerifyPassword);
+         END;
+      END; {of IF ELSE block}
+33:
+   UNTIL stopMe;
+
+VerifyPassword := TRUE;
+
+END; {of FUNC VerifyPassword}
+
+END.
+ÿ

@@ -1,0 +1,1157 @@
+{ Copyright 1983, 1984, Apple Computer Inc. }
+
+(*$S ProcStart *)
+
+  procedure Get_ProgInfo (var errnum : int2;  var prog_pathname : pathname;
+                          var obj_ptr : ObjHandle;  var stk_info : stkInfo_rec;
+                          var loadedJT_ptr : ptr_JumpTable;
+                          var unit_list : IUuse_list;
+                          var fetch_bitmap : seg_bitmap);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      nObjBuffBlocks = 4;                     { # buffer blocks for prog file }
+
+    var
+      long_ptr : ^int4;                       { for initializing bitmap }
+      obj_block : ObjBlock;                   { 'invariant' block from prog file }
+      obj_varblock : ObjVarBlock;             { 'variant' block from prog file }
+      prog_scavenged : boolean;               { true if prog file was scavenged }
+
+    procedure Recover (error : int2);
+      { procedure used by Get_ProgInfo to recover from any errors that occur
+        while getting information from the program file. }
+
+      begin
+        if obj_ptr <> nil then
+          begin
+            CloseObjFile (obj_ptr, false);
+            obj_ptr := nil
+          end;
+
+        errnum := error;   { Make_Process will fix it up for return to user }
+        exit (Get_ProgInfo)
+      end { Recover };
+
+
+    procedure Do_VersionCntrl;
+      { procedure used by Get_ProgInfo to handle Version Control block }
+
+      begin
+        {bitmap := obj_block;}
+        (*$IFC debug2 *)
+        if Trace (pm, 90) then writeln ('      verified & skipped VersionCntl');
+        (*$ENDC *)
+      end { Do_VersionCntrl };
+
+
+    procedure Do_UnitTable;
+      { procedure used by Get_Resources to handle Unit Table block }
+
+      var
+        index : int2;                         { for scanning use list }
+        uDirEntry_ptr : ptr_UnitDirEntry;     { ptr to entry in Unit Directory }
+
+      begin
+        (*$IFC debug2 *)
+        if Trace (pm, 90) then writeln ('      verified & got UnitTable');
+        (*$ENDC *)
+
+        { build list of intrinsic units used by program }
+        with obj_block.bUnitTable, unit_list do
+          begin
+            high_iunit := maxunit;   num_sharedIUs := 0;   sum_IUdata := 0;
+            index := 1;
+            repeat
+              use_list[index] := false;
+              index := index + 1
+            until index > maxIUnit;
+
+            index := 1;
+            repeat
+              GetObjVar (obj_ptr, UnitVariant, obj_varblock);
+              if obj_ptr^.error > 0 then Recover (e_fsread);
+              with obj_varblock.bUnitVariant do
+                begin
+                  Get_UnitDir_Entry (UnitNumber, uDirEntry_ptr);
+                  if uDirEntry_ptr = nil then
+                    begin
+                      (*$IFC debug2 *)
+                      write ('   Unit # ', UnitNumber:1, ' (', UnitName);
+                      writeln (') not found in INTRINSIC.LIB');
+                      (*$ENDC *)
+                      Recover (e_nounit)
+                    end;
+
+                  with uDirEntry_ptr^ do
+                    begin
+                      if (UnitName <> uName) or (UnitType <> uType) or
+                         (uDatasize < 0) then
+                        begin
+                          (*$IFC debug2 *)
+                          write ('   Unit # ', UnitNumber:1, ' (', UnitName);
+                          writeln (') doesn''t match name/type in INTRINSIC.LIB');
+                          (*$ENDC *)
+                          Recover (e_badunit)
+                        end;
+
+                      use_list[UnitNumber] := true
+                    end { with uDirEntry_ptr^ };
+
+                  if UnitType = 2 { shared } then
+                    num_sharedIUs := num_sharedIUs + 1
+                  else
+                    { regular Intrinsic Unit }
+                    sum_IUdata := sum_IUdata + uDirEntry_ptr^.uDatasize
+                end { with obj_varblock.bUnitVariant };
+
+              index := index + 1
+            until index > nUnits
+          end { with obj_block.bUnitTable, unit_list }
+      end { Do_UnitTable };
+
+
+    procedure Do_OSData;
+      { procedure used by Get_ProgInfo to handle OSData block }
+
+      begin
+        (*$IFC debug2 *)
+        if Trace (pm, 90) then writeln ('      verified & got OSData');
+        (*$ENDC *)
+        GetObjSeq (obj_ptr, @fetch_bitmap, Sizeof(fetch_bitmap));
+        if obj_ptr^.error > 0 then Recover (e_fsread)
+      end { Do_OSData };
+
+
+    procedure Do_Executable;
+      { procedure used by Get_ProgInfo to handle Executable block }
+
+      var
+        high_unit : iUnitRange;           { highest Intrinsic Unit # used }
+
+      begin
+        (*$IFC debug2 *)
+        if Trace (pm, 90) then writeln ('      verified & got Executable');
+        (*$ENDC *)
+        with stk_info, obj_block.bExecutable do
+          begin
+            max_stksize := MaxStack;
+            init_dynstk := DynStack;
+            init_disk := MinHeap;
+            IUdata_size := unit_list.sum_IUdata;
+            comm_size := DataSize;
+            glob_size := MainSize;
+            stk_delta := StkSegDelta;
+            jt_delta := JTSegDelta;
+            dpt_size := unit_list.high_iunit * 4;
+            jt_size := JTSize
+          end;
+      end { Do_Executable };
+
+
+    begin  { Get_ProgInfo }
+      obj_ptr := nil;   prog_scavenged := false;
+
+      CheckLoaded (errnum, prog_pathname, stk_info, unit_list, loadedJT_ptr);
+      if errnum <> 0 then
+        begin  { File system error }
+          if (errnum >= 1270) and (errnum <= 1272) then
+            Recover (e_prog_open)
+          else if errnum > 0 then
+            Recover (e_fsread)
+        end
+      else if loadedJT_ptr = nil then
+        begin  { program is not loaded }
+          InitObjFile (obj_ptr, nObjBuffBlocks);
+          if obj_ptr = nil then Recover (e_noobjblock);
+          OpenObjFile (obj_ptr, prog_pathname, false { existing file });
+
+          if obj_ptr^.error > 0 then
+            begin  { couldn't open prog file }
+              if obj_ptr^.error = 1130 { protection violation } then
+                Recover (e_protected)
+              else if obj_ptr^.ObjFile^.refnum = -1 then
+                Recover (e_prog_open)
+              else
+                Recover (e_fsread)
+            end;
+
+          { get needed info from prog file }
+          if obj_ptr^.error = -1176 { scavenged } then prog_scavenged := true
+            else prog_scavenged := false;
+
+          { set up default fetch ahead bitmap }
+          long_ptr := pointer(ord(@fetch_bitmap) + Sizeof(fetch_bitmap));
+          repeat
+            long_ptr := pointer(ord(long_ptr) - 4);
+            long_ptr^ := 0
+          until long_ptr = @fetch_bitmap;
+          long_ptr^ := no_FAinfo;
+
+          repeat
+            GetObjInvar (obj_ptr, obj_block);
+            if obj_ptr^.error > 0 then Recover (e_fsread);
+
+            case obj_block.blockHeader of
+              VersionCtrl : Do_VersionCntrl;
+              UnitTable   : Do_UnitTable;
+              OSData      : Do_OSData;
+              Executable  : Do_Executable;
+              otherwise     Recover (e_inv_progfile)
+            end
+          until obj_block.blockHeader = Executable;
+
+          (*$IFC debug2 *)
+          if Trace (pm, 90) then
+            with stk_info do
+              begin
+                writeln ('   glob_size=', glob_size, ' comm_size=', comm_size);
+                writeln ('   IUdata_size=', IUdata_size);
+                writeln ('   jt_delta=', jt_delta, ' stk_delta=', stk_delta);
+                writeln ('   init_dstk=', init_dynstk, ' init_disk=', init_disk)
+              end;
+          (*$ENDC *)
+          if prog_scavenged then errnum := w_progscaved
+        end { program not loaded }
+    end { Get_ProgInfo };
+
+
+  procedure Get_Resources (var errnum : int2;  var pcb_ptr : ptr_PCB;
+                           var stk_handle : segHandle;
+                           var sloc_handle : segHandle;
+                           var prog_pathname : pathname);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      sloc_ldsn = -1;                     { ldsn for binding new syslocal segs }
+      stk_ldsn = -2;                      { ldsn for binding new stack segs }
+
+    var
+      ord_ptr : absptr;                   { general ordinal of a ptr }
+      int_level : intson_type;            { current interrupt level }
+
+    procedure Recover (error : int2);
+      { procedure used by Get_Resources to recover from errors encountered
+        trying to get the resources necessary for a process creation. }
+
+      begin
+        if pcb_ptr <> nil then
+          begin
+            Relspace (ord(pcb_ptr), b_sysglobal_ptr);
+            pcb_ptr := nil
+          end;
+
+        with stk_handle do
+          if seg_refnum <> -1 then
+            begin  { recover stack segment }
+              Close_Dataseg (errnum, seg_refnum);
+              (*$IFC debug2 *)
+              if (errnum <> 0) and Trace (pm, 90) then
+                begin
+                  writeln ('   GetResources : close stk err = ', errnum);
+                  readln
+                end;
+              (*$ENDC *)
+              seg_refnum := -1
+            end;
+
+        with sloc_handle do
+          if seg_refnum <> -1 then
+            begin  { recover syslocal segment }
+              Close_Dataseg (errnum, seg_refnum);
+              (*$IFC debug2 *)
+              if (errnum <> 0) and Trace (pm, 90) then
+                begin
+                  writeln ('   GetResources : close sysloc err = ', errnum);
+                  readln
+                end;
+              (*$ENDC *)
+              seg_refnum := -1
+            end;
+
+        errnum := error;   { Make_Process will fix it up for return to user }
+        exit (Get_Resources)
+      end { Recover };
+
+
+    begin  { Get_Resources }
+      { get space for new PCB }
+      if not Getspace (Sizeof (PCB), b_sysglobal_ptr, ord_ptr) then
+        Recover (e_nosysglob)
+      else
+        begin
+          pcb_ptr := pointer(ord_ptr);
+          Intsoff (allints, int_level);
+          pcb_ptr^.glob_id := next_gprocid;
+          next_gprocid := next_gprocid + 1;
+          Intson (int_level)
+        end;
+
+      { get data segments for new syslocal and stack }
+      with sloc_handle do
+        Make_SysDataseg (errnum, prog_pathname, seg_size, disk_size, seg_refnum,
+                         seg_ptr, sloc_ldsn);
+      if errnum <> 0 then Recover (e_makesysloc);
+
+      with stk_handle do
+        Make_SysDataseg (errnum, prog_pathname, seg_size, disk_size, seg_refnum,
+                         seg_ptr, stk_ldsn);
+      if errnum <> 0 then Recover (e_makestk);
+
+      (*$IFC debug2 *)
+      if Trace (pm, 50) then
+        writeln ('   leaving Get_Resources');
+      (*$ENDC *)
+      errnum := 0
+    end { Get_Resources };
+
+
+  procedure CreateProcess (newpcb_ptr : ptr_PCB;  sloc_handle : segHandle;
+                           stk_handle : segHandle;  stk_info : stkInfo_rec;
+                           jt_ptr : ptr_JumpTable;  unit_list : IUuse_list;
+                           start_PC : absptr;  evnt_chn_refnum : int2);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      sloc_ptr : slocal_ptr;              { ptr to new syslocal for process }
+      start_addr : ^int4;                 { PC for initial break pt, if desired }
+      error : int2;                       { error return from Create_BP }
+
+
+    procedure Build_Stack;
+      { procedure used by CreateProcess build the stack portion of the stack
+        segment and the initial environment save area for the new process }
+
+      const
+        Init_SR = 0;                           { initial SR for process }
+
+      var
+        stk_base : ^init_stack;                { ptr to base of new stack }
+        DPT_ptr : ^IUdata_ptrs;                { ptr to data ptr table in seg }
+
+      begin
+        with stk_info do
+          begin
+            DPT_ptr := pointer(ord(jt_ptr) - dpt_size);
+            stk_base := pointer(ord(DPT_ptr) - jt_delta - stk_delta);
+
+            with stk_base^ do
+              begin  { format new stack base }
+                start_addr := ord(@ExitSys);
+                glob_base := 0;   { initial link for A5 }
+                In_buffptr := 0;
+                Out_buffptr := 0;
+                units_size := comm_size + IUdata_size;
+                OSorMonitor := 0;   { indicates OS world }
+                C_parms := 0;
+                V_parms := 0
+              end;
+
+            with sloc_ptr^.env_save_area, stk_handle do
+              begin  { format new environment save area }
+                A5 := sysA5;   { for Initiate }
+                A6 := MMU_Base (stackmmu+1) - (seg_size -
+                         (ord(@stk_base^.start_addr) - seg_ptr));
+                A7 := A6;
+
+                SR := Init_SR;
+                PC := ord(@Initiate)
+              end
+          end { with stk_info }
+      end { Build_Stack };
+
+
+    procedure Build_Syslocal;
+      { procedure used by CreateProcess to build the syslocal segment for the
+        new process }
+
+      const
+        abortPages = 6;                   { 3K extra for stack overflow abort }
+
+      var
+        error : int2;                     { error return for Find_LCCB }
+        ord_ptr : absptr;                 { general ordinal of a pointer }
+        ECrdb_ptr : ptr_ECrdb;            { ptr to EC refdb for comm channel }
+
+      begin
+        with sloc_ptr^ do
+          begin
+            { set up sizes, etc. for Getspace/Relspace }
+            { set sl_free_pool_addr for use with Getspace while in Build_Syslocal }
+            sl_free_pool_addr := ord(sloc_ptr) + Sizeof (syslocal);
+            { must set sl_free_pool_addr to 'final' value upon exit }
+            size_slocal := sloc_handle.seg_size;
+            Init_Freepool (sl_free_pool_addr, size_slocal - Sizeof (syslocal));
+
+            { do process handling initialization }
+            termE_ptr := ord(nil);
+            commchan := evnt_chn_refnum;
+            if commchan > 0 then
+              begin  { could do Open in Initiate }
+                Chk_Refnum (error, commchan, ecrefdb, ord_ptr);
+                ECrdb_ptr := pointer(ord_ptr);
+                with ECrdb_ptr^.eccb_ptr^ do
+                  numSenders := numSenders + 1
+              end;
+
+            { compute maximum stack segment size allowed for process }
+            with stk_info, stk_handle do
+              begin
+                max_stksize := max_stksize + jt_size + dpt_size + jt_delta +
+                                 stk_delta;
+                if max_stksize < seg_size then max_stksize := seg_size;
+                maxStk_pages := (max_stksize + mempgsize - 1) DIV mempgsize
+              end;
+            if maxStk_pages + abortPages > maxpgmmu then
+              maxStk_pages := maxpgmmu - abortPages;
+
+            { set up the SCB for starting the user's code }
+            with SCB do
+              begin
+                domvalue := 1;   { doesn't matter }
+                PCvalue := MMU_Base (stackmmu+1) - stk_info.jt_size + start_PC;
+                A5value := env_save_area.A6 + 4
+              end;
+
+            { set up refnum allocation stuff }
+            with loc_refnum.hd_refnum_list do
+              begin
+                fwd_link := ord(@fwd_link) - ord(sloc_ptr);
+                bkwd_link := fwd_link
+              end;
+            loc_refnum.next_refnum := beg_locrefnum
+          end { with sloc_ptr^ };
+
+        { now set up everything else }
+        Excep_Setup (sloc_ptr);
+        EC_Setup (sloc_ptr);
+        FS_Setup (sloc_ptr);
+        MM_Setup (stk_handle.seg_refnum, sloc_handle.seg_refnum, jt_ptr,
+                  newpcb_ptr^.plcbRP, newpcb_ptr^.slocal_sdbRP);
+
+        { set correct 'syslocal relative' ptr to free pool for new process.  Note
+          that Getspace can no longer be called by Make_Process to obtain space
+          in the new process's syslocal segment. }
+        sloc_ptr^.sl_free_pool_addr := MMU_Base (syslocmmu) + Sizeof (syslocal)
+      end { Build_Syslocal };
+
+
+    procedure Build_PCB;
+      { procedure used by CreateProcess to build a PCB for the new process }
+
+      var
+        int_level : intson_type;          { current interrupt level }
+        mypcb_ptr : ptr_PCB;              { ptr to PCB of calling process }
+
+      begin
+        mypcb_ptr := pointer(c_pcb_ptr);
+
+        { format PCB for new process }
+        with newpcb_ptr^ do
+          begin
+            blk_state := [];     { active }
+            domain := 0;         { start out in system code }
+            priority := mypcb_ptr^.priority;
+            norm_pri := priority;
+            sems_owned := 0;
+            { glob_id was set by Get_Resources }
+
+            proctype := user;
+            np_count := 0;   { process starts preemptive }
+            softints := [];
+            fatherptr := ord(mypcb_ptr) - b_sysglobal_ptr;
+            sonptr := 0;
+            Init_sem (fam_sem, 0);   { inititalize for coordination }
+            terming := false;
+            { term_cause is filled in when terminating }
+
+            excep_pending := 0;
+            pcbfreqptr := ord(nil);
+
+            { slocal_sdbRP was set by MM_Setup }
+            { plcbRP was set by Load_Program }
+            need_mem := true
+          end;
+
+        { link new process into hierarchy }
+        Intsoff (allints, int_level);
+        newpcb_ptr^.brotherptr := mypcb_ptr^.sonptr;
+        mypcb_ptr^.sonptr := ord(newpcb_ptr) - b_sysglobal_ptr;
+        Intson (int_level)
+      end { Build_PCB };
+
+
+    begin  { CreateProcess }
+      sloc_ptr := pointer(sloc_handle.seg_ptr);
+
+      Build_Stack;
+      (*$IFC debug3 *)
+      if Trace (pm, 90) then writeln ('      after Build_Stack');
+      (*$ENDC *)
+
+      Build_Syslocal;
+      (*$IFC debug3 *)
+      if Trace (pm, 90) then writeln ('      after Build_Syslocal');
+      (*$ENDC *)
+
+      Build_PCB;
+      (*$IFC debug3 *)
+      if Trace (pm, 90) then writeln ('      after Build_PCB');
+      (*$ENDC *)
+
+      if debugProcess then
+        begin
+          start_addr := pointer(ord(jt_ptr) + start_PC + 2);
+          Create_BP (newpcb_ptr^.glob_id, start_addr^+4, error);
+          (*$IFC debug2 *)
+          if error <> 0 then
+            begin  { shouldn't happen }
+              writeln ('   *** error from Create_BP = ', error:1);
+              readln
+            end
+          (*$ENDC *)
+        end
+    end { CreateProcess };
+
+
+  procedure FinishCreate (newpcb_ptr : ptr_PCB;
+                          stk_handle, sloc_handle : segHandle;
+                          obj_ptr : ObjHandle);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    var
+      int_level : intson_type;            { current interrupt level }
+      error : int2;                       { error return for data segments }
+
+    begin
+      with stk_handle do
+        begin  { clean up stack segment }
+          Close_Dataseg (error, seg_refnum);
+          (*$IFC debug2 *)
+          if error <> 0 then
+            begin
+              writeln ('   FinishCreate : close stk err = ', error);
+              readln
+            end
+          (*$ENDC *)
+        end;
+
+      with sloc_handle do
+        begin  { clean up syslocal segment }
+          Close_Dataseg (error, seg_refnum);
+          (*$IFC debug2 *)
+          if error <> 0 then
+            begin
+              writeln ('   FinishCreate : close sysloc err = ', error);
+              readln
+            end
+          (*$ENDC *)
+        end;
+
+      { clean up program file }
+      if obj_ptr <> nil then CloseObjFile (obj_ptr, false);
+
+      { finally, link new process into global list and Ready queue }
+      Add_PCBglist (newpcb_ptr);
+      with newpcb_ptr^ do
+        begin
+          next_schedPtr := newpcb_ptr;
+          prev_schedPtr := newpcb_ptr
+        end;
+      Intsoff (allints, int_level);
+      Queue_Process (newpcb_ptr, Ready);
+      Intson (int_level)
+    end { FinishCreate };
+
+
+  procedure Make_Process (* var errnum : int2;  var proc_id : int4;
+                            var progfile : pathname;  var entryname : namestring;
+                            evnt_chn_refnum : int2 *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*   System call procedure to create a new process in the    *)
+        (*   operating system.  The new process is created as a son  *)
+        (*   of the calling (father) process.  The basic algorithm   *)
+        (*   is to acquire the necessary resources (data segments    *)
+        (*   for stack, syslocal, and proclocal; and a PCB) and      *)
+        (*   format them for the new process.  The new process will  *)
+        (*   begin execution in the operating system procedure       *)
+        (*   Initiate and thereafter in its own code.  Note that the *)
+        (*   new process is created in the active state at the same  *)
+        (*   priority as its father.                                 *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*   progfile : the pathname describing the program file to  *)
+        (*              be executed by the new process.  A null name *)
+        (*              indicates that the program file that the     *)
+        (*              calling process is executing is to be used   *)
+        (*              (provided for the FORK mentality).           *)
+        (*                                                           *)
+        (*   entryname : the string denoting the entry point in the  *)
+        (*               program to be used.  A null string          *)
+        (*               indicates that the main entry point is to   *)
+        (*               be used.                                    *)
+        (*                                                           *)
+        (*   evnt_chn_refnum : the refnum of a blank event channel   *)
+        (*                     already opened by the caller to       *)
+        (*                     establish communication with the new  *)
+        (*                     process regarding system-type         *)
+        (*                     events.                               *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*   errnum : the error return parameter for this system     *)
+        (*            call procedure (see values below).             *)
+        (*                                                           *)
+        (*   proc_id : a global process ID for the newly created     *)
+        (*             process.                                      *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*   None.                                                   *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*   Lots.  See constants in ProcMgmt implementation.        *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      n_fp_blks = 5;                      { # disk blocks in new sloc free pool }
+
+    (*$IFC debug1 *)
+    type
+      mp_logEvent = record   { process creation log }
+                     mp_create : int1;     { type = 20 }
+                     mp_end    : boolean;  { true => end of creation }
+                     mp_father : absptr;   { creating process }
+                     mp_errret : int2;     { error return @ end }
+                     mp_son    : absptr    { new son process }
+                   end;
+
+      mp_nameEvent = record  { process creation program name log }
+                       mp_pname    : int1;        { type = 24 }
+                       mp_res      : int1;        { reserved }
+                       mp_progName : string[9]    { 1st 9 chars of object name }
+                     end;
+    (*$ENDC *)
+
+    var
+      prog_pathname : pathname;           { local copy of pathname to prog file }
+      obj_ptr : ObjHandle;                { ptr to ObjDescriptor for prog file }
+      stk_handle : segHandle;             { descriptor for new stack segment }
+      stk_info : stkInfo_rec;             { information block for new stack seg }
+      sloc_handle : segHandle;            { descriptor for new syslocal segment }
+      sloc_blks_reqd : int1;              { # disc blocks needed for new slocal }
+      jt_ptr : ptr_JumpTable;             { ptr to new jump table }
+      IUD_refnum : int2;                  { refnum for opening IU Directory seg }
+      start_PC : int4;                    { offset in jt to user's start PC  }
+      newpcb_ptr : ptr_PCB;               { ptr to PCB for new process }
+      mypcb_ptr : ptr_PCB;                { ptr to PCB of calling process }
+      prog_scavenged : boolean;           { true if prog file has been scavenged }
+      lib_scavenged : boolean;            { true if a lib file has been scavenged }
+      old_fFence : FlushLevel;            { current value of flush fence }
+      loadedJT_ptr : ptr_JumpTable;       { ptr to jump table for loaded program }
+      unit_list : IUuse_list;             { list of Intrinsic Units used by prog }
+      fetch_bitmap : seg_bitmap;          { bit map for fetch ahead of segments }
+      pCheckRec : parmcheck;              { record for Valid_Addr checking }
+      (*$IFC debug1 *)
+      logError : int2;                    { error return for logging calls }
+      MP_event : mp_logEvent;             { for logging the process creation }
+      MPname_event : mp_nameEvent;        { for logging program file name }
+      progUnit : int2;                    { unit # of prog pathname }
+      progPname : pathname;               { prog pathname without volume }
+      (*$ENDC *)
+
+
+    procedure Recover (error : int2);
+      { procedure used by Make_Process to recover from any error conditions
+        that may arise during process creation.  Releases all resources
+        acquired thus far and sets the error return parameter (errnum) based
+        on the internal error value passed to it. }
+
+      begin
+        (*$IFC debug2 *)
+        if Trace (pm, 90) then
+          begin
+            writeln (' *** Make_Process error ', error, ' ***');
+            writeln ('     obj_ptr^.error = ', obj_ptr^.error)
+          end;
+        (*$ENDC *)
+
+        { release resources acquired in the course of creation }
+        if obj_ptr <> nil then CloseObjFile (obj_ptr, false);
+
+        if IUD_refnum <> -1 then Close_IUDirectory (IUD_refnum);
+
+        if stk_handle.seg_refnum <> -1 then
+          begin  { recover stack segment }
+            Close_Dataseg (errnum, stk_handle.seg_refnum);
+            (*$IFC debug2 *)
+            if (errnum <> 0) and Trace (pm, 90) then
+              begin
+                writeln ('   Make_Process : close stack err = ', errnum);
+                readln
+              end
+            (*$ENDC *)
+          end { recover stack segment };
+
+        if sloc_handle.seg_refnum <> -1 then
+          begin  { recover syslocal segment }
+            Close_Dataseg (errnum, sloc_handle.seg_refnum);
+            (*$IFC debug2 *)
+            if (errnum <> 0) and Trace (pm, 90) then
+              begin
+                writeln ('   Make_Process : close sysloc err = ', errnum);
+                readln
+              end
+            (*$ENDC *)
+          end { recover syslocal segment };
+
+        { restore normal File System flushing }
+        SetFlushLevel (old_fFence, old_fFence);
+
+        if newpcb_ptr <> nil then
+          Relspace (ord(newpcb_ptr), b_sysglobal_ptr);
+
+        { now set return values and go back to caller }
+        proc_id := -1;
+        errnum := proc_errbase + eb_make + error;
+
+        (*$IFC debug1 *)
+        if Trace (spare2, 10) then
+          if Logging then
+            begin  { must log the creation end }
+              with MP_event do
+                begin
+                  mp_end := true;
+                  mp_errret := errnum;
+                  mp_son := ord(nil)
+                end;
+              Log (logError, ord(@MP_event))
+            end;
+        (*$ENDC *)
+        exit (Make_Process)
+      end { Recover };
+
+
+    procedure Build_JumpTable;
+      { procedure used by Make_Process to read the jump table into the
+        bottom of the stack segment for the new process }
+
+      begin
+        with stk_handle, stk_info do
+          begin
+            jt_ptr := pointer(seg_ptr + seg_size - jt_size);
+
+            if loadedJT_ptr <> nil then
+              { program (and jump table) are loaded }
+              Mover (ord(loadedJT_ptr), ord(jt_ptr), jt_size)
+            else
+              begin
+                GetObjSeq (obj_ptr, pointer(ord(jt_ptr)), jt_size);
+                if obj_ptr^.error > 0 then Recover (e_fsread)
+              end
+          end { with }
+      end { Build_JumpTable };
+
+
+    begin  { Make_Process }
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then writeln ('   Entering Make_Process...');
+      (*$ENDC *)
+
+      { validate parameters passed in }
+      with pCheckRec do
+        begin
+          numcheck := 5;
+          with parms[1] do
+            begin
+              addr := ord(@proc_id);
+              readwrite := true
+            end;
+          with parms[2] do
+            begin
+              addr := ord(@progfile);
+              readwrite := false
+            end;
+          with parms[3] do
+            begin
+              addr := ord(@progfile) + Sizeof (progfile);
+              readwrite := false
+            end;
+          with parms[4] do
+            begin
+              addr := ord(@entryname);
+              readwrite := false
+            end;
+          with parms[5] do
+            begin
+              addr := ord(@entryname) + Sizeof (entryname);
+              readwrite := false
+            end
+        end { with };
+      if not Valid_Addr (errnum, pCheckRec) then exit (Make_Process);
+
+      { set some initial values, etc. }
+      newpcb_ptr := nil;   obj_ptr := nil;
+      stk_handle.seg_refnum := -1;   sloc_handle.seg_refnum := -1;
+      prog_scavenged := false;   lib_scavenged := false;
+      IUD_refnum := -1;
+
+      sloc_blks_reqd := (Sizeof (syslocal) + (n_fp_blks * mempgsize))
+                          DIV mempgsize + 1;
+      with sloc_handle do
+        begin
+          seg_size := sloc_blks_reqd * mempgsize;
+          disk_size := seg_size
+        end;
+
+      { prevent File System from flushing during creation }
+      SetFlushLevel (lowFlush, old_fFence);
+
+      if evnt_chn_refnum <= 0 then
+        evnt_chn_refnum := -1
+      else if not localEC (evnt_chn_refnum) then
+        Recover (e_commchan);
+
+      if progfile <> '' then prog_pathname := progfile
+      else
+        begin  { fork }
+          mypcb_ptr := pointer(c_pcb_ptr);
+          Get_PName (errnum, mypcb_ptr^.glob_id, true, prog_pathname)
+        end;
+
+      (*$IFC debug1 *)
+      if Trace (spare2, 10) then
+        if Logging then
+          begin  { must log the creation start }
+            with MP_event do
+              begin
+                mp_create := 20;
+                mp_end := false;
+                mp_father := c_pcb_ptr
+              end;
+            Log (logError, ord(@MP_event));
+
+            with MPname_event do
+              begin
+                mp_pname := 24;
+                SplitPathname (logError, prog_pathname, progUnit, progPname);
+                if Length (progPname) <= 9 then
+                  mp_progName := progPname
+                else
+                  mp_progName := Copy (progPname, 1, 9)
+              end;
+            Log (logError, ord(@MPname_event))
+          end;
+      (*$ENDC *)
+
+      Open_IUDirectory (IUD_refnum);
+      if IUD_refnum = -1 then Recover (e_fsread);
+
+      Get_ProgInfo (errnum, prog_pathname, obj_ptr, stk_info, loadedJT_ptr,
+                    unit_list, fetch_bitmap);
+      if (obj_ptr = nil) and (loadedJT_ptr = nil) then
+        Recover (errnum);
+      if errnum = w_progscaved then prog_scavenged := true;
+
+      { compute stack segment size needed }
+      with stk_handle, stk_info do
+        begin
+          seg_size := glob_size + comm_size + IUdata_size + init_dynstk;
+          seg_size := seg_size + stk_delta + jt_delta + dpt_size + jt_size;
+          seg_size := (seg_size + mempgsize - 1) DIV mempgsize * mempgsize;
+
+          disk_size := seg_size;
+          if init_disk > init_dynstk then
+            begin  { allocate additional disk space }
+              disk_size := disk_size + (init_disk - init_dynstk);
+              disk_size := (disk_size + mempgsize - 1) DIV mempgsize * mempgsize
+            end
+        end;
+
+      if entryname = 'resident' then
+        begin  { kludge for booting from Sony }
+          sloc_handle.disk_size := 0;
+          stk_handle.disk_size := 0
+        end;
+
+      Get_Resources (errnum, newpcb_ptr, stk_handle, sloc_handle, prog_pathname);
+      if errnum > 0 then Recover (errnum);
+
+      Build_JumpTable;
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then writeln ('      after Build_JumpTable');
+      (*$ENDC *)
+
+      Load_Program (errnum, @prog_pathname, obj_ptr, loadedJT_ptr, stk_info,
+                    jt_ptr, newpcb_ptr^.plcbRP, unit_list, fetch_bitmap,
+                    start_PC);
+      if errnum > 0 then Recover (errnum);
+      if errnum = w_lfscaved then lib_scavenged := true;
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then writeln ('      after Load_Program');
+      (*$ENDC *)
+
+      CreateProcess (newpcb_ptr, sloc_handle, stk_handle, stk_info, jt_ptr,
+                     unit_list, start_PC, evnt_chn_refnum);
+      (*$IFC debug2 *)
+      if Trace (pm, 90) then writeln ('      after CreateProcess');
+      (*$ENDC *)
+
+      Close_IUDirectory (IUD_refnum);
+
+      if entryname = 'nonPreempt' then
+        { temp kludge for Window Mgr/Filer problem }
+        newpcb_ptr^.np_count := 1;   { process starts out non-preemptive }
+
+      if entryname = 'suspend' then
+        { temp kludge for WorkShop process start problem }
+        Send_SoftInt (newpcb_ptr, susp);   { process starts out suspended }
+
+      FinishCreate (newpcb_ptr, stk_handle, sloc_handle, obj_ptr);
+
+      { restore normal File System flushing }
+      SetFlushLevel (old_fFence, old_fFence);
+
+      proc_id := newpcb_ptr^.glob_id;
+      if prog_scavenged then
+        errnum := -(proc_errbase + eb_make - w_progscaved)
+      else if lib_scavenged then
+        errnum := -(proc_errbase + eb_make - w_lfscaved)
+      else
+        errnum := 0;
+
+      (*$IFC debug1 *)
+      CHK_SAMPLER(prog_pathname,proc_id); (* see if prog execution to be sampled *)
+
+      if Trace (spare2, 10) then
+        if Logging then
+          begin  { must log the creation end }
+            with MP_event do
+              begin
+                mp_end := true;
+                mp_errret := errnum;
+                mp_son := ord(newpcb_ptr)
+              end;
+            Log (logError, ord(@MP_event))
+          end;
+      (*$ENDC *)
+    end { Make_Process };
+
+
+  procedure Make_SProcess (* var errnum : int2;  var pcb_ptr : ptr_PCB;
+                             stk_size : int4;  start_PC : int4;  priValue : int2;
+                             resident : boolean *);
+
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:                                              *)
+        (*                                                           *)
+        (* Input Parameters:                                         *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+    const
+      n_fp_blks = 5;                      { # disk blocks in new sloc free pool }
+
+    var
+      stk_handle : segHandle;             { descriptor for new stack segment }
+      stk_info : stkInfo_rec;             { information block for new stack seg }
+      sloc_handle : segHandle;            { descriptor for new syslocal segment }
+      sloc_blks_reqd : int1;              { # disc blocks needed for new slocal }
+      jt_ptr : ptr_JumpTable;             { ptr to new jump table }
+      unit_list : IUuse_list;             { dummy Intrinsic Unit list }
+      sys_pName : pathname;               { null pathname for sys process prog }
+
+
+    procedure Recover;
+      { procedure used by Make_SProcess to recover from errors encountered
+        while getting resources for the new system process. }
+
+      begin
+        (*$IFC debug3 *)
+        if Trace (pm, 90) then
+          writeln (' *** Make_SProcess error ', errnum, ' ***');
+        (*$ENDC *)
+
+        pcb_ptr := nil;
+        errnum := proc_errbase + eb_make + errnum;
+
+        exit (Make_SProcess)
+      end { Recover };
+
+
+    procedure ModifyProcess;
+      { procedure used by Make_SProcess to make all the modifications to the
+        control structures necessary to turn a process into a system process. }
+
+      var
+        sloc_ptr : slocal_ptr;            { ptr to new syslocal for process }
+        start_ptr : ^int4;                { ptr to start PC in new stack seg }
+        mrbt_base : MRBT_ptr;             { ptr to new process's MRBT }
+
+      begin
+        with pcb_ptr^ do
+          begin
+            priority := priValue;   norm_pri := priority;
+            proctype := sys
+          end;
+
+        sloc_ptr := pointer(sloc_handle.seg_ptr);
+        with sloc_ptr^ do
+          begin
+            with stk_handle do
+              start_ptr := pointer(seg_ptr + seg_size - (MMU_Base (stackmmu+1) -
+                                     env_save_area.a7));
+
+            { set starting address for new system process }
+            start_ptr^ := start_PC;
+
+            mrbt_base := pointer(mrbt_addr - MMU_Base (syslocmmu) + ord(sloc_ptr))
+          end;
+
+        (*{ mark MRBT entry for shared segment as no access so it can be
+          expanded/swapped }
+        with mrbt_base^[shrsegmmu] do
+          begin
+            access := mmuabsent;
+            sdbRP := 0
+          end*)
+      end { ModifyProcess };
+
+
+    begin  { Make_SProcess }
+      (*$IFC debug3 *)
+      if Trace (pm, 90) then writeln ('   Entering Make_SProcess...');
+      (*$ENDC *)
+
+      { set some initial values, etc. }
+      pcb_ptr := nil;
+      stk_handle.seg_refnum := -1;   sloc_handle.seg_refnum := -1;
+
+      sloc_blks_reqd := (Sizeof (syslocal) + (n_fp_blks * mempgsize))
+                          DIV mempgsize + 1;
+      with sloc_handle do
+        begin
+          seg_size := sloc_blks_reqd * mempgsize;
+          if resident then disk_size := 0
+            else disk_size := seg_size
+        end;
+
+      with stk_info do
+        begin
+          max_stksize := ord4(maxpgmmu) * mempgsize;   { can have max stack size }
+          init_dynstk := stk_size;
+          IUdata_size := 0;
+          comm_size := 0;
+          glob_size := 0;
+          stk_delta := Sizeof (init_stack);
+          jt_delta := 0;
+          dpt_size := 0;
+          jt_size := 0
+        end;
+
+      { compute stack segment size needed }
+      with stk_handle, stk_info do
+        begin
+          seg_size := glob_size + comm_size + IUdata_size + init_dynstk;
+          seg_size := seg_size + stk_delta + jt_delta + dpt_size + jt_size;
+          seg_size := (seg_size + mempgsize - 1) DIV mempgsize * mempgsize;
+
+          if resident then disk_size := 0
+            else disk_size := seg_size
+        end;
+
+      sys_pName := '';   { indicates system process }
+      Get_Resources (errnum, pcb_ptr, stk_handle, sloc_handle, sys_pName);
+      if errnum <> 0 then Recover;
+
+      with stk_handle do
+        jt_ptr := pointer(seg_ptr + seg_size);
+      pcb_ptr^.plcbRP := 0;   { no program loaded for system process }
+
+      CreateProcess (pcb_ptr, sloc_handle, stk_handle, stk_info, jt_ptr,
+                     unit_list, start_PC, 0);
+      (*$IFC debug3 *)
+      if Trace (pm, 90) then writeln ('      after CreateProcess');
+      (*$ENDC *)
+
+      ModifyProcess;
+
+      FinishCreate (pcb_ptr, stk_handle, sloc_handle, nil);
+
+      errnum := 0
+    end { Make_SProcess };
+ÿ

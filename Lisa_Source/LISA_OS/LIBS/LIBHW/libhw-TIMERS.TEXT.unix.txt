@@ -1,0 +1,786 @@
+
+;
+;   File TIMERS.TEXT
+;
+;-----------------------------------------------------------------------------
+;
+;   Hardware Interface for the Timers, Clock and Calendar
+;
+;   Written by Rick Meyers
+;   Copyright 1983, Apple Computer Inc.
+;
+;
+;
+;   The routines below provide an assembly language interface to a millisecond
+;   timer with alarms, and the current date and time in three different formats.
+;   Input parameters are passed in registers, output parameters are returned
+;   in registers.  Unless otherwise noted, all registers are preserved.
+;
+;   Routines labeled with a * require supervisor mode.
+;
+;-----------------------------------------------------------------------------
+;   Change Log
+;   <15Aug83>  LAN  Changed MicroSecond Timer to accomodate the increased clock
+;                   speed on the Pepsi I/O board.
+;   <16Aug83>  LAN  Modified MilliSecond Timer to for Pepsi.
+;   <18Aug83>  LAN  Check global PostPepsiIO instead of location $FCC031
+;   <21Oct83>  LAN  In TimeToDate, allow December 31 in a leap year
+;   <31Jan84>  DTO  Change system clock from 10 ms to 20 ms.
+;   <31Jan84>  DTO  Allow 6522 shift register to cause alarm interrupts.
+;
+;
+;-----------------------------------------------------------------------------
+;
+;   The Microsecond Timer
+;
+;   The microsecond timer simulates a continuously running 32-bit counter
+;   which is incremented every microsecond.  The timer is reset to 0 each
+;   time the machine is booted.  The timer changes sign about once every
+;   35 minutes, and rolls over every 70 minutes.
+;
+;   The microsecond timer is designed for performance measurements.  It has
+;   a resolution of 2 microseconds.  Calling MicroTimer from Pascal takes
+;   takes about 135 microseconds.  Note that interrupt processing will have
+;   a major effect on microsecond timings.
+;
+;
+;   Routine:    MicroTimer *
+;   Arguments:    D0 (output)  --  microsecond timer value (long)
+;   Function:   Return the current value of the microsecond timer.
+;
+
+MicroTimer      MOVEM.L D1-D4,-(SP)         ; save registers
+                CLR.L   D3                  ; clear register
+                CLR.L   D4                  ; clear register
+                DISABLE                     ; disable interrupts
+                MOVE.L  MicroTicks,D0       ; microsecond timer
+                MOVE.B  VIA1+T1CH1,D3       ; original high-order counter
+                MOVE.B  VIA1+IFR1,D1        ; interrupt flag register
+                MOVE.B  VIA1+T1CL1,D2       ; low-order counter
+                MOVE.B  VIA1+T1CH1,D4       ; final high-order counter
+
+                CMP.B   #$FF,D3             ; original high-order = $FF ?
+                BNE.S   @0                  ; branch if not $FF
+                CLR.L   D3                  ; change it to 0
+
+@0              CMP.W   D3,D4               ; compare original and final
+                BLT.S   @1                  ; branch if final < original
+                BGT.S   @2                  ; branch if final > original
+                BTST    #6,D1               ; timer interrupt was pending ?
+                BNE.S   @3                  ; branch if interrupt was pending
+                BRA.S   @4                  ; continue
+
+@1              MOVE.B  #0,D2               ; final < original, low <- 0
+                BRA.S   @4                  ; continue
+
+@2              MOVE.B  LCounterInit,D2     ; final > original, ie. rollover       <15Aug83>
+                MOVE.B  HCounterInit,D3     ; low and high <- max                  <15Aug83>
+
+@3              ADD.L   #20000,D0           ; interrupt was pending                      <31Jan84>
+                JSR     Timer0              ; timer pseudo-interrupt
+
+@4              ENABLE                      ; enable interrupts
+                ASL.W   #8,D3               ; high order counter * 256
+                MOVE.B  D2,D3               ;  + low order counter
+                TST.B   PostPepsiIO         ; post-Pepsi I/O board?                      <18Aug83>
+                BEQ.S   @5                  ; branch if this is a pre-Pepsi board        <15Aug83>
+
+                SUB.W   #$637B,D3           ; - counter maximum                          <31Jan84>
+                NEG.W   D3                  ; ticks since last interrupt                 <15Aug83>
+                ASR.W   #1,D3               ; ticks/2                                    <15Aug83>
+                ADD.L   D3,D0               ; add ticks/2                                <15Aug83>
+                ASR.W   #1,D3               ; ticks/4                                    <15Aug83>
+                ADD.L   D3,D0               ; add ticks/4                                <15Aug83>
+                ASR.W   #3,D3               ; ticks/32                                   <15Aug83>
+                ADD.L   D3,D0               ; add ticks/32                               <15Aug83>
+                ASR.W   #3,D3               ; ticks/256                                  <15Aug83>
+                ADD.L   D3,D0               ; microsecond timer !                        <15Aug83>
+                BRA.S   @6                  ; restore registers and return               <15Aug83>
+
+@5              SUB.W   #$27CA,D3           ;  - counter maximum                         <31Jan84>
+                NEG.W   D3                  ; ticks since last interrupt
+                MOVE.W  D3,D2               ; we're currently 1.84% high
+                ASR.W   #6,D2               ; ticks/64
+                SUB.W   D2,D3               ; subtract off 1/64th
+                ASR.W   #2,D2               ; ticks/256
+                SUB.W   D2,D3               ; subtract off 1/256th
+                ADD.L   D3,D0               ; add adjusted ticks twice
+                ADD.L   D3,D0               ; microsecond timer !
+
+@6              MOVEM.L (SP)+,D1-D4         ; restore registers
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   The Millisecond Timer
+;
+;   The millisecond timer simulates a continuously running 32-bit counter
+;   which is incremented every millisecond.  The timer is reset to 0 each
+;   time the machine is booted.  The timer changes sign about once every
+;   25 days, and rolls over every 7 weeks.
+;
+;   The millisecond timer is designed for timing user interactions such
+;   as mouse clicks and repeat keys.  It can also be used for performance
+;   measurements, assuming that millisecond resolution is sufficient.
+;
+;   Twenty independent alarms are associated with the millisecond timer.
+;   These alarms are dynamically assigned to users, associating each alarm
+;   with a user ALARM routine.  Alarms should be returned when no longer
+;   needed.  The alarms have a 20 millisecond resolution.                       <31Jan84>
+;
+;   Once assigned, an alarm can be set to a specific value of the millisecond
+;   timer (absolute setting), or to a specified number of milliseconds in
+;   the future (relative setting).  When the timer reaches the alarm's setting,
+;   the user supplied ALARM routine associated with the alarm is called.
+;   If, when an alarm is set, the alarm setting is 'in the past', the alarm
+;   goes off immediately.  (In this context, 'in the past' means any            <31Jan84>
+;   time in the last 25 days).  Each of the alarms remembers only one setting.
+;   Resetting an alarm causes it to disregard any previous setting.
+;
+;   The user supplied ALARM routines run as interrupt handlers.  Interrupts
+;   at priority levels 1-6 are disabled during their execution.  To guarentee
+;   proper response to interrupts, they should complete their processing within
+;   1-2 milliseconds.  The alarm routines may lower the interrupt priority
+;   level, and need not preserve the registers.
+;
+;
+;   Routine:    Timer *
+;   Arguments:    D0 (output)  --  millisecond timer value (long)
+;   Function:   Return the current value of the millisecond timer.
+;
+
+Timer           MOVE.L  D1,-(SP)            ; save registers
+                MOVE.L  #0,D1               ; clear register
+                DISABLE                     ; disable interrupts
+                MOVE.L  TimerTicks,D0       ; millisecond timer
+                MOVE.B  VIA1+T1CH1,D1       ; T1 counter (high order)
+                BTST    #6,VIA1+IFR1        ; timer interrupt pending ?
+                BEQ.S   @1                  ; branch if not pending
+
+                ADD.L   #20,D0              ; compensate for pending interrupt     <31Jan84>
+                MOVE.B  VIA1+T1CH1,D1       ; re-read T1 counter (high order)
+
+@1              ENABLE                      ; enable interrupts
+                CMP.L   #$63,D1             ; weird value in counter ?             <31Jan84>
+                BLS.S   @2                  ; branch if ok
+                MOVE.L  #0,D1               ; correct to 0
+
+@2              TST.B   PostPepsiIO         ; 0=pre-Pepsi, else=post-Pepsi         <18Aug83>
+                BEQ.S   @3                  ; branch if high bit not set           <16Aug83>
+
+                SUB.L   #100,D1             ; (counter - 100)                      <31Jan84>
+                NEG.L   D1                  ; (100 - counter)                      <31Jan84>
+                ASR.W   #3,D1               ; divide counter by 8                  <16Aug83>
+                ADD.L   D1,D0               ; add counter/8                        <16Aug83>
+                ASR.W   #1,D1               ; divide counter by 16                 <16Aug83>
+                ADD.L   D1,D0               ; add counter/16                       <16Aug83>
+                ASR.W   #2,D1               ; divide counter by 64                 <16Aug83>
+                BRA.S   @4                  ; skip pre-Pepsi calculation           <16Aug83>
+
+@3              SUB.L   #40,D1              ; (counter - 40)                       <31Jan84>
+                NEG.L   D1                  ; (40 - counter)                       <31Jan84>
+                ASR.L   #1,D1               ; low digit of timer
+
+@4              ADD.L   D1,D0               ; millisecond timer
+                MOVE.L  (SP)+,D1            ; restore registers
+                RTS                         ; return
+
+
+;
+;   Routine:    ALARM  (user routine)
+;   Arguments:    none
+;   Function:   User supplied routine which is called when one of the
+;               millisecond timer's alarms goes off.
+;
+;
+;   Routine:    AlarmAssign
+;   Arguments:    D0 (output)  --  alarm number (integer)
+;                 A0 (input)   --  address of ALARM (address)
+;   Function:   Assign an alarm number to the caller.  Associate the user ALARM
+;               routine with this alarm.  An alarm number of 0 indicated that
+;               all alarms are currently allocated.
+;
+
+AlarmAssign     MOVE.L  A1,-(SP)            ; save registers
+                LEA     AlarmEnabled,A1     ; bit 0: 0=free, 1=assigned
+                MOVE.W  #Alarms,D0          ; maximum alarm number
+
+@1              BSET    #0,0(A1,D0.W)       ; currently free ?
+                BEQ.S   @2                  ; branch if currently free
+                DBF     D0,@1               ; try next counter
+                MOVE.W  #0,D0               ; 0 indicates no free alarms
+
+@2              LEA     AlarmRoutine,A1     ; user alarm routine table
+                ASL.W   #2,D0               ; alarm number as long index
+                MOVE.L  A0,0(A1,D0.W)       ; user alarms routine
+                ASR.W   #2,D0               ; alarm number (integer)
+                MOVE.L  (SP)+,A1            ; restore registers
+                RTS                         ; return
+
+
+;
+;   Routine:    AlarmReturn
+;   Arguments:    D0 (input)   --  alarm number (integer)
+;   Function:   Return an alarm.  This alarm may then be assigned to another
+;               user.
+;
+
+
+AlarmReturn     TST.W   D0                  ; alarm number < 0 ?
+                BLT.S   @1                  ; error if alarm number < 0
+                CMP.W   #Alarms,D0          ; alarm number > Alarms ?
+                BGT.S   @1                  ; error if alarm number > Alarms
+
+                MOVE.L  A0,-(SP)            ; save registers
+                LEA     AlarmEnabled,A0     ; bit 0: assigned, bit 1: enabled
+                MOVE.B  #0,0(A0,D0.W)       ; free, disabled
+                MOVE.L  (SP)+,A0            ; restore registers
+@1              RTS                         ; return
+
+
+;
+;   Routine:    AlarmAbsolute
+;   Arguments:    D0 (input)   --  alarm number (integer)
+;                 D1 (input)   --  milliseconds (long)
+;   Function:   Set an alarm.  When the millisecond timer reaches the alarm
+;               setting, the user routine ALARM associated with this alarm
+;               will be called.
+;
+
+AlarmAbsolute   TST.W   D0                  ; alarm number < 0 ?
+                BLT.S   @2                  ; error if alarm number < 0
+                CMP.W   #Alarms,D0          ; alarm number > Alarms ?
+                BGT.S   @2                  ; error if alarm number > Alarms
+
+                MOVEM.L D0-D1/A0,-(SP)      ; save registers
+                LEA     AlarmSetting,A0     ; alarm setting table
+                ASL.W   #2,D0               ; alarm number as long index
+                MOVE.L  D1,0(A0,D0.W)       ; alarm setting (long)
+                LEA     AlarmEnabled,A0     ; alarm enabled table
+                ASR.W   #2,D0               ; alarm number
+                BSET    #1,0(A0,D0.W)       ; bit 1: 0=disabled, 1:enabled
+
+                MOVE.L  AlarmTicks,D0       ; millisecond alarm
+                SUB.L   TimerTicks,D0       ; millisecond alarm - timer
+                SUB.L   TimerTicks,D1       ; new setting - timer
+                CMP.L   D0,D1               ; which will occur sooner ?
+                BGE.S   @1                  ; branch if millisecond alarm sooner
+
+                MOVE.L  TimerTicks,AlarmTicks ; examine alarm tables soon
+
+@1              MOVEM.L (SP)+,D0-D1/A0      ; restore registers
+@2              RTS                         ; return
+
+
+;
+;   Routine:    AlarmRelative
+;   Arguments:    D0 (input)   --  alarm number (integer)
+;                 D1 (input)   --  milliseconds (long)
+;   Function:   Set an alarm to the curret time plus a specified number
+;               of milliseconds.  When the millisecond timer reaches the
+;               alarm setting, the user routine ALARM associated with this
+;               alarm will be called.
+
+AlarmRelative   MOVE.L  D1,-(SP)            ; save registers
+                ADD.L   TimerTicks,D1       ; add current millisecond timer
+                JSR     AlarmAbsolute       ; set the alarm
+                MOVE.L  (SP)+,D1            ; restore registers
+                BGT.S   @2                  ; ok to wait for next timer interrupt?      <31Jan84>
+                MOVE.B  #$84,VIA1+IER1      ; no, cause interrupt immediately           <31Jan84>
+@2              RTS                         ; return                                    <31Jan84>
+
+
+;
+;   Routine:    AlarmOff
+;   Arguments:    D0 (input)   --  alarm number (integer)
+;   Function:   Disable an alarm.
+;
+
+AlarmOff        TST.W   D0                  ; alarm number < 0 ?
+                BLT.S   @1                  ; error if alarm number < 0
+                CMP.W   #Alarms,D0          ; alarm number > Alarms ?
+                BGT.S   @1                  ; error if alarm number > Alarms
+
+                MOVE.L  A0,-(SP)            ; save registers
+                LEA     AlarmEnabled,A0     ; alarm enabled table
+                BCLR    #1,0(A0,D0.W)       ; bit 1: 0=disabled, 1=enabled
+                MOVE.L  (SP)+,A0            ; restore registers
+@1              RTS                         ; return
+
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Date and Time
+;
+;   The current date and time is available as a set of 16-bit integers which
+;   represent the year, day, hour, minute and second.  The date and time
+;   are based on the hardware clock/calendar.  This clock continues to
+;   operate during soft power off, and for brief periods on battery backup
+;   if the machine is unplugged.  Setting the date and time also sets the
+;   clock/calendar and time stamp described below.  Conversions from the
+;   date and time format to the time stamp and clock/calendar formats are
+;   provided.
+;
+;
+;   Routine:    DateTime *
+;   Arguments:    D0 (output)  --  year    1980..1995 (integer)
+;                 D1 (output)  --  day         1..366 (integer)
+;                 D2 (output)  --  hour         0..23 (integer)
+;                 D3 (output)  --  minute       0..60 (integer)
+;                 D4 (output)  --  second       0..60 (integer)
+;   Function:   Return the current data and time.
+;
+
+DateTime        JSR     Clock               ; read hardware clock/claendar
+                JSR     ClockToDate         ; convert to date and time
+                RTS                         ; return
+
+
+;
+;   Routine:    SetDateTime *
+;   Arguments:    D0 (input)   --  year    1980..1995 (integer)
+;                 D1 (input)   --  day         1..366 (integer)
+;                 D2 (input)   --  hour         0..23 (integer)
+;                 D3 (input)   --  minute       0..60 (integer)
+;                 D4 (input)   --  second       0..60 (integer)
+;   Function:   Set the current data and time.
+;
+
+SetDateTime     MOVEM.L D0-D1,-(SP)         ; save registers
+                JSR     DateToClock         ; convert to clock/calendar
+                JSR     SetClock            ; set hardware clock/calendar
+                MOVEM.L (SP)+,D0-D1         ; restore registers
+                RTS                         ; return
+
+
+;
+;   Routine:    DateToTime
+;   Arguments:    D0 (input)   --  year    1901..2030 (integer)
+;                 D1 (input)   --  day         1..366 (integer)
+;                 D2 (input)   --  hour         0..23 (integer)
+;                 D3 (input)   --  minute       0..60 (integer)
+;                 D4 (input)   --  second       0..60 (integer)
+;                 D0 (output)  --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;   Function:   Convert from date and time format to time stamp format.
+;
+;
+;   Algorithm:  ((((((((year-1901)*365)+((year-1901) ASR 2)+(day-1))*24)+
+;                    hour)*60)+minute)*60)+second
+
+
+DateToTime      MOVEM.L D1-D5,-(SP)         ; save registers
+                SUB.W   #1901,D0            ; (year-1901)
+                MOVE.W  D0,D5               ; save (year-1901)
+                MULU    #365,D0             ; (year-1901)*365
+                ASR.W   #2,D5               ; (year-1901) ASR 2
+                ADD.W   D5,D0               ; years*365 + leap years -> days
+                ADD.W   D1,D0               ; add days this year
+                SUB.W   #1,D0               ; January 1st is day 1
+                MULU    #24,D0              ; days*24 -> hours
+                EXT.L   D2                  ; hour (long)
+                ADD.L   D2,D0               ; add hours this day
+                JSR     Times60             ; hours*60 -> minutes
+                EXT.L   D3                  ; minute (long)
+                ADD.L   D3,D0               ; add miuntes this hour
+                JSR     Times60             ; minutes*60 -> seconds
+                EXT.L   D4                  ; second (long)
+                ADD.L   D4,D0               ; time stamp
+                MOVEM.L (SP)+,D1-D5         ; restore registers
+                RTS                         ; return
+
+;   Subroutine Times60 multiplies the long value in D0 by 60.
+;   D1 is used as a temporary register.
+
+Times60         ASL.L   #2,D0               ; *4
+                MOVE.L  D0,D1               ; *4
+                ASL.L   #1,D0               ; *8
+                ADD.L   D1,D0               ; *12
+                MOVE.L  D0,D1               ; *12
+                ASL.L   #2,D0               ; *48
+                ADD.L   D1,D0               ; *60
+                RTS
+
+
+
+;
+;   Routine:    DateToClock
+;   Arguments:    D0 (input)   --  year    1980..1995 (integer)
+;                 D1 (input)   --  day         1..366 (integer)
+;                 D2 (input)   --  hour         0..23 (integer)
+;                 D3 (input)   --  minute       0..60 (integer)
+;                 D4 (input)   --  second       0..60 (integer)
+;                 D0 (output)  --  high order word of clock (integer)
+;                 D1 (output)  --  low order two words of clock (long)
+;   Function:   Convert from date and time format to clock/calendar format.
+;
+;
+
+DateToClock     MOVEM.L D2-D7,-(SP)         ; save registers
+                MOVE.W  #10,D6              ; D6 <- 10
+                MOVE.L  #$000F000F,D7       ; D7 <- 000F 000F
+                SUB.W   #1980,D0            ; year - 1980
+                AND.L   #$0000000F,D0       ; 0000, (year - 1980) mod 16
+
+                EXT.L   D1                  ; day (long)
+                DIVU    D6,D1               ; day mod 10, day div 10
+                MOVE.W  D1,D5               ; day div 10
+
+                EXT.L   D5                  ; day div 10 (long)
+                DIVU    D6,D5               ; (day div 10) mod 10, day div 100
+                AND.L   D7,D5               ; day middle nibble, high nibble
+                LSL.L   #4,D0               ; make room for day high nibble
+                OR.W    D5,D0               ; add day high nibble
+                SWAP    D5                  ; day middle nibble
+                LSL.L   #4,D0               ; make room for day middle nibble
+                OR.W    D5,D0               ; 0000, clock high word
+
+                SWAP    D1                  ; garbage, low day nibble
+
+                EXT.L   D2                  ; hour (long)
+                DIVU    D6,D2               ; hour mod 10, hour div 10
+                AND.L   D7,D2               ; hour low nibble, high nibble
+                LSL.L   #4,D1               ; make room for hour high nibble
+                OR.W    D2,D1               ; add hour high nibble
+                SWAP    D2                  ; hour low nibble
+                LSL.L   #4,D1               ; make room for hour low nibble
+                OR.W    D2,D1               ; add hour low nibble
+
+                EXT.L   D3                  ; minute (long)
+                DIVU    D6,D3               ; minute mod 10, minute div 10
+                AND.L   D7,D3               ; minute low nibble, high nibble
+                LSL.L   #4,D1               ; make room for minute high nibble
+                OR.W    D3,D1               ; add minute high nibble
+                SWAP    D3                  ; minute low nibble
+                LSL.L   #4,D1               ; make room for minute low nibble
+                OR.W    D3,D1               ; add minute low nibble
+
+                EXT.L   D4                  ; second (long)
+                DIVU    D6,D4               ; second mod 10, second div 10
+                AND.L   D7,D4               ; second low nibble, high nibble
+                LSL.L   #4,D1               ; make room for second high nibble
+                OR.W    D4,D1               ; add second high nibble
+                SWAP    D4                  ; second low nibble
+                LSL.L   #4,D1               ; make room for second low nibble
+                OR.W    D4,D1               ; add second low nibble
+
+                LSL.L   #4,D1               ; tenths of seconds <- 0
+                MOVEM.L (SP)+,D2-D7         ; restore registers
+                RTS                         ; return
+
+
+
+
+;-----------------------------------------------------------------------------
+;
+;   Time Stamp
+;
+;   The current date and time is also available as a 32-bit unsigned integer
+;   which represents the number of seconds since the midnight prior to
+;   1 January 1901.  This time stamp will roll over once every 135 years.
+;   Beware -- for dates beyond the mid 1960's the sign bit is set.  The time
+;   stamp is based on the hardware clock/calendar.  This clock continues to
+;   operate during soft power off, and for brief periods on battery backup
+;   if the machine is unplugged.  Setting the time stamp also sets the
+;   date and time and the clock/calendar described below.  Since the clock/
+;   calendar is restricted to 1980-1995, the time stamp is also restricted
+;   to this range.  Conversions from the time stamp format to the date and
+;   time and clock/calendar formats are provided.
+;
+;
+;   Routine:    TimeStamp *
+;   Arguments:    D0 (output)  --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;   Function:   Return the current time stamp.
+;
+
+TimeStamp       MOVE.L  D1,-(SP)            ; save registers
+                JSR     Clock               ; read the hardware clock/calendar
+                JSR     ClockToTime         ; convert to time stamp
+                MOVE.L  (SP)+,D1            ; restore registers
+                RTS                         ; return
+
+
+;
+;   Routine:    SetTimeStamp *
+;   Arguments:    D0 (input)   --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;   Function:   Set the current time stamp.
+;
+
+SetTimeStamp    MOVEM.L D0-D1,-(SP)         ; save registers
+                JSR     TimeToClock         ; convert to clock/calendar format
+                JSR     SetClock            ; set the hardware clock/calendar
+                MOVEM.L (SP)+,D0-D1         ; restore registers
+                RTS                         ; return
+
+;
+;   Routine:    TimeToDate
+;   Arguments:    D0 (input)   --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;                 D0 (output)  --  year    1901..2030 (integer)
+;                 D1 (output)  --  day         1..366 (integer)
+;                 D2 (output)  --  hour         0..23 (integer)
+;                 D3 (output)  --  minute       0..60 (integer)
+;                 D4 (output)  --  second       0..60 (integer)
+;  Function:   Convert from time stamp format to date and time format.
+;
+;  Notes:                  60  --  seconds / minute
+;                       3,600  --  seconds / hour
+;                      86,400  --  seconds / day            128*675
+;                  31,536,000  --  seconds / 365 days       128*675*365
+;                  94,608,000  --  seconds / 3 years        128*675*365*3
+;                 126,230,400  --  seconds / 4 year cycle   128*675*1461
+;
+
+TimeToDate      MOVE.L  D0,D3               ; save seconds since 1901
+                LSR.L   #7,D0               ; seconds since 1901 / 128
+                DIVU    #675,D0             ; seconds / 128, days since 1901
+                SWAP    D0                  ; days since 1901, seconds / 128
+                MOVE.L  D0,D2               ; days since 1901, seconds / 128
+                MOVE.W  #0,D0               ; days since 1901, 0
+                SWAP    D0                  ; days since 1901 (long)
+                DIVU    #1461,D0            ; days, 4 years cycles since 1901
+                MOVE.L  D0,D1               ; days, 4 years cycles since 1901
+                LSL.W   #2,D0               ; years in cycles
+                SWAP    D1                  ; days this cycle
+                EXT.L   D1                  ; days this cycle
+                DIVU    #365,D1             ; days, years this cycle
+                CMPI.W  #4,D1               ; is it 12-31 in a leap year?       <21Oct83>
+                BNE.S   @0                  ; branch if not new years eve       <21Oct83>
+                MOVEQ   #0,D1               ; don't convert to Jan 1 yet        <21Oct83>
+                ADD.L   #$3016D,D1          ; 3 years, 365 days                 <21Oct83>
+@0              ADD.W   D1,D0               ; years since 1901
+                ADD.W   #1901,D0            ; year (integer)
+                SWAP    D1                  ; day (integer)
+                ADD.W   #1,D1               ; January 1st is day 1
+                EXT.L   D2                  ; seconds / 128
+                LSL.L   #7,D2               ; high order seconds
+                AND.L   #$0000007F,D3       ; low order seconds
+                ADD.L   D3,D2               ; seconds this day
+                DIVU    #3600,D2            ; seconds, hour (integer)
+                MOVE.L  D2,D3               ; seconds, hour (integer)
+                SWAP    D3                  ; seconds this hour
+                EXT.L   D3                  ; seconds this hour
+                DIVU    #60,D3              ; seconds, minute (integer)
+                MOVE.L  D3,D4               ; seconds, miunte (integer)
+                SWAP    D4                  ; second (integer)
+                RTS                         ; return
+
+
+;
+;   Routine:    TimeToClock
+;   Arguments:    D0 (input)   --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;                 D0 (output)  --  high order word of clock (integer)
+;                 D1 (output)  --  low order two words of clock (long)
+;   Function:   Convert from time stamp format to clock/calendar format.
+;
+;
+
+TimeToClock     MOVEM.L D2-D4,-(SP)         ; save registers
+                JSR     TimeToDate          ; convert to date and time
+                JSR     DateToClock         ; convert to clock/calendar
+                MOVEM.L (SP)+,D2-D4         ; restore registers
+                RTS                         ; return
+
+
+;-----------------------------------------------------------------------------
+;
+;   Clock and Calendar
+;
+;   The hardware maintains a clock/calendar.  The clock has a resolution of
+;   a tenth of a second, and rolls over every 16 years. The clock continues
+;   to operate during soft power off, and can operate for brief periods on
+;   battery backup if the machine is unplugged.
+;
+;   The clock/calendar is packed into six bytes as follows:
+;
+;       0000yyyy dddddddd  ddddhhhh hhhhmmmm  mmmmssss sssstttt
+;
+;   where y*4 represents the year (1980=0), d*12 the day, h*8 the hour, m*8
+;   minutes, s*8 seconds, and t*4 tenths of seconds.  The year is in binary
+;   format; all other fields are stored in binary coded decimal.
+;
+;   If the clock/calendar hasn't been set since the last loss of battery power,
+;   the bit pattern 0FFF FFFF FFFF will be returned.
+;
+;
+;   Routine:    Clock *
+;   Arguments:    D0 (output)  --  high order word of clock (integer)
+;                 D1 (output)  --  low order two words of clock (long)
+;   Function:   Return the current date and time in clock/calendar format.
+;
+
+
+Clock           MOVE.B  #0,ClockReady       ; 0=not ready, else=ready
+                MOVE.W  #$02,D0             ; 'read clock' command
+                JSR     COPSCMD             ; send command to COPS
+                MOVE.W  #20000,D1           ; time-out counter
+
+@1              DISABLE                     ; disable interrupts
+                BTST    #1,VIA2+IFR2        ; COPS Interrupt pending ?
+                BEQ.S   @2                  ; branch if not pending
+                JSR     COPS                ; (D0) process COPS Interrupt
+
+@2              ENABLE                      ; enable interrupts
+                TST.B   ClockReady          ; spin until date ready
+                BNE.S   @4                  ; branch if ready
+                DBF     D1,@1               ; loop until time-out
+
+                MOVE.L  #4545,D0            ; wavelength for A below middle C
+                MOVE.L  #200,D1             ; duration of 200 milliseconds
+                JSR     Beep                ; beep, then use old clock value
+
+@4              MOVE.L  #0,D0               ; clear register
+                MOVE.W  ClockHigh,D0        ; high order word of clock
+                MOVE.L  ClockLow,D1         ; low order two words of clock
+                RTS                         ; return
+
+
+
+;
+;   Routine:    SetClock *
+;   Arguments:    D0 (input)   --  high order word of clock (integer)
+;                 D1 (input)   --  low order two words of clock (long)
+;   Function:   Set the hardware clock/calendar.
+;
+
+SetClock        MOVEM.L D0-D5,-(SP)         ; save registers
+                MOVE.L  COPSCounter,D5      ; COPS transaction counter
+                MOVE.W  D0,D2               ; save clock high order word
+                AND.L   #$00000FFF,D2       ; set alarm field to zero
+                MOVE.W  #$2C,D0             ; disable clock/timer, set clock
+                JSR     COPSCMD             ; send command to COPS
+
+                MOVEQ   #2-1,D4             ; outer loop - 2 iterations
+
+@1              MOVEQ   #8-1,D3             ; inner loop - 8 iterations
+
+@2              ROL.L   #4,D2               ; shift next nibble to low bits
+                MOVE.W  D2,D0               ; low nibble and garbage
+                AND.W   #$000F,D0           ; next nibble of clock data
+                OR.W    #$0010,D0           ; 'write to clock' command
+                JSR     COPSCMD             ; send command to COPS
+                DBF     D3,@2               ; loop 8 times
+
+                MOVE.L  D1,D2               ; low order two words
+                DBF     D4,@1               ; loop twice
+
+                MOVE.W  #$25,D0             ; enable clock, disable timer
+                JSR     COPSCMD             ; send command to COPS
+                CMP.L   COPSCounter,D5      ; interrupted ?
+                MOVEM.L (SP)+,D0-D5         ; restore registers
+                BNE.S   SetClock            ; branch if interrupted
+
+                ADD.L   #1,COPSCounter      ; COPS transaction counter
+                RTS                         ; return
+
+
+;
+;   Routine:    ClockToDate
+;   Arguments:    D0 (input)   --  high order word of clock (integer)
+;                 D1 (input)   --  low order two words of clock (long)
+;                 D0 (output)  --  year    1980..1995 (integer)
+;                 D1 (output)  --  day         1..366 (integer)
+;                 D2 (output)  --  hour         0..23 (integer)
+;                 D3 (output)  --  minute       0..60 (integer)
+;                 D4 (output)  --  second       0..60 (integer)
+;   Function:   Convert from clock/calendar format to date and time format.
+;
+
+ClockToDate     CMP.W   #$0FFF,D0           ; clock initialized ?
+                BNE.S   @1                  ; branch if initialized
+
+                MOVE.W  #1980,D0            ; year   <- 1980
+                MOVE.W  #1,D1               ; day    <- 1
+                MOVE.W  #0,D2               ; hour   <- 0
+                MOVE.W  #0,D3               ; minute <- 0
+                MOVE.W  #0,D4               ; second <- 0
+                RTS                         ; return
+
+@1              MOVEM.L D5-D7,-(SP)         ; save registers
+                MOVE.W  D0,D5               ; high order clock (word)
+                MOVE.L  D1,-(SP)            ; low order clock (long)
+                MOVE.W  #10,D6              ; D6 <- 10
+                MOVE.L  #$0000000F,D7       ; D7 <- 0000 000F
+
+                ROL.W   #8,D0               ; garbage and year since 1980
+                AND.L   D7,D0               ; year since 1980
+                ADD.W   #1980,D0            ; year (integer)
+
+                ROL.B   #4,D5               ; day middle, day high nibbles
+                MOVE.W  D5,D1               ; garbage and day high nibble
+                AND.L   D7,D1               ; day high nibble
+                MULU    D6,D1               ; (day high)*10
+                ROL.B   #4,D5               ; day high, day middle nibbles
+                AND.W   D7,D5               ; day middle nibble
+                ADD.L   D5,D1               ; (day high)*10 + day middle
+                MULU    D6,D1               ; ((day high)*10) + middle)*10
+                MOVE.L  (SP)+,D5            ; low order clock (long)
+                ROL.L   #4,D5               ; day low nibble in place
+                MOVE.W  D5,D4               ; garbage and day low nibble
+                AND.W   D7,D4               ; day low nibble
+                ADD.W   D4,D1               ; day (integer)
+
+                ROL.L   #4,D5               ; hour high nibble in place
+                MOVE.W  D5,D2               ; garbage and hour high nibble
+                AND.L   D7,D2               ; hour high nibble
+                MULU    D6,D2               ; (hour high)*10
+                ROL.L   #4,D5               ; hour low nibble in place
+                MOVE.W  D5,D4               ; garbage and hour low nibble
+                AND.W   D7,D4               ; hour low nibble
+                ADD.W   D4,D2               ; hour (integer)
+
+                ROL.L   #4,D5               ; minute high nibble in place
+                MOVE.W  D5,D3               ; garbage and minute high nibble
+                AND.L   D7,D3               ; minute high nibble
+                MULU    D6,D3               ; (minute high)*10
+                ROL.L   #4,D5               ; minute low nibble in place
+                MOVE.W  D5,D4               ; garbage and minute low nibble
+                AND.W   D7,D4               ; minute low nibble
+                ADD.W   D4,D3               ; minute (integer)
+
+                ROL.L   #4,D5               ; second high nibble in place
+                MOVE.W  D5,D4               ; garbage and second high nibble
+                AND.L   D7,D4               ; second high nibble
+                MULU    D6,D4               ; (second high)*10
+                ROL.L   #4,D5               ; second low nibble in place
+                MOVE.W  D5,D6               ; garbage and second low nibble
+                AND.W   D7,D6               ; second low nibble
+                ADD.W   D6,D4               ; second (integer)
+
+                CMP.W   #59,D4              ; second = 59 ?
+                BEQ.S   @2                  ; branch if second = 59
+
+                ROL.L   #4,D5               ; tenths nibble in place
+                AND.W   D7,D5               ; tenths nibble
+                CMP.W   #5,D5               ; tenths < 5 ?
+                BLT.S   @2                  ; branch if tenths < 5
+                ADD.W   #1,D4               ; round seconds up
+
+@2              MOVEM.L (SP)+,D5-D7         ; restore registers
+                RTS                         ; return
+
+
+;
+;   Routine:    ClockToTime
+;   Arguments:    D0 (input)   --  high order word of clock (integer)
+;                 D1 (input)   --  low order two words of clock (long)
+;                 D0 (output)  --  number of seconds since midnight prior to
+;                                    1 January 1901 (unsigned long)
+;   Function:   Convert from clock/calendar format to time stamp format.
+;
+
+ClockToTime     MOVEM.L D1-D4,-(SP)         ; save registers
+                JSR     ClockToDate         ; convert to date and time
+                JSR     DateToTime          ; convert to time stamp
+                MOVEM.L (SP)+,D1-D4         ; restore registers
+                RTS                         ; return
+
+
+
+ÿ

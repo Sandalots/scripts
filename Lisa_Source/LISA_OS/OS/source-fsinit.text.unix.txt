@@ -1,0 +1,1389 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT initialize;
+
+INTERFACE
+
+  USES
+
+    {$U object/driverdefs.obj }       driverdefs,
+    {$U object/hwint.obj      }       hwint,
+    {$U object/sysglobal.obj  }       globalda,
+    {$U object/procprims.obj  }       proc_prims,
+    {$U object/sched.obj      }       sched,
+    {$U object/mmprim.obj     }       mmprimitives,
+    {$U object/asynctr.obj    }       asynctr,
+    {$U object/genio.obj      }       genio,
+    {$U object/twiggy.obj     }       twiggy,
+    {$U object/vmstuff.obj    }       vmstuff,
+    {$U object/sfileio.obj    }       sfileio,
+    {$U object/fsdir.obj      }       fs_directory,
+    {$U object/fsprim.obj     }       fs_primitives,
+    {$U object/objio.obj      }       objio,
+    {$U object/mm0.obj        }       memorymanager,
+    {$U object/ds0.obj        }       datasegs,
+    {$U object/fsui.obj       }       fs_interface,
+    {$U object/clock.obj      }       clock,
+    {$U object/exceprim.obj   }       exceprim,
+    {$U object/eventchn.obj   }       eventchn,
+    {$U object/timemgr.obj    }       timemgr,
+    {$IFC DEBUG2}
+      {$U object/volcheck.obj }       volcheck,
+    {$ENDC}
+    {$U object/scavenger.obj  }       scavnger;
+
+
+
+
+type
+     xfer_op = (pswRead, pswWrite);
+
+     ut_commands = (no_op,
+                    initvol,
+                    zap,
+                    dumpdata,
+                    setfstrace,
+                    fsscavenge,
+                    writeBT,
+                    format,
+                    verify,
+                    eject,
+                    flushbuffers,
+                    boot_unmount,
+                    boot_remount,
+                    copy_volume,
+                    mount_BD,
+                    xfer_passwd,
+                    gp );
+
+
+     ut_parmt = record
+                  gp_parm : longint;
+                  case command : ut_commands of
+
+                    no_op,
+                    flushbuffers,
+                    boot_remount : (                           );
+
+                    initvol      : (idev_name : e_name;
+                                    pages : longint;
+                                    newvolname : e_name;
+                                    newpassword : e_name;
+                                    max_sfiles : integer       );
+
+                    zap,
+                    writeBT,
+                    format,
+                    verify,
+                    eject        : (dev_name : e_name          );
+
+                    dumpdata     : (ddev_name : e_name;
+                                    pagenum : longint          );
+
+                    setfstrace,
+                    boot_unmount : (level : integer            );
+
+                    fsscavenge   : (sdev_name : e_name;
+                                    soptions : ScvOptions      );
+
+
+                    copy_volume  : (from_dev : e_name;
+                                    to_dev   : e_name;
+                                    buffaddr : longint;
+                                    buffsize : longint         );
+
+                    mount_BD     : (mon_unitnum : integer;
+                                    twig_unitnum : integer     ); (*
+                                     = UPPER *)
+                                                                  (* 2 = LOWER *)
+                    xfer_passwd  : (path     : pathname;
+                                    password : e_name;
+                                    op       : xfer_op );
+
+                    gp           : (funct : integer;
+                                    parm1 : longint;
+                                    parm2 : longint;
+                                    parm_array : array[0..15] of longint )
+
+                  end;
+
+(* Shutdown modes available through FS_SHUTDOWN *)
+ sm_type = (restart_shell, reset_machine, kill_power, do_return);
+
+
+
+
+
+
+function INITVERSION : integer;
+
+procedure FS_Master_Init ( var ecode : error );
+
+procedure  FS_Emergency;
+
+procedure FS_Shutdown ( var ecode     : error;
+                        shutdown_mode : sm_type );
+
+procedure FS_Utilities ( var ecode : error;
+                         var parms : Ut_Parmt );
+
+procedure FS_Setup ( sl_ptr : slocal_ptr );
+
+procedure FS_Cleanup;
+
+procedure PWBT ( var errnum : integer;
+                   srcfname : pathname;
+                 boot_drive : integer);
+
+
+IMPLEMENTATION
+
+(*$S fs4 *)   (* file system initialization segment *)
+(*$IFC NOT DEBUG2*)
+(*$R-*)
+(*$ENDC*)
+
+
+
+
+const vercode = 11;    (* version of this unit *)
+
+      (* Error codes *)
+      E_INIT_FS_MOUNT  = 1170;
+      E_NAME_INVALID   = 1171;
+      E1_BITMAP_NOSPACE = 1172;
+      E_INIT_DEF_MOUNT = 1169;
+      E_BOOT_READ      = 1197;
+      W_TEMP_UNMOUNT   = -1060;
+      E_BOOT_DEV_BAD   = 897;
+      E_DEV_RANGE      = 1168;
+      E_NOT_BLOCK_DEV  = 1167;
+      E_BUF_TOO_SMALL  = 1158;
+      E_VOL_TOO_SMALL = 1160;
+      pwr_already_off = 1162;
+      E_FUNCTION = 1163;
+      E_NOT_TWIGGY = 1164;
+      E_NO_DEV_MOUNTED = 1165;
+      E_DEV_MOUNTED = 1166;
+      E_FS_VERSION     = 866;
+      E_BOOT_NOT_MOUNT = 1136;
+      E_BOOT_MOUNT     = 1137;
+      E_PRIORITY       = 1138;
+      E2_BOOT_MOUNT    = 1141;
+      E_VOL_MOUNTED    = 1142;
+      E_MDDF_NOSPACE   = 1143;
+      E_BT_REMOUNT   = 1144;
+      E2_BITMAP_NOSPACE = 1145;
+      W_FORMAT = -684;
+
+
+
+
+
+
+(*$S fs3 *)
+function INITVERSION;
+begin
+  initversion := vercode;
+end;
+
+
+
+
+
+
+
+
+
+
+(*$S fs3 *)
+procedure pdev_control (var ecode : error; devnum : integer; ccode : integer);
+
+var p : params;
+
+begin
+  with p do
+  begin
+    fnctn_code := ccode;
+    (*$IFC NOT OS15*)
+    dvindex := devnum;
+    (*$ENDC*)
+  end;
+  drivercall (ecode, devnum, @p);
+end;  (* of procedure pdev_control *)
+
+
+
+
+
+
+(*$S fs4 *)
+procedure GET_BT_FILE(device: integer; var itsname : pathname);
+  (****************)
+  (*
+  (*  Description:
+  (*    Convert a device index (into configinfo) into the name of the
+  (*    boot tracks program, if any, for that device.
+  (*
+  (****************)
+var
+   ptr:^drvrec;
+begin
+  itsname := '-#BOOT-SYSTEM.BT_';
+  with configinfo[device]^ do
+     begin
+        ptr := pointer(drvrec_ptr);
+        if (ptr <> nil)
+           then itsname := CONCAT(itsname, ptr^.drvname)  {CD device}
+        else if (devname = '#14#1') or (devname = '#14#2')
+           then itsname := CONCAT(itsname, 'TWIG');
+     end; {of with}
+end; {of get_bt_file}
+
+
+
+
+
+(*$S fs4 *)
+procedure NEWVOLUME (var ecode  : error;
+                        device  : integer;
+                     pagecount  : longint;
+                     sfilecount : integer;
+              var vname, pword  : e_name);
+
+
+label 1;
+
+const
+      MEMPAGES    = 256; (* size of mem-resident data seg    *)
+      FREE_SNUM   = 0;   (* sfile # on a free page               *)
+      MDDF_SNUM   = 1;   (* sfile # of the MDDF prim sfile       *)
+      BMAP_SNUM   = 2;   (* sfile # of the alloc map prim sfile  *)
+      SLIST_SNUM  = 3;   (* sfile # of the sfile list prim sfile *)
+      MDDF_HOME   = 0;   (* page where MDDF begins *)
+      BMAP_HOME   = 1;   (* page where volume alloc map begins *)
+      MDDF_PAGES  = 1;   (* number of pages composing the MDDF *)
+      LPAGES      = 1;   (* number of pages in a file leader *)
+      HINT_OFFSET = 0;   (* offset of hint entry in the leader *)
+      HINT_PAGES  = 1;   (* pages dedicated to hint entry in the leader *)
+      FMAP_OFFSET = 0;   (* offset of file map in the leader *)
+      SMAP_OFFSET = 128; (* byte offset of small filemap in leader page *)
+      MIN_VOLSIZE = 280; (* minimum volume size allowed *)
+      MDDF_BACKUP = 270; (* MDDF backup location *)
+      DEFVERSION  = 0;   (* initial version for s-files *)
+      DEFVOLUME   = 0;   (* initial volume number *)
+
+      DEFCLUSTERSIZE = 1;   (* default size of page clusters *)
+      DELTA_SFILES   = 20;  (* extra slots allotted in the s-list *)
+      SREDUCE        = 16;  (* reduction factor applied to s-file list length *)
+
+var i, tempo, maxscount, sentpp, spagestart, spages, pgdatasize : integer;
+    bitmbytes, bitmstart, fpagestart, wsize : integer;
+    bitmpages, cat_pages : longint;
+    dsrefnum, ldsn, rootchunk : integer;
+    actual, tempp, pagenum, lastfspage, vblockcount, ublockcount, fpages : longint;
+    memsize, segptr, diskpage, ebcount, cat_bytes : longint;
+    tempecode : error;
+    page : pagetype;
+    MDDF : MDDFdb;
+    mapptr : bitmapptr;
+   {emptychunk : array [1..rootchunk] of centry;}
+    mapaddr, tempaddr : absptr;
+    segname : pathname;
+    btname: pathname;
+    liptr : ^longint;
+    plrec : plrect;
+    plrecp : plrecpt;
+    please_close_ds : boolean;
+    null_buf : array[0..defpgdatasize] of byte;
+    p_extconfig: ^ext_diskconfig;
+    junk : longint;
+    bitmExtra : integer;
+    nullName : e_name;
+    NewRec : ObjRec;
+    CatSentry : s_entry;
+
+
+
+
+procedure clearmap;
+var i : longint;
+begin
+  (*$R-*)
+  for i := 0 to lastfspage do
+  begin
+    mapptr^ [i] := false;
+  end;
+(*$IFC DEBUG2*)
+  (*$R+*)
+(*$ENDC*)
+end;
+
+
+
+
+procedure make_psfile (var ecode : error;
+                       sfnum, startpage, size, ldataused : integer;
+                       freelist : boolean);
+var pagenum, finish : integer;
+    actual : longint;
+
+begin      (* make privileged s-file *)
+  ecode := 0;
+  pagenum := startpage;
+  finish := startpage + size - 1;
+  with page.labl do
+  begin
+    fileid := sfnum;
+    bkwdlink := redlight;
+    relpage:=0;
+    if freelist then   (* special initialization for free pages *)
+    begin
+      fwdlink := redlight;
+      dataused := 0;
+    end
+    else dataused := pgdatasize;
+    repeat
+      if not freelist then
+      begin
+        if pagenum > startpage then bkwdlink := pagenum - 1;
+        if pagenum < finish then
+        begin
+          fwdlink := pagenum + 1;
+        end
+        else
+        begin
+          fwdlink := redlight;
+          dataused := ldataused;
+        end;
+      end;
+      abspage := pagenum;
+      {
+          (* write the initialized page to disk, but not if a page label page *)
+      if (pagenum < mounttable [device]^.MDDFdata^.pl_basepage) or
+         (pagenum >= mounttable [device]^.MDDFdata^.pl_basepage +
+          mounttable [device]^.MDDFdata^.pl_pages) then
+      }
+
+      (* using default initialized MDDF *)
+      with mounttable[device]^.MDDFdata^ do
+        lisaio(ecode, device, ord(@page), pagenum+geography.firstblock, 1,
+               actual, RAW_IO, NIL, WRITEOP);
+      if ecode > 0 then   (* I/O error writing initial pages to device *)
+      begin
+        def_unmount (tempecode, device);
+        Rel_MRData(tempecode, mapaddr);
+        goto 1;
+      end;
+
+      {
+      pglblio (page.labl, device, pagenum, writeop, ecode); (* write pagelabel *)
+
+      if ecode > 0 then
+      begin
+        def_unmount (tempecode, device);
+        Rel_MRData(tempecode, mapaddr);
+        goto 1;
+      end;
+      }
+      if not freelist then relpage := relpage + 1;
+      pagenum := pagenum + 1;
+    until (pagenum > finish);
+  end;  (* of with page do *)
+end;   (* of procedure make_psfile *)
+
+
+
+
+
+(* assumes this procedure is called only for blockstructured devices! *)
+
+
+
+begin
+
+  ecode := 0;                            (* assume no errors to start with *)
+  please_close_ds := false;              (* dataseg not opened yet *)
+  i := pos ('-',vname);
+  if i <> 0 then
+  begin                                  (*  '-' not allowed in volume name. *)
+    ecode := E_NAME_INVALID;
+    goto 1;
+  end;
+
+  (*$IFC OS15*)
+  if configinfo[device]^.devt <> non_io then UP(ecode,configinfo[device],nil);
+  if ecode > 0 then goto 1;
+  p_extconfig:=pointer(configinfo [device]^.ext_addr);
+  vblockcount := p_extconfig^.num_bloks;  (* configured device size *)
+  (*$ELSEC*)
+  vblockcount := configinfo [device]^.num_bloks;  (* configured device size *)
+  (*$ENDC*)
+  ublockcount := pagecount;                       (* users requested device size *)
+  if ublockcount = 0 then ublockcount := vblockcount;  (* use whole vol *)
+  if (ublockcount < MIN_VOLSIZE) then ublockcount := MIN_VOLSIZE;   (* min volume size *)
+  if (ublockcount < vblockcount) then (* user over-ride? *)
+  begin
+    vblockcount := ublockcount;
+  end;
+
+  (*$IFC OS15*)
+  lastfspage := (vblockcount-p_extconfig^.fs_strt_blok) - 1;
+  (*$ELSEC*)
+  lastfspage := (vblockcount-configinfo [device]^.fs_strt_blok) - 1;
+  (*$ENDC*)
+
+(*$IFC DEBUG2*)
+  if trace (FS, 99) then writeln ('NEWVOLUME:  initializing ',lastfspage+1,' pages.');
+(*$ENDC*)
+
+
+  segname := 'dummy';                         (* mem-resident data seg *)
+  memsize := ord4 (MEMPAGES) * mempgsize;
+  ldsn := 0;
+  segptr := badptr1;
+
+  make_dataseg (ecode, segname, memsize, 0, (* no disk space *)
+                          dsrefnum, segptr, ldsn, ds_private);
+  if ecode > 0 then goto 1;
+
+  please_close_ds := true;              (* now it's open! *)
+
+  tempp := segptr;
+  tempo := 32767 (* ugh! systems programming style! *);
+     (* only 32K longints at a time, though! *)
+
+  for i := 0 to tempo do
+  begin
+    liptr := pointer (tempp);
+    liptr^ := 0;
+    tempp := tempp + sizeof (longint);
+  end;
+
+     (* format, clear headers/data, set up bad block maps, etc. in drivers *)
+
+  pdev_control(ecode, device, dskformat);
+  if ecode > 0 then goto 1;
+  if ecode = W_FORMAT then
+  begin
+    (* Write every block on a disk that doesn't support formatting *)
+    plrecp := @plrec;
+    with plrecp^ do with plabel do    (* set up initial page label contents *)
+    begin
+      volume := DEFVOLUME;
+      datastat := dataok;
+      version := DEFVERSION;
+      fileid := FREE_SNUM;
+      dataused := 0;
+      abspage := 0;
+      relpage := 0;
+      fwdlink := redlight;   (* driver should determine this actual value *)
+      bkwdlink := redlight;
+      lflink := redlight;
+      ldataused := 0;
+    end;
+
+    diskpage := 0;
+    fpages := vblockcount;
+    i := MEMPAGES;
+    repeat
+      if i > fpages then i := fpages;
+      lisaio (ecode, device, segptr, diskpage, i, actual,
+                                                  with_header, plrecp, writeop);
+      diskpage := diskpage + actual;
+      fpages := fpages - actual;
+      if ecode  > 0 then goto 1;
+    until (fpages = 0);
+
+  end;    (* of formatting/zeroing device *)
+
+
+  bitmbytes := ((lastfspage+1)+7) div 8;   (* size of bitmap in bytes *)
+  mapptr := pointer(badptr1);
+  Make_MRData(ecode, bitmbytes, mapaddr);
+  if ecode > 0 then
+  begin
+    ecode := E1_BITMAP_NOSPACE;   (* no space for bitmap in sysglobal *)
+    goto 1;
+  end;
+
+  mapptr := pointer(mapaddr);
+  def_mount (ecode, device);    (* attempt default temp mount of volume on unit *)
+  if ecode <> 0 then
+  begin
+    ecode := E_INIT_DEF_MOUNT;
+    Rel_MRData(tempecode, mapaddr);
+    goto 1;
+  end;
+
+  with page do    (* initialize page label invariants *)
+  begin
+    labl.version:= DEFVERSION;
+    labl.volume := DEFVOLUME;
+    labl.datastat := dataok;
+    {pagenum determines labl.fileid};
+    {labl.dataused:=0;}
+    {labl.abspage  := pagenum};
+    {labl.relpage:=0;}
+    {pagenum determines labl.fwdlink};
+    {pagenum determines labl.bkwdlink};
+  end;
+
+  pgdatasize := defblocksize - sizeof (pagelabel); (* data bytes per page *)
+
+  for i := 0 to pgdatasize-1 do page.data [i] := 0;(* clear the page data *)
+
+  (* calculate primitive s-file addresses and sizes *)
+
+  bitmstart := BMAP_HOME;      (* page where bit map starts, assumes MDDF is one page *)
+{$IFC BLK512}
+  Pg(bitmbytes+(DEFPGDATASIZE-1), bitmpages);
+{$ELSEC}
+  bitmpages := (bitmbytes+pgdatasize-1) div pgdatasize; (* data pages for bitmap *)
+{$ENDC}
+  spagestart := bitmstart + bitmpages;
+  sentpp := pgdatasize div sizeof (s_entry); (* s_entries per data block *)
+
+  (* compute the s-list size *)
+
+  tempp := (lastfspage + 1) div LPAGES;  (* the ceiling on s-list size *)
+  maxscount := (tempp div SREDUCE) + DELTA_SFILES;  (* the actual default s-list size *)
+  if (sfilecount > 0) and (sfilecount <= tempp) then
+       maxscount := sfilecount + DELTA_SFILES;  (* use user-supplied size *)
+
+  (* now round the chosen size up to a full page *)
+  maxscount := ((maxscount + sentpp) div sentpp) * sentpp;
+  spages := (maxscount div sentpp) + 1; (* number of pages it takes for max s-files *)
+  fpagestart := spagestart + spages;
+  fpages := lastfspage - fpagestart + 1;
+
+   (* set up latest defaults during init *)
+
+  with mounttable [device]^.MDDFdata^ do
+  begin
+    (*$IFC OS15*)
+    {geography.firstblock := p_extconfig^.fs_strt_blok;}
+    geography.lastblock := p_extconfig^.fs_strt_blok + lastfspage;
+                                               (* adjusted vblockcount - 1 *)
+    (*$ELSEC*)
+    {geography.firstblock := configinfo [device]^.fs_strt_blok;}
+    geography.lastblock := configinfo [device]^.fs_strt_blok + lastfspage;
+                                               (* adjusted vblockcount - 1 *)
+    (*$ENDC*)
+    geography.lastfspage := lastfspage;
+    blockcount := geography.lastblock + 1; (* total number of blocks, fs or not *)
+    {blocksize := defblocksize;   (* bytes in a block, includes header and data  *)}
+    datasize := pgdatasize;    (* bytes of data in a block, not including header *)
+  end;
+
+
+     (* create the MDDF primitive sfile page label *)
+     (* sfile 1 page 0 size 1 *)
+
+  make_psfile (ecode, MDDF_SNUM, MDDF_HOME, MDDF_PAGES, sizeof (MDDFdb), false);
+  make_psfile (ecode, MDDF_SNUM, MDDF_BACKUP, MDDF_PAGES, sizeof (MDDFdb), false);
+
+     (* create the bit map primitive sfile page label(s) (sfile 2) *)
+{$IFC BLK512}
+  PgOffset(bitmbytes, junk, bitmExtra);
+{$ELSEC}
+  bitmExtra := bitmbytes mod pgdatasize;
+{$ENDC}
+  make_psfile (ecode, BMAP_SNUM, bitmstart, bitmpages, bitmExtra, false);
+
+     (* create the slist primitive sfile page label(s) (sfile 3) *)
+
+  make_psfile (ecode, SLIST_SNUM, spagestart, spages, 0, false);
+
+
+
+  with MDDF do (* create and store initial MDDF for system *)
+  begin
+    fsversion := cur_version;
+    getid (volid);   (* get a unique id *)
+    volnum := DEFVOLUME;
+    volname := vname;
+    password := pword;
+    init_machine_id := serial_no;   (* serial number of this machine *)
+    master_machine_id := 0;         (* until theft protection *)
+    dt_created := timestamp; (* time of initialization *)
+    zero_time (DT_copy_created);
+    zero_time (DT_copied);
+    zero_time (DT_scavenged);
+    copy_thread := 0;
+    (*$IFC OS15*)
+    geography.firstblock := p_extconfig^.fs_strt_blok;
+    geography.lastblock := p_extconfig^.fs_strt_blok + lastfspage;
+                                               (* adjusted vblockcount - 1 *)
+    (*$ELSEC*)
+    geography.firstblock := configinfo [device]^.fs_strt_blok;
+    geography.lastblock := configinfo [device]^.fs_strt_blok + lastfspage;
+                                               (* adjusted vblockcount - 1 *)
+    (*$ENDC*)
+    geography.lastfspage := lastfspage;
+    blockcount := geography.lastblock + 1; (* total number of blocks, fs or not *)
+    blocksize := defblocksize;   (* bytes in a block, includes header and data  *)
+    datasize := pgdatasize;  (* bytes of data in a block, not including header *)
+    cluster_size := DEFCLUSTERSIZE;       (* number of data blocks in a cluster for this disk *)
+    MDDFaddr := MDDF_HOME;            (* where to find MDDF system file on this device *)
+    MDDFsize := sizeof (MDDF);        (* byte size of MDDF system file *)
+    bitmap_addr := BMAP_HOME;         (* where to find bit map system file *)
+    bitmap_size := lastfspage + 1;    (* one bit per page *)
+    bitmap_bytes := bitmbytes;        (* byte size of the allocation bit map *)
+                                      (* note: not all may be needed or used *)
+    bitmap_pages := bitmpages;        (* data pages for bitmap *)
+    slist_addr := spagestart;         (* where to find s_entry system file *)
+                                      (* (list of s-files) *)
+    slist_packing := sentpp;          (* s_entries per data block *)
+    slist_block_count := spages;   (* number of contiguous blocks for slist file *)
+    first_file := firstfile;          (* first allocatable s-file *)
+    rootsnum := TREE_ID;
+    empty_file := firstfile;     (* initially, first empty slot in slist, too *)
+    maxfiles := maxscount - 1;        (* fnum of last usable file slot *)
+    hintsize := LPAGES;  (* number of pages allocated for leader for each s-file *)
+    leader_offset := HINT_OFFSET;  (* page offset in hints of file leader *)
+    leader_pages := HINT_PAGES;    (* number of pages in the leader *)
+    flabel_offset := pgdatasize - max_label_size;(* byte offset in first hint page of file label *)
+    unusedi1 := 0;                (* reserved for future use *)
+    map_offset := FMAP_OFFSET;    (* page offset in hints of file map *)
+    map_size := maxmapindex + 1;  (* number of file map entries per page of the map *)
+    filecount := firstfile - 1;   (* MDDF, bitmap, and s-file list files allocated *)
+    unusedl1 := 0;                (* spare field *)
+    freestart := fpagestart;      (* start of free list of pages *)
+    freecount := fpages;          (* number of free pages in the list *)
+    rootmaxentries := maxfiles;   (* max catalog entries in root *)
+    mountinfo := unmounted;
+    overmount_stamp.a := 0;
+    overmount_stamp.b := 0;
+    pmem_id := serial_no;         (* machine ID for this copy of param mem *)
+    pmem := param_mem;            (* current parameter memory *)
+    vol_scavenged := false;       (* volume modified by scavenger *)
+    tbt_copied := false;          (* volume not copied *)
+
+    backup_volid.a := 0;   (* volume that this volume backs-up *)
+    backup_volid.b := 0;
+    result_scavenge := 0;  (* result field set by scavenger *)
+    smallmap_offset := SMAP_OFFSET;  (* byte offset of small map in hint page *)
+    hentry_offset := 0;    (* byte offset of hentry in first page of hints *)
+    boot_code := 0;        (* reserved for future use *)
+    boot_environ := 0;     (* reserved for future use *)
+    flabel_size := max_label_size;  (* size of user-defined file label *)
+
+    (*
+     *  Calculate file system overhead for this volume (in pages).  Overhead
+     *  is considered to be the space occupied by the MDDF, allocation map,
+     *  S-list, and volume catalog file.
+     *)
+    cat_bytes := ord4 (rootmaxentries) * sizeof (centry);
+{$IFC BLK512}
+    Pg(hintsize+(ord4(cat_bytes + (DEFPGDATASIZE-1))), cat_pages);
+{$ELSEC}
+    cat_pages := hintsize + (ord4(cat_bytes + pgdatasize - 1) div pgdatasize);
+{$ENDC}
+    fs_overhead := MDDF_PAGES + bitmap_pages + slist_block_count + cat_pages;
+
+    oem_id := 0;
+    root_page := -1;
+    tree_depth := 0;
+    node_id := ROOT_NID;
+    vol_seq_no := 0;
+    vol_mounted := FALSE;
+  end;
+
+  (* write the MDDF *)
+  with mounttable[device]^ do
+  begin
+    with MDDFdata^ do
+    begin
+      MDDFaddr := MDDF_BACKUP;
+      MDDF_io(ecode, device, ord(@MDDF), writeop);
+      MDDFaddr := MDDF_HOME;
+      MDDF_io(ecode, device, ord(@MDDF), writeop);
+      if ecode > 0 then   (* I/O error writing initial pages to device *)
+      begin
+        def_unmount(tempecode, device);
+        Rel_MRData(tempecode, mapaddr);
+        goto 1;
+      end;
+    end;
+    MDDFdata^ := MDDF;  (* update the in-core MDDF *)
+  end;
+
+  (* create an initial bit map and write into bit map file *)
+
+  clearmap;        (* initialize a bit map *)
+
+  (* mark MDDF, bitmap, s-list allocated *)
+    (*$R-*)
+  for i := 0 to fpagestart-1 do
+                        mapptr^ [i] := true;
+  mapptr^[MDDF_BACKUP] := true;
+    (*$IFC DEBUG2*)
+    (*$R+*)
+    (*$ENDC*)
+
+
+  (* write out the initialized bitmap using real MDDF *)
+  bitmap_io(ecode, device, writeop, mapaddr);
+
+  Rel_MRData(tempecode, mapaddr);
+  def_unmount (ecode, device);     (* unmount the initialized volume *)
+
+
+
+  (* now we have a new system-initialized Lisa volume, which should come up *)
+
+
+  real_mount (ecode, device);
+  if ecode > 0 then
+  begin
+    ecode := E_INIT_FS_MOUNT;
+    goto 1;
+  end;
+
+  nullName := '';
+  MakeKey(ROOT_NID, @nullName, @NewRec);
+  with NewRec do
+  begin
+    eType := threadentry;
+    parID := -1;
+    myName := '';
+  end{with};
+  Insert(mounttable[device], @NewRec, sizeof(ThreadRec), NIL, ecode);
+
+  (* Allocate primitive s-file s-list entries *)
+  with CatSentry do
+  begin
+    hintaddr := -1;
+    fileaddr := -1;
+  end;
+  for i := 0 to TREE_ID do
+    slist_io(ecode, device, i, writeop, CatSentry);
+
+  real_unmount (tempecode, device);             (* causes flushfs *)
+  if ecode <= 0 then ecode := tempecode;         (* remember first error *)
+
+
+  close_dataseg (tempecode, dsrefnum);          (* PWBT will need the ldsn *)
+  if tempecode = 0 then please_close_ds := false else
+  begin
+    if ecode = 0 then
+    begin
+      ecode := tempecode;                         (* remember first error *)
+    end;
+  end;
+
+  (* try PWBT even if we got errors above.  What have we to lose?  NOTHING!  *)
+
+  if device <> bootdev then                     (* write boot tracks if not boot *)
+  begin
+    GET_BT_FILE(device, btname);
+    PWBT (tempecode, btname, device);
+    if ecode = 0 then ecode := tempecode;       (* remember first error *)
+  end;
+
+
+1:   (* exit *)
+
+  if please_close_ds then close_dataseg (tempecode, dsrefnum);
+
+
+end;  (* of procedure newvolume *)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  {$S fs3 }
+  procedure FS_Master_Init (* var ecode : error *);
+
+  label 1;
+
+  var
+       tempecode : error;
+       volname, password : e_name;
+       i : integer;
+       ans : string [1];
+       vblockcount, ublockcount : longint;
+       p_extconfig: ^ext_diskconfig;
+
+  begin
+
+    if (bootdev < firstdev) or (bootdev > maxdev) then
+    begin
+      ecode := E_BOOT_DEV_BAD;
+      goto 1;
+    end;
+
+    InitQVM (ecode);             (* bring up the virtual memory             *)
+    if ecode > 0 then goto 1;
+
+    InitBufPool(ecode);
+    if ecode > 0 then goto 1;
+
+    InitFS (ecode);              (* bring up the file system internals      *)
+    if ecode > 0 then goto 1;
+
+    FS_Mount (ecode, bootdev); (* mount the boot device                   *)
+    if ecode > 0 then
+    begin
+      if ecode = E_FS_VERSION then    (* unrecognized Lisa File System volume on bootdev *)
+      begin
+        {$IFC DEBUG2}
+        ans := 'N';
+        writeln ('Not a valid Lisa File System volume on unit ',bootdev);
+        writeln ('Would you like to initialize this volume? ');
+        write ('(You will lose all data on the volume)  Y/N ?  ');
+        readln (ans);
+        if (ans='y') or (ans='Y') then
+        begin
+          writeln ('Initializing a BRAND NEW LISA file system disk(ette)!');
+          (*$IFC OS15*)
+          p_extconfig:=pointer(configinfo [bootdev]^.ext_addr);
+          vblockcount := p_extconfig^.num_bloks;
+          (*$ELSEC*)
+          vblockcount := configinfo [bootdev]^.num_bloks;
+          (*$ENDC*)
+          writeln ('Volume has ',vblockcount,' blocks usable by file system.');
+          write ('How many blocks do you want to use (0 for all of them)? ');
+          readln (ublockcount);
+          if (ublockcount > 0) and (ublockcount < vblockcount) then
+          begin
+            vblockcount := ublockcount;
+          end;
+          repeat
+            write ('What is the name of this volume (32 chars. max)?  ');
+            readln (volname);
+            i := pos ('-',volname);
+            if i <> 0 then writeln ('''-'' not allowed in volume name.')
+          until i = 0;
+          write ('What is the password for this volume (optional, 32 chars. max)?  ');
+          readln (password);
+          newvolume (ecode, bootdev, vblockcount, 0, volname, password);
+          if ecode <> 0 then
+          begin
+            writeln('Error ',ecode,' on initialization of boot volume.');
+          end;
+          fs_mount (ecode, bootdev); (* mount the boot device                   *)
+          if ecode <> 0 then
+          begin
+            writeln('Error ',ecode,' on mount of boot volume after initialization.');
+          end;
+        end
+        else
+        begin
+          writeln ('Volume not initialized.');
+          disinitqvm (tempecode);
+          goto 1;
+        end;
+        {$ENDC}
+        {$IFC NOT DEBUG2}
+        goto 1;
+        {$ENDC}
+      end
+      else
+      if ecode = E_BOOT_READ then
+      begin
+        {$IFC DEBUG2}
+        writeln ('Volume ',bootdev,' not formatted, or is otherwise unreadable.');
+        {$ENDC}
+        disinitqvm (tempecode);
+        goto 1;
+      end
+      else
+      if ecode = W_LEFT_OPEN then     (* warnings *)
+      begin
+        {$IFC DEBUG2}
+        writeln
+  ('The last time the OS was booted from this disk, it was not shut down normally.');
+        writeln
+  ('A shutdown via the command shell is recommended, since it will insure that ');
+        writeln
+  ('buffers are flushed, etc.  We will proceed, hoping things are not too bad.');
+       {$ENDC}
+      end
+      else if ecode = W_SCAVENGED then
+      begin
+        {$IFC DEBUG2}
+        writeln
+  ('Warning:  boot volume was scavenged since last time it was mounted.');
+        {$ENDC}
+      end
+      else if ecode = W_TEMP_UNMOUNT then        (* mounting a temp-unmounted boot volume *)
+      begin
+        {$IFC DEBUG2}
+        writeln
+  ('Warning: boot volume was temporarily unmounted since last time it was mounted.');
+        writeln
+  ('It was not shut down normally either.');
+        writeln;
+        {$ENDC}
+      end
+      else
+      begin
+        {$IFC DEBUG2}
+        writeln ('Error ',ecode,' mounting boot device ',bootdev);
+        {$ENDC}
+        disinitqvm (tempecode);
+        goto 1;
+      end;
+    end;
+    uiinit (ecode);              (* bring up the user interface             *)
+    if ecode <> 0 then
+    begin
+      disinitfs (tempecode);
+      disinitqvm (tempecode);
+      goto 1;
+    end;
+
+    {$IFC DEBUG2}
+    if mounttable [bootdev] <> pointer (badptr1) then
+    begin
+      writeln ('Boot volume mounted is named ', mounttable [bootdev]^.name);
+    end
+    else
+    begin
+      writeln ('WARNING:  Boot volume is not mounted.');
+    end;
+    {$ENDC}
+
+    flush_level := closeFlush;  (* initial trace fence for flushing *)
+    fs_mode := asynch;          (* set switch for asynchronous I/O *)
+    enterShutdown := FALSE;     (* flag is raised when FS shutdown code is entered *)
+
+  1:
+
+  end;  (* of procedure FS_MASTER_INIT  *)
+
+
+
+
+
+
+
+
+  (*
+   *  FlushFiles :  emergency flush of open files on a device.
+   *
+   *  Scan down the chain of FCB's for a device, and flush the important
+   *  buffered information for each file.  File size and map are flushed,
+   *  but dates and flags are lost.  Pages belonging to temporary files are
+   *  reclaimed (to appease the CB's).  Pages belonging to files that have
+   *  been killed but not closed are lost.
+   *)
+  (*$S kr_fs *)
+  procedure  FlushFiles ( ptrDCB : DCBptr; device : integer );
+
+  var
+       addrFCB  : absptr;     (* address of File Control Block *)
+       ptrFCB   : SFCB_ptr;   (* pointer to File Control Block *)
+       addrHead : absptr;     (* address of head of FCB chain *)
+       VaParms  : parmcheck;  (* parameter array passed to valid_addr *)
+       count    : longint;    (* pages freed returned by fmap_mgr *)
+       ecode    : integer;    (* error code *)
+
+       procedure  ForgetIt;
+       begin
+         Beep(3822, 100);  (* Ouch!  FCB chain was munged *)
+         exit(FlushFiles);
+       end{proc ForgetIt};
+
+
+  begin
+      with ptrDCB^ do
+      begin
+        (* Don't want to block *)
+        init_sem(semmap, 1);
+        init_sem(semMDDF, 1);
+
+        addrFCB := sfcbchain.fwd_link + b_sysglobal_ptr;
+        addrHead := ord(@sfcbchain);
+        VaParms.numcheck := 1;
+
+        (* Whip down the chain of File Control Blocks *)
+
+        while addrFCB <> addrHead do
+        begin
+          (* Make sure the FCB ptr is a valid address *)
+          (* Is the address odd? *)
+          if (addrFCB mod 2) <> 0 then ForgetIt;
+          (* Is the address in range? *)
+          with VaParms.parms[1] do
+          begin
+            addr := addrFCB;
+            readwrite := TRUE;
+          end;
+          if not valid_addr(bootdev, VaParms) then ForgetIt;
+
+          ptrFCB := pointer(addrFCB);
+          (* Minimal validity check on FCB contents *)
+          if ptrFCB^.curdev <> device then ForgetIt;
+
+          with ptrFCB^ do
+          begin
+            (* Write the buffered S-list entry *)
+            slist_io(ecode, curdev, sfilenum, WRITEOP, sent);
+            if sfilenum <> TEMP_SFILE then
+            begin
+              (* Permanent file *)
+              if not old_volume(curdev) then
+                fmap_io(ecode, curdev, sent.hintaddr, 0, @fmap, WRITEOP);
+            end
+            else
+            begin
+              (* Temporary file *)
+              (* Take a trip through the fmap manager to free those data pages *)
+              fmap_mgr(ecode, curdev, sfilenum, @fmap, @sent, FMRELEASE, 0 {from pg},
+                       count);
+            end;
+
+            (* Get ptr to next FCB in chain *)
+            addrFCB := head.fwd_link + b_sysglobal_ptr;
+          end{with};
+        end{while};
+      end{with};
+
+  end{proc FlushFiles};
+
+
+
+
+  (*$S kr_fs *)
+  procedure  GiveUpGhost ( downMode : sm_type );
+
+  const
+       WAIT_SECS = 6;
+
+  var
+       ptrL    : ^longint;
+       counter : longint;
+       i       : integer;
+
+  begin
+      if downMode = kill_power then
+        RampContrast(255);
+
+      i := WAIT_SECS;   (* wait time in seconds *)
+      repeat
+        for counter := 0 to 130000 do ;  (* one second spin loop *)
+        i := i - 1;
+      until i <= 0;
+
+      (* Paint the screen black if not returning to caller *)
+      if downMode <> do_return then
+      begin
+        (* place twiggy ROM in a known state *)
+        twigoff;
+
+        ptrL := pointer($110);   (* pointer to address of base of screen *)
+        ptrL := pointer(ptrL^);  (* pointer to base of screen *)
+        for i := 1 to 8192 do
+        begin
+          ptrL^ := -1;     (* turn off 32 pixels *)
+          ptrL := pointer(ord(ptrL) + sizeof(longint));
+        end;
+      end;
+
+      case downMode of
+
+        reset_machine:
+        begin
+          ptrL := pointer(12);   (* pointer to address error vector *)
+          ptrL^ := -1;           (* odd address in address error vector *)
+          ptrL := pointer(-1);   (* bad pointer value *)
+          ptrL^ := 0;            (* generate double address error; reset machine *)
+        end;
+
+        do_return: ;  (* return to caller *)
+
+        otherwise  (* default is power off *)
+        begin
+          powerdown;
+          while true do ;  (* spin *)
+        end;
+      end{case};
+
+  end{proc GiveUpGhost};
+
+
+
+
+  (*$S kr_fs *)
+  procedure  FS_Emergency;
+
+  var
+       ecode  : integer;
+       device : integer;
+       ptrDCB : DCBptr;
+
+       procedure FlushMem( addrBuf : absptr;
+                           nbytes  : longint;
+                           page_no : longint );
+
+       var
+            count : integer;
+
+       begin
+           while nbytes > 0 do
+           begin
+             if nbytes > DEFPGDATASIZE then
+               (* write full page *)
+               count := DEFPGDATASIZE
+             else
+               (* write partial page *)
+               count := nbytes;
+             vm(ecode, device, page_no, sizeof(pagelabel), addrBuf, count, WRITEOP);
+             nbytes := nbytes - count;
+             addrBuf := addrBuf + count;
+             page_no := page_no + 1;
+           end{while};
+       end{proc FlushMem};
+
+
+  begin
+      (*
+       *  If shutdown code was entered previously, and execution was
+       *  interrupted, the state of the FS is unknown.  Flushing data
+       *  structures may trash the disk; so exit immediately.
+       *)
+      if enterShutdown then GiveUpGhost(reset_machine);
+
+      (*
+       *  Ensure that execution does not block.
+       *  Reinitialize all FS buffer semaphores, and set
+       *  synchronous I/O mode.
+       *)
+      InitVMSems;
+      SetIOMode(synch);
+      enterShutdown := TRUE;  (* shutdown code has been entered *)
+
+      (* Make sure buffers get flushed *)
+      FlushQVM(ecode);
+      FlushNodes(-1, TRUE {clear}, ecode);
+
+      (* Enumerate all devices in the system *)
+      for device := 0 to MAXDEV do
+      begin
+        ptrDCB := mounttable[device];
+        if ptrDCB <> pointer(BADPTR1) then with ptrDCB^ do
+        begin
+          (* Device is mounted *)
+          if configinfo[device]^.blockstructured then with ptrDCB^ do
+          begin
+            if (allocmap <> pointer(BADPTR1)) and (MDDFdata <> pointer(BADPTR1)) then
+            begin
+              (*
+               *  Device is block structured (a disk).
+               *  Flush important buffered info for open files on the device, and
+               *  clean-up temp files.
+               *)
+              FlushFiles(ptrDCB, device);
+              with MDDFdata^ do
+              begin
+                (* Flush bitmap and MDDF *)
+                FlushMem(ord(allocmap), bitmap_bytes, bitmap_addr);
+                FlushMem(ord(MDDFdata), sizeof(MDDFdb), MDDFaddr);
+              end{with};
+            end{if};
+          end{if};
+        end{if};
+      end{for};
+
+      FlushQVM(ecode);
+
+      GiveUpGhost(do_return);
+
+  end{proc FS_Emergency};
+
+
+
+
+  (*$S fs3 *)
+  procedure FS_SHUTDOWN (* var ecode:error; shutdown_mode : sm_type *);
+
+  const
+        MAX_RETRIES = 8;
+
+  var devnum,i : integer;
+      sfcbabsptr, headaddr : absptr;
+      sfcbptr : sfcb_ptr;
+      lptr : ^longint;
+      c : char;
+      retry_close : integer;
+      save_link : integer;
+
+
+      procedure  EjectDev ( dev : integer );
+
+      var
+           ecode   : integer;
+           ext_ptr : ^ext_diskconfig;
+
+      begin
+        with configinfo[dev]^ do
+        begin
+           ext_ptr:=pointer(ext_addr);
+           if blockstructured then
+              if ext_ptr^.ejectable then
+               begin
+                (*$IFC OS15*)
+                if devt <> non_io then
+                   UP(ecode,configinfo[dev],nil);
+                (*$ENDC*)
+                (* eject the media *)
+                pdev_control (ecode, dev, dskunclamp);
+              end;
+        end; {of with}
+      end;
+
+      procedure  UnmountDev ( dev : integer );
+
+      var
+           ecode : integer;
+
+      begin
+        (* Allow permanent drivers to be unloaded at this point *)
+        configinfo[dev]^.permanent := FALSE;
+        real_unmount(ecode, dev);
+        if ecode > 0 then def_unmount (ecode, devnum);
+        EjectDev(dev);
+     end; {of UnmountDev}
+
+  begin
+  (*$IFC DEBUG2*)
+    if trace (FS, 99) then writeln ('FS_SHUTDOWN:  shutting down the file system zzzzz');
+  (*$ENDC*)
+    InitVMSems;
+    SetIOMode(synch);  (* set switch for synchronous I/O *)
+
+    enterShutdown := TRUE;  (* note that shutdown code has been entered *)
+    flushqvm(ecode);
+    FlushNodes(-1, TRUE {clear}, ecode);
+    uidisinit (ecode);
+    flushfs (ecode);  (* Try to flush immediately in case OSQUITing from LisaBug *)
+    {disinitfs (ecode);}
+
+    for devnum := 0 to maxdev do        (* eject each unmounted device, *)
+                                        (*  before boot disk goes away. *)
+      if mounttable [devnum] = pointer (badptr1) then
+         if devnum <> bootdev then
+            EjectDev(devnum);  (* eject unmounted media *)
+
+    (*  close all open sfiles and unmount all devices  *)
+
+    for devnum := 0 to maxdev do        (* for each device *)
+    begin
+      if mounttable [devnum] <> pointer (badptr1) then    (* device is mounted *)
+      begin
+        if configinfo [devnum]^.blockstructured then
+        begin   (* close all sfiles, release all sfile control blocks, which only *)
+                (* exist on block-structured devices                              *)
+          with mounttable [devnum]^ do
+          begin
+            (* Don't want to block *)
+            if (allocmap <> pointer(BADPTR1)) and (MDDFdata <> pointer(BADPTR1)) then
+            begin
+              init_sem(semmap, 1);
+              init_sem(semMDDF, 1);
+              init_sem(mounttable[devnum]^.semio, 1);
+
+              (* get absptr to first sfcb on chain *)
+              sfcbabsptr := sfcbchain.fwd_link + b_sysglobal_ptr;
+
+              (* get absptr to head of chain, which points to itself when empty *)
+              headaddr := ord (@sfcbchain);
+
+              while sfcbabsptr <> headaddr do   (* i.e., a sfcb is linked to dcb *)
+              begin
+                save_link := sfcbchain.fwd_link; (* save link to the first FCB *)
+                sfcbptr := pointer (sfcbabsptr); (* real pointer to sfcb *)
+
+                (* Don't want block on a semaphore *)
+                init_sem(sfcbptr^.semio, 1);
+                init_sem(sfcbptr^.semgp, 1);
+
+                sfcbptr^.OS_c_request := true;   (* OS is forcing close on file  *)
+
+                retry_close := 0;
+                repeat
+                  (* try to close the file several times before giving up *)
+                  if sfcbptr^.sfilenum = TEMP_SFILE then
+                    close_temp(ecode, sfcbptr)
+                  else
+                  begin
+                    (*
+                     *  Make the file look like it's ready to close.
+                     *  File may be open several times with global refnum.
+                     *)
+                    sfcbptr^.nusers := 1;
+                    close_sfile(ecode, sfcbptr);   (* will release sfcb if last close *)
+                  end;
+                  retry_close := retry_close + 1;
+                until (ecode <= 0) or (retry_close >= MAX_RETRIES);
+
+                (* did link to first FCB change? *)
+                if sfcbchain.fwd_link = save_link then
+                begin
+                  (* close failed to remove FCB; release the FCB and go on *)
+                  dequeue(sfcbptr^.head, b_sysglobal_ptr);
+                  relspace(sfcbabsptr, b_sysglobal_ptr);
+                end;
+                sfcbabsptr := sfcbchain.fwd_link + b_sysglobal_ptr; (* keep looking *)
+              end;    (* of while sfcbabsptr <> headaddr do *)
+
+              mapdirty := TRUE;  (* flush bitmap and MDDF always *)
+              MDDFdirty := TRUE;
+
+              if devnum <> bootdev then
+                UnmountDev(devnum);
+            end;    (* of if pointers valid *)
+          end;    (* of with mounttable [devnum]^ do *)
+        end    (* of if configinfo [devnum]^.blockstructured then *)
+        else
+          (* not blockstructured *)
+          UnmountDev(devnum);
+
+
+        (* now no sfiles are open on device if it is blockstructured *)
+        (* if it is not block structured, files may be open, but there are no sfcbs *)
+        (* flush out a consistent state, and unmount the device *)
+        flushfs (ecode);
+
+      end  (* of if mounttable[devnum] <> pointer(badptr1) *)
+      else
+        EjectDev(devnum);  (* eject unmounted media *)
+    end;    (* of for devnum := 0 to maxdev do *)
+
+    (* Now unmount the boot device *)
+    UnmountDev(bootdev);
+
+    (* all devices are unmounted and all buffers are flushed *)
+    disinitqvm (ecode); (* should not cause any I/O to occur now *)
+
+    GiveUpGhost(shutdown_mode);
+
+  end;   (* of procedure FS_SHUTDOWN *)
+
+
+
+
+
+{$I source/fsinit1.text }
+{$I source/fsinit2.text    }
+
+END.
+ÿ

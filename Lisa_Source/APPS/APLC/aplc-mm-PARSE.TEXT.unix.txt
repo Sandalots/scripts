@@ -1,0 +1,1227 @@
+
+                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+
+(***************************************.*******.**************************************
+   validDate - validates that the last 6 lexemes trapped in the lex cache
+               form an actual date.  The numeric values for the individual
+               date parts of a date will be changed from their longreal
+               representation to their integer form.  The routine returns
+               true if a valid date does exist in the cache.
+
+               The numbering in the cache is:
+                  0 - month
+                  1 - slash (/ = DIVop or - SUBop)
+                  2 - day
+                  3 - slash (/ = DIVop or - SUBop)
+                  4 - year
+*)
+(*$S dateCalc *)
+function  validDate(* changeCache : boolean) : boolean *);
+label 2;
+var status   : numType;
+    x        : integer;
+    leap     : integer;
+    month    : integer;
+    datePart : integer;
+    VT       : variantType;
+    invalid  : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   validDate := true;
+   for x := 0 to 4 do with cachelex[x] do begin
+      if not odd(x) then begin
+         packnum(value.lrealvar, VT, status);
+         if status = bytekind then begin
+            VT.intvar := VT.bytevar;
+            status := intKind
+         end;
+         if (status = intKind) and (VT.intvar > 0) then begin
+            case dataFormat.dateFormat[x div 2 + 1] of
+               'y','Y' : begin
+                            if (VT.intvar <= 99) then leap := LeapYear(1900 + VT.intvar)
+                            else if VT.intvar > 9999 then goto 2
+                            else leap := LeapYear(VT.intvar);
+                            lastdate.year := VT.intvar
+                         end;
+               'd','D' : begin
+                            if VT.intvar > 31 then goto 2;
+                            lastdate.day := VT.intvar
+                         end;
+               otherwise begin
+                            if VT.intvar > 12 then goto 2;
+                            month := monthLen[VT.intvar+1] - monthLen[VT.intvar];
+                            lastdate.month := VT.intvar
+                         end
+            end;
+            if changeCache then value.intvar := VT.intvar;
+            if x = 0 then datePart := VT.intvar
+         end
+         else goto 2
+      end
+      else if dataFormat.dateFormat[4] <> lexCH then goto 2
+   end;
+   if lastdate.day <= month + leap*ord(datePart = 2) then exit(validDate);
+2: validDate := false
+end;
+
+
+(***************************************.*******.**************************************
+   parse - parses the line pointed to by DATALINE and validates it as a true Lisacalc
+           expression.  NUMBYTES states the number of characters in DATALINE to parse.
+           ROW & COL are the coordinates of the cell where the formula will be placed.
+           The routine returns true if the parse was successful with the formula
+           appearing in the EVAL array.
+
+           The style of parsing is split into three flavors which is determined by the
+           OPERATION parameter:
+              PFormula    : parse the string as a formula
+              PValue      : parse the string as a value (text or numeric)
+              PCoordinate : parse the string as a coordinate range reference
+           If any errors occur during the parsing, the ERROR record will be setup
+           to signal the error.
+
+           Parse uses the following arrays to obtain parsing information:
+                except    : list of parsing exceptions and the states to branch to
+                            for the exception.
+                action    : parsing table:
+                paction   : parsing table:
+                prodgoto  : braching table for the parsing states.
+                lhs       : # elements on Left Hand Side of the current production
+                numrhs    : # elements on Right Hand Side of the current production
+                chk       : parsing table:
+                def       : parsing table:
+*)
+(*$S compile *)
+function  parse
+  (* operation : parseKind;             {parse operation}
+     dataline  : ptrdata;               {ptr to line to be parsed}
+     numBytes  : integer;               {# bytes in line}
+     row, col  : integer;               {circular reference information}
+     var error : errRecord              {error infomation}
+  ) : boolean *);                       {parse succesful? }
+label 3;
+const defaultflag = -1000;
+var errorflag  : boolean;               {internal parse error exists}
+    abortflag  : boolean;               {abort parse}
+    acceptflag : boolean;               {expression is valid}
+    textflag   : boolean;               {have a textstring?}
+    dateNotGen : boolean;               {was a date just generated}
+    parseCoords: boolean;
+    prefix     : str40;                 {prefix tack on to coordinate parsing}
+    errorstart : integer;               {index into TEXTLINE of the last LHS}
+    boundcnt   : integer;               {# of BOUNDop's seen}
+    sempt      : integer;               {semantics stack pointer}
+    evalsize   : integer;               {# bytes in EVAL array}
+    spot       : integer;
+    VT         : variantType;
+    prevlex    : symbol;
+    lastPcode  : byte;                  {last pCode generated}
+    semantics  : semStack;
+    curr       : record
+                    funcptr  : integer;         {ptr to last func on stack}
+                    argcount : integer;         {current func argument count}
+                    errflag  : integer;         {# of unresolved errors}
+                    numerrs  : integer;         {total # of errors}
+                    prod     : integer;         {current production}
+                    token    : integer;         {current lexeme token class}
+                    state    : integer          {current state}
+                 end;
+    cRow,cCol  : integer;
+    numRows    : integer;
+
+(*$IFC DEBUGVERSION *)
+    remevalsize: integer;
+(*$ENDC *)
+
+
+    (*
+       ErrorMess  - Shorthand call to "LErrorMess" for error messages.
+       LErrorMess - error messages returned by parser.  Each message has a number
+                    MESSNUMBER associated with it.  LEXEME1 and LEXEME2 are used by
+                    some messages to construct the message.  The constructions and
+                    message number are returned in the ERROR buffer, which is passed
+                    as a parameter to "parse".
+    *)
+    (*$S specialCase *)
+    procedure LErrorMess(messnumber : integer; lexeme1, lexeme2 : symbol);
+    var enote     : boolean;
+        result    : resultStr;
+        dChrvalue : extended;
+
+        (*$S calcBusiness *)
+        procedure busFuncProbs;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           WordFromLexeme(lexeme1, 40, @error.mess1);
+           I2X(maxCoeffVars, dChrValue);
+           rstr(dChrValue, result, 0, 13, maxDecPlaces, enote);
+           error.mess2 := result
+        end;
+
+
+    (*$S specialCase *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if operation <> PValue then begin
+          error.status := messnumber;
+          case messnumber of
+             5008  : begin
+                        error.mess1    := ' ';
+                        error.mess1[1] := chr(textline^[lastbufpt-1]);
+                        I2X(ord(textline^[lastbufpt-1]), dChrValue);
+                        rstr(dChrValue, result, 0, 13, maxDecPlaces, enote);
+                        error.mess2 := result
+                     end;
+             15015 : busFuncParts;
+             15013,
+             5009  : begin
+                        WordFromLexeme(lexeme1, 40, @error.mess1);
+                        WordFromLexeme(lexeme2, 40, @error.mess2)
+                     end;
+             15003,
+             15004,
+             15005,
+             15006,
+             15007,
+             15008,
+             15016,
+             15014 : WordFromLexeme(lexeme1, 40, @error.mess1)
+          end
+       end;
+       if messNumber <> 15010 then begin
+          curr.numerrs := curr.numerrs + 1;
+          abortflag    := true
+       end
+    end;
+
+
+    (*$S specialCase *)
+    procedure ErrorMess(messnumber : integer);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       LErrorMess(messnumber, JUNKop, JUNKop)
+    end;
+
+
+    (*
+        initparser - initializes variables used during the parse.
+    *)
+    (*$S compile *)
+    procedure initparser;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       evalsize    := -1;
+       lastPcode   := ord(BOUNDop);
+       prevlex     := BOUNDop;
+       lastlexeme  := BOUNDop;
+       lastvaltype := RNUMBERop;
+       textlength  := numBytes;
+       textline    := @dataline^;
+       prevbufpt   := 0;
+       lastbufpt   := -1;
+       lastch      := ' ';
+       next1ch     := chr(eofchar);
+       next2ch     := chr(eofchar)
+    end;
+
+
+    (*
+        GetToken - receives the LASTLEXEME from "lex", the lexical analyizer,
+                   and sets CURR.TOKEN to the LASTLEXEME's TOKEN class.
+    *)
+    (*$S compile *)
+    procedure GetToken;
+    var errorNum : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       lex(operation, errorNum);
+       if parseCoords and (lastlexeme = BOUNDop) then begin
+          case boundcnt of
+             0 : begin
+                    initparser;
+                    lex(operation, errorNum);
+                    if lastlexeme = BOUNDop then sempt := sempt - 2
+                 end;
+             1 : lastlexeme := RPARENop
+          end;
+          boundcnt := boundcnt + 1
+       end;
+       if (lastLexeme = EDGEop) and not parseCoords then curr.token := VARIABLE
+       else curr.token := token[lastlexeme];
+       if curr.token < 0 then curr.token := 0;
+       if errorNum <> ok then ErrorMess(errorNum);
+
+       prevlex := lastlexeme
+
+    end;
+
+
+    (*
+        PutBytes - moves bytes into the EVAL array.  The routine is passed
+                   a pointer to the start of the data to be moved in, the # of bytes
+                   to move and the associated opcode.
+    *)
+    (*$S compile *)
+    procedure PutBytes(ptrtobyte : ptrData; nbytes : integer; opcode : byte);
+    var x : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+       if debug[2] then dumpsemantics(semantics, sempt);
+(*$ENDC *)
+
+       evalsize := evalsize + 1;
+       eval[evalsize] := opcode;
+       dateNotGen     := (opcode <> PUSHDATE) or (operation <> PValue);
+
+       if nbytes + evalsize <= evalmax then begin
+          moveLfast(@ptrtobyte^, @eval[evalsize+1], nbytes);
+          evalsize := evalsize + nbytes
+       end
+       else ErrorMess(15011)
+    end;
+
+
+    (*
+       PutPcode - shorthand call to PutBytes for opcodes that have no operand data
+    *)
+    (*$S compile *)
+    procedure PutPcode(opcode : byte);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       PutBytes(nil, 0, opcode);
+       lastPcode := opcode
+    end;
+
+
+    (*
+        GenRange - generates the code for a range specification.  A circular
+                   reference check is made to trap simple circular references.
+    *)
+    (*$S compile *)
+    procedure GenRange;
+    var rg : range;
+        VT : variantType;
+
+        (*$S calcBusiness *)
+        function badRange : boolean;
+        var nRow, nCol : integer;
+            numBytes   : integer;
+            theFunc    : funcSym;
+            overRide   : boolean;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           nCol := rg.hiCol - rg.loCol + 1;
+           nRow := rg.hiRow - rg.loRow + 1;
+           badRange := false;
+           overRide := false;
+
+           theFunc  := funcName[curr.funcPtr];
+           case theFunc.lexeme of
+              REGRESSop : if curr.argCount = 1 then begin
+                             cRow := nCol;
+                             cCol := 2;
+                             if cRow < 2 then begin
+                                overRide := true;
+                                rg.hiCol := rg.loCol + 1;
+                                numRows  := nRow
+                             end
+                          end;
+              COEFFop   : if curr.argCount = 1 then begin
+                             cRow := nCol;
+                             cCol := nCol;
+                             if cCol > maxCoeffVars then LErrorMess(15015, theFunc.lexeme, JUNKop)
+                          end;
+              LINSYSop  : case curr.argCount of
+                             1 : begin
+                                    cRow    := nCol;
+                                    numRows := nRow
+                                 end;
+                             2 : if numRows <> nRow then overRide := true
+                                 else cCol := nCol
+                          end
+           end;
+
+           if (curr.argCount = theFunc.ReqArgNum) or overRide then
+              if (nRow <> cRow) or (nCol <> cCol) or overRide then begin
+                 rg.rKind := aRectRg;
+                 if override then rg.hiRow := rg.loRow + numRows - 1
+                 else begin
+                         rg.hiRow := rg.loRow + cRow - 1;
+                         rg.hiCol := rg.loCol + cCol - 1
+                      end;
+                 GetRgName(rg, pointer(ord(@error.mess2) + 1), numBytes);
+                 error.mess2[0] := chr(numBytes);
+                 LErrorMess(15014, theFunc.lexeme, JUNKop)
+              end
+        end;
+
+    (*$S compile *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       VT.rangevar.first  := semantics[sempt-2].cval;
+       VT.rangevar.second := semantics[sempt].cval;
+
+       rg.loRow := VT.rangevar.first.length;
+       rg.loCol := VT.rangevar.first.start;
+       rg.hiRow := VT.rangevar.second.length;
+       rg.hiCol := VT.rangevar.second.start;
+
+       if curr.funcPtr <> -1 then
+          case funcName[curr.funcPtr].lexeme of
+             REGRESSop,
+             COEFFop,
+             LINSYSop : if badRange then exit(GenRange);
+             DETop    : if rg.hiRow - rg.loRow <> rg.hiCol - rg.loCol then
+                           LErrorMess(15016, DETop, JUNKop)
+          end;
+
+       if CoordInRange(row, col, rg) then ErrorMess(15010);
+       PutBytes(@VT, pcodesize[PUSHCRANGE], PUSHCRANGE)
+    end;
+
+
+    (*
+        GenCoord - generates the code for a coordinate specification.    A circular
+                   reference check is made to trap simple circular references.
+    *)
+    (*$S compile *)
+    procedure GenCoord;
+    var VT : variantType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       VT.coordvar := semantics[sempt].cval;
+       if (VT.coordvar.start = col) and (VT.coordvar.length = row) then ErrorMess(15010);
+       PutBytes(@VT, pcodesize[PUSHCOORD], PUSHCOORD)
+    end;
+
+
+    (*
+       GenDate - takes a date the is contained in the date cache and generates
+                 the code for it.
+
+       Note: the date cache should be validated with "validDate" before this
+       routine is called.
+    *)
+    (*$S dateCalc *)
+    procedure GenDate;
+    var VT : variantType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       VT.date := lastdate;
+       if VT.date.year <= 99 then VT.date.year := VT.date.year + 1900;
+       if (operation = PValue) and (evalSize >= 4) then evalsize := evalsize - 5;
+(*$IFC DEBUGVERSION *)
+       remevalsize := evalsize;
+(*$ENDC *)
+       PutBytes(@VT, pcodesize[PUSHDATE], PUSHDATE)
+    end;
+
+
+    (*
+        GenValue - generates the code for a constant value.  The code
+                   that is generated depends upon the type of constant.  Packing
+                   will be done down to the byte level for constants that are integers
+                   as opposed to reals.  The # of bytes needed for operand data
+                   is determine through the used of the variants corresponding to
+                   the type of the constant.
+    *)
+    (*$S compile *)
+    procedure GenValue;
+    var status  : numType;
+        opcode  : byte;
+        op2code : byte;
+        VT      : variantType;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       with semantics[sempt] do begin
+          {determine type of value and generate appropriate pointers &
+           correct opcodes and fill in pertinent data}
+          op2code := PUSHNOP;
+          if valtype = DATEop then status := dateKind
+          else packnum(rval, VT, status);
+          case status of
+             nanKind,
+             lRealKind : opcode := PUSHLREAL;
+             sRealKind : opcode := PUSHSREAL;
+             intKind   : opcode := PUSHINT;
+             byteKind  : opcode := PUSHBYTE;
+             dateKind  : GenDate
+          end;
+
+          {move opcode and data into EVAL}
+          if status <> dateKind then PutBytes(@VT, pcodesize[opcode], opcode);
+          case lexeme of
+             CDOLLARop : opcode := PUSHCDOLLAR;
+             DOLLARop  : opcode := PUSHDOLLAR;
+             otherwise   opcode := PUSHNOP
+          end;
+          if opcode <> PUSHNOP then PutPCode(opcode);
+          if op2code <> PUSHNOP then PutPCode(op2code)
+       end
+    end;
+
+
+    (*
+       ValidateFunc - determines if the function currently being parsed, pointed
+                      to be CURR.FUNCPTR, can receive RANGETYPE as a function
+                      argument.  RANGETYPE set to true means that a RANGE is the
+                      function argument, false signals an expression.
+    *)
+    (*$S compile *)
+    procedure ValidateFunc(rangetype : boolean);
+    var errflag : boolean;
+        x       : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       with funcname[curr.funcptr] do
+          if ReqArgNum > 0 then
+             if ((curr.argcount <= ReqArgNum) and (OptArgNum < 0)) or
+                (curr.argcount <= OptArgNum) then begin
+                errflag := not (curr.argcount-1 in argtype) = rangetype;
+                if (lexeme = INDEXop) and (curr.argCount = 1) then errFlag := false;
+                if errflag then begin
+                   if rangetype then x := 15005
+                   else x := 15006;
+                   LErrorMess(x, lexeme, JUNKop)
+                end
+             end
+             else if OptArgNum >= 0 then LErrorMess(15007, lexeme, JUNKop)
+    end;
+
+
+    (*
+       GenRgInfo - generates the code for needed for the coordinate display.  The
+                   type of code generated is dependent upon the PRODUCTION being
+                   used
+    *)
+    (*$S compile *)
+    procedure GenRgInfo(production : integer);
+    var firstnum   : integer;
+        secondnum  : integer;
+        firstOpd   : semInfo;
+        secondOpd  : semInfo;
+        VT         : variantType;
+        rangeinfo  : rangeType;
+        xNumber    : extended;
+
+
+        (*$S compile *)
+        procedure GenInfo(var low, high : idType; snip, grid : rgKind);
+        var isEllipse : boolean;
+            valid     : boolean;
+            first     : integer;
+            second    : integer;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           valid  := false;
+           first  := firstnum;
+           second := secondnum;
+           isEllipse := (semantics[sempt-1].lexeme = ELLIPSEop);
+           if isEllipse then grid := snip;
+           VT.rangeinfo.rKind := grid;
+
+           if (firstOpd.lexeme = EDGEop) or (secondOpd.lexeme = EDGEop) then begin
+              if SecondOpd.lexeme = EDGEop then
+                 if isEllipse then second := 1
+                 else begin
+                         valid  := (first = 1);
+                         second := mInfSnip
+                      end;
+              if firstOpd.lexeme = EDGEop then
+                 if isEllipse then first := idMax
+                 else begin
+                         valid := (second = idMax);
+                         first := pInfSnip
+                      end
+           end;
+           if (first > 0) and (second > first) then begin
+              low    := first;
+              first  := second;
+              second := low
+           end;
+           low  := second;
+           high := first;
+           if not isEllipse and (not valid and (second + 1 <> first)) then ErrorMess(5005)
+        end;
+
+
+
+    (*$S compile *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERISON *)
+       remevalsize := remevalsize + 1;
+(*$ENDC *)
+       if evalsize < 0 then begin
+          PutPcode(PUSHNOP);
+          firstOpd  := semantics[sempt];
+          secondOpd := semantics[sempt-2];
+          D2X(secondOpd.rval, xNumber);
+          X2I(xNumber, secondNum);
+          D2X(firstOpd.rval, xNumber);
+          X2I(xNumber, firstnum);
+
+          with VT.rangeinfo do begin
+             rKind := aWTBoxRg;
+             FixRange(VT.rangeinfo);
+             case production of
+                20 : begin
+                        rKind := a1CellRg;
+                        loRow := firstOpd.cval.length;
+                        loCol := firstOpd.cval.start;
+                        FixRange(VT.rangeinfo)
+                     end;
+                30 : begin
+                        rKind := aRectRg;
+                        rangeinfo.first  := secondOpd.cval;
+                        rangeinfo.second := firstOpd.cval;
+                        normcoords(rangeinfo);
+                        loRow := rangeinfo.first.length;
+                        loCol := rangeinfo.first.start;
+                        hiRow := rangeinfo.second.length;
+                        hiCol := rangeinfo.second.start
+                     end;
+                31 : GenInfo(loRow, hiRow, aRowRg, aRowGrid);
+                32 : begin
+                        secondnum := secondOpd.id.start;
+                        firstnum  := firstOpd.id.start;
+                        GenInfo(loCol, hiCol, aColRg, aColGrid)
+                     end;
+                33 : if firstOpd.lexeme <> ALLop then begin
+                        rKind := aColRg;
+                        loCol := firstOpd.id.start;
+                        hiCol := firstOpd.id.start
+                     end;
+                34 : begin
+                        rKind := aRowRg;
+                        loRow := firstnum;
+                        hiRow := firstnum
+                     end
+             end
+          end;
+          PutBytes(@VT, pcodesize[PUSHRANGE], PUSHRANGE)
+       end
+    end;
+
+
+    (*
+       GenIdent - generates a text identifier
+    *)
+    (*$S compile *)
+    procedure GenIdent;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if parseCoords then GenRgInfo(33)
+       else with semantics[sempt] do begin
+               PutPcode(PUSHTEXT);
+               PutBytes(@textline^[id.start], id.length, id.length);
+               PutPcode(0)
+            end
+    end;
+
+
+    (*
+        GenerateCode - does the code generation for PRODUCTION.  Produce a postordered
+                       encoding of the formula.  The code is generated into the
+                       EVAL array.  The generate code contains all the
+                       information for evaluating the formula and reconstructing a
+                       textual version of it.
+    *)
+    (*$S compile *)
+    procedure GenerateCode(production : integer);
+    var Llexeme : variantType;
+        x       : integer;
+        gen     : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERISON *)
+       remevalsize := evalsize;
+(*$ENDC *)
+       {determine if code is to be generated for this prodcution}
+       with semantics[sempt-1] do begin
+          Llexeme.lexeme := lexeme;
+          case production of
+             1,
+
+            {2  : no code generated}
+
+            {3  : no code generated}
+
+             4,
+
+            {5  : no code generated}
+
+             6,
+
+            {7  : no code generated}
+
+             8,
+
+            {9  : no code generated}
+
+             10,
+
+            {11 : no code generated}
+
+             12 : if dateNotGen then PutPcode(ord(Llexeme.lexeme));
+
+            {13 : no code generated}
+
+             14 : if Llexeme.lexeme = SUBop then PutPcode(UNARYMINUS);
+
+            {15 : no code generated}
+
+             16 : PutPcode(ord(Llexeme.lexeme));
+
+             17 : if parseCoords then GenRgInfo(34)
+                  else begin
+                          gen := true;
+                          if cachecnt = 5 then
+                             if operation = PValue then
+                                if validDate(true) then begin
+                                   gen := false;
+                                   GenDate
+                                end;
+                          if gen then GenValue
+                       end;
+
+            {13 : no code generated}
+
+             18 : GenIdent;
+
+             19 : if semantics[sempt].lexeme = TRUEop then PutPcode(PUSHTRUE)
+                  else PutPcode(PUSHFALSE);
+
+             20 : if parseCoords then GenRgInfo(production)
+                  else GenCoord;
+
+             21 : PutPcode(ord(Llexeme.lexeme));
+
+             22,
+             23 : with semantics[sempt] do
+                     case lexeme of
+                        RESULTop,
+                        CELLop  : begin
+                                     gen := false;
+                                     for x := 0 to sempt - 1 do
+                                        if semantics[x].lexeme = SEARCHop then gen := true;
+                                     if gen then PutPcode(ord(lexeme))
+                                     else LErrorMess(15003, lastlexeme, JUNKop)
+                                  end;
+                        otherwise PutPcode(ord(lexeme))
+                     end;
+
+             24 : begin
+                     with funcname[funcptr] do
+                        if ReqArgNum > 0 then
+                           if ((curr.argcount = 3) and (lexeme = SEARCHop)) or
+                              (curr.argcount < ReqArgNum) then LErrorMess(15008, lexeme, JUNKop);
+                     PutPcode(ord(semantics[sempt-numrhs[production]+1].lexeme));
+                     with semantics[sempt-numrhs[production]] do begin
+                        curr.funcptr  := funcptr;
+                        curr.argcount := argcount
+                     end
+                  end;
+
+             25,
+             26 : begin
+                     curr.funcptr  := semantics[sempt].sval;
+                     curr.argcount := 0;
+                     if production = 25 then begin
+                        if lastlexeme = SEARCHop then
+                           for x := 0 to sempt - 1 do
+                              if lastlexeme = semantics[x].lexeme then
+                                 LErrorMess(15013, lastLexeme, lastLexeme);
+                        PutPcode(PUSHMARKER)
+                     end
+                  end;
+
+            {27 : no code generated}
+
+            {28 : no code generated}
+
+             29 : begin
+                     curr.argcount := curr.argcount + 1;
+                     ValidateFunc(false)
+                  end;
+
+             30 : if Llexeme.lexeme = ELLIPSEop then begin
+                     if parseCoords then GenRgInfo(production)
+                     else begin
+                             curr.argcount := curr.argcount + 1;
+                             ValidateFunc(true);
+                             if error.status = 0 then GenRange
+                          end
+                  end
+                  else ErrorMess(5006);
+
+             31,
+             32 : if operation <> PCoordinate then ErrorMess(5007)
+                  else GenRgInfo(production);
+
+            {33 : code generated by GenRgInfo}
+
+            {34 : code generated by GenRgInfo}
+
+          end
+       end
+(*$IFC DEBUGVERSION *)
+       ;if debug[4] then dumpcode(remevalsize, evalsize, semantics, sempt, curr.prod);
+(*$ENDC *)
+    end;
+
+
+    (*
+        stackit - puts the CURR.STATE and related semantics information onto
+                  the SEMANTICS stack.  Function returns true if the stacking operation
+                  was done.  False signals a SEMANTICS stack overflow.
+    *)
+    (*$S compile *)
+    function stackit : boolean;
+    var rowCoord : integer;
+        xNumber  : extended;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       sempt := sempt + 1;
+       if sempt <= SemStkmax then begin
+
+          {stack information onto the SEMANTICS stack}
+          stackit := true;
+          with semantics[sempt] do begin
+             state    := curr.state;
+             bufpt    := prevbufpt;
+             lexeme   := lastlexeme;
+             valtype  := lastvaltype;
+             if (lastLexeme = EDGEop) and not parseCoords then klass := VARIABLE
+             else klass := token[lastlexeme];
+             funcptr  := curr.funcptr;
+             argcount := curr.argcount;
+
+             {Parsing coordinates allows only the following lexeme classes}
+             if parseCoords and (boundcnt = 1) and
+                 not (klass in [ELLIPSE, COORD, BOUND, NUMBER, VARIABLE]) then
+                 ErrorMess(5001);
+
+             {determine values associated with LASTLEXEME's token class and check
+              their validity
+             }
+             case klass of
+                FUNC2,
+                FUNC3    : sval := lastsym;
+                VARIABLE : begin
+                              id := lastident;
+                              if parseCoords then
+                                 if (lastlexeme <> ALLop) and
+                                    not CoordInMatrix(lastcoord.start, lastcoord.start) then
+                                    ErrorMess(5002)
+                                 else id := lastcoord
+                           end;
+                NUMBER   : begin
+                              rval := lastvalue;
+                              if parseCoords then begin
+                                 if lastlexeme = RNUMBERop then begin
+                                    D2X(lastvalue, xNumber);
+                                    ClearXcps;
+                                    X2I(xNumber, rowCoord);
+                                    if not CoordInMatrix(rowCoord, rowCoord) or TestXcp(INEXACT) then ErrorMess(5003)
+                                 end
+                                 else if lastlexeme <> EDGEop then ErrorMess(5005)
+                              end
+                              else if lastlexeme <> EDGEop then begin
+                                      if operation = PFormula then
+                                         if lastlexeme = CDOLLARop then
+                                            ErrorMess(15009)
+                                   end
+                              else begin
+                                      klass := VARIABLE;
+                                      id    := lastident
+                                   end
+                           end;
+                COORD    : if (operation = PCoordinate) or (lastlexeme <> EDGEop) then begin
+                              if not CoordInMatrix(lastcoord.length, lastcoord.start) then ErrorMess(5004)
+                              else begin
+                                      cval.start  := lastcoord.start;
+                                      cval.length := lastcoord.length
+                                   end
+                           end
+             end
+          end
+       end
+       else stackit := false
+    end;
+
+
+    (*
+        newstate - determine if the next CURR.TOKEN is to be shifted onto the
+                   SEMANTICS stack.  Function returns true if token is to be shifted
+                   onto the SEMANTICS stack.  False signals that a possible default
+                   state exists.
+    *)
+    (*$S compile *)
+    function newstate : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       newstate  := false;
+       curr.prod := paction[curr.state];
+       if curr.prod > defaultflag then begin
+          if curr.token < 0 then getToken;
+          curr.prod := curr.prod + curr.token;
+          if (curr.prod >= 0) and (curr.prod <= actionmax) then begin
+             curr.prod := action[curr.prod];
+             if chk[curr.prod] = curr.token then begin
+                curr.token := -1;
+                curr.state := curr.prod;
+                if curr.errflag > 0 then curr.errflag := curr.errflag - 1;
+                newstate := true
+             end
+          end
+       end
+    end;
+
+
+    (*
+        default - determines if the parser is in the default state (i.e.,
+                  end-of-parse).  Looks through the EXCEPT table to see if eof has
+                  been located (token = 0).  Function returns true if end-of-parse
+                  is encountered.  False signals that a reduction is to be done.
+    *)
+    (*$S compile *)
+    function default : boolean;
+    var excpt : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       default   := false;
+       curr.prod := def[curr.state];
+       if curr.prod = -2 then begin
+          if curr.token < 0 then getToken;
+
+          {look for exception for this particular state}
+          excpt := -2;
+          repeat
+             excpt := excpt + 2
+          until (except[excpt] = -1) and (except[excpt + 1] = curr.state);
+
+          {look for particular token and corresponding next state}
+          repeat
+             excpt := excpt + 2
+          until (except[excpt] < 0) or (except[excpt] = curr.token);
+          curr.prod := except[excpt + 1];
+          if curr.prod < 0 then default := true
+       end
+    end;
+
+
+    (*
+       detererror - determines from the SEMANTICS stack and LASTLEXEME
+                    an appropriate error message.
+    *)
+    (*$S specialCase *)
+    procedure detererror;
+    var topstack : symbol;
+        cont     : boolean;
+        x        : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+       if debug[5] and (operation <> PValue) then dumpsemantics(semantics, sempt);
+(*$ENDC *)
+       topstack  := semantics[sempt].lexeme;
+       if lastlexeme = BOUNDop then begin
+          case token[topstack] of
+             LOGICALOR,
+             LOGICALAND,
+             LOGICALNOT,
+             UPARROW,
+             MULOP,
+             SIGN,
+             LRELOP   : LErrorMess(15004, topstack, JUNKop);
+             otherwise  begin
+                           x    := sempt;
+                           cont := true;
+                           while cont and (x >= 0) do begin
+                              cont := false;
+                              case semantics[x].klass of
+                                 LPAREN : ErrorMess(15001);
+                                 FUNC2,
+                                 FUNC3  : ErrorMess(15002);
+                                 otherwise
+                                          begin
+                                             cont := true;
+                                             x    := x - 1
+                                          end
+                              end
+                           end;
+                           if cont then begin
+                              LErrorMess(5009, lastlexeme, topstack);
+                              if (lastlexeme = BOUNDop) and (topstack = BOUNDop) then error.status := BlankLine
+                           end
+                        end
+          end
+       end
+       else if lastlexeme = JUNKop then ErrorMess(5008)
+       else if lastlexeme = topstack then
+               case lastlexeme of
+                  RPARENop : ErrorMess(15012);
+                  otherwise  ErrorMess(5008)
+               end
+       else LErrorMess(5009, lastlexeme, topstack)
+    end;
+
+
+    (*
+        errorRecovery - attempts to resume parsing if an error was
+                        encountered.  Function returns true if "errorRecovery" wants
+                        the parser to restart by checking the default state (going
+                        to "newstate".  False signals that the next action should
+                        be to stack the next token (going to "stackit").  The
+                        function also sets the ABORT flag meaning that
+                        recovery was not possible and to end parsing.
+    *)
+    (*$S compile *)
+    function errorRecovery : boolean;
+    var temp : symbol;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       errorRecovery := false;
+
+       {generate error message and accumlated # of errors}
+(*$IFC DEBUGVERSION *)
+       if curr.errflag = 0 then
+(*$ENDC *)
+       begin
+          if sempt = 4 then
+             case semantics[3].lexeme of
+                EDGEop,
+                IDENTop : case lastlexeme of
+                             EDGEop,
+                             IDENTop : begin
+                                          temp := lastlexeme;
+                                          if stackit then GenerateCode(32);
+                                          GetToken;
+                                          if lastlexeme = RPARENop then begin
+                                             acceptflag := true;
+                                             exit(errorRecovery)
+                                          end
+                                          else lastlexeme := temp
+                                       end
+                          end
+             end;
+          if operation <> PValue then detererror;
+(*$IFC DEBUGVERSION *)
+          curr.numerrs := curr.numerrs + 1
+(*$ELSEC *)
+          curr.numerrs := 1;
+          abortFlag    := true
+(*$ENDC *)
+       end;
+
+(*$IFC DEBUGVERSION *)
+       {Backtrack through SEMANTICS stack removing entries until an ERRCODE
+        marker is found or the bottom of the stack.  If the marker is found,
+        resume parsing from that SEMANTICS stack state and stack the next token.}
+       if curr.errflag <= 2 then begin
+          curr.errflag := 3;
+          while sempt >= 0 do begin
+             curr.prod := paction[semantics[sempt].state] + ERRCODE;
+             if (curr.prod >= 0) and (curr.prod <= actionmax + 1) then
+                if chk[action[curr.prod]] = ERRCODE then begin
+                   curr.state := action[curr.prod];
+                   exit(errorRecovery)
+                end;
+             curr.prod := paction[semantics[sempt].state];
+             sempt := sempt - 1
+          end;
+          abortflag := true
+       end;
+
+       {Backtracking through the SEMANTICS stack did not reveal an ERRCODE marker.
+        If the current token is not the BOUNDop then resume parsing by checking
+        for the default state.  Otherwise its a fatal parse error and we stop.}
+       if curr.errflag <= 3 then
+          if curr.token = 0 then abortflag := true
+          else begin
+                  curr.token := -1;
+                  errorRecovery := true
+               end
+(*$ENDC *)
+    end;
+
+
+
+    (*
+       reduce - performs a stack reduction of the current production.  A
+                reduction will trigger the code generator to produce code for the
+                current production (if code is to be generated at all).
+    *)
+    (*$S compile *)
+    procedure reduce;
+    var nextstate : integer;
+        leftside  : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+       if debug[2] then
+          writeln('Reducing: ',curr.prod:1,'  lhs: ',lhs[curr.prod]:1,'   rhs: ',numrhs[curr.prod]:1);
+(*$ENDC *)
+       GenerateCode(curr.prod);
+       errorstart := semantics[sempt].bufpt;
+       sempt     := sempt - numrhs[curr.prod];
+       leftside  := lhs[curr.prod];
+       nextstate := prodgoto[leftside] + semantics[sempt].state + 1;
+       if nextstate >= actionmax + 1 then curr.state := action[prodgoto[leftside]]
+       else begin
+               curr.state := action[nextstate];
+               if chk[curr.state] <> -leftside then
+                  curr.state := action[prodgoto[leftside]]
+            end
+    end;
+
+
+(*$S compile *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   {initialize parsing flags}
+   sempt         := -1;                 {semantics stack pointer}
+   acceptflag    := false;
+   abortflag     := false;
+   errorflag     := false;
+   parse         := false;
+
+   parseCoords   := (operation = PCoordinate);
+   boundcnt      := 0;
+   curr.funcptr  := -1;
+   curr.argcount := 0;
+   curr.errflag  := 0;                  {current # of unresolved parsing errs}
+   curr.numerrs  := 0;                  {total # of parsing errs}
+   curr.token    := -1;                 {current parse token (-1 = none)}
+   curr.state    := 0;                  {current parse state}
+   errorstart    := 0;
+   cachecnt      := 0;
+   error.status  := ok;
+   error.mess1   := '';
+   error.mess2   := '';
+   initparser;
+
+   {begin parse, ending only when the parse is completed or a fatal error is found}
+   if parseCoords then begin
+      WordFromLexeme(SUMop, 40, @prefix);
+      prefix     := concat(prefix, '(');
+      textlength := length(prefix);
+      textline   := pointer(ord(@prefix) + 1)
+   end;
+   repeat
+      if stackit then begin
+      3: if not abortflag then
+            if not newstate then begin
+               if not default then begin
+                  if curr.prod = 0 then begin
+                     if errorRecovery and not abortflag then goto 3
+                  end
+                  else reduce
+               end
+               else acceptflag := true
+            end
+      end
+      else begin
+              ErrorMess(5012);
+              errorflag := true
+           end
+   until acceptflag or errorflag or abortflag;
+
+   if operation = PValue then begin
+      PutPcode(PUSHEND);
+      curr.numerrs := 0;
+      textflag     := false;
+      VT.bytevar   := eval[0];
+      if VT.bytevar > ENDPCODE then
+         case token[VT.lexeme] of
+            BOOLCONST,
+            FUNC1     : case VT.lexeme of
+                           RESULTop,
+                           CELLop,
+                           TODAYop,
+                           PIop    : textflag := true;
+                           PINFop  : textflag := (evalsize <> 1 + ord(eval[1] = UNARYMINUS));
+                           otherwise textflag := (evalsize <> 1)
+                        end;
+            otherwise   textflag := true
+         end
+      else begin
+              if (VT.bytevar > ENDCOORD) and (VT.bytevar <= ENDNUMBERS) then begin
+                 spot := pcodesize[VT.bytevar] + 1;
+                 textflag  := true;
+                 abortflag := false;
+                 repeat
+                    case eval[spot] of
+                       PUSHDOLLAR,
+                       PUSHCDOLLAR,
+                       PUSHNOP      : spot := spot + 1;
+                       otherwise      abortflag := true
+                    end
+                 until abortflag;
+                 VT.bytevar := eval[spot];
+                 if VT.bytevar > ENDPCODE then begin
+                    if token[VT.lexeme] = MODIFIER then
+                       if eval[spot+1] = UNARYMINUS then
+                          textflag := (evalsize <> spot+2)
+                       else textflag := (evalsize <> spot+1)
+                 end
+                 else if VT.bytevar = UNARYMINUS then
+                         textflag := (evalsize <> spot+1) or (eval[0] = PUSHDATE)
+                 else textflag := (evalsize <> spot)
+              end
+              else textflag := not((VT.byteVar = PUSHTRUE) or (VT.byteVar = PUSHFALSE))
+           end;
+      if textflag or not acceptflag then begin
+         evalsize := -1;
+         PutPcode(PUSHTEXT);
+         PutPcode(0);
+         PutPcode(0)
+      end
+   end;
+
+   error.errSpot.lpFst := errorstart;
+   error.errSpot.lpLim := lastbufpt;
+   if curr.numerrs = 0 then begin
+      parse := true;
+      PutPcode(PUSHEND)
+   end
+(*$IFC DEBUGVERSION *)
+   ;if curr.numerrs = 0 then begin
+      if debug[4] then dumpformula(@eval[0])
+   end
+   else begin
+           if debug[5] then errorprint(error, textline, textlength);
+           writeln('number of errors in parse: ',curr.numerrs:1)
+        end
+(*$ENDC *)
+end;
+
+
+ÿ

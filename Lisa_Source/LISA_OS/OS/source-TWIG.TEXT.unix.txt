@@ -1,0 +1,239 @@
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+
+{file source/twig}
+
+UNIT lddrivers;         {twiggy version}
+
+INTERFACE
+
+USES
+    (*$U object/ldutil.obj*)              ldutil,
+    (*$U object/driverdefs.obj*)          driverdefs;
+
+{Here is the standard device interface for all loader devices:}
+
+procedure DEVINIT(blk0, drv : integer);
+
+procedure READ_BLOCK(var error         :integer;
+                         drive         :integer;
+                         block         :longint;
+                     var buffer,header :integer);
+
+procedure READ_SEQ(var error         :integer;
+                       drive         :integer;
+                       block         :longint;
+                       pages         :integer;
+                   var buffer,header :integer);
+
+
+IMPLEMENTATION
+
+const
+   maxtrk = 92;
+   blocksize = 512;
+type
+   byte = -128..127; (* 1-byte integer *)
+
+   remap_table = record
+                   osid : integer;
+                   version : integer;
+                   numbad : integer;
+                   bad_blok : array[0..15] of integer;
+                 end;
+
+var
+   remapper : remap_table;
+   drive_no,
+   fs_blk0 : integer;  {not currently needed}
+   sector_table : array[0..maxtrk] of integer; {gives the address of the first}
+                                               {block/sector for each track.}
+
+
+procedure ASM_READ_BLOCK(var rc      :integer;
+                             blk     :longint;
+                         var buf,hdr :integer);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read the block 'blk' into the buffer pointed to by 'buf',
+       (*      with the return code assigned into 'rc'.
+       (*
+       (*************************************************************)
+        external;
+
+
+
+procedure INIT_TWIG_TABLE(tbl_adr : longint);
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read the table of start sectors of each track
+       (*      into the table whose address is TBL_ADR.
+       (*
+       (*************************************************************)
+        external;
+
+
+
+function CNV_BLK(block, drive : integer) : longint;
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Convert block/drive into the prom expected/packed
+       (*      representation.
+       (*
+       (*  {assumes block is already range checked}
+       (*
+       (*************************************************************)
+const
+     last_side0 = 45;  {highest track still on side 0}
+     spare_track = 23;
+     spare_side = 1;
+type blockadr = record drv: byte;
+                       side:byte;
+                       blk: byte;
+                       trk: byte;
+                end; {of blockadr}
+var
+   where : blockadr;
+   result : ^longint;     {does type conversion}
+   curr_track : integer;
+   i : integer;
+begin
+   with remapper do
+         if numbad > 0 then
+            for i := 0 to numbad-1 do
+               if (bad_blok[i] = block) then
+                  with where do
+                     begin
+                        if drive=0 then drv := 0 else drv := -128; {-128 = $80}
+                        side := spare_side;
+                        trk := spare_track;
+                        if i < 12 then blk := i + 1 else blk := i + 2;
+                        result := @where;
+                        CNV_BLK := result^;
+                        EXIT(CNV_BLK);
+                     end;
+
+      for curr_track := maxtrk-1 downto 0 do
+         if (block >= sector_table[curr_track]) then
+            with where do
+               begin
+                  if drive=0 then drv := 0 else drv := -128; {-128 = $80}
+                  if (curr_track <= last_side0) then
+                     begin
+                        side := 0;
+                        trk := curr_track;
+                     end
+                  else
+                     begin
+                        side := 1;
+                        trk := 91 - curr_track;
+                     end;
+                  blk := block - sector_table[curr_track];
+
+                  result := @where;
+                  CNV_BLK := result^;
+                  EXIT(CNV_BLK);
+               end;
+end; {of CNV_BLK}
+
+
+
+procedure DEVINIT{blk0, drv : integer};
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Initialize device driver.
+       (*
+       (* Input parameters:
+       (*    Blk0 - the absolute block number of FS block 0,
+       (*    drv - the boot drive number (0/1 for twiggy)
+       (*
+       (*************************************************************)
+const
+   remap1adr = $4BF;
+   remap2adr = $4CC;
+   osidvalue = $4AFC;
+   curr_version = 1;
+var
+   buf : array[0..255] of integer;
+   hdr : array[0..11] of integer; {psuedo-header}
+   workptr : ^remap_table;
+   error, i : integer;
+   remapadr : array[1..2] of integer;
+begin
+   fs_blk0 := blk0;
+   INIT_TWIG_TABLE( ord4( @sector_table) );
+   remapadr[1] := remap1adr;
+   remapadr[2] := remap2adr;
+   i := 1;
+   remapper.numbad := 0;        {init for case of NO sparing table exists}
+   repeat
+
+   {WARNING: The '+1', below, changes the track by one, into the }
+   { sparing track.  NASTY!! }
+      ASM_READ_BLOCK(error, CNV_BLK(remapadr[i], drv) + 1 {tricky},
+                        buf[0], hdr[0] );
+      if error<>0 then TRAP(bootdeviceflop);
+      workptr := @remapper;
+      MOVELEFT(buf[0], workptr^, SIZEOF(remap_table) );
+      with remapper do
+         if (osid=osidvalue) and (version=curr_version) then
+            EXIT(DEVINIT);
+      i := i+1;
+   until i=3;  {whereupon no sparing table could be found}
+end;
+
+
+
+procedure READ_BLOCK{var error         :integer;
+                         drive:        :integer;
+                         block         :longint;
+                     var buffer,header :integer};
+       (*************************************************************)
+       (*
+       (* Description:
+       (*    Read the block 'block' of drive number 'drive' into the buffer
+       (*    pointed to by 'buffer', with the return code assigned into 'error'.
+       (*
+       (*************************************************************)
+const
+  maxblock = 1683;  {highest legit block request}
+var
+   lbl : ^pagelabel;
+begin
+   if (block>maxblock) or (block<0) then error := -1
+   else
+      begin
+         ASM_READ_BLOCK(error, CNV_BLK(block, drive), buffer, header);
+         lbl := @header;
+         lbl^.abspage := block;
+      end;
+end; {of read_block}
+
+
+
+procedure READ_SEQ{var error         :integer;
+                       drive         :integer;
+                       block         :longint;
+                       pages         :integer;
+                   var buffer,header :integer};
+var
+   destination: ^integer;
+begin
+   destination := @buffer;
+   while (pages>0) do
+      begin
+         READ_BLOCK(error, drive, block, destination^, header);
+         if error<>0 then EXIT(read_seq);
+         destination := pointer(ord4(destination) + blocksize);
+         block := block + 1;
+         pages := pages - 1;
+      end;
+end; {of read_seq}
+
+
+end. {of unit lddrivers}
+
+ÿ

@@ -1,0 +1,700 @@
+        .title 'FMULT (1.10) SUBROUTINE  - 6/17/81 - 14:30:03 - 2.2'
+        PAGE
+;
+        .proc    mc%FMULT   ; 0,0
+        .def     mc%mul_opt
+        .ref     mc%vld_long
+;
+;************************************************************************
+;
+;       revision      date        description
+;       --------      ----        -----------
+;         1.1        8.jul.80      original
+;
+;         1.2       24.sept.80     mods to match spec 1.1
+;
+;         1.3        8.oct.80      removed stack frame reference which
+;                                  frees reg A1 - use regs. A0, A1, A3,
+;                                  & A4 instead of A3, A4, A5, & A6 for
+;                                  temp storage - optimized s-exp calc
+;
+;         1.4       14.oct.80      chg to calc entire intermediate result
+;
+;         1.5        5.jan.81      chg FPRB pointer from reg a6 to reg a3;
+;                                  chg to return unrounded result in d0-d2
+;                                  with g-r-s bits in d3 (caller must round);
+;                                  chg 'masquerade zero' test.
+;
+;         1.6       13.jan.81      modified for EXORMACS download
+;
+;         1.7       29.jan.81      ***  MICROSYSTEMS RELEASE  ***
+;                                  inserted call to valid at very end
+;
+;         1.8       13.feb.81      permanently converted to resident asm form
+;
+;         1.9        1.apr.81      added 'mc%mul_opt' entry point
+;
+;         1.10      23.apr.81      added 'mc%mul_opt' entry point
+;
+;       Hough       17 Jan 83      Reorganized so mult_main uses full 32 bit exponent.
+;                                  mc%fmult entry will call mc%vld_long.
+;************************************************************************
+;
+;               mc%fmult  -  68k floating point multiply routine
+;
+;
+;       This subroutine has two entry points to allow the caller to
+;       multiply either with or without rounding.
+;
+;       The two entry points are:
+;
+;          mc%fmult     - After the product is calculated, 'VALID' subroutine
+;                      is called to round the result and check for OVF or UNF.
+;
+;          mc%mul_opt - The unrounded product is returned without any checks
+;                      for OVF or UNF.
+;
+;
+;
+;       enter with:    d0-d2    contains source_argument
+;       ==========              (does not need to be properly tagged)
+;
+;                      d3       cleared  (these will be g-rnd-stiky bits)
+;
+;                      a3       points to fp register block (FPRB)
+;
+;                      a2       points to destination_FP_reg in FPRB
+;                               containing destination_argument.
+;
+;
+;
+;
+;
+;             31              15              0
+;             |---------------|---------------|
+;        d0   | s |   |  tag  |  exponent     | <--+
+;             |---------------!---------------|    |
+;        d1   | mantissa MSW  | mantissa NMSW |    |- source_argument
+;             |---------------|---------------|    |
+;        d2   | mantissa NLSW | mantissa LSW  | <--+
+;             |---------------|---------------|
+;        d3   |           $00000000           |
+;             |---------------|---------------|
+;
+;
+;
+;
+;             31              15              0
+;             |               |               |   lo memory
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;      a2 --> | s |   |  tag  |   exponent    | <--+
+;             |---------------|---------------|    |
+;             | mantissa MSW  | mantissa NMSW |    |- destination_FP_reg
+;             |---------------|---------------|    |
+;             | mantissa NLSW | mantissa LSW  | <--+
+;             |---------------|---------------|
+;             |                               |
+;             |---------------|---------------|
+;             |               |               |   hi memory
+;
+;
+;
+;
+;       exit with:     d0-d3    If (entry point = mc%fmult) then
+;       =========                  Contains rounded result in reg. d0-d2
+;                                  written over source argument; reg. d3
+;                                  cleared by valid.  (result is not typed,
+;                                  tag field is trash).
+;                               Else  (entry point = mc%mul_opt)
+;                                  Contains unrounded result in reg. d0-d2;
+;                                  reg. d3 contains g-r-s bits.  No OVF or
+;                                  UNF checking is performed.  (result is
+;                                  not typed, tag field is trash).
+;                               Endif
+;
+;                      d4-d7    destroyed
+;
+;                      a0-a1    destroyed
+;
+;                      a2-a7    unchanged
+;
+;
+;
+;       Subroutines Called:   Valid
+;       ==================
+;
+;
+;***********************  F L A G S   ******************************
+;
+;  This procedure is called by: decbin (mc%fmult)
+;                               bindec (mc%mul_opt)
+;
+;
+;  Exception    Set by     Reason
+;  =========    ======     ======
+;
+;  rsvx         ---        Not affected by this routine
+;
+;  iovf         ---        Not affected by this routine
+;
+;  inex         Valid %    Result can not be exactly represented
+;                          using the current rounding precision.
+;
+;  dz           ---        Not affected by this routine
+;
+;  unfl         Valid %    Result too small for internal extended
+;                          precision.
+;
+;  ovfl         Valid %    Result too large for internal extended
+;                          precision.
+;
+;  iop          ---        Not affected by this routine
+;
+;  % - These exception bits can be set ONLY when the mc%fmult entry point used.
+;
+;
+;
+;******************************************************************************
+  PAGE
+;
+;
+;
+;
+;******************************************************************************
+;
+;
+;               OVERVIEW  OF  PROCEDURE  FOR  mc%fmult
+;               -----------------------------------
+;
+; SIGN
+; ----
+;       The sign of the result = (sign_source_arg)  EOR  (sign_destin_arg)
+;
+; EXPONENT
+; --------
+;       Since both source_arg and destin_arg mantissas are 64 bits of the
+;       form, ( x.xxx----x ), the intermediate result will be 128 bits of
+;       the form ( xx.xxx----x ). The result to be returned, however, should
+;       be of the form ( x.xxx----x ) with 64 bits of significance; therefore
+;
+;             result exponent = exp_source_arg + exp_destin_arg + 1
+;
+;       with the '1' added in to allow the intermediate result to be
+;       considered as 128 bits of the form (x.xxx----x).  After the
+;       result mantissa has been calculated, should it turn out to be
+;       of the form (0.xxx----x), the result exponent will then be
+;       decremented by '1' and the result mantissa shifted left by
+;       one to normalize.  It can be shown that this method will
+;       not add false significance to the result formed when one or
+;       both of the arguments are not-normalized numbers.
+;
+;
+;  MANTISSA
+;  --------
+;       As noted above only the 64 MSB (rounded appropriately) of the
+;       128 bit intermediate result need be returned.  In order to
+;       round correctly to 64 bits regardless of rounding mode, a
+;       minimum of one guard bit, one round bit, and one stiky bit
+;       are required.  mc%fmult will calculate one guard bit and 15 round
+;       bits exactly with all subsequent result mantissa bits 'ored'
+;       into the 16-bit stiky word.
+;       See the following figures for a graphic illustration of this concept.
+;
+;
+ PAGE
+;
+;
+;
+;       63            31            0
+;       |------|------|------|------|  source_arg mantissa = 64 bits
+;  'B'  |  B3  |  B2  |  B1  |  B0  |                      = 4 Words
+;       |------|------|------|------|                      = 2 LWords
+;         MSW    NMSW   NLSW    LSW
+;
+;
+;
+;       63            31            0
+;       |------|------|------|------|  destin_arg mantissa = 64 bits
+;  'C'  |  C3  |  C2  |  C1  |  C0  |                      = 4 Words
+;       |------|------|------|------|                      = 2 LWords
+;         MSW    NMSW   NLSW    LSW
+;
+;
+;       63            31            0
+;       |------|------|------|------|  result mantissa = 64 bits
+;       |             |             |                  = 4 Words
+;       |------|------|------|------|                  = 2 LWords
+;                                   |------|------|         +
+;       |                           |g-rnd |stiky |    1 LWord g-rnd-
+;       |                           |------|------|            stiky
+;       |                           31            0
+;       |                           |      |      |
+;       |                           |      |      +-------------+
+;       |                           |      |  logical 'or'      |
+;       |                           |      |                    |
+;
+;       127           95            63            31            0
+;       |------|------|------|------|------|------|------|------|
+;       |             |             |             |             |
+;       |------|------|------|------|------|------|------|------|
+;       Intermediate Result Mantissa
+;
+;
+;
+;       The following figure illustrates the relationship between the
+;       Intermediate Result Mantissa and the 16 partial products (PP)
+;       which are shown formed into 7 partial product blocks (PPB).  The
+;       (Bn-Cm) notation used to describe each PP refers to the respective
+;       source_arg and destin_arg mantissa words used to form that PP
+;       (see fig above).
+;       If the Intermediate Result Mantissa is considered as four 32 bit
+;       long words (LWords), the figure shows that all odd numbered PPB
+;       must be added into the Intermediate Result Mantissa across the
+;       LWord boundaries.
+;
+;
+ PAGE
+;
+;       Figure illustrating PP relationships to Intermediate Result Mantissa
+;
+;
+;       127           95            63            31            0
+;       |------|------|------|------|------|------|------|------|
+;       |             |             |             |             |
+;       |------|------|------|------|------|------|------|------|
+;       Intermediate Result Mantissa
+;                                                 |------|------|
+;                                                 |   B0C0 PP   | PPB0
+;                                                 |------|------|
+;
+;                                          |------|------|
+;                                          |   B1C0 PP   |
+;                                          |------|------|    PPB1
+;                                          |   B0C1 PP   |
+;                                          |------|------|
+;
+;                                   |------|------|
+;                                   |   B2C0 PP   |
+;                                   |------|------|
+;                                   |   B1C1 PP   |    PPB2
+;                                   |------|------|
+;                                   |   B0C2 PP   |
+;                                   |------|------|
+;
+;                            |------|------|
+;                            |   B3C0 PP   |
+;                            |------|------|
+;                            |   B2C1 PP   |
+;                            |------|------|    PPB3
+;                            |   B1C2 PP   |
+;                            |------|------|
+;                            |   B0C3 PP   |
+;                            |------|------|
+;
+;                     |------|------|
+;                     |   B3C1 PP   |
+;                     |------|------|
+;                     |   B2C2 PP   |     PPB4
+;                     |------|------|
+;                     |   B1C3 PP   |
+;                     |------|------|
+;
+;              |------|------|
+;              |   B3C2 PP   |
+;              |------|------|      PPB5
+;              |   B2C3 PP   |
+;              |------|------|
+;
+;       |------|------|
+;       |   B3C3 PP   |      PPB6
+;       |------|------|
+ PAGE
+;
+;
+;
+;       For mantissa multiplication, 32 bit partial products (PP) are
+;       formed and added together as shown above to form Partial Product
+;       Blocks (PPB).  These PPB's are then added together in data regs
+;       d5_d6__d7_d0 to form an exact 128-bit intermediate result.
+;
+;       The MS 96-bits of the result are placed in register d1-d3;
+;       the LS 32-bits of the result are logically 'ored' into the
+;       LS-word of reg d3 (stiky word).
+;
+;       The unrounded result is checked to see if it looks like a normal
+;       zero (this can only occur as the product of two grossly unnormalized
+;       numbers); if this 'masquerade_zero' is detected, the exponent is
+;       decremented to force the underflow path in the valid subroutine
+;       to be taken.
+;
+;       Return to caller.
+;
+;       Note that this method allows all calculations to be performed
+;       in the 68,000's data registers which limits memory accesses to
+;       destination_argument reads.  To further minimize the (ea)
+;       calculation overhead involved in memory accesses,the destination_arg
+;       mantissa words (C3, C2, C1, C0) are read into registers
+;       A0, A1, A3, & A4 (after saving A3-A4 on stack) for use in PP
+;       calculations.
+;
+;
+;       DATA REGISTER USAGES FOR MANTISSA CALCULATION
+;       =============================================
+;
+;             31              15              0
+;             |---------------|---------------|
+;        d0   |       result LS 32 bits       | <- will be 'ored' into stiky
+;             |---------------!---------------|
+;        d1   | B3 mtissa word| B2 mtissa word| <--|
+;             |---------------|---------------|    |- source_argument mantissa
+;        d2   | B1 mtissa word| B0 mtissa word| <--|
+;             |---------------|---------------|
+;        d3   |           $00000000           | <-- note: caller cleared d3
+;             |---------------|---------------|
+;        d4   |                               |
+;             |---------------|---------------|
+;        d5   |     MSW            NMSW       | <--|
+;             |---------------|---------------|    |
+;        d6   |     NLSW            LSW       |    |- result mantissa
+;             |---------------|---------------|    |    accummulator
+;        d7   |     g-round-stiky LWord       | <--|       (RMA)
+;             |---------------|---------------|
+;
+ PAGE
+;
+;
+;       ADDRESS REGISTER USAGES FOR MANTISSA CALCULATIONS
+;       =================================================
+;
+;             31              15              0
+;             |---------------|---------------|
+;        a0   |               | C3 mtissa word| <--+
+;             |---------------|---------------|    |--+
+;        a1   |               | C2 mtissa word| <--+  |
+;             |---------------|---------------|       |
+;        a2   |   ptr. to destin_arg in FPRB  |       |-destination_arg
+;             |---------------|---------------|       |  mantissa words
+;        a3   |               | C1 mtissa word| <--+  |
+;             |---------------|---------------|    |--+
+;        a4   |               | C0 mtissa word| <--+
+;             |---------------|---------------|
+;
+;
+;
+;              *********************************
+;
+;
+;
+;       Restating this mc%fmult procedure in an algorithmic form:
+;
+;
+;
+;       Save registers a3, a4, & a5 on stack.
+;
+;       Calculate result sign & exponent in d0; save it in reg a5.
+;
+;       Move destin_arg mantissa words (4) into regsisters a0, a1, a3, & a4
+;
+;       Calc the one PP in PPB0 in reg. d0.
+;
+;       Calc the two PP in PPB1 in regs. d4,d5
+;
+;       Sum the 2 PP of PPB1 in reg. d5 propogating the carry into MSW
+;               of reg. d7. Reg d3 = 0 is reserved for use in carry
+;               propogation.
+;
+;       Remember that odd numbered PPB's must be added into the RMA
+;               across LWord boundaries; therefore add the LSW of the PPB1
+;               summation in reg d5 to the MSW of reg d0 saving carry in
+;               X bit.  Add with Xtend the MSW of the PPB1 summation in
+;               reg d5 to the LSW of reg d7 propogating carry into MSW of
+;               reg d7.
+;
+;       Calc the 3 PP of PPB2 in regs. d4-d6.
+;
+;       Add the 3 PP of PPB2 in regs. d4-d6 into reg. d7 propogating
+;               carrys into LSW of reg d6.
+;
+;       Calc one of the 4 PP of PPB3 in reg d4.  Successively calc the
+;               remaining 3 PP of PPB3 in reg. d5 adding each into reg
+;               d4 and propogating carrys into MSW of reg d6.
+;
+;       Remember that odd numbered PPB's must be added into the RMA
+;               across LWord boundaries; therefore add the LSW of the PPB3
+;               summation in reg d4 to the MSW of reg d7 saving carry in
+;               X bit.  Add with Xtend the MSW of the PPB3 summation in
+;               reg d4 to the LSW of reg d6 propogating carry into MSW of
+;               reg d6.
+;
+;       Successively calc the 3 PP of PPB4 in reg d4 adding each into
+;               reg d6 and propogating carrys into a cleared reg d5's LSW.
+;
+;       Calc the 2 PP of PPB5 in regs d3 & d4.
+;
+;       Sum the 2 PP of PPB5 in reg d4 propogating carry into MSW of
+;               reg d5.  Reg d3 is re-cleared for use in carry propogation.
+;
+;       Remember that odd numbered PPB's must be added into the RMA
+;               across LWord boundaries; therefore add the LSW of the PPB5
+;               summation in reg d4 to the MSW of reg d6 saving carry in
+;               X bit.  Add with Xtend the MSW of the PPB5 summation in
+;               reg d4 to the LSW of reg d5 propogating carry into MSW of
+;               reg d5.
+;
+;       Calc the 1 PP of PPB6 in reg d4 and add into reg d5.  No carry
+;               will ever be generated since a multiply involving two.
+;               64-bit operands will always fit in 128-bits.
+;
+;       Move the MS 96-bits of the 128-bit intermediate result from
+;               regs. d5-d7 into regs. d1-d3
+;
+;       Logically 'or' the two words in reg d0 which comprise the
+;               LS 32-bits of the 128-bit intermediate result into
+;               the sticky word (reg d3 LSW).
+;
+;       Move the result sign-exp saved in reg a5 back into reg d0.
+;
+;       IFTST  (MSB of result mantissa) EQ 0
+;               Shift result mantissa and g-rnd-sticky
+;               left by one and decrement exponent.
+;       ENDIF
+;
+;       IFTST  (unrounded result in d0-d2 looks like normal zero)
+;               Shift result mantissa and g-rnd-sticky
+;               left by one and decrement exponent.
+;               (this will cause the UNF-flag to be set in 'VALID')
+;       ENDIF
+;
+;       Restore registers a3, a4, & a5.
+;
+;       Call 'valid' to chk for ovf and unf and to round the result.
+;
+;       Return
+;
+;******************************************************************************
+  PAGE
+;
+;
+;
+;
+;
+;                     ***********************
+;                     *  mc%fmult STARTS HERE  *
+;                     ***********************
+;
+;
+;
+        
+        debugbegin
+        bsr.s   mult_main
+        jmp     mc%vld_long              ; Validate.
+        debugend 'MC%FMULT',0
+
+mc%mul_opt
+MULT_MAIN
+        
+        debugbegin
+        move.l  d0,d4                   ; D4 gets sign/exponent of ea.
+        move.l  (a2),d5                 ; D5 gets sign/exponent of fpn.
+        eor.l   d5,d4                   ; D4 gets sign of result.
+        andi.l  #$80000000,d4           ; Clear all other bits.
+        move.l  d4,-(sp)                ; Save sign of result on stack.
+;
+;      Calculate result exponent.
+;
+        ext.l   d5                      ; D5 gets 32 bit exponent of fpn.
+        ext.l   d0                      ; 32 bit exponent for ea.
+        add.l   d5,d0                   ; D0 gets exponent of result.
+        ADDQ.l  #1,D0
+        
+;
+;      Save a3, a4, & a5 on stack
+;
+        MOVEM.L A3/A4/A5,-(A7)
+        MOVE.L  D0,A5                  ; SAVE RESULT EXP IN REG A5
+;
+;      Move destin_arg's four mantissa words into regs. a0, a1, a3, & a4.
+;
+        MOVEM.W FRACT(A2),A0/A1/A3/A4
+;
+;      First work on PPB0 & PPB1. Note that d3 was cleared by front-end.
+;
+        MOVE.W  A4,D0                  ; C0 -> D0
+        MOVE.W  A4,D5                  ; C0 -> D5
+        MOVE.W  A3,D4                  ; C1 -> D4
+;
+        MULU    D2,D0                  ; B0 * C0 -> D0
+        MULU    D2,D4                  ; B0 * C1 -> D4
+        SWAP    D2                     ; ACCESS B1 WORD OF SOURCE_ARG MANTISSA
+        MULU    D2,D5                  ; B1 * C0 -> D5
+;
+        MOVE.L  D3,D7                  ; CLEAR D7 FOR CARRY PROP
+        ADD.L   D4,D5                  ; B0C1 + B1C0 -> D5
+        ADDX.W  D7,D7                  ; ADD CARRY INTO D7 LSW
+        SWAP    D7                     ; MAKE D7 LSW INTO D7 MSW
+        SWAP    D0                     ; ACCESS D0 MSW
+        ADD.W   D5,D0                  ; (D5 LSW) + (WAS D0 MSW) -> (WAS D0 MSW)
+        SWAP    D5                     ; ACCESS D5 MSW
+        MOVE.W  D5,D7                  ; (WAS D5 MSW) -> (D7 LSW)
+        ADDX.L  D3,D7                  ; ADD CARRY INTO D7 LONG WORD
+;
+; Next work on PPB2.
+;
+        MOVE.W  A4,D4                  ; C0 -> D4
+        MOVE.W  A3,D6                  ; C1 -> D6
+        MOVE.W  A1,D5                  ; C2 -> D5
+;
+        MULU    D2,D6                  ; B1 * C1 -> D6
+        SWAP    D2                     ; ACCESS B0 WORD OF SOURCE_ARG MANTISSA
+        MULU    D2,D5                  ; B0 * C2 -> D5
+        MULU    D1,D4                  ; B2 * C0 -> D4
+;
+        ADD.L   D6,D7                  ; B1C1 + D7 -> D7
+        MOVE.L  D3,D6                  ; CLEAR D6 FOR CARRY PROPOG
+        ADDX.W  D3,D6                  ; ADD CARRY INTO D6 LSW
+        ADD.L   D5,D7                  ; B0C2 + (B1C1 + D7) -> D7
+        ADDX.W  D3,D6                  ; ADD CARRY INTO D6 LSW
+        ADD.L   D4,D7                  ; B2C0 + (B0C2 + B1C1 + D7) -> D7
+        ADDX.W  D3,D6                  ; ADD CARRY INTO D6 LSW
+;
+; Next work on PPB3.
+;
+        MOVE.W  A0,D4                  ; C3 -> D4
+        MULU    D2,D4                  ; B0 * C3 -> D4
+        SWAP    D6                     ; ACCESS MSW FOR CARRY PROPOG
+        SWAP    D2                     ; ACCESS B1 WORD OF SOURCE_ARG MANTISSA
+        MOVE.W  A1,D5                  ; C2 -> D5
+        MULU    D2,D5                  ; B1 * C2 -> D5
+        ADD.L   D5,D4                  ; B1C2 + B0C3 => D4
+        ADDX.W  D3,D6                  ; ADD CARRY INTO WHAT WAS D6 MSW
+        MOVE.W  A3,D5                  ; C1 -> D5
+        MULU    D1,D5                  ; B2 * C1 -> D5
+        ADD.L   D5,D4                  ; B2C1 + (B1C2 + B0C3) -> D4
+        ADDX.W  D3,D6                  ; ADD CARRY INTO WHAT WAS D6 MSW
+        MOVE.W  A4,D5                  ; C0 -> D5
+        SWAP    D1                     ; ACCESS B3 WORD OF SOURCE_ARG MANTISSA
+        MULU    D1,D5                  ; B3 * C0 -> D5
+        ADD.L   D5,D4                  ; B3C0 + (B2C1 + B1C2 + B0C3) -> D4
+        ADDX.W  D3,D6                  ; ADD CARRY INTO WHAT WAS D6 MSW
+        SWAP    D6                     ; RESTORE D6
+;
+;      Get here with PPB3 summation in reg d4 which must now be added
+;      into the LWord formed by the concatanation of d6 LSW-d7 MSW with
+;      carrys propogated appropriately.
+;
+        SWAP    D7                     ; ACCESS MSW D7
+        ADD.W   D4,D7                  ; (D4 LSW) + (WAS D7 MSW) -> (WAS D7 MSW)
+        SWAP    D7                     ; RESTORE D7
+        SWAP    D4                     ; ACCESS (PPB3 SUMMATION) MSW
+        ADDX.W  D4,D6                  ; (WAS D4 MSW) + (D6 LSW) + C -> (D6 LSW)
+        SWAP    D6                     ; ACCESS MSW D6
+        ADDX.W  D3,D6                  ; ADD CARRY INTO WHAT WAS D6 MSW
+        SWAP    D6                     ; RESTORE D6
+;
+;      Next work on PPB4.  Note that both d1 and d2 remain swapped which
+;      means that source_arg mantissa words B3 and B1 are currently accessible.
+;
+        MOVE.W  A0,D4                  ; C3 -> D4
+        MULU    D2,D4                  ; B1 * C3 -> D4
+        MOVE.L  D3,D5                  ; CLEAR D5 FOR CARRY PROPOG
+        ADD.L   D4,D6                  ; B1C3 + D6 -> D6
+        ADDX.W  D3,D5                  ; ADD CARRY INTO D5 LSW
+        MOVE.W  A3,D4                  ; C1 -> D4
+        MULU    D1,D4                  ; B3 * C1 -> D4
+        ADD.L   D4,D6                  ; B3C1 + (B1C3 + D6) -> D6
+        ADDX.W  D3,D5                  ; ADD CARRY INTO D5 LSW
+        SWAP    D1                     ; ACCESS SOURCE_ARG MANTISSA WORD B2
+        MOVE.W  A1,D4                  ; C2 -> D4
+        MULU    D1,D4                  ; B2 * C2 -> D4
+        ADD.L   D4,D6                  ; B2C2 + (B3C1 + B1C3 + D6) -> D6
+        ADDX.W  D3,D5                  ; ADD CARRY INTO D5 LSW
+;
+;      Next work on PPB5.  Note that source_arg mantissa words B2 and B1 are
+;      currently accessible.
+;
+        MOVE.W  A0,D4                  ; C3 -> D4
+        MOVE.W  A1,D3                  ; C2 -> D3
+        MULU    D1,D4                  ; B2 * C3 -> D4
+        SWAP    D1                     ; ACCESS SOURCE_ARG MANTISSA WORD B3
+        MULU    D1,D3                  ; B3 * C2 -> D3
+        ADD.L   D3,D4                  ; B3C2 + B2C3 -> D4
+        moveq   #0,D3                  ; RE-CLEAR D3 FOR USE IN CARRY PROPOG
+        SWAP    D5                     ; ACCESS MSW D5
+        ADDX.W  D3,D5                  ; ADD CARRY INTO WHAT WAS MSW D5
+        SWAP    D5                     ; RESTORE D5
+;
+;      Get here with PPB5 summation in reg d4 which must now be added
+;      into the LWord formed by the concatanation of d5 LSW-d6 MSW with
+;      carrys propogated appropriately.
+;
+        SWAP    D6                     ; ACCESS MSW D6
+        ADD.W   D4,D6                  ; (D4 LSW) + (WAS D6 MSW) -> (WAS D6 MSW)
+        SWAP    D6                     ; RESTORE D6
+        SWAP    D4                     ; ACCESS MSW D4
+        ADDX.W  D4,D5                  ; (WAS D4 MSW) + (D5 LSW) + C -> (D5 LSW)
+        SWAP    D5                     ; ACCESS MSW D5
+        ADDX.W  D3,D5                  ; ADD CARRY INTO WHAT WAS MSW D5
+        SWAP    D5                     ; RESTORE D5
+;
+;      Next work on PPB6.  Note that source_arg mantissa words B1 and B3 are
+;      currently accessible.
+;
+        MOVE.W  A0,D4                  ; C3 -> D4
+        MULU    D1,D4                  ; B3 * C3 -> D4
+        ADD.L   D4,D5                  ; B3C3 + D5 -> D5
+;
+;      Get here with 64 MSB of result mantissa in regs d5 and d6;
+;      have 1 LWord of g-rnd-stiky in reg d7 and 1 LWord of stiky in reg d0.
+;
+        MOVE.L  D5,D1                  ; MOVE RESULT MTISSA 2 MSWS INTO D1
+        MOVE.L  D6,D2                  ; MOVE RESULT MTISSA 2 LSWS INTO D2
+        MOVE.L  D7,D3                  ; MOVE RESULT G-RND-STK INTO D3
+;
+;      'OR' the two words of stiky in reg d0 into the stiky word in reg d3
+;      and restore the result sign-exp to reg d0 which was saved in reg a5.
+;
+        OR.W    D0,D3
+        SWAP    D0
+        OR.W    D0,D3
+        MOVE.L  A5,D0
+;
+;      Next test MSB of result mantissa.  If MSB set then result OK now in
+;      form (1.xxx---x), else shift result mantissa and g-rnd-sticky
+;      left by one and dec exponent since result now in form (0.xxx---x).
+;      Note that this does not impart false significance to a result
+;      formed when one or both args are not-normalized.
+;
+        TST.L      D1
+        blt     @1                     ; IF (MSB OF RESULT MTISSA A '1') THEN
+           ASL.L      #1,D3               ; SHIFT LEFT ONCE TO NORMALIZE
+           ROXL.L     #1,D2
+           ROXL.L     #1,D1
+           SUBQ.l     #1,D0               ; DECREMENT EXPONENT
+@1                                     ; END
+;
+;      Now have unrounded result in d0-d2 with g-rnd-stiky in d3.
+;      Check for unrounded result masquerading as normal zero.
+;
+        cmp.l   #xextminxp,d0
+        bne     @2
+           TST.L    D1
+           bne  @2
+              TST.L    D2
+              bne      @2                    ; IF (LOOKS LIKE NORMAL ZERO)
+                 ASL.L    #1,D3                 ; SHIFT MANTISSA LEFT ONCE
+                 ROXL.L   #1,D2
+                 ROXL.L   #1,D1
+                 SUBQ.l   #1,D0                 ; DECREMENT EXP TO FORCE UNF
+@2                                           ; END
+;
+;      Restore the saved regs. a3, a4, & a5 from stack
+;
+        MOVEM.L    (A7)+,A3/A4/A5      ; RESTORE A3,A4,& A5
+        bclr    #31,d0                  ; Clear sign bit position.
+        or.l    (sp)+,d0                ; Recall sign of result.
+        rts
+        debugend 'MC%MUL_O',0
+       
+ÿ

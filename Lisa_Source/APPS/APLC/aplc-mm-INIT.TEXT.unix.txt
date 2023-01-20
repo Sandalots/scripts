@@ -1,0 +1,823 @@
+(*$F-+ *)
+unit parser;                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+     intrinsic;
+
+interface
+
+uses (*$U UnitStd.obj *)                UnitStd,
+     (*$U UnitHz.obj *)                 UnitHz,
+     (*$U Storage.obj *)                Storage,
+     (*$U QuickDraw.obj *)              QuickDraw,
+     (*$U Fontmgr.obj *)                FontMgr,
+     (*$U dbenv.obj *)                  dbenv,
+     (*$U FEdec.obj *)                  FEdec,
+     (*$U fld.obj *)                    fieldedit,
+     (*$U teenv.obj *)                  teenv,
+
+     (*$U libos/syscall.obj *)          syscall,
+     (*$U FPlib.obj *)                  FPlib,
+     (*$U PMDecl *)                     PMDecl,
+     (*$U PrStdInfo *)                  PrStdInfo,
+     (*$U aplc/mm/matmgr.obj *)         matmgr,
+     (*$U international *)              International,
+     (*$U MathLib.obj *)                MathLib,
+     (*$U aplc/mm/bgenv *)              bgenv;
+
+
+                  {p-codes - these are imbeded into a formula to facilate the
+                   formula's evaluation and formatting.  Each p-code has associated
+                   with it a certain amount of data (0 -> ??? bytes).  These sizes
+                   are stored in the PCODESIZE array.  Any additions or deletions
+                   in the p-code list should be reflected in PCODESIZE.  There are
+                   special marker p-codes that serve to delineated major groups in
+                   the pcode list.  ENDPCODE must be the highest numbered valued
+                   p-code.  STARTPCODE, ENDCOORD & ENDOPERAND are markers that
+                   separate major groups and do not get generated.  The byte number
+                   given below is the number of bytes for the p-code itself (1 byte)
+                   plus the number of bytes of operand data.
+                  }
+const STARTPCODE  = -128;
+      PUSHCOORD   = -128;                       {push coordinate - 3 bytes}
+      PUSHECOORD  = -127;                       {push error coordinate - 3 bytes}
+      PUSHCRANGE  = -126;                       {push coordinate range - 5 bytes}
+      PUSHECRANGE = -125;                       {push error coordinate range - 5 bytes}
+      ENDCOORD    = -125;
+      PUSHSREAL   = -124;                       {push short real value - 5 bytes}
+      PUSHLREAL   = -123;                       {push long real value - 9 bytes}
+      PUSHINT     = -122;                       {push integer value - 3 bytes}
+      PUSHBYTE    = -121;                       {push byte value - 2 bytes}
+      PUSHDOLLAR  = -120;                       {push dollar amount marker - 1 byte}
+      PUSHCDOLLAR = -119;                       {push dollar w/comma marker - 1 byte}
+      PUSHDATE    = -118;                       {push date - 5 bytes}
+      PUSHPERCENT = -117;                       {push percentage marker - 1 byte}
+      PUSHNOP1    = -116;
+      PUSHNOP3    = -115;
+      ENDNUMBERS  = -115;
+      PUSHTEXT    = -114;                       {push text string - ?? bytes}
+      PUSHMARKER  = -113;                       {push function marker - 1 byte}
+      PUSHTRUE    = -112;                       {push true marker - 1 byte}
+      PUSHFALSE   = -111;                       {push false marker - 1 byte}
+      UNARYMINUS  = -110;                       {unary minus - 1 byte}
+      PUSHNOP     = -109;                       {no operation - 1 byte}
+      PUSHRANGE   = -108;                       {coordinate display range marker}
+      PUSHEND     = -107;                       {push end of formula marker - 1 byte}
+      PUSHPENNY   = -106;                       {push penny marker - 1 byte}
+      PUSHPARTS   = -105;                       {push date parts - 13 bytes}
+      ENDPCODE    = -105;                       {end marker for rule - 1 byte}
+
+
+                  {parse tokens - these are used by the parser to determine the
+                   type of the lexeme being parsed.  These tokens have direct
+                   correlation with the tokens appearing in the grammar.
+                  }
+      BOUND       = 0;
+      ERRCODE     = 256;
+      NUMBER      = 257;                        {any numeric value}
+      LOGICALAND  = 258;                        {logical and operator}
+      COORD       = 259;                        {single coordinate value}
+      LRELOP      = 260;                        {relational operators}
+      LOGICALOR   = 261;                        {logical or operator}
+      MULOP       = 262;                        {multiply precedence operators}
+      SIGN        = 263;                        {sign precendence operators}
+      FUNC1       = 264;                        {constant value funcs - no args}
+      FUNC2       = 265;                        {funcs with more than one argument}
+      FUNC3       = 266;                        {funcs with only one argument}
+      LOGICALNOT  = 267;                        {not operator}
+      BOOLCONST   = 268;                        {boolean constant}
+      VARIABLE    = 269;                        {identifier reference}
+      COMMA       = 270;                        {comma puncuation}
+      LPAREN      = 271;                        {left parenthesis}
+      RPAREN      = 272;                        {right parenthesis}
+      UPARROW     = 273;                        {power operator}
+      ELLIPSE     = 274;                        {coordinate puncuation}
+      MODIFIER    = 275;                        {modifier}
+
+
+type  numType     = (nanKind, lrealKind, srealKind, intKind, byteKind, dateKind,
+                     partsKind, textKind);
+
+      operandType = (VALUEINFO, STACKMARKER, COORDRANGE, EVALRANGE, PERCENTAGE, COORDINFO, TYPEINFO);
+
+        calcStack   = array [0..CalcStkMax] of
+                       record
+                          val         : variantType;
+                          NANkind     : cnSymKind;
+                          dataIsBlank : boolean;
+                          reference   : variantType;
+                          op          : operandType;
+                          case alias of
+                             twdlDee : (coord      : rangeType);
+                             twdlDye : (date       : dateACs);
+                             twdlDoe : (myEnviorn  : environ;
+                                        formPos    : integer
+                                       )
+                       end;
+
+var   lastbufpt   : integer;                    {last textline position}
+      messagelen  : integer;                    {index to last character position in
+                                                 the message buffer}
+
+                  {the code for formula returned by the parser}
+      eval        : array [0..evalMax] of byte;
+                  {the # bytes of data for each pcode}
+      pcodesize   : array [STARTPCODE..ENDPCODE] of byte;
+
+      NaErrs      : array [cnSymkind, cnSymKind] of cnSymKind;
+
+    function LeapYear
+      (year : integer
+      ) : integer;
+
+    procedure normcoords
+      (var coord : rangeType            {coordinate to be normalized}
+      );
+
+    procedure packnum
+      (number        : longreal;
+       var numValue  : variantType;
+       var typeOfNum : numType          {packing code number}
+      );
+
+    procedure startwrite
+      (message : ptrData;               {ptr to where message is to be written}
+       maxlen : integer                 {maximum # of chars to generate}
+      );
+
+    procedure writecoord
+      (coord        : pident;           {coordinate to go into message buffer}
+       var colwidth : byte              {}
+      );
+
+    procedure writefnum
+      (number   : extended;             {number to go into message buffer}
+       docommas : boolean               {format with commas? }
+      );
+
+    procedure writechar
+      (ch : char                        {character to go into message buffer}
+      );
+
+    procedure writenum
+      (number : extended                {number to go into message buffer}
+      );
+
+    procedure writestring
+      (message : str80                  {string to go into message buffer}
+      );
+
+    procedure writeword
+      (lexeme : symbol                  {lexeme whose text goes into the}
+      );                                {message buffer}
+
+
+implementation
+
+(*$R- *)
+
+(*$IFC teSym *)
+(*$D+ *)
+(*$ELSEC *)
+(*$D- *)
+(*$ENDC *)
+
+const sopMin      = '!';                        {Min/Max single-char op character}
+      sopMax      = '|';
+      dopMin      = '<';                        {Min/Max double-char op character}
+      dopMax      = '>';
+      eofchar     = 8;
+      cachesize   = 5;
+      funcMax     = 63;                         {number # of functions - 1}
+
+                  {parse table constants}
+      exceptmax   = 5;                          {max # of exceptions}
+      actionmax   = 103;                        {max # of action table entries}
+      pactionmax  = 53;                         {max # of paction table entries}
+      prodmax     = 12;                         {max # of production goto entries}
+      rulesmax    = 32;                         {max # of grammar rules}
+
+type  sopRange     = sopMin..sopMax;            {range of single-char operators}
+      dopRange     = dopMin..dopMax;            {range of double-char operators}
+      argset       = set of 0..15;              {argument type information}
+      funcsym      = record                     {function table entry}
+                        reqargnum : byte;       {required # of arguments, -1 = infinity}
+                        optargnum : byte;       {option # of arguments, -1 = infinit}
+                        argtype   : argset;     {argument type information}
+                        lexeme    : symbol      {function lexeme}
+                     end;
+      semInfo      = record
+                        state     : integer;    {current parse state}
+                        argcount  : integer;    {func arg #}
+                        bufpt     : integer;    {textline position}
+                        funcptr   : integer;    {function ptr, if any}
+                        lexeme    : symbol;     {lexeme occurance}
+                        valtype   : symbol;     {type of last numeric value}
+                        case klass : integer of {lex token values}
+                           COORD     : (cval : pident);
+                           FUNC2,
+                           FUNC3     : (sval : integer);
+                           NUMBER    : (rval : longreal);
+                           VARIABLE  : (id   : ident)
+                     end;
+
+      semStack     = array [0..SemStkMax] of semInfo;
+
+      ptrs         = record
+                        s : integer;
+                        e : integer
+                     end;
+
+var   VofTenths   : extended;
+      VofTens     : extended;
+      next1ch     : char;                       {look ahead charaters for lex}
+      next2ch     : char;
+      lastch      : char;                       {last character scanned}
+      lastcoord   : ident;                      {last matrix coord scanned}
+      lastident   : ident;                      {last identifier scanned}
+      lastvalue   : longreal;                   {last real number scanned}
+      lastvaltype : symbol;                     {type of the last value scanned}
+      lastlexeme  : symbol;                     {last lexeme scanned}
+      lastdate    : dateType;                   {last date scanned}
+      lastParseOp : parseKind;                  {last parsing operation}
+      textline    : ptrData;                    {ptr to line to be parsed}
+      messageptr  : ptrData;                    {ptr to start of message buffer}
+      messagemax  : integer;                    {max length of message buffer}
+      lastsym     : integer;                    {index to last function symbol scanned}
+      prevbufpt   : integer;                    {previous position on textline}
+      numfunc     : integer;                    {# of functions in function table}
+      textlength  : integer;                    {length of line to be parsed}
+      cachecnt    : integer;
+      cachelex    : array [0..cachesize] of
+                       record
+                          value : variantType;
+                          lexCH : char
+                       end;
+
+
+                  {parse tables}
+      except      : array [0..exceptmax] of byte;
+      action      : array [0..actionmax] of byte;
+      paction     : array [0..pactionmax] of integer;
+      prodgoto    : array [0..prodmax] of byte;
+      lhs         : array [0..rulesmax] of byte;
+      numrhs      : array [0..rulesmax] of byte;
+      chk         : array [0..pactionmax] of integer;
+      def         : array [0..pactionmax] of byte;
+
+                  {lex tables}
+      sopchar     : array [sopRange] of symbol;
+      dopchar     : array [dopRange, dopRange] of symbol;
+      chrclass    : array [char] of letterclass;
+                  {table of function definitions}
+      funcname    : array [0..funcMax] of funcsym;
+
+
+    procedure getRgName (rg: range; rgNameX: ptrData; var numBytes: integer); external;
+
+    procedure normcoords
+      (* var coord : rangeType          {coordinate to be normalized}
+      *); external;
+
+procedure initKeys; forward;
+procedure initNaErrs; forward;
+procedure initArrays(mode : IOmodeType; var status : integer); forward;
+function  validDate(changeCache : boolean) : boolean; forward;
+
+(*$IFC DEBUGVERSION *)
+{all of these externals are in aplc/mm/STUBS - Unit STUBS}
+procedure dumpenv(en : environ); external;
+procedure dumpformula(formula : ptrData); external;
+procedure errorprint(error : errRecord; textline : ptrData; textlength : integer); external;
+procedure statusmess(status : integer); external;
+function  wNAN(value : cnSymKind) : char; external;
+function  wExc : char; external;
+function  wRg(rg : range ) : char; external;
+function  wSHR(value : shareKind) : char; external;
+function  wSNIP(value : snipKind) : char; external;
+function  wNUM(number : longreal) : char;  external;
+function  wXNUM(number : extended) : char;  external;
+function  wWords(value : symbol) : char;  external;
+(*$ENDC *)
+
+(*$IFC MMINITCODE *)
+(***************************************.*******.************************************
+   initClasses - initializes the class characteristics of each
+                 character.  The general class info is stored into CHRCLASS
+                 with more specific information concerning the lexeme associated
+                 with the character stored in SOPCHAR & DOPCHAR.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initClasses;
+var ch  : char;
+    ch2 : char;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   for ch := chr(0) to chr(255) do begin
+      if ch in ['0'..'9'] then chrclass[ch] := digit
+      else if ch in ['a'..'z','A'..'Z'] then chrclass[ch] := letter
+      else if ch in ['$', '.'] then chrclass[ch] := other
+      else chrclass[ch] := junk;
+      if (ch >= sopMin) and (ch <= sopMax) then sopchar[ch] := JUNKop;
+      if (ch >= dopMin) and (ch <= dopMax) then
+         for ch2 := dopMin to dopMax do  dopchar[ch, ch2] := JUNKop
+   end;
+   chrclass['"']          := quote;
+   chrclass[chr(eofchar)] := endfile;
+
+   sopchar['^'] := POWop;               chrclass['^'] := sops;
+   sopchar['+'] := ADDop;               chrclass['+'] := sops;
+   sopchar['-'] := SUBop;               chrclass['-'] := sops;
+   sopchar['*'] := MULTIop;             chrclass['*'] := sops;
+   sopchar['/'] := DIVop;               chrclass['/'] := sops;
+   sopchar['='] := EQop;                chrclass['='] := sops;
+   sopchar['('] := LPARENop;            chrclass['('] := sops;
+   sopchar[')'] := RPARENop;            chrclass[')'] := sops;
+   sopchar['|'] := LINEop;              chrclass['|'] := sops;
+   sopchar[':'] := ELLIPSEop;           chrclass[':'] := sops;
+   sopchar[','] := COMMAop;             chrclass[','] := sops;
+   sopchar[';'] := COMMAop;             chrclass[';'] := sops;
+
+   sopchar['<'] := LTop;                chrclass['<'] := dops;
+   sopchar['>'] := GTop;                chrclass['>'] := dops;
+
+   dopchar['<','>'] := NEop;            dopchar['<','='] := LEop;
+   dopchar['>','='] := GEop
+end;
+
+
+(***************************************.*******.************************************
+   initTokens - initializes the token characteristics of each
+                lexeme.  The tokens are used during the parsing phase and also
+                to determine more general information about a lexeme.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initTokens;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   token[MULTIop]   := MULOP;           token[DIVop]       := MULOP;
+   token[ADDop]     := SIGN;            token[SUBop]       := SIGN;
+   token[POWop]     := UPARROW;         token[MODop]       := MULOP;
+   token[INTDIVop]  := MULOP;
+
+   token[EQop]      := LRELOP;          token[NEop]        := LRELOP;
+   token[LTop]      := LRELOP;          token[LEop]        := LRELOP;
+   token[GEop]      := LRELOP;          token[GTop]        := LRELOP;
+   token[ORop]      := LOGICALOR;       token[ANDop]       := LOGICALAND;
+   token[NOTop]     := LOGICALNOT;
+
+   token[SUMop]     := FUNC2;           token[MINop]       := FUNC2;
+   token[MAXop]     := FUNC2;           token[COUNTop]     := FUNC2;
+   token[AVGop]     := FUNC2;           token[NPVop]       := FUNC2;
+   token[LOOKop]    := FUNC2;           token[PIop]        := FUNC1;
+   token[ABSop]     := FUNC3;           token[INTop]       := FUNC2;
+   token[EXPop]     := FUNC3;           token[SQRTop]      := FUNC3;
+   token[LNop]      := FUNC3;           token[LOGop]       := FUNC3;
+   token[SINop]     := FUNC3;           token[ASINop]      := FUNC3;
+   token[COSop]     := FUNC3;           token[ACOSop]      := FUNC3;
+   token[TANop]     := FUNC3;           token[ATANop]      := FUNC3;
+   token[SQRop]     := FUNC2;           token[EDGEop]      := NUMBER;
+   token[NAop]      := FUNC1;           token[ERRORop]     := FUNC1;
+   token[PENNYop]   := NUMBER;          token[DROUNDop]    := FUNC2;
+   token[ROUNDop]   := FUNC2;           token[MINFop]      := FUNC1;
+   token[ALLop]     := VARIABLE;        token[PINFop]      := FUNC1;
+   token[SEARCHop]  := FUNC2;           token[ANNUITYop]   := FUNC2;
+   token[COMPop]    := FUNC2;           token[IFop]        := FUNC2;
+
+   token[ELLIPSEop] := ELLIPSE;         token[COMMAop]     := COMMA;
+   token[LINEop]    := ELLIPSE;         token[CELLop]      := FUNC1;
+   token[RESULTop]  := FUNC1;           token[STDop]       := FUNC2;
+   token[INDEXop]   := FUNC2;           token[SIGNop]      := FUNC3;
+
+   token[RNUMBERop] := NUMBER;          token[DOLLARop]    := NUMBER;
+   token[CDOLLARop] := NUMBER;          token[PERCENTop]   := MODIFIER;
+
+   token[IDENTop]   := VARIABLE;        token[COORDop]     := COORD;
+   token[TRUEop]    := BOOLCONST;       token[FALSEop]     := BOOLCONST;
+
+   token[LPARENop]  := LPAREN;          token[RPARENop]    := RPAREN;
+   token[MONTHSop]  := MODIFIER;        token[DAYSop]      := MODIFIER;
+   token[YEARSop]   := MODIFIER;        token[WEEKSop]     := MODIFIER;
+   token[MONTHop]   := MODIFIER;        token[DAYop]       := MODIFIER;
+   token[YEARop]    := MODIFIER;        token[WEEKop]      := MODIFIER;
+   token[TODAYop]   := FUNC1;           token[DATEop]      := NUMBER;
+   token[IRRop]     := FUNC2;           token[COEFFop]     := FUNC2;
+   token[XRRop]     := FUNC2;           token[NFVop]       := FUNC2;
+   token[REGRESSop] := FUNC2;           token[LINSYSop]    := FUNC2;
+   token[HSINop]    := FUNC3;           token[HCOSop]      := FUNC3;
+   token[HTANop]    := FUNC3;           token[DETop]       := FUNC2;
+
+   token[JUNKop]    := ERRCODE;         token[BOUNDop]     := BOUND;
+   token[lexLast]   := ERRCODE;
+end;
+
+
+(***************************************.*******.************************************
+   initWords - reproduces a textual version of the associated lexeme.
+               Used to recreated the formula for display and editing.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initWords(var wordsInit : boolean);
+var wordFile  : text;
+    wordLen   : integer;
+    x         : integer;
+    lexeme    : symbol;
+    lexWord   : str80;
+    VT        : variantType;
+    newSize   : integer;
+    Proc_Info : ProcInfoRec;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   Info_Process(x, My_ID, Proc_Info);
+   if x <> 0 then begin
+      writeln(chr(7),'Init_Process in initarrays- error: ',x:1);
+      wordsInit := false;
+      exit(initWords)
+   end;
+   x := 1;
+   repeat
+      x := x + 1
+   until Proc_info.ProgPathName[x] = '-';
+   Proc_info.ProgPathName := concat(copy(Proc_info.ProgPathName, 1, x),'aplc/mm/KeyWords.text');
+
+   writeln('reading KeyWord information from: ',Proc_info.ProgPathName);
+
+   reset(wordFile, Proc_info.ProgPathName);
+   VT.byteVar := 0;
+   wordLen    := 0;
+   wordsInit  := true;
+   WordBuffer := pointer(ord(HAllocate(theHeap, 350)));
+
+   for lexeme := VT.lexeme to lexlast do
+      if wordsInit then begin
+         readln(wordFile, lexWord);
+         x := pos(' ', lexWord);
+         if x <> 0 then lexWord := copy(lexword, 1, x-1);
+(*$IFC DEBUGVERSION *)
+         if debug[0] then writeln('lexeme(',ord(lexeme):1,',',length(lexWord):1,'): ',lexWord);
+(*$ELSEC *)
+(*$IFC MMINITCODE *)
+         writeln('lexeme(',ord(lexeme):1,',',length(lexWord):1,'): ',lexWord);
+(*$ENDC *)
+(*$ENDC *)
+         words[lexeme] := wordLen;
+         newSize  := wordLen + length(lexWord) + 1;
+         if newSize > CbDataOfH(theHeap, @WordBuffer^) then ChangeSizeH(theHeap, @WordBuffer^, newSize);
+         if newSize > CbDataOfH(theHeap, @WordBuffer^) then wordsInit := false
+         else begin
+                 for x := 0 to length(lexWord) do begin
+                    if x <> 0 then
+                       if lexWord[x] = '.' then lexWord[x] := ' ';
+                    WordBuffer^^[wordLen + x] := ord(lexword[x])
+                 end;
+                 wordLen := newSize
+              end
+      end;
+   close(wordFile)
+end;
+
+
+(***************************************.*******.************************************
+   initConsts - sets up all of the floating point constants.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure InitConsts;
+var tempVal  : extended;
+    temp2Val : extended;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   Str2X('9999999999999999', VofTens);
+
+   Str2X('3.14159265358979323846', VofPI);
+   Str2X('NAN', VofNan);
+   Str2X('+++', VofPinf);
+   Str2X('---', VofMinf);
+   I2X(0, xVofZero);
+   X2D(xVofZero, VofZero);
+   I2X(1, tempVal);
+   X2D(tempVal, VofOne);
+
+   Str2X('99999999', tempVal);
+   I2X(1, VofTenths);
+   DivX(tempVal, VofTenths);
+
+   I2X(1, VofHalf);
+   I2X(2, tempVal);
+   DivX(tempVal, VofHalf);
+
+   I2X(10, VofLOG10);
+   LnX(VofLog10)
+
+end;
+
+
+(***************************************.*******.************************************
+   initSizes - sets up the # of bytes of operand data used by each
+               p-code.  The size information is derived from the packing
+               variant used by the pcode.  The size information is stored in
+               PCODESIZE.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initSizes;
+var variant : variantType;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   pcodesize[PUSHCOORD]    := sizeof(variant.coordvar);
+   pcodesize[PUSHECOORD]   := sizeof(variant.coordvar);
+   pcodesize[PUSHCRANGE]   := sizeof(variant.rangevar);
+   pcodesize[PUSHECRANGE]  := sizeof(variant.rangevar);
+
+   pcodesize[PUSHSREAL]    := sizeof(variant.srealvar);
+   pcodesize[PUSHLREAL]    := sizeof(variant.lrealvar);
+   pcodesize[PUSHINT]      := sizeof(variant.intvar);
+   pcodesize[PUSHBYTE]     := sizeof(variant.bytevar);
+   pcodesize[PUSHDOLLAR]   := 0;
+   pcodesize[PUSHCDOLLAR]  := 0;
+   pcodesize[PUSHPERCENT]  := 0;
+   pcodesize[PUSHPENNY]    := 0;
+   pcodesize[PUSHNOP1]     := 0;
+   pcodesize[PUSHNOP3]     := 0;
+   pcodesize[PUSHTEXT]     := 0;
+
+   pcodesize[PUSHMARKER]   := 0;
+   pcodesize[PUSHTRUE]     := 0;
+   pcodesize[PUSHFALSE]    := 0;
+   pcodesize[UNARYMINUS]   := 0;
+   pcodesize[PUSHNOP]      := 0;
+   pcodesize[PUSHRANGE]    := sizeof(variant.rangeinfo);
+   pcodesize[PUSHDATE]     := sizeof(variant.date);
+   pcodesize[PUSHPARTS]    := sizeof(variant.dateparts);
+   pcodesize[PUSHEND]      := 0
+end;
+
+
+(***************************************.*******.************************************
+   initMonths -
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initMonths;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   monthLen[1]  := 0;
+   monthLen[2]  := 31;
+   monthLen[3]  := 59;
+   monthLen[4]  := 90;
+   monthLen[5]  := 120;
+   monthLen[6]  := 151;
+   monthLen[7]  := 181;
+   monthLen[8]  := 212;
+   monthLen[9]  := 243;
+   monthLen[10] := 273;
+   monthLen[11] := 304;
+   monthLen[12] := 334;
+   monthLen[13] := 400
+end;
+
+
+(***************************************.*******.************************************
+   initTables - reads the parse tables from the PARSEFILE.  The tables
+                are arranged in the file following the order listed in "tablename".
+                The tables are read by first reading the # of entries to be
+                read and then the actual entries.
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initTables(var tableInit : boolean);
+label 1;
+var parsefile : text;                       {file for reading parse tables}
+    number    : integer;
+    tablenum  : integer;
+    item      : integer;
+    cnt       : integer;
+    maximums  : array [0..7] of integer;
+    str       : str40;
+    x         : integer;
+    Proc_Info : ProcInfoRec;
+
+    (* Write the name of the table being read *)
+    function tablename(num : integer) : char;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       case num of
+          0 : write('EXCEPTION');
+          1 : write('ACTION');
+          2 : write('PACTION');
+          3 : write('PRODGOTO');
+          4 : write('LHS');
+          5 : write('NUMRHS');
+          6 : write('CHK');
+          7 : write('DEF')
+       end;
+       tablename := ' '
+    end;
+
+
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   Info_Process(x, My_ID, Proc_Info);
+   if x <> 0 then begin
+      writeln(chr(7),'Init_Process in initTables- error: ',x:1);
+      tableInit := false;
+      exit(initTables)
+   end;
+   x := 1;
+   repeat
+      x := x + 1
+   until Proc_info.ProgPathName[x] = '-';
+   Proc_info.ProgPathName := concat(copy(Proc_info.ProgPathName, 1, x),'aplc/mm/Tables.text');
+
+   writeln('reading table information from: ',Proc_info.ProgPathName);
+
+   reset(parseFile, Proc_info.ProgPathName);
+
+   tablenum := 0;
+
+   (* set up table maximums so that we can determine if there is enough
+      space to read in the table *)
+   maximums[0] := exceptmax;
+   maximums[1] := actionmax;
+   maximums[2] := pactionmax;
+   maximums[3] := prodmax;
+   maximums[4] := rulesmax;
+   maximums[5] := rulesmax;
+   maximums[6] := pactionmax;
+   maximums[7] := pactionmax;
+   tableInit   := true;
+
+   repeat
+      (* read in # of table entries and determine if enough storage exists for
+         the table *)
+      readln(parsefile, number);
+      number := number - 1;
+
+(*$IFC DEBUGVERSION *)
+      if debug[0] then
+         writeln('# table entries: ',number:1,' into table ',tablename(tablenum));
+(*$ELSEC *)
+(*$IFC MMINITCODE *)
+      writeln('# table entries: ',number:1,' into table ',tablename(tablenum));
+(*$ENDC *)
+(*$ENDC *)
+
+      if maximums[tablenum] < number then begin
+         writeln(tablename(tablenum),'table overflow: max(',maximums[tablenum]:1,
+                 ') attempting (',number:1,')',chr(7));
+         tableInit := false;
+         goto 1
+      end;
+
+      cnt := 0;
+
+      (* read in entries and store into appropriate table *)
+      while cnt <= number do begin
+         if eoln(parsefile) then readln(parsefile);
+         read(parsefile, item);
+         case tablenum of
+            0 : except[cnt] := item;
+            1 : action[cnt] := item;
+            2 : paction[cnt] := item;
+            3 : prodgoto[cnt] := item;
+            4 : lhs[cnt] := item;
+            5 : numrhs[cnt] := item;
+            6 : chk[cnt] := item;
+            7 : def[cnt] := item
+         end;
+         cnt := cnt + 1;
+(*$IFC DEBUGVERSION *)
+         if debug[0] then begin
+            write(item:1,',  ');
+            if cnt mod 10 = 0 then writeln
+         end;
+(*$ELSEC *)
+(*$IFC MMINITCODE *)
+         write(item:1,',  ');
+         if cnt mod 10 = 0 then writeln;
+(*$ENDC *)
+(*$ENDC *)
+         case tablenum of
+            0 : if except[cnt - 1] <> item then tableInit := false;
+            1 : if action[cnt - 1] <> item then tableInit := false;
+            2 : if paction[cnt - 1] <> item then tableInit := false;
+            3 : if prodgoto[cnt - 1] <> item then tableInit := false;
+            4 : if lhs[cnt - 1] <> item then tableInit := false;
+            5 : if numrhs[cnt - 1] <> item then tableInit := false;
+            6 : if chk[cnt - 1] <> item then tableInit := false;
+            7 : if def[cnt - 1] <> item then tableInit := false
+         end;
+         if not tableInit then begin
+            writeln(tablename(tablenum),' item #',cnt:1,' not stored properly');
+(*$IFC DEBUGVERSION *)
+            FatalMess(12)
+(*$ENDC *)
+         end
+      end;
+
+(*$IFC DEBUGVERSION *)
+      if debug[0] then begin
+         if cnt mod 10 <> 0 then writeln;
+         writeln
+      end;
+(*$ELSEC *)
+(*$IFC MMINITCODE *)
+      if cnt mod 10 <> 0 then writeln;
+      writeln;
+(*$ENDC *)
+(*$ENDC *)
+
+      tablenum := tablenum + 1
+   until eof(parsefile) or (tablenum > 7);
+1: close(parsefile)
+end;
+
+(*$ENDC *)
+
+
+(***************************************.*******.************************************
+   initParser -
+****************************************.*******.***********************************)
+(*$S initial *)
+procedure initparser
+   (* var status   : integer
+   *);
+var tablesInit : boolean;
+    lexword : str40;
+    lexeme  : symbol;
+    x       : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC MMINITCODE and not DEBUGVERSION  *)
+   writeln('Regenerating LISACALCTABLES');
+   initFPlib;
+   initConsts;
+   initClasses;
+   initTokens;
+   initWords(tablesInit);
+   initSizes;
+   initMonths;
+   initNaErrs;
+   initKeys;
+   if tablesInit then initTables(tablesInit);
+   if tablesInit then initArrays(mmWrite, status)
+   else status := OpenErr;
+
+   writeln('lexeme buffer: ',CbDataOfH(theHeap, @WordBuffer^):1);
+   for x := 1 to CbDataOfH(theHeap, @WordBuffer^) do begin
+      write(wordbuffer^^[x-1]:1,'  ');
+      if x mod 15 = 0 then writeln
+   end;
+   writeln;
+   for lexeme := multiOp to lexLast do begin
+      WordFromLexeme(lexeme, 40, @lexWord);
+      writeln('lexeme(',ord(lexeme):1,',',length(lexWord):1,'): ',lexWord)
+   end;
+(*$ENDC *)
+
+(*$IFC DEBUGVERSION and MMINITCODE *)
+   if debug[0] then begin
+      writeln('Regenerating LISACALCTABLES');
+      initConsts;
+      initClasses;
+      initTokens;
+      initWords(tablesInit);
+      initSizes;
+      initMonths;
+      initNaErrs;
+      initKeys;
+      if tablesInit then initTables(tablesInit);
+      if tablesInit then initArrays(mmWrite, status)
+      else status := OpenErr
+   end
+   else initArrays(mmRead, status);
+   if debug[1] or debug[0] then begin
+      writeln('lexeme buffer: ',CbDataOfH(theHeap, @WordBuffer^):1);
+      for x := 1 to CbDataOfH(theHeap, @WordBuffer^) do begin
+         write(wordbuffer^^[x-1]:1,'  ');
+         if x mod 15 = 0 then writeln
+      end;
+      writeln;
+      for lexeme := multiOp to lexLast do begin
+         WordFromLexeme(lexeme, 40, @lexWord);
+         writeln('lexeme(',ord(lexeme):1,',',length(lexWord):1,'): ',lexWord)
+      end
+   end;
+   StatusMess(status)
+(*$ELSEC *)
+   initArrays(mmRead, status)
+(*$ENDC *)
+end;
+
+(*$I aplc/mm/graf.text *)
+(*$I aplc/mm/lex.text *)
+(*$I aplc/mm/parse.text *)
+
+(*$S initial *)
+END.
+
+
+ÿ

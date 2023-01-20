@@ -1,0 +1,742 @@
+UNIT SONY;
+
+
+      (*  By Rich Castro  9/14/83                                               *)
+      (*  Copyright 1983, 1984, Apple Computer Inc. *)
+      (*                                                                        *)
+      (*  A device specific driver for the Sony microfloppy drive.  Will work   *)
+      (*  for built-in internal or externally attached drive.  Uses the generic *)
+      (*  hard disk driver HDISK.                                               *)
+
+INTERFACE
+
+  USES
+      (*$Uobject/driverdefs.obj*)
+      driverdefs,
+      (*$Uobject/driversubs.obj*)
+      driversubs;
+
+   function DRIVER (parameters: param_ptr): integer;
+
+IMPLEMENTATION
+
+  (*$SETC SonyDebug=False*)      (*Debug Mode *)
+
+  CONST
+    (* responses to hdisk *)
+    ok        = 0;              (* no errors *)
+    waitint   = 1;              (* wait for interrupt *)
+    badparms  = 2;              (* driver passed bad block # *)
+    syserrbase = 10000;         (* base value for system errors *)
+    generic_rd_err = 606;
+    nospace   = 610;
+    nodiskpres = 614;
+    fatal_cs_err = 617;
+    formaterr = 618;
+    badcontrol = 623;
+
+    (* errors from disk ROM *)
+    not_issued = 1809;
+    vererr = 1821;
+    read_err = 1823;
+    write_err = 1824;
+
+    (* low level driver commands *)
+    initdisk  = 0;      (* initialize interface *)
+    interrupt = 2;      (* interrupt received *)
+    finish_read = 4;    (* complete read operation *)
+    isdiskin = 6;       (* check for disk inserted *)
+
+    (* drive commands *)
+    readdisk  = 0;      (* read data *)
+    writedisk = 1;      (* write data *)
+    unclamp   = 2;      (* unclamp disk *)
+    format    = 3;      (* format disk *)
+    verify    = 4;      (* verify disk *)
+    formattrk = 5;      (* format track *)
+    verifytrk = 6;      (* verify track *)
+    read_bf   = 7;      (* read brute force *)
+    write_bf  = 8;      (* write brute force *)
+
+    (* go-byte commands *)
+    nulcmd    = -128;   (* handshake nop cmd *)
+    excmd     = -127;   (* execute RWTS cmd *)
+    seek      = -125;   (* seek cmd *)
+    clristat  = -123;   (* clear interrupt status *)
+    enabstat  = -122;   (* enable interrupts *)
+    clrmask   = -121;   (* clear interrupt mask *)
+    goaway    = -119;   (* disable controller *)
+
+  TYPE
+
+    h4bits = 0..15;
+
+    { Note: defs marked with (**) may have corresponding defs in assembly language
+      portion of driver }
+
+    ext_drive_cb = record    (*extension to drive_cb for SONY *)
+              (**)   hwbase: longint;           (* base address of shared memory *)
+              (**)   command: int1;             (* command to driver *)
+              (**)   go_cmd: int1;              (* go-byte command *)
+              (**)   block: integer;            (* block # *)
+              (**)   response:integer;          (* response command from driver*)
+              (**)   error:integer;             (* error code from driver *)
+              (**)   int_stat: packed record    (* interupt status byte *)
+                                bot_int: boolean;
+                                bot_done: boolean;
+                                unused: boolean;  (* SONY has no button *)
+                                bot_in: boolean;
+                                notop: h4bits;    (* only one drive *)
+                               end;
+              (**)   cs_err_cnt: int1;          (* checksum error count from driver *)
+              (**)   disk_present: (nodisk,somedisk,notreadable,notOS,gooddisk);
+                                                (* status of disk in drive *)
+                     needs_verify: boolean;     (* T if need verify after write *)
+                     bbtabl1_bad: boolean;      (* T if primary bad block table bad *)
+                     orig_blok: integer;        (* starting block for write w/ verify request *)
+                     final_blok: integer;       (* final block of write w/ verify request *)
+
+                     (* states for state-machine *)
+                     alt_rd_state: (format1_st,format2_st,
+                                    unclmp1_st,unclmp2_st,
+                                    verify1_st,verify2_st,verify3_st,verify4_st,
+                                      verify5_st,verify6_st,verify7_st,
+                                    nuthin);
+
+                   end;
+
+   ptr_ext_drive_cb = ^ext_drive_cb;
+
+
+   procedure SONYASM(cb_ptr: absptr); external;
+
+   function ALTERED_STATES(drivecb_ptr: hdiskcb_ptr): boolean;
+      (*************************************************************)
+      (*                                                           *)
+      (* Description: Perform the function required by             *)
+      (*              alt_rd_state variable                        *)
+      (*                                                           *)
+      (* Input Parameters:  none                                   *)
+      (*                                                           *)
+      (* Output Parameters:  returns FALSE if continue not needed  *)
+      (*                                                           *)
+      (* Side Effects:                                             *)
+      (*                                                           *)
+      (* Special Conditions of Use:                                *)
+      (*                                                           *)
+      (* Error Conditions:  none                                   *)
+      (*                                                           *)
+      (*************************************************************)
+
+    VAR
+      i, j, index: integer;
+      extdrivecb_ptr: ptr_ext_drive_cb;
+      extdevrec_ptr: ^ext_diskconfig;
+      configptr: ptrdevrec;
+      scratch_header: ^pagelabel;
+
+    begin
+      ALTERED_STATES := false; (*usually don't do continue after returning*)
+      with drivecb_ptr^ do
+        begin
+          extdrivecb_ptr:=pointer(ext_ptr);
+          configptr:=pointer(config_addr);
+        end;
+      extdevrec_ptr:=pointer(configptr^.ext_addr);
+      WITH drivecb_ptr^, extdrivecb_ptr^, extdevrec_ptr^ do
+      case alt_rd_state of
+
+        (*format*)
+
+        format1_st: begin
+          go_cmd := excmd;
+          command := format;
+          block := 0;
+          SONYASM(ord(drivecb_ptr));
+          if error <> 0 then
+            SYSTEM_ERROR (error + syserrbase);
+          alt_rd_state := format2_st
+        end; (*format1_st*)
+
+        format2_st: begin (*finished formatting*)
+          if error <> 0 then
+          begin (*error formatting disk*)
+            disk_present := notreadable;
+          end
+          else
+          begin (*successfully formatted for the OS*)
+            bbtabl1_bad := false;
+            disk_present := gooddisk;
+          end;
+          alt_rd_state := nuthin;
+          IODONE (drivecb_ptr, error)
+        end; (*format4_st*)
+
+        (*unclamp*)
+
+        unclmp1_st: begin
+          go_cmd := excmd;
+          command := unclamp;
+          block := 0;
+          SONYASM(ord(drivecb_ptr));
+          alt_rd_state := unclmp2_st
+        end; (*unclmp1st*)
+
+        unclmp2_st: begin
+          alt_rd_state := nuthin;
+          IODONE (drivecb_ptr, error)
+        end; (*unclmp2_st*)
+
+        (*verify blocks just written by re-reading all*)
+
+        verify1_st:
+          WITH cur_info_ptr^ do
+          begin
+            if error <> 0 then
+              begin (*return with error on verify*)
+                read_flag := false; (*this was originally a write request before
+                                        verifying*)
+              end
+              else (*no errors*)
+                if blkno = final_block then
+                begin (*done*)
+                  read_flag := false; (*this was originally a write request before verifying*)
+                  needs_verify:=false; (* done with verify *)
+                end
+                else
+                begin (*successful intermediate read*)
+                  blkno := blkno + 1;       (*increment sequential block number*)
+
+                  (************************************)
+                  (* make call to start the next read *)
+                  (************************************)
+
+                end
+          end; (*verify1_st*)
+
+      end (*case*)
+    end; (*altered_states*)
+
+(**********************************************************************************************************)
+
+
+   procedure START_NONIOREQ (drivecb_ptr: hdiskcb_ptr);
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:  Start request for unclamp or format cmds    *)
+        (*                                                           *)
+        (* Input Parameters: pointer to control block                *)
+        (*                                                           *)
+        (* Output Parameters:  none                                  *)
+        (*                                                           *)
+        (* Side Effects:  Control block variables  sectors_left,     *)
+        (*   cur_info_ptr, cur_req_ptr modified.                     *)
+        (*   Request changed from active to in-service.              *)
+        (*                                                           *)
+        (* Special Conditions of Use:  Disk ints must be off.        *)
+        (*                                                           *)
+        (* Error Conditions:  none                                   *)
+        (*                                                           *)
+        (*************************************************************)
+
+       VAR
+           extdrivecb_ptr : ptr_ext_drive_cb;
+           cur_req_ptr : reqptr_type;
+
+        begin
+          extdrivecb_ptr := pointer(drivecb_ptr^.ext_ptr);
+          with drivecb_ptr^, extdrivecb_ptr^ do
+          begin
+            cur_req_ptr := req_hd_ptr;                      (* get pointer to next request *)
+            cur_req_ptr^.reqstatus.reqsrv_f := in_service;  (* from active to in_service *)
+            cur_info_ptr := pointer(cur_req_ptr^.req_extent);
+            case cur_req_ptr^.operatn of
+              2: begin (*unclamp*)
+                  alt_rd_state := unclmp1_st
+                 end; (*unclamp*)
+
+              3: begin (*start format operation*)
+                  alt_rd_state := format1_st
+                 end; (*format*)
+
+            end; (*case*)
+          end
+       end; (* start_nonioreq *)
+
+
+   procedure NONIO_REQ (var errnum: integer; devconfig: ptrdevrec; drvcmd: int1);
+        (*************************************************************)
+        (*                                                           *)
+        (* Description:  Build a request for format or unclamp       *)
+        (*                                                           *)
+        (* Input Parameters:  device index into configinfo           *)
+        (*                    drive command (format or unclamp)      *)
+        (*                                                           *)
+        (* Output Parameters:                                        *)
+        (*                                                           *)
+        (* Side Effects:                                             *)
+        (*                                                           *)
+        (* Special Conditions of Use:                                *)
+        (*                                                           *)
+        (* Error Conditions:                                         *)
+        (*                                                           *)
+        (*************************************************************)
+
+   VAR
+     d_ptr: absptr;
+     leftlink: reqptr_type;
+     ptrsysg: ^longint;
+     drivecb_ptr: hdiskcb_ptr;
+     extdrivecb_ptr: ptr_ext_drive_cb;
+     ints: intson_type;
+     reqptr: reqptr_type;
+     bool: boolean;
+
+   begin
+         ptrsysg := pointer(bsysglob);
+         drivecb_ptr := pointer(devconfig^.cb_addr);            (* set ptr to control block *)
+         extdrivecb_ptr := pointer(drivecb_ptr^.ext_ptr);       (* ptr to extent block *)
+         if extdrivecb_ptr^.disk_present = nodisk then
+         begin  (*prevent format or unclamp if a simultaneous disk insert could
+                 come along and cause the next sony command to give a "not_issued"
+                 error*)
+           errnum := nodiskpres;
+           EXIT (NONIO_REQ);
+         end;
+         if not GETSPACE(sizeof(reqblk), ptrsysg^, d_ptr) then
+           errnum := nospace
+         else
+         begin
+           errnum := 0;
+           reqptr := pointer (d_ptr);  (*point to the request*)
+
+           (* initialize the request block *)
+
+           WITH reqptr^, drivecb_ptr^ do
+           begin
+             cfigptr := devconfig;
+             operatn := drvcmd;
+             req_extent := ord(nil);    (*no extension block present for non-io req*)
+
+              (*add to pcb queue*)
+
+             LINK_TO_PCB (reqptr);
+
+             (*add to device queue*)
+
+             INTSOFF(int_prio,ints);                    (* disable interrupts *)
+             reqspec_info := req_hd_ptr^.reqspec_info;  (*use same sort key as current request*)
+             leftlink := pointer(req_hd_ptr^.dev_chain.bkwd_link - sizeof(rb_headT)
+                           + ptrsysg^);
+             if req_hd_ptr = dummy_req_ptr then
+               req_hd_ptr := reqptr; (*place at end of queue unless its the only one*)
+             cur_num_requests := cur_num_requests+1;
+             ENQUEUE (dev_chain, leftlink^.dev_chain, ptrsysg^);
+
+             if cur_num_requests = 1 then
+             begin
+               START_NONIOREQ(drivecb_ptr);
+               bool := ALTERED_STATES (drivecb_ptr);
+             end;
+
+             INTSON(ints);
+
+             with reqptr^.list_chain do               (* set up request block linkage *)
+               begin
+                 fwd_link := ord(@fwd_link) - ptrsysg^;
+                 bkwd_link := fwd_link
+               end;
+
+             BLK_REQ(reqptr,reqptr);
+
+             (*Process will continue here after completion of request*)
+             if not reqptr^.reqstatus.reqsuccess_f
+               then errnum:= reqptr^.hard_error;
+             CANCEL_REQ(reqptr);
+           end
+         end;
+    end; (*nonio_req*)
+
+(*********************************************************************************************************)
+
+
+  procedure NEW_REQ (drivecb_ptr: hdiskcb_ptr);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  Start up new request or enter ALTERED_STATES*)
+       (*                                                           *)
+       (* Input Parameters:  Accesses control block to get status.  *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Call with disk interrupts     *)
+       (*   off.                                                    *)
+       (*                                                           *)
+       (* Error Conditions:  Any errors are saved in the request.   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    extdrivecb_ptr: ptr_ext_drive_cb;
+    configptr: ptrdevrec;
+    reqext_ptr: extdptr_type;
+
+
+              begin
+                configptr := pointer(drivecb_ptr^.config_addr);
+                extdrivecb_ptr:=pointer(drivecb_ptr^.ext_ptr);
+                with configptr^, drivecb_ptr^, extdrivecb_ptr^, req_hd_ptr^ do
+                begin
+                  if alt_rd_state = nuthin then
+                    if (operatn = unclamp) or (operatn = format)
+                      then START_NONIOREQ(drivecb_ptr);
+
+                  if alt_rd_state <> nuthin then
+                    if not ALTERED_STATES (drivecb_ptr) then
+                      EXIT (NEW_REQ);
+
+                  reqext_ptr:=pointer(req_extent);
+                  with reqext_ptr^ do
+                    begin
+                      if read_flag
+                        then command:=readdisk
+                        else command:=writedisk;
+                      block:=blkno;
+                      needs_verify:=v_flag and not read_flag; (* set verify needed flag *)
+                      if needs_verify then
+                        orig_blok:=block;                      (* save starting block for verify *)
+                      go_cmd:=excmd;
+                      SONYASM(ord(drivecb_ptr));
+                      if error <> 0 then
+                        SYSTEM_ERROR(error + syserrbase)(*error on previous req*)
+                    end;
+                  end; (* with *)
+              end;(*new_req*)
+
+
+  procedure DISK_INT(drivecb_ptr: hdiskcb_ptr; slot,chan: integer);
+       (*************************************************************)
+       (*                                                           *)
+       (* Description:  DISK read/write done interrupt handler.     *)
+       (*                                                           *)
+       (* Input Parameters:  Accesses control block to get status.  *)
+       (*                                                           *)
+       (* Output Parameters:  none                                  *)
+       (*                                                           *)
+       (* Side Effects:  If the current request completes it is un- *)
+       (*   blocked and dequeued, and the next request started.     *)
+       (*   Control block variables are used or modified.           *)
+       (*                                                           *)
+       (* Special Conditions of Use:  Call with disk interrupts     *)
+       (*   off.                                                    *)
+       (*                                                           *)
+       (* Error Conditions:  Any errors are saved in the request.   *)
+       (*                                                           *)
+       (*************************************************************)
+
+  VAR
+    block_no: integer;
+    req_ptr: reqptr_type;
+    ext_ptr: extdptr_type;
+    byteptr: ^int1;
+    diskerr: integer;
+    extdrivecb_ptr: ptr_ext_drive_cb;
+    extdevrec_ptr: ^ext_diskconfig;
+
+  begin
+
+  extdrivecb_ptr:= pointer(drivecb_ptr^.ext_ptr);
+  with drivecb_ptr^, extdrivecb_ptr^ do
+   begin
+    command:=interrupt;
+    go_cmd:=0;
+    SONYASM(ord(drivecb_ptr));  (* go read interrupt status *)
+
+    (*$IFC SONYdebug*)
+    if TRACE (DD,1) then
+    begin
+     writeln('Disk interrupt received');
+     writeln(command,block,go_cmd,response,error);
+    end;
+    (*$ENDC*)
+
+    diskerr := error;
+    go_cmd := clristat;
+    byteptr := @int_stat;
+    command := byteptr^;
+    SONYASM(ord(drivecb_ptr));  (*clear all current interrupts*)
+
+    (* handle interrupts for event manager *)
+
+    if int_stat.bot_in then
+    begin
+      bbtabl1_bad := false;
+      disk_present := gooddisk;
+      if chan < 0 then          (* internal disk being used? *)
+         KEYPUSHED (11)
+      else
+        KEYPUSHED (12+slot); (*12-14*)
+    end;
+
+    if (not int_stat.bot_done) or (cur_num_requests = 0) then
+      EXIT(DISK_INT);
+
+    error := diskerr;  (*restore original interrupting error number*)
+
+      if alt_rd_state <> nuthin then
+      begin
+        NEW_REQ (drivecb_ptr);
+        EXIT(DISK_INT)
+      end;
+
+    (* must have received read/write done interrupt *)
+
+      case diskerr of
+        0: if needs_verify then                 (* continue read verify after write *)
+           begin
+             {  ****VERIFY NOT IMPLEMENTED YET****
+             if sect_left = 1 then
+               WITH cur_info_ptr^ do
+               begin (*re-read all that was written*)
+                 final_block := blkno;
+                 blkno := orig_block;
+                 read_flag := true;
+            (*change xfer_count, operatn and restore orig header? -- see twiggy!*)
+                 command:=readdisk; (*do the first read*)
+                 (*go_cmd = ?*)
+                 SONYASM(ord(drivecb_ptr));
+                 if error <> 0 then
+                   SYSTEM_ERROR (error + syserrbase);
+                 alt_rd_state := verify1_st;
+                 EXIT(DISK_INT)
+               end
+             }
+           end;
+
+      end;  (*case*)
+
+    (*check for read complete, let IODONE do the rest*)
+
+    if cur_info_ptr^.read_flag then
+      begin
+        command:=finish_read;
+        go_cmd:=0;
+        SONYASM(ord(drivecb_ptr));
+        extdevrec_ptr := pointer(config_addr^.ext_addr);
+        raw_header_ptr^.abspage := block - extdevrec_ptr^.fs_strt_blok;
+        error := diskerr;  (*original disk error*)
+        if error = read_err then
+          if cs_err_cnt > 0 then
+            error := generic_rd_err
+          else
+            error := fatal_cs_err;
+      end;
+
+    if cur_num_requests <> 0 then
+      if response <> waitint then
+        begin (* interrupt for disk device - inform HDISK *)
+          IODONE(drivecb_ptr,error)  (* it might be better to use okxfernext?*)
+        end;
+    end (*with*)
+  end; (*DISK_INT*)
+
+(*********************************************************************************************************)
+
+   function DRIVER(* parameters: param_ptr): integer *);
+     (*Main routine of SONY Driver*)
+     label 100;
+
+     var
+       drivecb_ptr: hdiskcb_ptr;
+       extdrivecb_ptr: ptr_ext_drive_cb;
+       extdevrec_ptr: ^ext_diskconfig;
+       newextdrivecb: absptr;
+       sector_ptr: ^longint;
+       dc_rec_ptr: ^dc_rec;
+       errnum: integer;
+       ptrsysg: ^longint;
+       left_link: link_ptr;
+       prevints,ints: intson_type;
+       ordptr: absptr;
+       reqptr,first_req_ptr: reqptr_type;
+
+     begin
+       with parameters^, configptr^ do
+         begin
+           drivecb_ptr:=pointer(cb_addr);
+           case fnctn_code of
+
+            dinterrupt: (* device interrupt *)
+              begin
+                DISK_INT(drivecb_ptr,slot_no,iochannel); (*process the interrupt*)
+                extdrivecb_ptr:= pointer(drivecb_ptr^.ext_ptr);
+                with extdrivecb_ptr^ do
+                if go_cmd = clristat then
+                begin (*haven't touched drive since last told to clear int status*)
+                  go_cmd := nulcmd; (*sending null TWICE makes sure last cmd completed*)
+                  SONYASM(ord(drivecb_ptr));
+                  SONYASM(ord(drivecb_ptr))
+                end;
+              end;(*dinterrupt*)
+
+            dinit:  (* first stage to initialize disk unit *)
+              begin
+                USE_HDISK(configptr); (*use HDISK to handle sector headers *)
+                goto 100;             (*go call HDISK*)
+              end;(*dinit*)
+
+            hdinit:  (* final stage to initialize disk unit *)
+
+            (* Initialize globals, init drive interface, clear interrupts,
+               enable drive, test for disk in place *)
+
+              begin
+                driver:=nospace; (* insufficient resources *)
+                ptrsysg:=pointer(bsysglob);
+                if GETSPACE(sizeof(ext_drive_cb),ptrsysg^,newextdrivecb) then
+                  begin
+                    extdrivecb_ptr:=pointer(newextdrivecb);
+                    drivecb_ptr^.ext_ptr:=newextdrivecb;
+                    with drivecb_ptr^, extdrivecb_ptr^ do
+                      begin
+                        if iochannel >= 0
+                          then hwbase:= ord4(iospacemmu)*$20000 +
+                                        ord4($4000)*slot_no + $2000
+                          else hwbase:= ord4(iospacemmu)*$20000 + $0C000;
+                        v_flag:=false;
+                        needs_verify:=false;
+                        disk_present:=nodisk;
+                        bbtabl1_bad:=false;
+                        orig_blok:=0;
+                        final_blok:=0;
+                        alt_rd_state:=nuthin;                   (*beginning state for state-machine*)
+                        command:=initdisk;                      (*have driver init device*)
+                        go_cmd:=0;
+                        SONYASM(ord(drivecb_ptr));
+                        driver:=error;
+                        if error <> 0 then
+                          begin                                 (* error response from driver *)
+                            (*$IFC SonyDebug*)
+                            if TRACE(DD,10) then
+                              begin
+                                writeln('Error initializing SONY drive');
+                                writeln('Error = ',error);
+                              end;
+                            (*$ENDC*)
+                          end
+                         else
+                          begin                                 (* initialization complete *)
+                            command := isdiskin;                (* check for disk in place *)
+                            go_cmd := 0;
+                            SONYASM(ord(drivecb_ptr));
+                            if response <> 0 then               (* means disk inserted *)
+                              begin
+                                bbtabl1_bad := false;
+                                disk_present := gooddisk;
+                              end;
+                            extdevrec_ptr:=pointer(ext_addr);
+                            with extdevrec_ptr^ do
+                              begin
+                                num_bloks:= 800;
+                                rvrs_hdr:=0; (*header at beginning of sector*)
+                              end;
+                          end;
+                      end;(*with extdrivecb_ptr*)
+                  end; (*if*)
+              end; (*hdinit*)
+
+            hddown:  (* down the device *)
+              begin
+                extdrivecb_ptr:= pointer(drivecb_ptr^.ext_ptr);
+                with drivecb_ptr^, extdrivecb_ptr^ do
+                  begin
+                    go_cmd := clrmask;                (*disable drive*)
+                    command := -120; (*=$88*)
+                    SONYASM(ord(drivecb_ptr));
+
+                    ptrsysg:=pointer(bsysglob);
+                    RELSPACE(ext_ptr,ptrsysg^); (*release cb extension *)
+                    ext_ptr:=ord(nil);
+                  end;
+                driver:=0;
+              end;(*hddown*)
+
+            dskio:
+              begin
+                extdrivecb_ptr:= pointer(drivecb_ptr^.ext_ptr);
+                if extdrivecb_ptr^.disk_present = nodisk then
+                  (*prevent read or write if a simultaneous disk insert could
+                    come along and cause the next sony command to give a
+                    "not_issued" error*)
+                  errnum := nodiskpres
+                else
+                  CALL_HDISK(errnum,configptr,parameters);
+                driver:=errnum;
+            end; (*dskio*)
+
+            hdskio:  NEW_REQ (pointer(cb_addr));(*perform I/O or non I/O request*)
+
+            dskunclamp: (* Unclamp request *)
+              begin
+                NONIO_REQ(errnum,configptr,unclamp);(* build and queue request *)
+                if errnum = 0 then
+                begin
+                  extdrivecb_ptr:= pointer(drivecb_ptr^.ext_ptr);
+                  extdrivecb_ptr^.disk_present := nodisk;
+                end;
+                driver:=errnum
+              end;(*dskunclamp*)
+
+            dskformat: (* format *)
+              begin
+                NONIO_REQ(errnum,configptr,format);(* build and queue request *)
+                If errnum > 0 then
+                  driver:=formaterr
+                else
+                  driver := 0
+              end;(*dskformat*)
+
+            dcontrol: (* device control; passed parptr:absptr *)
+
+            (* Note: In future may need to disable interrupts if data structures might be  *)
+            (*       modified during this operation. *)
+
+              begin
+                dc_rec_ptr := pointer(parptr);
+                extdrivecb_ptr := pointer(drivecb_ptr^.ext_ptr);
+                with drivecb_ptr^, extdrivecb_ptr^, dc_rec_ptr^ do
+                  if dversion <> 2
+                    then driver := badcontrol (*wrong application version*)
+                    else
+                     begin
+                       driver:=0;
+                       case dcode of
+                        20: begin  (*get disk status*)
+                              ar10[0] := ord(disk_present);     (* disk status *)
+                              ar10[1] := 0;                     (* SONY has no button *)
+                              ar10[2] := 6;                     (* # of spare blocks *)
+                              ar10[3] := 0;                     (* bad block directory OK *)
+                              ar10[4] := 0;                     (* sparing status *)
+                              ar10[5] := 0;                     (* rewrite status *)
+                              ar10[6] := ord(v_flag)            (* verify status *)
+                            end;
+                        21: begin                               (* enable/disable sparing *)
+                              v_flag  := (ar10[2] <> 0)         (* verify *)
+                            end;
+                        otherwise driver := badcontrol;
+                       end;(*case*)
+                     end;
+              end;(*dcontrol*)
+
+            otherwise
+              begin
+100:            CALL_HDISK(errnum,configptr,parameters);
+                driver:=errnum;
+              end;
+           end;(*case fnctn_code*)
+
+       end;(*with*)
+     end;(*SONY*)
+end.
+
+ÿ

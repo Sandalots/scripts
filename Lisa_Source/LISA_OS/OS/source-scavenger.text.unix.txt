@@ -1,0 +1,4393 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT Scavnger;  (* sic *)
+
+INTERFACE
+
+{$U-}
+{$SETC SDEBUG = false}
+{$SETC STATS  = false}
+
+  USES
+     {$U object/driverdefs.obj}          driverdefs,
+     {$U object/sysglobal.obj}           globalda,
+     {$U object/procprims.obj}           proc_prims,
+     {$U object/mmprim.obj}              mmprimitives,
+     {$U object/ds0.obj}                 datasegs,
+     {$U object/asynctr.obj}             asynctr,
+     {$U object/genio.obj}               genio,
+     {$U object/twiggy.obj}              twiggy,
+     {$U object/vmstuff.obj}             vmstuff,
+     {$U object/sfileio.obj}             sfileio,
+     {$U object/fsdir.obj}               fs_directory,
+     {$U object/fsprim.obj}              fs_primitives,
+     {$U object/fsui.obj}                fs_interface,
+     {$U object/hwint.obj}               hwint;
+
+
+  type
+       (*
+        *  no_abort    don't give up even if it means killing innocent bystanders.
+        *  no_kill     don't expunge objects found with the kill bit set.
+        *  no_discard  don't discard old versions of data.
+        *  no_pipes    don't rebuild pipe objects.
+        *)
+       ScvOptions = set of ( no_abort, no_kill, no_discard, no_pipes );
+
+
+  procedure  Scavenge ( var ecode   : integer;
+                            devName : e_name;
+                            options : ScvOptions );
+
+
+
+IMPLEMENTATION
+
+{$S ni_scAvenger}        (* Scavenger segment *)
+
+  const
+       OK           = 0;     (* generic good value                  *)
+       FIRST_FS     = 14;    (* first release file system version   *)
+       PEPSI_FS     = 15;    (* pepsi release file system version   *)
+       SPRING_FS    = 17;    (* spring release file system version  *)
+       FIRSTLDSN    =  9;    (* LDSN's used to map Scavenger heap,  *)
+       LASTLDSN     = 16;    (* I/O buffer, and scratch segments    *)
+       BUFBLOCKS    = 61;    (* max blocks in the extent buffer     *)
+       IXFREELISTS  = 31;    (* max number of free lists - 1        *)
+       FREE_ID      = 0;     (* s-file id of free page              *)
+       MDDF_ID      = 1;     (* s-file id of MDDF                   *)
+       BMAP_ID      = 2;     (* s-file id of allocation map         *)
+       SLIST_ID     = 3;     (* s-file id of s-file list            *)
+       VDIR_ID      = 4;     (* s-file id of volume directory       *)
+       UFILE_ID     = 5;     (* s-file id of first user file        *)
+       TEMP_ID      = 32767; (* s-file id of temporary file         *)
+       DEFBLKSIZE   = 536;   (* standard number of bytes/block      *)
+       DEFDATASIZE  = 512;   (* standard number of data bytes/block *)
+       MDDFPRIMARY  = 0;     (* primary page location of MDDF       *)
+       MDDFBACKUP   = 270;   (* secondary page location of MDDF     *)
+       MAXRUNLEN    = 32767; (* max length of a run of pages        *)
+       MAXHOLESZ    = 20;    (* max hole that will be patched       *)
+       MAXCELLSZ    = 32;    (* max size of list element cell       *)
+       MAXPATCHES   = 30;    (* maximum patches allowed in file     *)
+       STRACE       = 97;    (* debug writeln trace fence value     *)
+       MERGETHRESH  = 20;    (* max clean free extent to merge with *)
+{$IFC STATS}
+       IXSTATS      = 50;    (* max size of heap statistics array   *)
+{$ENDC}
+
+
+       (* Unit local error codes *)
+       E_GAGME    = 1225;  (* internal inconsistency detected     *)
+       E_DEVNAME  = 1226;  (* invalid device name                 *)
+       E_NOTBLOCK = 1227;  (* device is not block-structured      *)
+       E_BOOTDEV  = 1228;  (* cannot scavenge the boot device     *)
+       E_HEAPOVFL = 1231;  (* maximum heap size reached           *)
+       E_CATALOG  = 1237;  (* trouble rebuilding the root catalog *)
+       E_NOMDDF   = 1240;  (* cannot find an MDDF on the volume   *)
+
+
+  type
+
+       (************************************************************************)
+       (*                     Scavenger Type Declarations                      *)
+       (************************************************************************)
+
+       byte_ptr   = ^byte;
+       addr_ptr   = ^longint;
+       MDDF_ptr   = ^MDDFdb;
+       hentry_ptr = ^hentry;
+
+       (***********************************)
+       (*                                 *)
+       (*  Generic link list cell header  *)
+       (*                                 *)
+       (***********************************)
+
+       SfileIdent = record
+                      case boolean of
+                        TRUE:  (  uniq : longint );
+                        FALSE: (  num  : integer;
+                                  vers : integer )
+                    end;
+
+       CellVariants = ( a, b, c, d, e );
+       cell_ptr = ^Cell;
+
+       Cell = packed record
+                link : cell_ptr;
+
+                case CellVariants of
+
+                  a:  (* Generic cell *)
+                  (
+                      key         : longint;  (* list is ordered on this 32-bit key *)
+                      (* size/update byte *)
+                      cellSize    : -16..15;
+                      updateRun   : boolean;
+                      updateFirst : boolean;
+                      updateLast  : boolean;
+                      pckByte     : byte;
+                  );
+
+                  b:  (* Packed Run Descriptor cell *)
+                  (
+                      pdiskPage  : longint;    (* page number *)
+                      updByte    : byte;
+                      flink_null : boolean;
+                      blink_null : boolean;
+                      length1    : boolean;
+                      relpg0     : boolean;
+                      fill0      : boolean;
+                      fill512    : boolean;
+                      sureBad    : boolean;
+                      maybeBad   : boolean;
+                  );
+
+                  c:  (* Free Run Descriptor *)
+                  (
+                      freePage   : longint;
+                      freeLength : longint;
+                  );
+
+                  d:  (* S-file Descriptor Block *)
+                  (
+                      sfileID   : SfileIdent;
+                      fsize     : longint;  (* saved cause it's in the s-list *)
+                      ptrLeader : cell_ptr;
+                      ptrData   : cell_ptr;
+                  );
+
+                  e:  (* Directory Descriptor *)
+                  (
+                      dirID      : longint;
+                      filler     : byte;
+                      foundDir   : boolean;
+                      dirCreated : longint;
+                      dirParID   : integer;
+                      dirName    : e_name;
+                  );
+              end;
+
+       (********************************)
+       (*                              *)
+       (*  Packed page run descriptor  *)
+       (*                              *)
+       (********************************)
+
+       MinRunDesc = packed record
+                      link       : cell_ptr;
+                      pdiskPage  : longint;    (* page number *)
+                      updByte    : byte;
+                      flink_null : boolean;
+                      blink_null : boolean;
+                      length1    : boolean;
+                      relpg0     : boolean;
+                      fill0      : boolean;
+                      fill512    : boolean;
+                      sureBad    : boolean;
+                      maybeBad   : boolean;
+                    end;
+
+       MaxRunDesc = packed record
+                      link       : cell_ptr;
+                      pdiskPage  : longint;    (* page number *)
+                      updByte    : byte;
+                      flink_null : boolean;
+                      blink_null : boolean;
+                      length1    : boolean;
+                      relpg0     : boolean;
+                      fill0      : boolean;
+                      fill512    : boolean;
+                      sureBad    : boolean;
+                      maybeBad   : boolean;
+                      pfill      : integer;
+                      plength    : integer;
+                      pfilePage  : longint;
+                      pforelink  : longint;
+                      pbacklink  : longint;
+                    end;
+
+       (**********************************)
+       (*                                *)
+       (*  Unpacked page run descriptor  *)
+       (*                                *)
+       (**********************************)
+
+       RunDesc = record
+                   filePage     : longint;
+                   diskPage     : longint;
+                   backlink     : longint;
+                   forelink     : longint;
+                   fill         : integer;
+                   numPages     : integer;
+                   contentBad   : boolean;
+                   contentMaybe : boolean;
+                   dirty        : boolean;
+                   firstDirty   : boolean;
+                   lastDirty    : boolean;
+                 end;
+       run_ptr = ^RunDesc;
+
+       FreeRunDesc = record
+                       link   : cell_ptr;
+                       freePage   : longint;
+                       freeLength : longint;
+                     end;
+
+       DirDesc = record
+                   link       : longint;
+                   dirID      : longint;
+                   filler     : byte;
+                   foundDir   : boolean;
+                   dirCreated : longint;
+                   dirParID   : integer;
+                   dirName    : e_name;
+                 end;
+
+       (***********************************************)
+       (*                                             *)
+       (*  Heap descriptor                            *)
+       (*                                             *)
+       (*    refnum   refnum of heap data segment     *)
+       (*    address  address of heap segment         *)
+       (*    size     current size of heap segment    *)
+       (*    used     high water mark in heap         *)
+       (*                                             *)
+       (***********************************************)
+
+       HeapDesc = record
+                    refnum  : integer;
+                    address : longint;
+                    size    : longint;
+                    used    : longint;
+                  end;
+
+      (*  Memory block list  *)
+      MemList = record
+                  toplavs : cell_ptr;
+                  blkSize : integer;
+                end;
+      memlist_ptr = ^MemList;
+
+
+      PageContents = array[0..511] of byte;
+      pgdata_ptr = ^PageContents;
+      pglabl_ptr = ^PageLabel;
+
+      FullPage = record
+                   Labl : PageLabel;
+                   Data : PageContents;
+                 end;
+      fullpg_ptr = ^FullPage;
+
+
+      DiskControl = record
+                      spare   : longint;
+                      rewrite : longint;
+                      reread  : longint;
+                    end;
+
+      BufDesc = record
+                  refnum    : integer;   (* refnum of the buffer segment       *)
+                  address   : longint;   (* address of the extent buffer       *)
+                  nblocks   : longint;   (* number of blocks in the bank       *)
+                  index     : longint;   (* next page fetched by NextPg        *)
+                  firstBlk  : longint;   (* first block in the bank            *)
+                  nextBlk   : longint;   (* last block in the bank + 1         *)
+                  blksLeft  : longint;   (* blocks remaining in current extent *)
+                  failedBlk : longint;   (* rewritten block to be read again   *)
+                  writeB    : boolean;   (* must write contents before reuse   *)
+                  readB     : boolean;   (* read extent contents from disk     *)
+                  dataOnly  : boolean;   (* page labels not present in buffer  *)
+                  ptrPl     : PlRecPt;   (* ptr to page label descriptor       *)
+                end;
+
+
+     (*****************************)
+     (*                           *)
+     (*  S-file Descriptor Block  *)
+     (*                           *)
+     (*****************************)
+
+     SFDB = record
+              link      : cell_ptr;
+              sfileID   : SfileIdent;
+              fsize     : longint;  (* saved cause it's in the s-list *)
+              ptrLeader : cell_ptr;
+              ptrData   : cell_ptr;
+            end;
+     SFDB_ptr = ^SFDB;
+
+     IntUnion = record
+                  case boolean of
+                    TRUE:   ( ptrI : ^integer );
+                    FALSE:  ( ptrL : ^longint )
+                end;
+
+     OptionDesc = record
+                    saveRemnants : boolean;
+                    killPipes    : boolean;
+                    reviveDead   : boolean;
+                    goForIt      : boolean;
+                  end;
+
+     RunVector = array[0..999] of RunDesc;
+     rvec_ptr = ^RunVector;
+
+     FileMods = packed record
+                  case boolean of
+                    TRUE:   ( word : integer );
+                    FALSE:  ( patchInsert  : boolean;
+                              relpageShift : boolean;
+                              collision    : boolean;
+                              peofUpdate   : boolean;
+                              fmapUpdate   : boolean;
+                              ldrPatch     : boolean;
+                              fillUpdate   : boolean;
+                              linkUpdate   : boolean;
+                              leofUpdate   : boolean;
+                              revived      : boolean);
+                end;
+
+
+
+
+  var
+       Heap          : HeapDesc;
+       FreeMemList   : array[0..IXFREELISTS] of MemList;
+       NullPage      : FullPage;
+       ExtentBuf     : BufDesc;
+       Scratch       : HeapDesc;
+       SavedRefnum   : array[FIRSTLDSN..LASTLDSN] of integer;
+       SaveDiskCntrl : DiskControl;
+       Option        : OptionDesc;
+
+{$IFC STATS}
+       AllocStats : array[0..IXSTATS] of record
+                                           size  : integer;
+                                           count : integer;
+                                         end;
+{$ENDC}
+       gdevice      : integer;     (* device being scavenged  *)
+       gptrMDDF     : MDDF_ptr;    (* pointer to MDDF in heap *)
+       gptrLabl     : pglabl_ptr;  (* ptr to label of next page in extent buf *)
+       gptrData     : pgdata_ptr;  (* ptr to data of next page in extent buf  *)
+       gptrRlabl    : pglabl_ptr;  (* ptr to label of first page in next run  *)
+       gptrRdata    : pgdata_ptr;  (* ptr to data of first page in next run   *)
+       gpage        : longint;     (* page number of first page in next run   *)
+       gptrSfList   : cell_ptr;    (* ptr to list of S-files found on volume  *)
+       gptrFreeList : cell_ptr;    (* ptr to list of free disk extents        *)
+       gnfiles      : integer;     (* count of files found on the volume      *)
+       gemptyFile   : integer;     (* next available s-file number on volume  *)
+       goldVol      : boolean;     (* first release volume format flag        *)
+       gvolDirty    : boolean;     (* has volume been altered by scavenger    *)
+       gfreeCnt     : longint;
+       gfsOverhead  : integer;     (* file system static + dynamic disk space *)
+       gflatCat     : boolean;
+{$IFC SDEBUG}
+       gwriteFlag   : boolean;
+{$ENDC}
+
+
+  {$R-}
+
+
+  function  Pair ( var Leftlabel  : PageLabel;
+                   var Rightlabel : PageLabel ) : boolean;  external;
+
+  procedure  ScvDir (     idNum : integer;
+                      var name  : e_name );  external;
+
+  procedure  PutFreeLen ( value   : longint;
+                          ptrCell : cell_ptr );  external;
+
+  function  GetFreeLen ( ptrCell : cell_ptr ) : longint;  external;
+
+  procedure  PutFsize ( value   : longint;
+                        ptrCell : cell_ptr );  external;
+
+  function  GetFsize ( ptrCell : cell_ptr ) : longint;  external;
+
+  procedure  NextCell (     ptrList : cell_ptr;
+                        var ptrCell : cell_ptr );  external;
+
+
+
+{$IFC SDEBUG}
+  procedure  PrHex ( n : longint );
+
+  var
+       HexRep : string[8];
+       digit  : integer;
+       i      : integer;
+
+  begin
+      HexRep := '01234567';  { set string length }
+      if n < 0 then
+        HexRep := '????????'
+      else
+        for i := 8 downto 1 do
+        begin
+          digit := n mod 16;
+          if digit > 9 then
+            HexRep[i] := chr(ord('A') + (digit - 10))
+          else
+            HexRep[i] := chr(ord('0') + digit);
+          n := n div 16;
+        end;
+
+      write(HexRep);
+  end{proc PrHex};
+
+
+  procedure  PrlnHex ( n : longint );
+  begin
+      PrHex(n); writeln;
+  end{proc PrlnHex};
+
+
+  procedure  PrRun ( ptrRun : run_ptr );
+
+  begin
+      with ptrRun^ do
+      begin
+        write(' abs = ',diskPage:6,' rel = ',filePage:5,' bkw = ',backlink:6);
+        writeln(' fwd = ',forelink:6,' len = ',numPages:5,' du = ',fill:3);
+      end{with};
+  end{proc PrRun};
+
+
+  procedure  PrLabel ( ptrLabl : pglabl_ptr );
+
+  begin
+      with ptrLabl^ do
+      begin
+          writeln('sf = ',fileid:4,' ver = ',version:2,' rel = ',relpage:5,
+                  ' fwd = ',fwdlink:5,' bck = ',bkwdlink:5);
+      end{with};
+  end{proc PrLabel};
+
+
+  procedure  PrPlablDesc ( ptrPlblDesc : plrecpt );
+
+  begin
+      with ptrPlblDesc^ do
+      begin
+        Prlabel(@plabel);
+        writeln('last link = ',lflink:1,'  fill = ',ldataused:1);
+      end{with};
+  end{proc PrPlablDesc};
+
+
+  procedure  PrIOMode ( mode : disk_io_type );
+
+  begin
+      case mode of
+        with_header:    writeln('with header');
+        without_header: writeln('without header');
+        raw_io:         writeln('raw');
+        chained_hdrs:   writeln('chained header');
+        otherwise       writeln('invalid');
+      end{case};
+  end{proc PrIOMode};
+
+
+  procedure  PrList ( ptrList : cell_ptr );
+
+  var
+       ptrHead : cell_ptr;
+       size    : integer;
+
+  begin
+      if ptrList = pointer(BAD) then exit(PrList);
+      ptrList := ptrList^.link;
+      ptrHead := ptrList;
+      repeat
+        size := ptrList^.cellSize;
+        if size < 0 then size := size + MAXCELLSZ;
+        write('          ',ptrList^.key:1);
+        write('  ',ptrList^.sfileID.num:1,'/',ptrList^.sfileID.vers:1);
+        write('  size = ',size:2,'  [ ');
+        if ptrList^.updateFirst then write('updFirst ');
+        if ptrList^.updateLast then write('updLast ');
+        if ptrList^.updateRun then write('updRun ');
+        if ptrList^.sureBad then write('bad ');
+        if ptrList^.maybeBad then write('maybe ');
+        writeln(']');
+        ptrList := ptrList^.link;
+      until ptrList = ptrHead;
+  end{proc PrList};
+
+
+  procedure  PrFileCondition ( fileCond : FileMods );
+
+  begin
+      with fileCond do
+      begin
+        if patchInsert  then writeln('   patch inserted');
+        if relpageShift then writeln('   relative page numbers shifted');
+        if collision then    writeln('   page collision resolved');
+        if peofUpdate then   writeln('   physical EOF adjusted');
+        if leofUpdate then   writeln('   logical EOF adjusted');
+        if fillUpdate then   writeln('   page label data fill field(s) adjusted');
+        if fmapUpdate then   writeln('   file map updated');
+        if linkUpdate then   writeln('   page label link(s) adjusted');
+        if ldrPatch then     writeln('   page(s) added to file leader');
+        if revived then      writeln('   kill bit was found set');
+      end{with};
+  end{proc PrFileCondition};
+
+
+  procedure  PrDirList ( ptrList : cell_ptr );
+
+  var
+       ptrHead : cell_ptr;
+
+  begin
+      if ptrList = pointer(BAD) then exit(PrDirList);
+      ptrList := ptrList^.link;
+      ptrHead := ptrList;
+      repeat
+        with ptrList^ do
+          writeln('id = ',dirID:5,'  parent = ',dirParID:5,'  name = "',dirName,'"');
+        ptrList := ptrList^.link;
+      until ptrList = ptrHead;
+  end{proc PrDirList};
+
+
+  procedure  PrKey ( ptrK : key_ptr );
+
+  var
+      parID  : integer;
+      name   : e_name;
+
+  begin
+      DecompKey(ptrK, @name, parID);
+      writeln('<',parID:1,'> ',name);
+  end{proc PrKey};
+{$ENDC}
+
+
+  function  CheckDevice ( var name  : e_name;
+                          var ecode : integer ) : integer;
+
+  var
+       device : integer;
+
+  begin
+      ecode := OK;
+      CheckDevice := BAD;
+      device := map_dev_name(name);
+      if (device < FIRSTDEV) or (device > MAXDEV) then
+        ecode := E_DEVNAME
+      else if mounttable[device] <> pointer(BADPTR1) then
+        (* Device is mounted *)
+        ecode := E_DEVNAME
+      else if not configinfo[device]^.blockstructured then
+        (* Device is a sequential device *)
+        ecode := E_NOTBLOCK
+      else if device = bootdev then
+        (* Device is the boot device *)
+        ecode := E_BOOTDEV
+      else
+        CheckDevice := device;
+  end{func CheckDevice};
+
+
+
+
+  (**************************************************************************)
+  (*                                                                        *)
+  (*                           Storage Management                           *)
+  (*                                                                        *)
+  (**************************************************************************)
+
+
+  procedure  HeapInit ( var ecode : integer );
+
+  const
+       INITSIZE = 2048;  (* initial segment size = 2K bytes *)
+
+  var
+       segPath   : Pathname;
+       i         : integer;
+
+  begin
+      ecode := OK;
+      segPath := 'ScavengerHeap';
+
+      with Heap do
+      begin
+        (* Create the heap segment *)
+        Make_Dataseg(ecode, segPath, INITSIZE, 0, refnum, address,
+                     FIRSTLDSN, ds_private);
+        if ecode > OK then exit(HeapInit);
+
+        size := INITSIZE;
+        used := 0;
+      end{with};
+
+      (*
+       *  Initialize the array of pointers to lists of free memory blocks.
+       *)
+      i := 0;
+      repeat
+        with FreeMemList[i] do
+        begin
+          blkSize := 0;
+          toplavs := pointer(BAD);
+          i := i + 1;
+        end{with};
+      until i > IXFREELISTS;
+  end{proc HeapInit};
+
+
+
+
+  function  GetMem ( var TheHeap : HeapDesc;
+                         nbytes  : longint;
+                         ptrAddr : addr_ptr ) : boolean;
+
+  var
+       loclEcode : integer;  (* local error code *)
+       junk      : longint;  (* new disk size returned by Size_Dataseg *)
+
+  begin
+       with TheHeap do
+       begin
+         if used+nbytes > size then
+         begin
+           (*
+            *  Need to enlarge the heap segment in order to satisfy
+            *  this request.  Segment should grow in increments of
+            *  512 byte pages.
+            *)
+           Size_Dataseg(loclEcode, refnum, nbytes, size, 0, junk);
+
+           if loclEcode > OK then
+           begin
+             (* Couldn't enlarge the data segment *)
+             GetMem := FALSE;
+             exit(GetMem);
+           end{if};
+         end{if};
+
+         (* Update segment descriptor and exit *)
+         ptrAddr^ := address + used;
+         used := used + nbytes;
+         GetMem := TRUE;
+       end{with};
+  end{func GetMem};
+
+
+
+
+  function  GetCell ( nbytes  : integer;
+                      ptrAddr : addr_ptr ) : boolean;
+
+  label  1;
+
+  var
+       ptrCell : cell_ptr;
+       ptrList : memlist_ptr;
+{$IFC STATS}
+       i       : integer;
+{$ENDC}
+
+  begin
+      (*
+       *  Search the free pool for a block of free memory of the appropriate
+       *  size.  If no such block is found, a fresh block is allocated from
+       *  the bottom of the heap segment.  Note that memory blocks in the
+       *  free pool are not disassembled to satisfy the request.
+       *)
+      ptrCell := pointer(BAD);
+      ptrList := @FreeMemList;
+      while ptrList^.blkSize > 0 do with ptrList^ do
+      begin
+        if blkSize = nbytes then
+        begin
+          (* Found a free list containing the right size blocks *)
+          if toplavs <> pointer(BAD) then
+          begin
+            (* Allocate the cell from the free list *)
+            ptrCell := toplavs;
+            toplavs := ptrCell^.link;
+          end{if};
+          goto 1;  (* break *)
+        end{if};
+        ptrList := pointer(ord(ptrList) + sizeof(MemList));
+      end{while};
+
+  1:  (* loop fallthrough *)
+      if ptrCell = pointer(BAD) then
+      begin
+        (*
+         *  The free pool contains no blocks of the requested size; so allocate
+         *  a new cell from fresh memory.
+         *)
+        if not GetMem(Heap, nbytes, @ptrCell) then
+        begin
+          (* Can't get a new cell *)
+          GetCell := FALSE;
+          exit(GetCell);
+        end{if};
+      end{if};
+
+      (* Cut dangling reference in the returned cell *)
+      ptrCell^.link := pointer(BAD);
+
+      ptrAddr^ := ord(ptrCell);
+      GetCell := TRUE;
+
+{$IFC STATS}
+     i := 0;
+     while AllocStats[i].size <> 0 do with AllocStats[i] do
+     begin
+       if size = nbytes then
+       begin
+         count := count + 1;
+         exit(GetCell);
+       end;
+       i := i + 1;
+     end;
+     (* invariant: AllocStats[i].size = 0 *)
+     with AllocStats[i] do
+     begin
+       size := nbytes;
+       count := 1;
+     end;
+{$ENDC}
+  end{func GetCell};
+
+
+
+
+  procedure  FreeCell ( ptrCell : cell_ptr );
+
+  var
+       ptrList : memlist_ptr;
+       i       : integer;
+       nbytes  : integer;
+
+  begin
+      (* Treat size as an unsigned 5-bit integer *)
+      nbytes := ptrCell^.cellSize;
+      if nbytes < 0 then nbytes := nbytes + MAXCELLSZ;
+
+      ptrList := @FreeMemList;
+      i := 0;
+      while (i < IXFREELISTS) and
+            (ptrList^.blkSize > 0) and
+            (ptrList^.blkSize <> nbytes) do
+      begin
+        ptrList := pointer(ord(ptrList) + sizeof(MemList));
+        i := i + 1;
+      end{while};
+
+      if i <= IXFREELISTS then
+      begin
+        with ptrList^ do
+        begin
+          (* Free list is singly-linked *)
+          ptrCell^.link := toplavs;
+          toplavs := ptrCell;
+          blkSize := nbytes;
+        end{with};
+      end
+      else
+{$IFC SDEBUG}
+        writeln('free block lost');
+{$ENDC}
+      (* else block to free is lost.  This error condition is ignored *)
+
+  end{proc FreeCell};
+
+
+
+
+  (**************************************************************************)
+  (*                                                                        *)
+  (*                       Data Structure Management                        *)
+  (*                                                                        *)
+  (**************************************************************************)
+
+  function  SearchList (     ptrList : cell_ptr;
+                             key     : longint;
+                         var ptrCell : cell_ptr ) : boolean;
+
+  label  1, 2;
+
+  var
+       ptrLast : cell_ptr;
+       ptrHead : cell_ptr;
+
+  begin
+      SearchList := FALSE;  (* assume cell not found *)
+      ptrCell := pointer(BAD);
+      if ptrList = pointer(BAD) then exit(SearchList);
+
+      ptrCell := ptrList^.link;  (* pointer to head of list     *)
+      ptrHead := ptrCell;        (* remember head cell location *)
+      ptrLast := ptrList;        (* last cell visited           *)
+
+      (* Peek at the tail cell and exit early if it is the insertion point *)
+      if key >= ptrList^.key then goto 1;
+
+      repeat
+        if ptrCell^.key = key then goto 2;
+        if ptrCell^.key > key then goto 1;
+        ptrLast := ptrCell;
+        ptrCell := ptrCell^.link;
+      until ptrCell = ptrHead;
+
+  1:  (* loop fallthrough *)
+      ptrCell := ptrLast;
+
+  2:  (* exit *)
+      SearchList := (ptrCell^.key = key);
+  end{func SearchList};
+
+
+
+
+  procedure  LinkCell ( var ptrList   : cell_ptr;
+                            ptrInsert : cell_ptr;
+                            ptrCell   : cell_ptr );
+
+  begin
+      if ptrInsert = pointer(BAD) then
+      begin
+        (* Link into empty list *)
+        ptrList := ptrCell;
+        ptrCell^.link := ptrCell;
+      end
+      else
+      begin
+        (* Link-in the new cell *)
+        ptrCell^.link := ptrInsert^.link;
+        ptrInsert^.link := ptrCell;
+
+        if ptrList = ptrInsert then
+          (* Update list ptr to reference new tail of list *)
+          if ptrCell^.key > ptrList^.key then
+            ptrList := ptrCell;
+      end{if};
+  end{proc LinkCell};
+
+
+
+
+  procedure  UnlinkCell ( var ptrList : cell_ptr;
+                              ptrPred : cell_ptr;
+                              ptrCell : cell_ptr );
+
+  begin
+      (* Unlink the cell *)
+      ptrPred^.link := ptrCell^.link;
+      if ptrList = ptrCell then
+        (* Update list ptr to reference new tail cell *)
+        if ptrCell^.link = ptrCell then
+          (* List is empty *)
+          ptrList := pointer(BAD)
+        else
+          (* New tail cell *)
+          ptrList := ptrPred;
+      ptrCell^.link := pointer(BAD);
+  end{proc UnlinkCell};
+
+
+
+
+  function  InsertCell ( var ptrList : cell_ptr;
+                             ptrCell : cell_ptr ) : boolean;
+
+  var
+       ptrInsert : cell_ptr;
+
+  begin
+      if SearchList(ptrList, ptrCell^.key, ptrInsert) then
+        (* Cell already present *)
+        InsertCell := FALSE
+      else
+      begin
+        LinkCell(ptrList, ptrInsert, ptrCell);
+        InsertCell := TRUE;
+      end{if};
+  end{func InsertCell};
+
+
+
+
+  procedure  CellRange (     range   : integer;
+                         var ptrCell : cell_ptr;
+                         var ecode   : integer );
+
+  var
+       size   : integer;
+       ptrNew : cell_ptr;
+
+  begin
+      ecode := OK;
+
+      (* Current size of cell *)
+      size := ptrCell^.cellSize;
+      if size < 0 then size := size + MAXCELLSZ;
+
+      if range > size then
+      begin
+        (* Must allocate a larger cell *)
+        if not GetCell(range, @ptrNew) then
+        begin
+          ecode := E_HEAPOVFL;
+          exit(CellRange);
+        end{if};
+        (* Copy contents of outgrown cell to new home *)
+        moveleft(ptrCell^, ptrNew^, size);
+        {$R-}
+        ptrNew^.cellSize := size;
+        {$IFC DEBUG2} {$R+} {$ENDC}
+        (* Free the outgrown cell *)
+        FreeCell(ptrCell);
+        ptrCell := ptrNew;
+      end{if};
+  end{proc CellRange};
+
+
+
+
+  (**************************************************************************)
+  (*                                                                        *)
+  (*                                Disk I/O                                *)
+  (*                                                                        *)
+  (**************************************************************************)
+
+  procedure  SetDiskMode ( var DiskCntrl : DiskControl );
+
+  const
+       GETDISKMODE = 20;
+       SETDISKMODE = 21;
+
+  var
+       loclEcode : integer;
+       DevOp     : Params;
+       DevParm   : DC_Rec;
+
+  begin
+       with DevOp do
+       begin
+         fnctn_code := dcontrol;
+         parptr := ord(@DevParm);
+       end{with};
+       with DevParm do
+       begin
+         dversion := 2;
+         dcode := GETDISKMODE;
+         Drivercall(loclEcode, gdevice, @DevOp);
+         with DiskCntrl do
+         begin
+           ar10[0] := spare;
+           ar10[1] := rewrite;
+           ar10[2] := reread;
+           spare := ar10[4];
+           rewrite := ar10[5];
+           reread := ar10[6];
+         end{with};
+
+         dcode := SETDISKMODE;
+         Drivercall(loclEcode, gdevice, @DevOp);
+       end{with};
+  end{proc SetDiskMode};
+
+
+
+
+  procedure  ReWriteBlock (     block     : longint;
+                                addrBlock : longint;
+                            var ecode     : integer );
+
+  var
+       loclEcode : integer;
+       actual    : longint;
+       DiskCntrl : DiskControl;
+
+  begin
+      ecode := OK;
+      with DiskCntrl do
+      begin
+        spare := 1; reread := 1; rewrite := 1;
+      end{with};
+      SetDiskMode(DiskCntrl);
+      LisaIO(ecode, gdevice, addrBlock, block, 1, actual, raw_io, nil, writeop);
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      writeln('                           rewrite blk = ',block:1,
+              '  cnt = ',actual:1,'  err = ',ecode:1);
+{$ENDC}
+      with DiskCntrl do
+      begin
+        spare := 1;  reread := 0; rewrite := 1;
+      end{with};
+      SetDiskMode(DiskCntrl);
+  end{proc ReWriteBlock};
+
+
+
+
+  procedure  LoadExtent ( var ecode : integer );
+
+  var
+       count     : longint;
+       loclEcode : integer;
+       ioMode    : disk_io_type;
+
+
+       procedure  CombExtent;
+
+       var
+            PageBuf   : FullPage;
+            loclEcode : integer;
+            actual    : longint;
+            block     : longint;
+
+       begin
+           with ExtentBuf do
+           begin
+             block := firstBlk;
+             repeat
+               LisaIO(loclEcode, gdevice, ord(@PageBuf), block, 1, actual,
+                      raw_io, nil, readop);
+               if loclEcode = 663 (* checksum *) then
+               begin
+                 PageBuf.Labl.datastat := DATABAD;
+                 ReWriteBlock(block, ord(@PageBuf), ecode);
+                 if ecode > OK then exit(LoadExtent);
+               end{if};
+               block := block + 1;
+             until block >= nextBlk;
+           end{with};
+       end{proc CombBank};
+
+
+begin
+     ecode := OK;
+
+     with ExtentBuf do
+     begin
+       if blksLeft > BUFBLOCKS then
+         count := BUFBLOCKS
+       else
+         count := blksLeft;
+
+       if writeB then
+       begin
+         writeB := FALSE;
+         if dataOnly then
+           ioMode := with_header
+         else
+           ioMode := raw_io;
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         PrPlablDesc(ptrPl);
+         if gwriteFlag then
+{$ENDC}
+         LisaIO(loclEcode, gdevice, address, firstBlk, nblocks, nblocks,
+                ioMode, ptrPl, writeop);
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         begin
+         write('w                                  blk = ',firstBlk:6,
+               '  cnt = ',nblocks:6,'  err = ',loclEcode:1,'   ');  PrIOMode(ioMode);
+         end;
+{$ENDC}
+       end{if};
+
+       (* Location of next portion of extent *)
+       firstBlk := nextBlk;
+       nblocks := 0;
+       loclEcode := OK;
+
+       if (count > 0) and readB then
+       begin
+         (* Read the extent *)
+         if dataOnly then
+           ioMode := without_header
+         else
+           ioMode := raw_io;
+         LisaIO(loclEcode, gdevice, address, firstBlk, count, nblocks,
+                ioMode, nil, readop);
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         begin
+         write('r                                  blk = ',firstBlk:6,
+               '  cnt = ',nblocks:6,'  err = ',loclEcode:1,'   ');  PrIOMode(ioMode);
+         end;
+{$ENDC}
+       end
+       else
+       begin
+         nblocks := count;
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         writeln('f                                  blk = ',firstBlk:6,
+                 '  cnt = ',nblocks:6,'  err = ',loclEcode:1);
+{$ENDC}
+       end{if};
+
+       blksLeft := blksLeft - nblocks;
+       nextBlk := firstBlk + nblocks;
+       index := 1;
+
+       case loclEcode of
+
+           -626,   (*  Data maybe bad after previous Scavenge       *)
+            625,   (*  Data definitely bad after previous Scavenge  *)
+            OK:    ;
+
+            606,   (*  Can't find sector (disk unformatted)  *)
+            617:   (*  Twiggy checksum error                 *)
+                 begin
+                   (*
+                    *  The first time a block read fails, try to rewrite the
+                    *  block and have it remapped by the disk driver/controller.
+                    *  Abort the second time the read fails.
+                    *)
+                   if nextBlk <> failedBlk then
+                     ReWriteBlock(nextBlk, ord(@NullPage), ecode);
+                   if ecode > OK then exit(LoadExtent);  (*** Fatal Error ***)
+                   failedBlk := nextBlk;  (* block to reread after rewrite *)
+                 end;
+
+            663:   (*  Profile checksum error  *)
+                 begin
+                   CombExtent;
+                 end;
+
+            otherwise  (* Unexpected I/O error; 662 included *)
+                 begin
+                   ecode := loclEcode;
+                   exit(LoadExtent);   (*** Fatal Error ***)
+                 end;
+       end{case};
+
+       if dataOnly then
+       begin
+         gptrLabl := pointer(BAD);
+         gptrData := pointer(address);
+       end
+       else
+       begin
+         gptrLabl := pointer(address);
+         gptrData := pointer(address + (nblocks * sizeof(PageLabel)));
+       end{if};
+     end{with};
+
+  end{proc LoadExtent};
+
+
+
+
+  procedure  ResetExtent (     page     : longint;
+                               length   : longint;
+                           var ecode    : integer );
+
+  var
+       block : longint;
+
+  begin
+      ecode := OK;
+      with ExtentBuf do
+      begin
+        with gptrMDDF^.geography do
+        begin
+          (* Map page number to block number and check range *)
+          block := page + firstblock;
+          if (block < firstblock) or (block+length-1 > lastblock) then
+          begin
+            ecode := E_GAGME;  (* extent range is bad *)
+            exit(ResetExtent);
+          end{if};
+        end{with};
+
+        blksLeft := length;
+        nextBlk := block;
+
+        (* Read the extent into the extent buffer segment *)
+        LoadExtent(ecode);
+      end{with};
+  end{proc ResetExtent};
+
+
+
+
+  function  SanityCheck ( ptrLabel : pglabl_ptr ) : boolean;
+
+  begin
+      with gptrMDDF^, ptrLabel^ do
+      begin
+        if (abs(fileid) > maxfiles) or
+           (abspage < 0) or (abspage > geography.lastfspage) or
+           (relpage < 0) or (relpage > geography.lastfspage) then
+              SanityCheck := FALSE
+        else
+              SanityCheck := TRUE;
+      end{with};
+  end{func SanityCheck};
+
+
+
+
+  function  NextPg ( var ptrLabl : pglabl_ptr;
+                     var ptrData : pgdata_ptr;
+                     var ecode   : integer ) : boolean;
+
+  var
+       i : integer;
+
+  begin
+       ecode := OK;
+       NextPg := TRUE;  (* assume end of extent *)
+
+       with ExtentBuf do
+       begin
+         if index > nblocks then
+         begin
+           if blksLeft <= 0 then exit(NextPg);  (* end of extent *)
+
+           (*
+            *  The next page is not in the page bank; execute a bank read to bring
+            *  in the page and its successors.
+            *)
+
+           (* Read next portion of extent *)
+           LoadExtent(ecode);
+           if ecode > OK then exit(NextPg);
+         end{if};
+
+         (* Page should now be in the bank; so return a handle for it *)
+
+         ptrData := gptrData;
+         gptrData := pointer(ord(gptrData) + sizeof(PageContents));
+
+         if not dataOnly then
+         begin
+           ptrLabl := gptrLabl;
+           gptrLabl := pointer(ord(gptrLabl) + sizeof(PageLabel));
+           with ptrLabl^ do
+           begin
+             (* Map tempfile pages into free pages *)
+             if fileid = TEMP_ID then fileid := FREE_ID;
+             (* Map garbaged pages into free pages *)
+             if not SanityCheck(ptrLabl) then fileid := FREE_ID;
+           end{with};
+         end{if};
+
+         index := index + 1;
+         NextPg := FALSE;
+       end{with};
+  end{func NextPg};
+
+
+
+
+
+  procedure  PageIO (     pagenum   : longint;
+                      var PageBuf   : FullPage;
+                          mode      : ioop;
+                      var ecode     : integer );
+
+  var
+       blocknum : longint;
+       actual   : longint;
+       ioMode   : disk_io_type;
+
+  begin
+      ecode := OK;
+
+      with gptrMDDF^.geography do
+      begin
+        blocknum := pagenum + firstblock;
+
+        if (blocknum < firstblock) or (blocknum > lastblock) then
+        begin
+          ecode := E_GAGME;
+          exit(PageIO);
+        end{if};
+      end{with};
+
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      if mode = writeop then write('WRITE ') else write('READ  ');
+      writeln(pagenum:1,'/',blocknum:1);
+      end;
+      if (mode = readop) or gwriteFlag then
+{$ENDC}
+      LisaIO(ecode, gdevice, ord(@PageBuf), blocknum, 1,
+             actual, raw_io, nil, mode);
+      if (ecode = -626) or (ecode = 625) or (ecode = 663) then ecode := OK;
+
+  end{proc PageIO};
+
+
+
+
+  procedure  ReadMDDF (     page  : longint;
+                        var ecode : integer );
+
+  var
+       actual   : longint;
+       PageBuf  : FullPage;
+       block    : longint;
+       ptrExt   : ^ext_diskconfig;
+       ptrMDDF  : MDDF_ptr;
+
+  begin
+      ecode := OK;
+
+      (* Read the MDDF *)
+      ptrExt := pointer(configinfo[gdevice]^.ext_addr);
+      block := ptrExt^.fs_strt_blok + page;
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      writeln('Read MDDF  ',page:1,'/',block:1);
+{$ENDC}
+      LisaIO(ecode, gdevice, ord(@PageBuf), block, 1, actual,
+             raw_io, nil, readop);
+      if ecode > OK then exit(ReadMDDF);
+
+      ptrMDDF := @PageBuf.Data;
+      with ptrMDDF^ do
+      begin
+        if ( (PageBuf.Labl.fileid <> MDDF_ID)
+                        or
+             ((fsversion <> FIRST_FS) and
+              (fsversion <> PEPSI_FS) and
+              (fsversion <> SPRING_FS))
+                        or
+             (blocksize <> DEFBLKSIZE)
+                        or
+             (datasize <> DEFDATASIZE)
+                        or
+             (length(volname) > MAX_ENAME) ) then ecode := E_NOMDDF
+        else
+        begin
+          (* Allocate heap space to store the MDDF *)
+          if gptrMDDF = pointer(BAD) then
+          begin
+            if not GetMem(Heap, sizeof(MDDFdb), @gptrMDDF) then
+            begin
+              ecode := E_HEAPOVFL;
+              exit(ReadMDDF);
+            end{if};
+          end{if};
+
+          (* Copy the MDDF into the heap *)
+          moveleft(PageBuf.Data, gptrMDDF^, sizeof(MDDFdb));
+
+          with gptrMDDF^ do
+          begin
+            goldVol := (fsversion = FIRST_FS);
+            gflatCat := (fsversion < SPRING_FS);
+          end{with};
+        end{if};
+      end{with};
+  end{proc ReadMDDF};
+
+
+
+
+  procedure  PackRun (     sfile   : SfileIdent;
+                       var Run     : RunDesc;
+                       var ptrCell : cell_ptr;
+                       var ecode   : integer );
+
+  var
+      MaxRun  : MaxRunDesc;
+      size    : integer;
+      p       : IntUnion;
+
+  begin
+      ecode := OK;
+      ptrCell := @MaxRun;
+
+      with Run, ptrCell^ do
+      begin
+        link := pointer(BAD);
+        updateRun := dirty;
+        updateFirst := firstDirty;
+        updateLast := lastDirty;
+
+        if sfile.num = FREE_ID then
+        begin
+          size := sizeof(FreeRunDesc);
+          freePage := Run.diskPage;
+          PutFreeLen(Run.numPages, ptrCell);
+        end
+        else
+        begin
+          size := sizeof(MinRunDesc);
+          p.ptrI := pointer(ord(@MaxRun) + sizeof(MinRunDesc));
+          pdiskPage := diskPage;
+          pckByte := 0;  (* clear packing flags *)
+          if contentBad then sureBad := TRUE;
+          if contentMaybe then maybeBad := TRUE;
+
+          if fill = 0 then
+            fill0 := TRUE
+          else if fill = DEFDATASIZE then
+            fill512 := TRUE
+          else
+          begin
+            p.ptrI^ := fill;
+            p.ptrI := pointer(ord(p.ptrI) + sizeof(integer));
+            size := size + sizeof(integer);
+          end{if};
+
+          if numPages = 1 then
+            length1 := TRUE
+          else
+          begin
+            p.ptrI^ := numPages;
+            p.ptrI := pointer(ord(p.ptrI) + sizeof(integer));
+            size := size + sizeof(integer);
+          end{if};
+
+          if filePage = 0 then
+            relpg0 := TRUE
+          else
+          begin
+            p.ptrL^ := filePage;
+            p.ptrL := pointer(ord(p.ptrL) + sizeof(longint));
+            size := size + sizeof(longint);
+          end{if};
+
+          if forelink = -1 then
+            flink_null := TRUE
+          else
+          begin
+            p.ptrL^ := forelink;
+            p.ptrL := pointer(ord(p.ptrL) + sizeof(longint));
+            size := size + sizeof(longint);
+          end{if};
+
+          if backlink = -1 then
+            blink_null := TRUE
+          else
+          begin
+            p.ptrL^ := backlink;
+            size := size + sizeof(longint);
+          end{if};
+        end{if};
+      end{with};
+
+      (* Allocate heap space for the packed run descriptor *)
+      if not GetCell(size, @ptrCell) then
+      begin
+        ecode := E_HEAPOVFL;
+        exit(PackRun);
+      end{if};
+
+      (* Copy the run descriptor into the heap *)
+      moveleft(MaxRun, ptrCell^, size);
+      {$R-}
+      ptrCell^.cellSize := size;
+      {$IFC DEBUG2} {$R+} {$ENDC}
+
+  end{proc PackRun};
+
+
+
+
+  procedure  UnpackRun (     ptrCell : cell_ptr;
+                         var Run     : RunDesc );
+
+  var
+      p      : IntUnion;
+
+  begin
+      p.ptrI := pointer(ord(ptrCell) + sizeof(MinRunDesc));
+      with ptrCell^, Run do
+      begin
+        diskPage := pdiskPage;
+        contentBad := sureBad;
+        contentMaybe := maybeBad;
+        dirty := updateRun;
+        firstDirty := updateFirst;
+        lastDirty := updateLast;
+
+        if fill0 then
+          fill := 0
+        else if fill512 then
+          fill := DEFDATASIZE
+        else
+        begin
+          fill := p.ptrI^;
+          p.ptrI := pointer(ord(p.ptrI) + sizeof(integer));
+        end{if};
+
+        if length1 then
+          numPages := 1
+        else
+        begin
+          numPages := p.ptrI^;
+          p.ptrI := pointer(ord(p.ptrI) + sizeof(integer));
+        end{if};
+
+        if relpg0 then
+          filePage := 0
+        else
+        begin
+          filePage := p.ptrL^;
+          p.ptrL := pointer(ord(p.ptrL) + sizeof(longint));
+        end{if};
+
+        if flink_null then
+          forelink := -1
+        else
+        begin
+          forelink := p.ptrL^;
+          p.ptrL := pointer(ord(p.ptrL) + sizeof(longint));
+        end{if};
+
+        if blink_null then
+          backlink := -1
+        else
+          backlink := p.ptrL^;
+      end{with};
+  end{proc UnpackRun};
+
+
+
+
+  procedure  GenericRun (     page     : longint;
+                              length   : longint;
+                              dataFill : integer;
+                          var Run      : RunDesc );
+
+  begin
+      with Run do
+      begin
+        diskPage := page;
+        filePage := 0;
+        forelink := -1;
+        backlink := -1;
+        fill := dataFill;
+        numPages := length;
+        contentBad := FALSE;
+        contentMaybe := FALSE;
+      end{with};
+  end{proc GenericRun};
+
+
+
+
+  procedure  SetupBuffer (     sfileID   : SfileIdent;
+                               reading   : boolean;
+                           var Run       : RunDesc;
+                           var LabelDesc : PlRect );
+
+  begin
+      with LabelDesc, Run do
+      begin
+        with plabel do
+        begin
+          volume := 0;
+          filler := 0;
+          fileid := sfileID.num;
+          version := sfileID.vers;
+          abspage := diskPage;
+          relpage := filePage;
+          if contentBad then
+            datastat := databad
+          else if contentMaybe then
+            datastat := datamaybe
+          else
+            datastat := dataok;
+          if numPages = 1 then
+          begin
+            dataused := fill;
+            fwdlink := forelink;
+          end
+          else
+          begin
+            dataused := DEFDATASIZE;
+            fwdlink := diskPage + 1;
+          end{if};
+          bkwdlink := backlink;
+        end{with};
+        lflink := forelink;
+        ldataused := fill;
+      end{with};
+
+      with ExtentBuf do
+      begin
+        readB := reading;
+        dataOnly := TRUE;
+        ptrPl := @LabelDesc;
+      end{with};
+  end{proc SetupBuffer};
+
+
+
+
+  procedure  RewriteRun (     sfileID   : SfileIdent;
+                              Run       : RunDesc;
+                              readFirst : boolean;
+                          var ecode     : integer );
+
+  var
+       LablDesc : PlRect;
+
+  begin
+      ecode := OK;
+
+      with ExtentBuf do
+      begin
+        SetupBuffer(sfileID, readFirst, Run, LablDesc);
+
+        (* We will generate the proper page labels *)
+        ResetExtent(Run.diskPage, Run.numPages, ecode);
+        if ecode > OK then exit(RewriteRun);
+
+        while blksLeft > 0 do
+        begin
+          writeB := TRUE;
+          LoadExtent(ecode);
+          if ecode > OK then exit(RewriteRun);
+        end{while};
+
+        (* Flush extent buffer *)
+        writeB := TRUE;
+        LoadExtent(ecode);
+
+        ptrPl := pointer(BAD);
+      end{with};
+  end{proc RewriteRun};
+
+
+
+
+{$IFC SDEBUG}
+  procedure  PrRunList ( ptrList : cell_ptr;
+                         leader  : boolean );
+
+  var
+       Run     : RunDesc;
+       ptrHead : cell_ptr;
+
+  begin
+      if ptrList = pointer(BAD) then exit(PrRunList);
+      ptrList := ptrList^.link;
+      ptrHead := ptrList;
+      repeat
+        if leader then write('*') else write(' ');
+        UnpackRun(ptrList, Run);
+        PrRun(@Run);
+        ptrList := ptrList^.link;
+      until ptrList = ptrHead;
+  end{proc PrRunList};
+{$ENDC}
+
+
+
+  procedure  CommitUpdates (     sfileID : SfileIdent;
+                                 ptrList : cell_ptr;
+                             var ecode   : integer );
+
+  var
+       ptrHead   : cell_ptr;
+       Run       : RunDesc;
+       loclEcode : integer;
+       readFirst : boolean;
+       readMode  : boolean;
+       TempRun   : RunDesc;
+       freelen   : longint;
+
+  begin
+      ecode := OK;
+
+      if ptrList = pointer(BAD) then exit(CommitUpdates);
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln('CommitUpdates');
+      if sfileID.num < 0 then
+        PrRunList(ptrList, true)
+      else if sfileID.num > 0 then
+        PrRunList(ptrList, false);
+      PrList(ptrList);
+      writeln;
+      end;
+{$ENDC}
+
+      ptrList := ptrList^.link;
+      ptrHead := ptrList;
+
+      (* Write nulls in free pages *)
+      if sfileID.num = FREE_ID then
+      begin
+        readMode := FALSE;
+        ClearMem(ExtentBuf.address, ord4(BUFBLOCKS)*DEFBLKSIZE);
+      end
+      else
+        readMode := TRUE;
+
+      (* Enumerate the list *)
+      repeat
+        if sfileID.num = FREE_ID then with ptrList^ do
+        begin
+          freelen := GetFreeLen(ptrList);
+          GenericRun(freePage, freelen, 0, Run);
+          with Run do
+          begin
+            dirty := updateRun;
+            firstDirty := updateFirst;
+            lastDirty := updateLast;
+            contentBad := FALSE;
+          end{with};
+        end
+        else
+          UnpackRun(ptrList, Run);
+        with Run do
+        begin
+          readFirst := readMode;
+          if (firstDirty or lastDirty) and (numPages = 1) then
+            dirty := TRUE;
+          if sfileID.num < 0 then contentBad := FALSE;
+
+          if dirty then
+          begin
+            if contentBad then
+            begin
+              ClearMem(ExtentBuf.address, ord4(BUFBLOCKS)*DEFBLKSIZE);
+              readFirst := FALSE;
+            end{if};
+
+            RewriteRun(sfileID, Run, readFirst, loclEcode);
+            firstDirty := FALSE;
+            lastDirty := FALSE;
+          end{if};
+
+          if firstDirty then
+          begin
+            TempRun := Run;
+            with TempRun do
+            begin
+              forelink := diskPage + 1;
+              fill := DEFDATASIZE;
+              numPages := 1;
+            end{with};
+            RewriteRun(sfileID, TempRun, readFirst, loclEcode);
+          end{if};
+
+          if lastDirty then
+          begin
+            TempRun := Run;
+            with TempRun do
+            begin
+              diskPage := diskPage + numPages - 1;
+              filePage := filePage + numPages - 1;
+              backlink := diskPage - 1;
+              numPages := 1;
+              RewriteRun(sfileID, TempRun, readFirst, loclEcode);
+            end{with};
+          end{if};
+        end{with};
+
+        ptrList := ptrList^.link;
+      until ptrList = ptrHead;
+  end{proc CommitUpdates};
+
+
+
+
+  function  NextRun ( var sfileID   : SfileIdent;
+                      var leader    : boolean;
+                      var ptrCell   : cell_ptr;
+                      var pageCount : integer;
+                      var ecode     : integer ) : boolean;
+
+  var
+       LeftLabel  : PageLabel;
+       RightLabel : PageLabel;
+       eox        : boolean;
+       Run        : RunDesc;
+
+  begin
+      ecode := OK;
+      pageCount := 0;
+
+      with ExtentBuf do
+      begin
+        leader := (gptrRlabl^.fileid < 0);
+        sfileID.num := abs(gptrRlabl^.fileid);
+        sfileID.vers := gptrRlabl^.version;
+
+        (*  Collect pages belonging to the run  *)
+        LeftLabel := gptrRlabl^;
+        repeat
+          RightLabel := gptrRlabl^;
+          pageCount := pageCount + 1;
+          eox := NextPg(gptrRlabl, gptrRdata, ecode);
+        until
+              (*
+               *  Page labels do not form a valid adjacent pair or
+               *  just short of rolling over the 16-bit length field or
+               *  error condition.
+               *)
+              ( not Pair(RightLabel, gptrRlabl^) ) or
+              ( pageCount = MAXRUNLEN            ) or
+              ( ecode > OK                       ) or eox;
+      end{with};
+      if ecode > OK then exit(NextRun);
+
+      with Run do
+      begin
+        filePage := LeftLabel.relpage;
+        diskPage := LeftLabel.abspage;
+        if diskPage <> gpage then
+        begin
+          (* A run always contains correct abspage information *)
+          diskPage := gpage;
+          dirty := TRUE;
+        end{if};
+        backlink := LeftLabel.bkwdlink;
+        forelink := RightLabel.fwdlink;
+        fill := RightLabel.dataused;
+        numPages := pageCount;
+        contentBad := FALSE;
+        contentMaybe := FALSE;
+        firstDirty := FALSE;
+        lastDirty := FALSE;
+        dirty := FALSE;
+      end{with};
+
+      PackRun(sfileID, Run, ptrCell, ecode);
+      if ecode > OK then exit(NextRun);
+
+      gpage := gpage + pageCount;
+
+      NextRun := eox;
+  end{func NextRun};
+
+
+
+
+  procedure  FreeRunList ( var ptrList : cell_ptr;
+                           var ecode   : integer );
+
+  var
+       ptrCell   : cell_ptr;
+       ptrInsert : cell_ptr;
+       ptrNext   : cell_ptr;
+       Run       : RunDesc;
+       freelen   : longint;
+
+  begin
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln('Free Run List'); PrList(ptrList);
+      end;
+{$ENDC}
+      ecode := OK;
+      if ptrList = pointer(BAD) then exit(FreeRunList);
+
+      repeat
+        ptrCell := ptrList^.link;
+        UnlinkCell(ptrList, ptrList, ptrCell);
+        UnpackRun(ptrCell, Run);
+
+        if not SearchList(gptrFreeList, Run.diskPage, ptrInsert) then
+        begin
+          if gptrFreeList <> pointer(BAD) then
+          begin
+            with ptrInsert^ do
+            begin
+              freelen := GetFreeLen(ptrInsert);
+              if updateRun or (freelen <= MERGETHRESH) then
+              begin
+                if Run.diskPage = freePage+freelen then
+                begin
+                  freelen := freelen + Run.numPages;
+                  FreeCell(ptrCell);
+                  updateRun := TRUE;
+                  PutFreeLen(freelen, ptrInsert);
+                  exit(FreeRunList);
+                end{if};
+              end{if};
+            end{with};
+
+            ptrNext := ptrInsert^.link;
+            with ptrNext^ do
+            begin
+              freelen := GetFreeLen(ptrNext);
+              if updateRun or (freelen <= MERGETHRESH) then
+              begin
+                if Run.diskPage+Run.numPages = freePage then
+                begin
+                  freePage := Run.diskPage;
+                  freelen := freelen + Run.numPages;
+                  FreeCell(ptrCell);
+                  PutFreeLen(freelen, ptrNext);
+                  exit(FreeRunList);
+                end{if};
+              end{if};
+            end{with};
+          end{if};
+
+          CellRange(sizeof(FreeRunDesc), ptrCell, ecode);
+          if ecode > OK then exit(FreeRunList);
+
+          with ptrCell^ do
+          begin
+            (* freePage copied by CellRange *)
+            PutFreeLen(Run.numPages, ptrCell);
+            updateRun := TRUE;
+            LinkCell(gptrFreeList, ptrInsert, ptrCell);
+          end{with};
+        end{if};
+      until ptrList = pointer(BAD);
+
+  end{proc FreeRunList};
+
+
+
+
+  procedure  AllocDisk (     npages : longint;
+                         var actual : longint;
+                         var page   : longint );
+
+  var
+       ptrCell : cell_ptr;
+       ptrHead : cell_ptr;
+       ptrPred : cell_ptr;
+       ptrMax  : cell_ptr;
+       ptrMaxPred : cell_ptr;
+       freelen : longint;
+
+  begin
+      page := BAD;
+      actual := 0;
+      if gptrFreeList = pointer(BAD) then exit(AllocDisk);
+
+      ptrPred := gptrFreeList;
+      ptrHead := gptrFreeList^.link;
+      ptrCell := ptrHead;
+      ptrMax := ptrCell;
+
+      repeat
+        with ptrCell^ do
+        begin
+          freelen := GetFreeLen(ptrCell);
+          if freelen > npages then
+          begin
+            freelen := freelen - npages;
+            page := freePage;
+            freePage := freePage + npages;
+            actual := npages;
+            PutFreeLen(freelen, ptrCell);
+            exit(AllocDisk);
+          end;
+          if freelen = npages then
+          begin
+            page := freePage;
+            UnlinkCell(gptrFreeList, ptrPred, ptrCell);
+            actual := npages;
+            exit(AllocDisk);
+          end{if};
+          (* Remember largest extent on disk *)
+          if freelen > GetFreeLen(ptrMax) then
+          begin
+            ptrMax := ptrCell;
+            ptrMaxPred := ptrPred;
+          end{if};
+        end{with};
+
+        ptrPred := ptrCell;
+        ptrCell := ptrCell^.link;
+      until ptrCell = ptrHead;
+
+      (* Return the largest extent on the disk *)
+      with ptrMax^ do
+      begin
+        page := freePage;
+        actual := GetFreeLen(ptrMax);
+        UnlinkCell(gptrFreeList, ptrMaxPred, pointer(ord(ptrMax)));
+      end{with};
+
+  end{func AllocDisk};
+
+
+
+  (*
+   *  sfile changed to FREE_ID if page run is deallocated.
+   *)
+  procedure  StoreRun (     leader  : boolean;
+                            ptrCell : cell_ptr;
+                        var sfile   : SfileIdent;
+                        var ecode   : integer );
+
+  var
+       ptrInsert  : cell_ptr;
+       ptrSFDB    : cell_ptr;
+       ptrDummy   : cell_ptr;
+       loclEcode  : integer;
+
+  begin
+      ecode := OK;
+      ptrSFDB := pointer(BAD);
+
+      if not SearchList(gptrSfList, sfile.uniq, ptrInsert) then
+      begin
+        if gptrSfList <> pointer(BAD) then
+        begin
+          (* S-file list is non-empty and not saving file remnants *)
+          ptrSFDB := ptrInsert;
+          if ptrSFDB^.sfileID.num = sfile.num then
+          begin
+            (*
+             *  The s-file in the SFDB list is an earlier version of the
+             *  s-file.
+             *)
+            with ptrSFDB^ do
+            begin
+              ptrDummy := ptrLeader;
+              FreeRunList(ptrDummy, loclEcode);
+              ptrLeader := ptrDummy;
+              ptrDummy := ptrData;
+              FreeRunList(ptrDummy, loclEcode);
+              ptrData := ptrDummy;
+              sfileID := sfile;
+            end{with};
+          end
+          else
+          begin
+            ptrSFDB := ptrSFDB^.link;
+            if ptrSFDB^.sfileID.num = sfile.num then
+            begin
+              (*
+               *  The s-file in the SFDB list is an later version of the
+               *  s-file.
+               *)
+              ptrCell^.link := ptrCell;  (* make cell into list *)
+              FreeRunList(ptrCell, loclEcode);
+              sfile.num := FREE_ID;
+              exit(StoreRun);
+            end
+            else
+              (* S-file is not represented in the SFDB list *)
+              ptrSFDB := pointer(BAD);
+          end{if};
+        end{if};
+      end
+      else
+        ptrSFDB := ptrInsert;
+
+      if ptrSFDB = pointer(BAD) then
+      begin
+        (*
+         *  This run belongs to an s-file that has not been seen heretofore.
+         *  Allocate an SFDB and insert it into the SFDB list.
+         *)
+        if not GetCell(sizeof(SFDB), @ptrSFDB) then
+        begin
+          ecode := E_HEAPOVFL;
+          exit(StoreRun);
+        end{if};
+        with ptrSFDB^ do
+        begin
+          sfileID := sfile;
+          PutFsize(0, ptrSFDB);
+          ptrLeader := pointer(BAD);
+          ptrData := pointer(BAD);
+          updByte := 0;
+          {$R-}
+          cellSize := sizeof(SFDB);
+          {$IFC DEBUG2} {$R+} {$ENDC}
+        end{with};
+        LinkCell(gptrSfList, ptrInsert, ptrSFDB);
+      end{if};
+
+      (* Have an SFDB *)
+      with ptrSFDB^ do
+      begin
+        if leader then
+        begin
+          ptrDummy := ptrLeader;
+          LinkCell(ptrDummy, ptrLeader, ptrCell);
+          ptrLeader := ptrDummy;
+        end
+        else
+        begin
+          ptrDummy := ptrData;
+          LinkCell(ptrDummy, ptrData, ptrCell);
+          ptrData := ptrDummy;
+        end{if};
+      end{with};
+
+  end{proc StoreRun};
+
+
+
+{$IFC SDEBUG}
+  procedure  PrSfList;
+
+  var
+       ptrList : cell_ptr;
+       ptrHead : cell_ptr;
+
+  begin
+      if gptrSfList = pointer(BAD) then exit(PrSfList);
+      ptrList := gptrSfList^.link;
+      ptrHead := ptrList;
+      repeat
+        write(ptrList^.key:10);
+        writeln('  ',ptrList^.sfileID.num:1,'/',ptrList^.sfileID.vers:1);
+        PrRunList(ptrList^.ptrLeader, true);
+        PrRunList(ptrList^.ptrData, false);
+        ptrList := ptrList^.link;
+      until ptrList = ptrHead;
+  end{proc PrList};
+{$ENDC}
+
+
+
+
+  procedure  ScanVolume ( var ecode : integer );
+
+  var
+       sfile     : SfileIdent;
+       ptrCell   : cell_ptr;
+       length    : integer;
+       done      : boolean;
+       leader    : boolean;
+       ptrInsert : cell_ptr;
+       ptrSFDB   : SFDB_ptr;
+       ignore    : boolean;
+{$IFC STATS}
+       freePgCnt  : longint;
+       allocPgCnt : longint;
+       i          : integer;
+       Run        : RunDesc;
+{$ENDC}
+{$IFC SDEBUG}
+       temp : longint;
+{$ENDC}
+
+
+  begin
+      ecode := OK;
+{$IFC STATS}
+      freePgCnt := 0; allocPgCnt := 0;
+{$ENDC}
+      with gptrMDDF^ do
+      begin
+        (*
+         *  Offset indicates last page of s-list.  Don't scan the
+         *  area reserved for the primitive s-files.
+         *)
+        gfsOverhead := bitmap_pages + slist_block_count + 1;
+        ResetExtent(gfsOverhead, (geography.lastfspage+1)-gfsOverhead, ecode);
+        if ecode > OK then exit(ScanVolume);
+      end{with};
+      gpage := gfsOverhead;
+      gfsOverhead := gfsOverhead + 1;  (* accounts for backup MDDF page *)
+      done := NextPg(gptrRlabl, gptrRdata, ecode);
+
+      repeat
+        done := NextRun(sfile, leader, ptrCell, length, ecode);
+        if ecode > OK then exit(ScanVolume);
+
+{$IFC SDEBUG}
+        if trace(FS,STRACE) then
+        begin
+        if leader then write('*') else write(' ');
+        write(sfile.num:3,'/',sfile.vers:2,'  ');
+        UnpackRun(ptrCell, Run);
+        end;
+{$ENDC}
+        if sfile.num = FREE_ID then
+        begin
+{$IFC SDEBUG}
+          temp := GetFreeLen(ptrCell);
+          with ptrCell^ do if trace(FS,STRACE) then
+            writeln(' abs = ',freePage:6,' len = ',temp:5);
+{$ENDC}
+          (* Insert run into list of free disk extents *)
+          ignore := InsertCell(gptrFreeList, ptrCell);
+        end
+        else
+        begin
+{$IFC SDEBUG}
+          if trace(FS,STRACE) then PrRun(@Run);
+{$ENDC}
+          (* Associate page run with appropriate s-file *)
+          StoreRun(leader, ptrCell, sfile, ecode);
+          if ecode > OK then exit(ScanVolume);
+        end{if};
+
+{$IFC STATS}
+        if sfile.num = FREE_ID then
+        begin
+          freePgCnt := freePgCnt + GetFreeLen(ptrCell);
+        end
+        else
+        begin
+          UnpackRun(ptrCell, Run);
+          allocPgCnt := allocPgCnt + Run.numPages;
+        end;
+{$ENDC}
+      until done;
+
+{$IFC STATS}
+      writeln; writeln;
+      with Heap do
+        writeln('Heap  size = ',size:1,'  used = ',used:1);
+      writeln('pages free = ',freePgCnt:1,'    MDDF free count = ',
+               gptrMDDF^.freecount:1);
+      writeln('pages alloc = ',allocPgCnt:1,'    total pages = ',
+               freePgCnt+allocPgCnt:1);
+
+      writeln; writeln;
+      i := 0;
+      while AllocStats[i].size <> 0 do with AllocStats[i] do
+      begin
+        writeln('           size = ',size:3,'   count = ',count:5);
+        i := i + 1;
+      end;
+{$ENDC}
+  end{proc ScanVolume};
+
+
+
+  procedure  FreeRun ( var Run   : RunDesc;
+                       var ecode : integer );
+
+  var
+       ignore  : boolean;
+       sfile   : SfileIdent;
+       ptrCell : cell_ptr;
+
+  begin
+      ecode := OK;
+      sfile.num := FREE_ID;
+      Run.dirty := TRUE;
+      PackRun(sfile, Run, ptrCell, ecode);
+      if ecode > OK then exit(FreeRun);
+      ignore := InsertCell(gptrFreeList, ptrCell);
+  end{proc FreeRun};
+
+
+
+
+  procedure  ConfirmLEOF (     ptrSFDB  : cell_ptr;
+                               ptrVec   : rvec_ptr;
+                               count    : integer;
+                           var fileSize : longint;
+                           var fileCond : FileMods;
+                           var ecode    : integer );
+
+  type
+       ScanState = ( scanning, peeking, filling );
+
+  var
+       s         : ScanState;
+       i         : integer;
+       newSize   : longint;
+       peekCount : integer;
+       ptrRun    : cell_ptr;
+       ignore    : boolean;
+       duUpdate  : boolean;
+
+  begin
+      ecode := OK;
+      s := scanning;
+      newSize := 0;
+      duUpdate := FALSE;
+
+      i := 1;
+      while i <= count do with ptrVec^[i] do
+      begin
+        case s of
+          scanning:
+          begin
+            if fill < DEFDATASIZE then
+            begin
+              if (i = count) and (fill > 0) then
+                newSize := newSize + (ord4(numPages - 1) * DEFDATASIZE) + fill
+              else
+              begin
+                (* Remember how many bytes on this page *)
+                peekCount := 0;
+                s := peeking;
+              end{if};
+            end
+            else
+            begin
+              if fill > DEFDATASIZE then
+              begin
+                fill := DEFDATASIZE;
+                contentmaybe := TRUE;
+                lastDirty := TRUE;
+                duUpdate := TRUE;
+              end{if};
+              newSize := newSize + (ord4(numPages) * DEFDATASIZE);
+            end{if};
+            i := i + 1;
+          end;
+
+          peeking:
+          begin
+            peekCount := peekCount + 1;
+            if fill <> 0 then
+            begin
+              i := i - peekCount;
+              s := filling;
+            end
+            else
+            begin
+              (* At end add-in the data bytes on the LEOF run *)
+              if i = count then with ptrVec^[i - peekCount] do
+                newSize := newSize + (ord4(numPages - 1) * DEFDATASIZE) + fill;
+              i := i + 1;
+            end{if};
+          end;
+
+          filling:
+          begin
+            if peekCount > 0 then
+            begin
+              if fill = 0 then dirty := TRUE;
+              fill := DEFDATASIZE;
+              peekCount := peekCount - 1;
+              contentMaybe := TRUE;
+              lastDirty := TRUE;
+              duUpdate := TRUE;
+              newSize := newSize + (ord4(numPages) * DEFDATASIZE);
+              i := i + 1;
+            end
+            else
+              s := scanning;
+          end;
+        end{case};
+      end{while};
+
+      if fileSize <> newSize then
+        fileCond.leofUpdate := TRUE;
+      fileCond.fillUpdate := duUpdate;
+
+      fileSize := newSize;
+  end{proc ConfirmLEOF};
+
+
+
+
+  procedure  ConfirmChain ( ptrVec   : rvec_ptr;
+                            count    : integer;
+                        var fileCond : FileMods );
+
+  var
+       i       : integer;
+       ptrPred : run_ptr;
+       ptrNext : run_ptr;
+       ptrRun  : run_ptr;
+       linkUpdate : boolean;
+       backExpected : longint;
+       foreExpected : longint;
+
+  begin
+      linkUpdate := FALSE;
+      i := 1;
+      ptrPred := pointer(BAD);
+      ptrRun := @ptrVec^[1];
+      ptrNext := pointer(ord(ptrRun) + sizeof(RunDesc));
+
+      while i <= count do
+      begin
+        if i = 1 then
+          backExpected := -1
+        else
+          backExpected := ptrPred^.diskPage + ptrPred^.numPages - 1;
+        if i = count then
+          foreExpected := -1
+        else
+          foreExpected := ptrNext^.diskPage;
+
+        with ptrRun^ do
+        begin
+          if backlink <> backExpected then
+          begin
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            writeln('* Backlink on page ',diskPage:1,
+                    ' changed from ',backlink:1,' to ',backExpected:1);
+{$ENDC}
+            backlink := backExpected;
+            linkUpdate := TRUE;
+            firstDirty := TRUE;
+          end{if};
+
+          if forelink <> foreExpected then
+          begin
+            (* Redlight link on the LEOF page is OK *)
+            if (foreLink <> -1) or (fill <= 0) or (ptrNext^.fill <> 0) then
+            begin
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              writeln('* Forelink on page ',diskPage+numPages-1:1,
+                      ' changed from ',forelink:1,' to ',foreExpected:1);
+{$ENDC}
+              forelink := foreExpected;
+              linkUpdate := TRUE;
+              lastDirty := TRUE;
+            end{if};
+          end{if};
+        end{with};
+
+        i := i + 1;
+        ptrPred := ptrRun;
+        ptrRun := ptrNext;
+        ptrNext := pointer(ord(ptrNext) + sizeof(RunDesc));
+      end{while};
+
+      fileCond.linkUpdate := linkUpdate;
+  end{proc ConfirmChain};
+
+
+
+
+  procedure  ConfirmPages (     ptrVec   : rvec_ptr;
+                                p1Hint   : longint;
+                                lowBnd   : longint;
+                            var count    : integer;
+                            var fileCond : FileMods;
+                            var ecode    : integer );
+
+  var
+       h, i, j : integer;
+       holeSize, size : longint;
+       ptrRun  : run_ptr;
+       ptrPred : run_ptr;
+       ptrNext : run_ptr;
+
+       procedure  InsertPatch;
+
+       var
+            k      : integer;
+            page   : longint;
+            actual : longint;
+
+       begin
+           size := holeSize;
+
+           repeat
+             ptrRun := @ptrVec^[i];
+             ptrNext := pointer(ord(ptrRun) + sizeof(RunDesc));
+             actual := 0;
+
+             if holeSize <= MAXHOLESZ then
+             begin
+               AllocDisk(size, actual, page);
+               if actual > 0 then
+               begin
+                 if lowBnd > 0 then
+                   fileCond.ldrPatch := TRUE
+                 else
+                   fileCond.patchInsert := TRUE;
+                 count := count + 1;
+
+                 (* Create a slot for the new run *)
+                 for k := count downto i+2 do
+                   ptrVec^[k] := ptrVec^[k - 1];
+
+                 (* Copy-in the new run *)
+                 with ptrNext^ do
+                 begin
+                   diskPage := page;
+                   numPages := actual;
+                   backlink := -1;
+                   forelink := -1;
+                   if i = 0 then
+                     filePage := 0
+                   else
+                     filePage := ptrRun^.filePage + ptrRun^.numPages;
+                   fill := 0;
+                   dirty := TRUE;
+                   contentBad := TRUE;
+{$IFC SDEBUG}
+                   if trace(FS,STRACE) then
+                   writeln('* Inserting patch:  len = ',numPages:1,
+                           '   rel = ',filePage:1);
+{$ENDC}
+                   size := size - numPages;
+                 end{with};
+
+                 i := i + 1;
+               end{if};
+             end{if};
+
+             if actual <= 0 then
+             begin
+               (* Didn't allocate pages to fill the hole *)
+               fileCond.relpageShift := TRUE;
+{$IFC SDEBUG}
+               if trace(FS,STRACE) then
+               writeln('* Shifting-out hole:  rel ',ptrNext^.filePage:1,
+                       ' becomes ',ptrNext^.filePage-size:1);
+{$ENDC}
+               for k := i+1 to count do
+               begin
+                 with ptrVec^[k] do
+                 begin
+                   filePage :=  filePage - size;
+                   dirty := TRUE;
+                 end{with};
+                 size := 0;
+               end{for};
+             end{if};
+           until  size <= 0;
+       end{proc InsertPatch};
+
+
+
+  begin
+      ecode := OK;
+      ptrRun := @ptrVec^[1];
+
+      i := 0;
+      if ptrRun^.numPages < lowBnd then
+      begin
+        holeSize := lowBnd;
+        InsertPatch;
+      end{if};
+
+      if count > 0 then if ptrRun^.filePage <> 0 then
+      begin
+        holeSize := ptrRun^.filePage;
+        InsertPatch;
+      end{if};
+
+      i := 1;
+      while i < count do
+      begin
+        ptrRun := @ptrVec^[i];
+        ptrPred := pointer(ord(ptrRun) - sizeof(RunDesc));
+        ptrNext := pointer(ord(ptrRun) + sizeof(RunDesc));
+        holeSize := ptrNext^.filePage - (ptrRun^.filePage + ptrRun^.numPages);
+
+        if holeSize < 0 then
+        begin
+          (* Collision *)
+
+          h := i + 1;  (* default *)
+          if ptrPred^.forelink = ptrNext^.diskPage then h := i
+          else if i = 1 then  (* first page of chain *)
+          begin
+            (* if page one hint matches, toss the other one *)
+            if p1Hint = ptrNext^.diskPage then h := i;
+          end{if};
+
+          (* Free the discarded run *)
+          fileCond.collision := TRUE;
+          FreeRun(ptrVec^[h], ecode);
+          if ecode > OK then exit(ConfirmPages);
+
+          (* one less run *)
+          count := count - 1;
+
+          (* Shift out the discarded run *)
+          for j := h to count do
+            ptrVec^[j] := ptrVec^[j + 1];
+        end
+        else if holeSize > 0 then
+          InsertPatch
+        else
+          i := i + 1;
+      end{while};
+  end{proc ConfirmPages};
+
+
+
+
+  (*
+   *  Copy list of packed runs to vector of unpacked runs.  The list
+   *  of packed runs is deallocated as the copy proceeds.
+   *)
+  function  CopyChain ( var ptrList : cell_ptr;
+                        var ptrVec : rvec_ptr;
+                        var ecode  : integer ) : integer;
+
+  label  1, 2;
+
+  var
+       Run     : RunDesc;
+       count   : integer;
+       i, j    : integer;
+       ptrCell : cell_ptr;
+       junk    : longint;
+       ptrRun  : run_ptr;
+
+  begin
+      ecode := OK;
+      CopyChain := 0;
+      count := 0;
+
+      if not GetMem(Scratch, ord4(MAXPATCHES)*sizeof(RunDesc), @ptrVec) then
+      begin
+        ecode := E_HEAPOVFL;
+        goto 2;
+      end{if};
+
+      if ptrList = pointer(BAD) then goto 2;
+
+      (* Init the sentinel to nulls *)
+      ClearMem(ord(ptrVec), sizeof(RunDesc));
+
+      repeat
+        ptrCell := ptrList^.link;
+        UnpackRun(ptrCell, Run);
+
+        (* Reserve space for new run *)
+        if not GetMem(Scratch, sizeof(RunDesc), @junk) then
+        begin
+          ecode := E_HEAPOVFL;
+          goto 2;
+        end{if};
+
+        i := 1;
+        ptrRun := @ptrVec^[1];
+        while i <= count do
+        begin
+          if ptrRun^.filePage > Run.filePage then goto 1;
+          i := i + 1;
+          ptrRun := pointer(ord(ptrRun) + sizeof(RunDesc));
+        end{while};
+
+  1:    (* loop fallthrough *)
+        count := count + 1;
+        for j := count downto i+1 do ptrVec^[j] := ptrVec^[j-1];
+        ptrRun^ := Run;
+
+        UnlinkCell(ptrList, ptrList, ptrCell);
+        FreeCell(ptrCell);
+      until ptrList = pointer(BAD);
+
+  2:
+      (* Init the sentinel to nulls *)
+      ClearMem(ord(@ptrVec^[count+1]), sizeof(RunDesc));
+
+      CopyChain := count;
+  end{proc CopyChain};
+
+
+
+
+  procedure  UncopyChain (     sfileID : SfileIdent;
+                               ptrVec  : rvec_ptr;
+                               count   : integer;
+                           var ptrList : cell_ptr;
+                           var ecode   : integer );
+
+  var
+       i       : integer;
+       ignore  : boolean;
+       ptrCell : cell_ptr;
+       ptrRun  : run_ptr;
+
+  begin
+      ecode := OK;
+      i := 2;
+      ptrRun := @ptrVec^[2];
+      while i <= count do
+      begin
+        PackRun(sfileID, ptrRun^, ptrCell, ecode);
+        if ecode > OK then exit(UncopyChain);
+        ignore := InsertCell(ptrList, ptrCell);
+        i := i + 1;
+        ptrRun := pointer(ord(ptrRun) + sizeof(RunDesc));
+      end{while};
+
+      (* Now insert relative run 0 AT HEAD OF LIST *)
+      PackRun(sfileID, ptrVec^[1], ptrCell, ecode);
+      if ecode > OK then exit(UncopyChain);
+      if ptrList = pointer(BAD) then
+      begin
+        ptrCell^.link := ptrCell;
+        ptrList := ptrCell;
+      end
+      else
+      begin
+        ptrCell^.link := ptrList^.link;
+        ptrList^.link := ptrCell;
+      end{if};
+  end{proc UncopyChain};
+
+
+
+  (*
+   *  Caller will write FmapBuf if fileCond <> 0
+   *)
+  procedure  ConfirmFmap ( var InitBuf   : FullPage;
+                               ptrH      : rvec_ptr;
+                           var ldrCount  : integer;
+                               ptrD      : rvec_ptr;
+                           var dataCount : integer;
+                           var fileCond  : FileMods;
+                           var ecode     : integer );
+
+  var
+       i           : integer;
+       di          : integer;
+       li          : integer;
+       actual      : longint;
+       ptrFmap     : flmap_ptr;
+       maxIndex    : integer;
+       fmPage      : longint;
+       leaderPage  : longint;
+       fmdirty     : boolean;
+       fmEntry     : mapentry;
+       extentCount : integer;
+       FmapBuf     : FullPage;
+       pageCount   : longint;
+
+
+       function  NxtPage : longint;
+
+       begin
+           with ptrH^[li] do
+           begin
+             if leaderPage >= filePage + numPages then
+               li := li + 1;
+           end{with};
+
+           if li > ldrCount then
+             NxtPage := BAD
+           else with ptrH^[li] do
+           begin
+             NxtPage := diskPage + (leaderPage - filePage);
+             leaderPage := leaderPage + 1;
+           end{if};
+
+       end{func NxtPage};
+
+
+       procedure  NxtExtent ( var fmEntry : mapentry );
+
+       var
+            contigPage : longint;
+
+       begin
+           if di > dataCount then
+             (* Have exhausted the extents that belong to the file *)
+             ClearMem(ord(@fmEntry), sizeof(fmEntry))
+           else with fmEntry do
+           begin
+             extentCount := extentCount + 1;
+
+             (* Return the next extent that belongs to the file *)
+             with ptrD^[di] do
+             begin
+               address := diskPage;
+               cpages := numPages;
+               contigPage := diskPage + numPages;
+             end{with};
+
+             di := di + 1;
+             while di <= dataCount do
+             begin
+               with ptrD^[di] do
+               begin
+                 if diskPage <> contigPage then
+                   exit(NxtExtent)
+                 else
+                 begin
+                   (* Fold the next run into the extent being returned *)
+                   cpages := cpages + numPages;
+                   contigPage := diskPage + numPages;
+                   di := di + 1;
+                 end{if};
+               end{with};
+             end{while};
+           end{if};
+       end{proc NxtExtent};
+
+
+  begin
+      ecode := OK;
+      di := 1;
+      li := 1;
+      leaderPage := 0;
+      fmdirty := FALSE;
+      fmPage := NxtPage;  (* page 0 of leader *)
+
+      (* Read page 0 of leader; returned to caller *)
+      PageIO(fmPage, InitBuf, readop, ecode);
+      if ecode > OK then exit(ConfirmFmap);
+
+      if goldVol then
+      begin
+        fmPage := NxtPage;  (* page 1 of leader *)
+        PageIO(fmPage, FmapBuf, readop, ecode);
+        if ecode > OK then exit(ConfirmFmap);
+        ptrFmap := @FmapBuf.Data;
+        maxIndex := MAXMAPINDEX;
+      end
+      else
+      begin
+        ptrFmap := pointer(ord(@InitBuf.Data) + 128);
+        maxIndex := MAXSMALLINDEX;
+      end{if};
+
+      (* Calculate the number of pages in the file *)
+      with ptrD^[dataCount] do
+        pageCount := filePage + numPages;
+
+      if ptrFmap^.size <> pageCount then
+      begin
+        ptrFmap^.size := pageCount;
+        fileCond.peofUpdate := TRUE;
+        fmdirty := TRUE;
+      end{if};
+
+      repeat
+        (* Enumerate filemap pages *)
+        i := 0;
+        extentCount := 0;
+        repeat
+          (* Enumerate entries on filemap page *)
+          NxtExtent(fmEntry);
+          with ptrFmap^.map[i] do
+          begin
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            if (fmEntry.address > 0) or (address > 0) then
+            writeln('* Map old ',i:2,': ',address:1,' / ',cpages:1,'   new: ',
+                    fmEntry.address:1,' / ',fmEntry.cpages:1);
+{$ENDC}
+            if (address <> fmEntry.address) or (cpages <> fmEntry.cpages) then
+            begin
+              fmdirty := TRUE;
+              address := fmEntry.address;
+              cpages := fmEntry.cpages;
+              fileCond.fmapUpdate := TRUE;
+            end{if};
+          end{with};
+          i := i + 1;
+        until i > maxIndex;
+
+        with ptrFmap^ do
+        begin
+          if (ecount <> extentCount) or (max_entries <> maxIndex) then
+            fmdirty := TRUE;
+          if fmdirty then
+          begin
+            ecount := extentCount;
+            max_entries := maxIndex;
+            ptrFmap := @FmapBuf.Data;
+            if leaderPage > 1 then
+              PageIO(fmPage, FmapBuf, writeop, ecode);
+            if ecode > OK then exit(ConfirmFmap);
+          end{if};
+        end{with};
+
+        maxIndex := MAXMAPINDEX;
+        ptrFmap := @FmapBuf.Data;
+
+        (* Read next page of the file map *)
+        fmPage := NxtPage;
+        if fmPage = BAD then
+        begin
+          if di <= dataCount then
+          begin
+            fileCond.ldrPatch := TRUE;
+            AllocDisk(1, actual, fmPage);
+            if actual > 0 then
+            begin
+              ldrCount := ldrCount + 1;
+              GenericRun(fmPage, 1, sizeof(filemap), ptrH^[ldrCount]);
+              fmPage := NxtPage;
+              ptrH^[ldrCount].filePage := leaderPage;
+              ClearMem(ord(@FmapBuf.Data), sizeof(PageContents));
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              writeln('* Extending file map; new page = ',fmPage:1);
+{$ENDC}
+            end
+            else
+            begin
+              dataCount := di - 1;  (* truncate the file map *)
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              writeln('* Filemap extension failed; extents = ',di:1);
+{$ENDC}
+            end{if};
+          end{if};
+        end
+        else
+        begin
+          (* Read the next page of the file map *)
+          PageIO(fmPage, FmapBuf, readop, ecode);
+          if ecode > OK then exit(ConfirmFmap);
+        end{if};
+
+      until fmPage = BAD;
+
+  end{proc ConfirmFmap};
+
+
+
+
+  procedure  FixSfile (     ptrSFDB   : cell_ptr;
+                            ptrSentry : sentry_ptr;
+                        var ecode     : integer );
+
+  var
+       i         : integer;
+       ptrH      : rvec_ptr;
+       ptrD      : rvec_ptr;
+       num_hint  : integer;
+       num_data  : integer;
+       LdrBuf    : FullPage;
+       ptrHentry : hentry_ptr;
+       actual    : longint;
+       loclEcode : integer;
+       ptrDummy  : cell_ptr;
+       sfileNum  : integer;
+       sfileVers : integer;
+       fileCond  : FileMods;
+       ptrLdrRun : run_ptr;
+       newPage   : longint;
+       leaderLen : longint;
+       ptrFmap   : flmap_ptr;
+       tempName  : e_name;
+{$IFC SDEBUG}
+       temp : longint;
+{$ENDC}
+
+
+
+       procedure  Fkill;
+       var i : integer;
+       begin
+{$IFC SDEBUG}
+           if trace(FS,STRACE) then
+           writeln('* Killing sfile # ',ptrSFDB^.sfileID.num:1);
+{$ENDC}
+           for i := 1 to num_hint do FreeRun(ptrH^[i], ecode);
+           if ecode > OK then exit(FixSfile);
+           if sfileNum <> MDDF_ID then
+             for i := 1 to num_data do FreeRun(ptrD^[i], ecode);
+           if ecode > OK then exit(FixSfile);
+           if sfileNum = gptrMDDF^.rootsnum then
+             gptrMDDF^.rootsnum := BAD;
+           ptrSFDB^.sfileID.uniq := BAD;  (* file went away *)
+           gnfiles := gnfiles - 1;
+           exit(FixSfile);
+       end{proc Fkill};
+
+
+  begin
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln;
+      writeln('S-FILE ',ptrSFDB^.sfileID.num:1);
+      PrRunList(ptrSFDB^.ptrLeader, true);
+      PrRunList(ptrSFDB^.ptrData, false);
+      PrList(ptrSFDB^.ptrLeader);
+      PrList(ptrSFDB^.ptrData);
+      writeln;
+      end;
+{$ENDC}
+
+       ecode := OK;
+       ptrHentry := @LdrBuf.Data;
+       fileCond.word := 0;
+       gnfiles := gnfiles + 1;  (* another sfile *)
+
+       with ptrSFDB^ do
+       begin
+         sfileNum := sfileID.num;
+         sfileVers := sfileID.vers;
+         (* Don't do any work if the s-file is the directory tree *)
+         if (not gflatCat) and (sfileNum = VDIR_ID) then exit(FixSfile);
+
+         Scratch.used := 0;  (* Scratch is empty *)
+         ptrDummy := ptrLeader;
+         num_hint := CopyChain(ptrDummy, ptrH, ecode);
+         ptrLeader := ptrDummy;
+         if ecode > OK then exit(FixSfile);
+         ptrDummy := ptrData;
+         num_data := CopyChain(ptrDummy, ptrD, ecode);
+         ptrData := ptrDummy;
+         if ecode > OK then exit(FixSfile);
+       end{with};
+
+       (* Free pages with invalid s-file numbers *)
+       if sfileNum <= SLIST_ID then Fkill;
+
+       ptrLdrRun := @ptrH^[1];
+
+       (* Leader pages *)
+       if goldVol then
+         leaderLen := 2
+       else
+         leaderLen := 1;
+       ConfirmPages(ptrH, ptrSentry^.hintaddr, leaderLen, num_hint, fileCond, ecode);
+       if ecode > OK then exit(FixSfile);
+
+       if ptrLdrRun^.contentBad then
+       begin
+         (* Leader was patched; must initialize contents *)
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         writeln('reconstructed leader sfile = ',sfileNum:1,' page = ',
+                  ptrLdrRun^.diskPage:1);
+{$ENDC}
+         with ptrLdrRun^ do
+         begin
+           fill := DEFDATASIZE;
+           newPage := diskPage;
+           dirty := FALSE;  (* We are updating the pages now *)
+         end{with};
+
+         with LdrBuf.Labl do
+         begin
+           filler := 0;
+           volume := 0;                abspage := newPage;
+           version := sfileVers;       relpage := 0;
+           fileid := -sfileNum;        bkwdlink := -1;
+           dataused := DEFDATASIZE;    datastat := dataok;
+
+           if goldVol then
+             fwdlink := newPage + 1
+           else
+             fwdlink := -1;
+         end{with};
+
+         (* Zero the page contents *)
+         ClearMem(ord(@LdrBuf.Data), sizeof(PageContents));
+
+         (* Initialize the catalog hint portion of the page *)
+         with ptrHentry^ do
+         begin
+           name := '';
+           getid(unique_id);
+           ftype := userfile;
+           DTC := timestamp;   (* time of creation *)
+           parentID := ROOT_NID;
+           version := CUR_FILE_VERSION;
+         end{with};
+
+         if goldVol then
+         begin
+           (* Write leader page 0 *)
+           PageIO(newPage, LdrBuf, writeop, ecode);
+           if ecode > OK then exit(FixSfile);
+
+           (* Initialize page label and contents of leader page 1 *)
+           ClearMem(ord(@LdrBuf.Data), sizeof(PageContents));
+           ptrFmap := @LdrBuf.Data;
+           ptrFmap^.max_entries := MAXMAPINDEX;
+           newPage := newPage + 1;
+         end
+         else
+         begin
+           (* Initialize the file map portion of the page *)
+           ptrFmap := pointer(ord(@LdrBuf.Data) + 128);
+           ptrFmap^.max_entries := MAXSMALLINDEX;
+           (* Assume rest is already zeroed *)
+         end{if};
+
+         (* And write the last page of leader *)
+         with LdrBuf.Labl do
+         begin
+           relpage := 1;
+           bkwdlink := newPage;
+           abspage := fwdlink;
+           fwdlink := -1;
+         end{with};
+         PageIO(newPage, LdrBuf, writeop, ecode);
+         if ecode > OK then exit(FixSfile);
+       end{if};
+
+       (* Data Pages *)
+       ConfirmPages(ptrD, ptrSentry^.fileaddr, 0, num_data, fileCond, ecode);
+       if ecode > OK then exit(FixSfile);
+
+       ptrSentry^.hintaddr := ptrLdrRun^.diskpage;
+       if num_data > 0 then
+         ptrSentry^.fileaddr := ptrD^[1].diskPage
+       else
+         ptrSentry^.fileaddr := 0;
+
+{$IFC SDEBUG}
+       temp := ptrSentry^.filesize;
+{$ENDC}
+       (* Returns adjusted file size *)
+       ConfirmLEOF(ptrSFDB, ptrD, num_data, ptrSentry^.filesize, fileCond, ecode);
+       if ecode > OK then exit(FixSfile);
+       PutFsize(ptrSentry^.filesize, ptrSFDB);
+
+{$IFC SDEBUG}
+       if trace(FS,STRACE) then
+       writeln('* Filesize   old: ',temp:1,
+               '   new: ',ptrSentry^.filesize:1);
+{$ENDC}
+
+      ConfirmChain(ptrH, num_hint, fileCond);
+      ConfirmChain(ptrD, num_data, fileCond);
+
+      (* Has side-effect of reading leader page 0 into LdrBuf *)
+      ConfirmFmap(LdrBuf, ptrH, num_hint, ptrD, num_data, fileCond, ecode);
+      if ecode > OK then exit(FixSfile);
+
+      tempName := ptrHentry^.name;
+      UpShift(@tempName);
+      if pos('SYSTEM.TEMP', tempName) = 1 then Fkill;
+      if ptrHentry^.killed then
+      begin
+        if Option.reviveDead then
+        begin
+          ptrHentry^.killed := FALSE;
+          fileCond.revived := TRUE;
+        end
+        else
+          Fkill;
+      end{if};
+      (* Make sure this null name gets updated from the catalog *)
+      if length(tempName) = 0 then ptrLdrRun^.contentBad := TRUE;
+
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      writeln('name = "',ptrHentry^.name,'"');
+{$ENDC}
+
+       ptrSentry^.version := ptrSFDB^.sfileID.vers;
+
+       if sfileNum = gptrMDDF^.rootsnum then
+       begin
+         with ptrH^[num_hint] do
+           gfsOverhead := gfsOverhead + filePage + numPages;
+         with ptrD^[num_data] do
+           gfsOverhead := gfsOverhead + filePage + numPages;
+       end{if};
+
+       if fileCond.word <> 0 then
+       begin
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         begin
+         writeln('***** DIRTY *****');
+         PrFileCondition(fileCond);
+         end;
+{$ENDC}
+         with ptrHentry^ do
+         begin
+           scavenged := true;
+           DTS := timestamp;
+           with ptrH^[num_hint] do
+             fsOverhead := filePage + numPages;
+           result_scavenge := fileCond.word;
+         end{with};
+         PageIO(ptrLdrRun^.diskPage, LdrBuf, writeop, loclEcode);
+         gvolDirty := true;
+       end
+       else
+       begin
+{$IFC SDEBUG}
+         if trace(FS,STRACE) then
+         writeln('***** CLEAN *****');
+{$ENDC}
+       end{if};
+
+      with ptrSFDB^ do
+      begin
+        ptrDummy := ptrLeader;
+        UncopyChain(sfileID, ptrH, num_hint, ptrDummy, ecode);
+        ptrLeader := ptrDummy;
+        if ecode > OK then exit(FixSfile);
+        ptrDummy := ptrData;
+        UncopyChain(sfileID, ptrD, num_data, ptrDummy, ecode);
+        ptrData := ptrDummy;
+      end{with};
+
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln;
+      PrRunList(ptrSFDB^.ptrLeader, true);
+      PrRunList(ptrSFDB^.ptrData, false);
+      PrList(ptrSFDB^.ptrLeader);
+      PrList(ptrSFDB^.ptrData);
+      writeln;
+      end;
+{$ENDC}
+
+  end{proc FixSfile};
+
+
+
+
+  procedure  RebuildSfiles ( var ecode : integer );
+
+  var
+       i       : integer;
+       sfile   : integer;
+       done    : boolean;
+       ptrLabl : pglabl_ptr;
+       ptrData : pgdata_ptr;
+       ptrPred : cell_ptr;
+       SaveSentry : S_entry;
+       loclEcode  : integer;
+       ptrSentry  : sentry_ptr;
+       ptrSFDB    : cell_ptr;
+       LablDesc   : PlRect;
+       Run        : RunDesc;
+       sfileID    : SfileIdent;
+       deleteSFDB : boolean;
+       ptrDel     : cell_ptr;
+       ptrHead    : cell_ptr;
+
+
+       procedure  ClearSentry;
+
+       begin
+           with ptrSentry^ do
+           begin
+             if (fileaddr <> 0) or
+                (hintaddr <> 0) or
+                (version <> 0) then
+             begin
+               ExtentBuf.writeB := TRUE;
+               ClearMem(ord(ptrSentry), sizeof(S_entry));
+             end{if};
+           end{with};
+           if (sfile >= UFILE_ID) and (sfile < gemptyFile) then
+             gemptyFile := sfile;
+       end{proc ClearSentry};
+
+  begin
+      ecode := OK;
+      sfileID.num := SLIST_ID;
+      sfileID.vers := 0;
+
+      with gptrMDDF^ do
+      begin
+        GenericRun(slist_addr, slist_block_count, DEFDATASIZE, Run);
+        SetupBuffer(sfileID, TRUE, Run, LablDesc);
+        ResetExtent(slist_addr, slist_block_count, ecode);
+        if ecode > OK then exit(RebuildSfiles);
+      end{with};
+
+      ptrSFDB := gptrSfList^.link;
+      ptrPred := gptrSfList;
+      deleteSFDB := FALSE;
+      sfile := 0;
+
+      repeat
+        (* Enumerate s-list pages *)
+        done := NextPg(ptrLabl, ptrData, ecode);
+        if ecode > OK then exit(RebuildSfiles);
+
+        ptrSentry := pointer(ord(ptrData));
+        i := 1;
+        repeat
+          (* Enumerate entries on s-list page *)
+          if ptrSFDB = pointer(BAD) then
+            ClearSentry
+          else if sfile <> ptrSFDB^.sfileID.num then
+            ClearSentry
+          else
+          begin
+            SaveSentry := ptrSentry^;
+            FixSfile(ptrSFDB, ptrSentry, ecode);
+            if ecode > OK then exit(RebuildSfiles);
+
+            if ptrSFDB^.sfileID.uniq = BAD then
+            begin
+              (* The s-file has been eliminated *)
+              ClearSentry;
+              deleteSFDB := TRUE;
+            end{if};
+
+            with SaveSentry do
+            begin
+              (* Mark extent buffer dirty if s-list has been updated *)
+              if (fileaddr <> ptrSentry^.fileaddr) or
+                 (hintaddr <> ptrSentry^.hintaddr) or
+                 (version <> ptrSentry^.version)   or
+                 (filesize <> ptrSentry^.filesize) then
+                ExtentBuf.writeB := TRUE;
+            end{with};
+
+            ptrDel := ptrSFDB;
+            NextCell(gptrSfList, ptrSFDB);
+
+            if deleteSFDB then
+            begin
+              (* Unlink and dispose of the current SFDB *)
+              UnlinkCell(gptrSfList, ptrPred, ptrDel);
+              FreeCell(ptrDel);
+              deleteSFDB := FALSE;
+            end
+            else
+              ptrPred := ptrDel;
+
+          end{if};
+
+          i := i + 1;
+          sfile := sfile + 1;
+          ptrSentry := pointer(ord(ptrSentry) + sizeof(S_entry));
+
+        until i > gptrMDDF^.slist_packing;
+      until done;
+
+      (* Flush the extent buffer *)
+      ResetExtent(0, 0, loclEcode);
+      ExtentBuf.ptrPl := pointer(BAD);
+
+      (* Write all s-file updates to disk *)
+      ptrSFDB := gptrSfList^.link;
+      ptrHead := ptrSFDB;
+      repeat
+        with ptrSFDB^ do
+        begin
+          sfileID.num := -sfileID.num;
+          CommitUpdates(sfileID, ptrLeader, loclEcode);
+          sfileID.num := -sfileID.num;
+          CommitUpdates(sfileID, ptrData, loclEcode);
+        end{with};
+
+        ptrSFDB := ptrSFDB^.link;
+      until ptrSFDB = ptrHead;
+  end{proc RebuildSfiles};
+
+
+  (*
+   *  Assumes nothing in extent buffer at entry.
+   *  Assumes whole bitmap will fit into extent buffer.
+   *)
+  procedure  UpdateBitmap ( var ecode : integer );
+
+  var
+       nlongs  : longint;
+       ptrLong : ^longint;
+       ptrLabl : pglabl_ptr;
+       ptrData : pgdata_ptr;
+       ptrBitmap : bitmapptr;
+       done    : boolean;
+       ptrCell : cell_ptr;
+       ptrHead : cell_ptr;
+       loclEcode : integer;
+       freelen : longint;
+       sfileID : SfileIdent;
+       Run     : RunDesc;
+
+  begin
+      ecode := OK;
+      ptrBitmap := pointer(ExtentBuf.address);
+      ptrLong := pointer(ord(ptrBitMap));
+
+      (* Initialize the bitmap to show all blocks allocated *)
+      nlongs := (gptrMDDF^.bitmap_bytes + 3) div 4;
+      repeat
+        ptrLong^ := -1;
+        nlongs := nlongs - 1;
+        ptrLong := pointer(ord(ptrLong) + sizeof(longint));
+      until nlongs = 0;
+
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln; writeln('Free Disk Extents'); writeln;
+      end;
+{$ENDC}
+
+      gfreeCnt := 0;
+      if gptrFreeList <> pointer(BAD) then
+      begin
+        ptrCell := gptrFreeList^.link;
+        ptrHead := ptrCell;
+        repeat
+          with ptrCell^ do
+          begin
+            freelen := GetFreeLen(ptrCell);
+            gfreeCnt := gfreeCnt + freelen;
+            fill_span(ptrBitmap, freePage, freelen, FALSE);
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            writeln('     ',freePage:6,'  ',freelen:6,'  free cnt = ',gfreeCnt:6);
+{$ENDC}
+          end{with};
+          ptrCell := ptrCell^.link;
+        until ptrCell = ptrHead;
+      end{if};
+
+      (* Write the bitmap primitive s-file using pattern in buffer *)
+      (* Can use PgOffset here *)
+      with gptrMDDF^ do
+        GenericRun(bitmap_addr, bitmap_pages, bitmap_bytes mod DEFDATASIZE, Run);
+      sfileID.num := BMAP_ID;
+      sfileId.vers := 0;
+      RewriteRun(sfileID, Run, FALSE, ecode);
+      (* Bitmap not written correctly is serious trouble *)
+      if ecode > OK then exit(UpdateBitmap);
+
+      (* Write nulls in every dirty free page *)
+      sfileID.num := FREE_ID;
+      CommitUpdates(sfileID, gptrFreeList, ecode);
+
+  end{proc UpdateBitmap};
+
+
+
+
+  procedure  WriteMDDF ( var ecode : integer );
+
+  var
+       PageBuf   : FullPage;
+       loclEcode : integer;
+
+  begin
+      ecode := OK;
+      with gptrMDDF^ do
+      begin
+        empty_file := gemptyFile;
+        filecount := gnfiles;
+        freecount := gfreeCnt;
+        vol_scavenged := gvolDirty;
+        DT_scavenged := timestamp;
+        bitmap_addr := MDDFPRIMARY + 1;
+        slist_addr := bitmap_addr + bitmap_pages;
+        fs_overhead := gfsOverhead;
+        result_scavenge := 0;
+
+        (* We're going to rebuilt the tree *)
+        root_page := BAD;
+        tree_depth := 0;
+      end{with};
+
+      ClearMem(ord(@PageBuf), sizeof(PageBuf));
+      with PageBuf.Labl do
+      begin
+        fileid := 1; fwdlink := -1; bkwdlink := -1;
+        dataused := sizeof(MDDFdb);
+      end{with};
+      moveleft(gptrMDDF^, PageBuf.Data, sizeof(MDDFdb));
+
+      PageIO(MDDFPRIMARY, PageBuf, writeop, ecode);
+
+      (* Update the backup MDDF if one exists *)
+      ReadMDDF(MDDFBACKUP, loclEcode);
+      if ecode <= OK then
+        PageIO(MDDFBACKUP, PageBuf, writeop, ecode);
+  end{proc WriteMDDF};
+
+
+
+
+  procedure  CatScanII ( var ecode : integer );
+
+  var
+       LdrPage    : FullPage;
+       loclEcode  : integer;
+       ptrSFDB    : cell_ptr;
+       ptrHead    : cell_ptr;
+       ptrHentry  : hentry_ptr;
+       page       : longint;
+       ptrPred    : cell_ptr;
+       ptrDCB     : DCBptr;
+       ptrCatFCB  : SFCB_ptr;
+       sfid       : SfileIdent;
+       actual     : longint;
+       CatRec     : centry;
+       DirRec     : ObjRec;
+       ptrDirList : cell_ptr;
+
+
+
+    (* Assume holding rootcat.semgp when called *)
+    procedure  Remnants;
+
+    label  1;
+
+    var
+         dirNumber : integer;
+         ptrDir    : cell_ptr;
+         nullName  : e_name;
+         dirName   : e_name;
+         ptrFmap   : flmap_ptr;
+
+    begin
+{$IFC SDEBUG}
+        if trace(FS,STRACE) then
+        begin
+        writeln; writeln('Remnant Sfiles');
+        PrList(gptrSfList);
+        writeln;
+        end;
+{$ENDC}
+        if gptrSflist = pointer(BAD) then exit(Remnants);
+        dirNumber := 1;
+        nullName := '';
+
+        (* Enumerate the SFDB list *)
+        ptrSFDB := gptrSfList^.link;
+        ptrHead := ptrSFDB;
+
+        repeat
+          if ptrSFDB^.sfileID.num = ptrDCB^.MDDFdata^.rootsnum then goto 1;
+          with ptrSFDB^.ptrLeader^.link^ do
+          begin
+            if sureBad then
+            begin
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              writeln('killing rebuilt s-file ',ptrSFDB^.sfileID.num:1);
+{$ENDC}
+              (* This rebuilt s-file has no catalog entry *)
+              kill_sfile(loclEcode, gdevice, ptrSFDB^.sfileID.num);
+              goto 1;
+            end{if};
+            page := key;  (* leader location *)
+          end{with};
+          (* Read the file leader page *)
+          PageIO(page, LdrPage, readop, loclEcode);
+{$IFC SDEBUG}
+          if trace(FS,STRACE) then
+          with ptrHentry^ do
+          writeln('Leader @ ',page:1,'  ',parentID:1,' "',name,'"');
+{$ENDC}
+          (* Have an s-file with a valid name; insert catalog entry *)
+          if gflatCat then
+          begin
+            (* Flat catalog record insertion *)
+            Lookup_by_Ename(ecode, ptrHentry^.name, ptrCatFCB, CatRec);
+            if ((ecode > OK) and (ecode <> 888 (* E_NOT_FOUND *) ))
+                              or
+               (CatRec.cetype = fileentry) then
+            begin
+              (* Error reading catalog, or catalog is full *)
+              ecode := E_CATALOG;
+              exit(Remnants);
+            end{if};
+            ecode := OK;
+
+            (* New catalog entry record *)
+            with CatRec do
+            begin
+              name := ptrHentry^.name;
+              sfile := ptrSFDB^.sfileID.num;
+              cetype := fileentry;
+              attributes := 0;
+
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            writeln('*  ',sfile:4,'  ',name,'  inserted');
+{$ENDC}
+            end{with};
+
+            (* Write the new catalog entry *)
+            with ptrCatFCB^ do
+              FileIO(loclEcode, ptrCatFCB, ord(@CatRec), sizeof(centry),
+                     actual, curpage, curoffset, writeop);
+          end
+          else
+          begin
+            (* Tree catalog record insertion *)
+            ptrFmap := pointer(ord(ptrHentry) + 128);
+            with ptrHentry^ do
+              MakeKey(parentID, @name, @DirRec);
+
+            (* New object record *)
+            with ptrHentry^, DirRec do
+            begin
+              sfile := ptrSFDB^.sfileID.num;
+              eType := fileentry;
+              fileDTC := DTC;
+              fileDTM := DTM;
+              size := GetFsize(ptrSFDB);
+              physSize := ord4(ptrFmap^.size) * DEFDATASIZE;
+              fsOvrhd := fsOverhead;
+              flags[fMaster] := master;
+              flags[fProtected] := protected;
+              flags[fSafety] := safety_on;
+              flags[fCrashed] := file_open;
+              flags[fScavenged] := scavenged;
+              flags[fClosed] := closed_by_OS;
+            end{with};
+
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            begin
+            write('insert '); PrKey(@DirRec);
+            end;
+{$ENDC}
+            (* Insert the new record *)
+            Insert(ptrDCB, @DirRec, sizeof(ObjectRec), NIL, loclEcode);
+
+            (* Make sure the object has a containing directory *)
+            if not SearchList(ptrDirList, ptrHentry^.parentID, ptrDir) then
+            begin
+              (* Directory containing this file doesn't exist *)
+              ClearMem(ord(@DirRec), sizeof(DirRec));
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              writeln('Containing directory ',ptrHentry^.parentID:1,' not found');
+{$ENDC}
+              repeat
+                ScvDir(dirNumber, dirName);
+                dirNumber := dirNumber + 1;
+                MakeKey(ROOT_NID, @dirName, @DirRec);
+                with DirRec do
+                begin
+                  eType := direntry;
+                  id := ptrHentry^.parentID;
+                  dirDTC := timestamp;
+                end{with};
+                Insert(ptrDCB, @DirRec, sizeof(DirectRec), NIL, ecode);
+              until ecode <> 1287; (* E_ENTRY_EXISTS *)
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              begin
+              write('insert error = ',ecode:1,'  '); PrKey(@DirRec);
+              end;
+{$ENDC}
+              ClearMem(ord(@DirRec), sizeof(DirRec));
+              MakeKey(ptrHentry^.parentID, @nullName, @DirRec);
+              with DirRec do
+              begin
+                eType := threadentry;
+                parID := ROOT_NID;
+                myName := dirName;
+              end{with};
+              Insert(ptrDCB, @DirRec, sizeof(ThreadRec), NIL, loclEcode);
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              begin
+              write('insert error = ',ecode:1,'  '); PrKey(@DirRec);
+              end;
+{$ENDC}
+              if (loclEcode > OK) or (ecode > OK) then
+              begin
+                ecode := E_CATALOG;
+                exit(Remnants);
+              end{if};
+            end{if};
+          end{if};
+
+    1:    (* continue *)
+          ptrSFDB := ptrSFDB^.link;
+        until ptrSFDB = ptrHead;
+    end{proc Remnants};
+
+
+
+
+    procedure  TreeScan;
+
+    label  1, 2;
+
+    var
+         ptrRun     : cell_ptr;
+         ptrCatSFDB : cell_ptr;
+         ptrDir     : cell_ptr;
+         ptrNode    : node_ptr;
+         ptrOffst   : offset_ptr;
+         ptrEntry   : entry_ptr;
+         i          : integer;
+         ignore     : boolean;
+         objName    : e_name;
+         objParent  : integer;
+         nullName   : e_name;
+         Run        : RunDesc;
+         maxNodeID  : integer;
+
+         procedure  LookupDir (     dirIdent : longint;
+                                var ptrCell  : cell_ptr );
+
+         var
+              ptrPred : cell_ptr;
+
+         begin
+             if not SearchList(ptrDirList, dirIdent, ptrPred) then
+             begin
+               if not GetCell(sizeof(DirDesc), @ptrCell) then
+               begin
+                 ecode := E_HEAPOVFL;
+                 exit(TreeScan);
+               end{if};
+
+               with ptrCell^ do
+               begin
+                 dirID := dirIdent;  (* key *)
+                 foundDir := FALSE;
+                 dirCreated := 0;
+               end{with};
+
+               LinkCell(ptrDirList, ptrPred, ptrCell);
+             end
+             else
+               ptrCell := ptrPred;
+
+         end{proc LookupDir};
+
+
+    begin
+
+        maxNodeID := ROOT_NID;
+        nullName := '';
+        ptrDirList := pointer(BAD);
+        ptrCatSFDB := gptrSfList^.link;
+        UnlinkCell(gptrSfList, gptrSfList, ptrCatSFDB);
+
+{$IFC SDEBUG}
+        if trace(FS,STRACE) then
+        begin
+        writeln('SFDB List'); PrList(gptrSfList); writeln;
+        end;
+{$ENDC}
+        with ptrCatSFDB^ do
+        begin
+          (* Looking for root catalog tree SFDB *)
+          if sfileID.num <> VDIR_ID then
+          begin
+            ecode := E_GAGME;
+            exit(TreeScan);
+          end{if};
+
+          (* Enter root directory in directory list *)
+          LookupDir(0, ptrDir);
+          ptrDir^.dirParID := -1;
+          ptrDir^.dirName := '';
+{$IFC SDEBUG}
+          if trace(FS,STRACE) then
+          begin
+          writeln; writeln('B-tree Nodes'); PrRunList(ptrData, false); writeln;
+          end;
+{$ENDC}
+          if ptrData = pointer(BAD) then goto 2;  (* tree empty *)
+          ptrRun := ptrData^.link;
+          ptrHead := ptrRun;
+        end{with};
+
+        with ExtentBuf do
+        begin
+          readB := TRUE;
+          dataOnly := TRUE;
+          ptrPl := pointer(BAD);
+        end{with};
+
+        (* Enumerate nodes in B-tree *)
+        repeat
+          UnpackRun(ptrRun, Run);
+
+{$IFC SDEBUG}
+          if trace(FS,STRACE) then
+          writeln('Next B-tree node page = ',Run.diskPage:1);
+{$ENDC}
+          (* Ignore nodes that are not internally consistent *)
+          if Run.numPages <> NODE_BLKS then goto 1;
+          ResetExtent(Run.diskPage, NODE_BLKS, loclEcode);
+          i := 0;
+          sfid.vers := -1;  (* max unsigned low word of longint key *)
+          ptrNode := pointer(ExtentBuf.address + (NODE_SIZE - sizeof(NodeDesc)));
+          ptrOffst := pointer(ord(ptrNode) - sizeof(integer));
+
+          if ptrNode^.kind <> leaf then goto 1;  (* skip index nodes *)
+
+          (* Enumerate records in node *)
+          while i < ptrNode^.nkeys do
+          begin
+            {$R-}
+            ptrEntry := pointer(ExtentBuf.address + ptrOffst^[-i]);
+            {$IFC DEBUG2} {$R+} {$ENDC}
+            with ptrEntry^ do
+            begin
+              DecompKey(@key, @objName, objParent);
+              if objParent > maxNodeID then maxNodeID := objParent;
+{$IFC SDEBUG}
+              if trace(FS,STRACE) then
+              begin
+              write(i:2); PrKey(@key);
+              case eType of
+               fileentry:   writeln('   file');
+               threadentry: writeln('   thread');
+               direntry:    writeln('   directory');
+              end;
+              end;
+{$ENDC}
+
+              case eType of
+                fileentry:
+                begin
+                  if gptrSfList <> pointer(BAD) then
+                  begin
+                    (* Lookup this sfile in the SFDB list *)
+                    sfid.num := sfile - 1;  (* will find predecessor to desired cell *)
+                    ignore :=  SearchList(gptrSfList, sfid.uniq, ptrPred);
+                    ptrSFDB := ptrPred^.link;
+
+                    if ptrSFDB^.sfileID.num = sfile then
+                    begin
+                      (* The catalog entry represents a real s-file *)
+                      with ptrSFDB^.ptrLeader^.link^ do
+                      begin
+                        if sureBad then
+                        begin
+                          (* Read the leader page to update the name *)
+                          page := key;
+                          PageIO(page, LdrPage, readop, loclEcode);
+                          if loclEcode <= 0 then
+                          begin
+                            (* The leader name needs to be updated from the catalog *)
+                            with ptrHentry^ do
+                            begin
+{$IFC SDEBUG}
+                              if trace(FS,STRACE) then
+                              writeln('Leader @ ',page:1,'  ',parentID:1,' "',ptrHentry^.name,
+                                      '" replaced from dir  ',objParent:1,' "',objName,'"');
+{$ENDC}
+                              name := objName;
+                              parentID := objParent;
+                              DTC := fileDTC;
+                              DTM := fileDTM;
+                            end{with};
+                            PageIO(page, LdrPage, writeop, loclEcode);
+
+                            sureBad := FALSE;  (* don't kill on second pass *)
+                          end{if};
+                        end{if};
+                      end{with};
+                    end{if};
+                  end{if};
+                end;
+
+                threadentry:
+                begin
+                  LookupDir(objParent, ptrDir);
+                  with ptrDir^ do
+                  begin
+                    (* Save key if we haven't seen the directory entry proper *)
+                    if not foundDir then
+                    begin
+                      dirParID := parID;
+                      dirName := myName;
+                    end{if};
+                  end{with};
+                end;
+
+                direntry:
+                begin
+                  LookupDir(id, ptrDir);
+                  if id > maxNodeID then maxNodeID := id;
+                  with ptrDir^ do
+                  begin
+                    if (not foundDir) or (dirDTC > dirCreated) then
+                    begin
+                      dirParID := objParent;
+                      dirName := objName;
+                      foundDir := TRUE;
+                   end{if};
+                  end{with};
+                end;
+              end{case};
+            end{with};
+
+            i := i + 1;  (* next record in B-tree node *)
+          end{while};
+
+    1:    (* continue *)
+
+          (* Deallocate the pages of the B-tree node or node fragment *)
+          with Run do
+          begin
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            writeln('deallocate node pages @ ',diskPage:1,' for ',numPages:1);
+{$ENDC}
+            deallocate(loclEcode, gdevice, diskPage, numPages);
+            with ptrDCB^.MDDFdata^ do
+              freecount := freecount + numPages;
+
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            writeln('WRITE  ',diskPage:1,'/',
+                    diskPage+ptrDCB^.MDDFdata^.geography.firstblock:1,
+                    ' for ',numPages:1);
+            if gwriteFlag then
+{$ENDC}
+            (* Blast the headers of the node pages *)
+            LisaIO(loclEcode, gdevice, ExtentBuf.address,
+                   diskPage + ptrDCB^.MDDFdata^.geography.firstblock, numPages,
+                   actual, without_header, nil, writeop);
+          end{with};
+
+          ptrRun := ptrRun^.link;  (* next B-tree node *)
+        until ptrRun = ptrHead;
+
+    2:  (* loop fallthrough *)
+        ecode := OK;
+{$IFC SDEBUG}
+        if trace(FS,STRACE) then
+        begin
+        writeln; writeln('Directories Found'); PrDirList(ptrDirList); writeln;
+        end;
+{$ENDC}
+        (* Enumerate the directory list and insert the directories into the tree *)
+        ptrDir := ptrDirList^.link;
+        ptrHead := ptrDir;
+        repeat
+          with ptrDir^, DirRec do
+          begin
+            if (dirParID = dirID) or
+               (not SearchList(ptrDirList, dirParID, ptrRun)) then
+                    dirParID := ROOT_NID;
+            objParent := dirID;  (* longint to int *)
+            objName := dirName;
+            MakeKey(objParent, @nullName, @key);
+            eType := threadentry;
+            myName := dirName;
+            parID := dirParID;
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            begin
+            write('insert '); PrKey(@DirRec);
+            end;
+{$ENDC}
+            Insert(ptrDCB, @DirRec, sizeof(ThreadRec), NIL, loclEcode);
+            if dirID <> ROOT_NID then
+            begin
+              MakeKey(dirParID, @objName, @key);
+              eType := direntry;
+              id := dirID;
+              dirDTC := dirCreated;
+{$IFC SDEBUG}
+            if trace(FS,STRACE) then
+            begin
+            write('insert '); PrKey(@DirRec);
+            end;
+{$ENDC}
+              Insert(ptrDCB, @DirRec, sizeof(DirectRec), NIL, ecode);
+            end{if};
+            if (ecode > OK) or (loclEcode > OK) then
+            begin
+              ecode := E_CATALOG;
+              exit(TreeScan);
+            end{if};
+          end{with};
+
+          ptrDir := ptrDir^.link;
+        until ptrDir = ptrHead;
+
+        (* Update highest node ID in MDDF *)
+        with ptrDCB^ do
+        begin
+          MDDFdata^.node_id := maxNodeID;
+          MDDFdirty := TRUE;
+        end{with};
+{$IFC SDEBUG}
+        if trace(FS,STRACE) then
+        writeln('Maximum node ID = ',maxNodeID:1);
+{$ENDC}
+    end{proc TreeScan};
+
+
+
+
+    procedure  FlatScan;
+
+    label  1;
+
+    var
+         i          : integer;
+         finished   : boolean;
+         savePage   : longint;
+         saveOffset : integer;
+         bufBytes   : longint;
+         ptrCatRec  : ^centry;
+         cdirty     : boolean;
+         ignore     : boolean;
+         deleteSFDB : boolean;
+         nbytes     : longint;
+
+         procedure  ClearCatRec;
+         begin
+             with ptrCatRec^ do
+             begin
+               if length(name) > 0 then cdirty := TRUE;
+               if (cetype <> emptyentry) and
+                  (cetype <> removed) then
+               begin
+                 cdirty := TRUE;
+                 cetype := removed;
+               end{if};
+               sfile := 0;
+               name := '';
+             end{with};
+         end{proc ClearCatRec};
+
+    begin
+        bufBytes := ((ord4(BUFBLOCKS) * DEFBLOCKSIZE) div ord4(sizeof(centry)))
+                        * ord4(sizeof(centry));
+
+        with ptrCatFCB^ do
+        begin
+          wait_sem(semgp, []);
+
+          (* Reset I/O pointer to beginning of catalog file *)
+          curpage := sent.fileaddr;
+          curoffset := 0;
+
+          sfid.vers := -1;  (* max unsigned version number *)
+
+          (* Read the rootcat file in big chunks *)
+          repeat
+            finished := TRUE;
+            cdirty := FALSE;
+
+            (* Save I/O pointer position before read *)
+            savePage := curpage;
+            saveOffset := curoffset;
+
+            FileIO(ecode, ptrCatFCB, ExtentBuf.address, bufBytes, actual,
+                   curpage, curoffset, readop);
+            if ecode = 848 then ecode := OK;
+            if ecode = 625 then
+            begin
+              cdirty := TRUE;  (* Rewrite to clear flags *)
+              ecode := OK;
+            end{if};
+            if ecode > OK then goto 1;  (* unexpected error *)
+            nbytes := actual;  (* remember how many bytes were read *)
+
+            ptrCatRec := pointer(ExtentBuf.address);
+
+            (* Enumerate the catalog entries in the buffer *)
+            while actual >= sizeof(centry) do
+            begin
+              finished := FALSE;  (* try to read another buffer-full *)
+
+              with ptrCatRec^ do
+              begin
+                if gptrSfList = pointer(BAD) then
+                  ClearCatRec
+                else if (sfile = ptrDCB^.MDDFdata^.rootsnum)
+                     or (sfile <= FREE_ID) then
+                  ClearCatRec
+                else
+                begin
+                  (* Lookup this sfile in the SFDB list *)
+                  sfid.num := sfile - 1;  (* will find predecessor to desired cell *)
+                  ignore :=  SearchList(gptrSfList, sfid.uniq, ptrPred);
+                  ptrSFDB := ptrPred^.link;
+
+                  if ptrSFDB^.sfileID.num <> sfile then
+                    (* No s-file behind the catalog entry *)
+                    ClearCatRec
+                  else
+                  begin
+                    (* Read the leader page to ensure names match *)
+                    deleteSFDB := TRUE;
+                    page := ptrSFDB^.ptrLeader^.link^.key;
+                    PageIO(page, LdrPage, readop, loclEcode);
+                    if loclEcode <= 0 then
+                    begin
+                      if length(ptrHentry^.name) = 0 then
+                      begin
+                        (* The leader name needs to be updated from the catalog *)
+                        ptrHentry^.name := name;
+                        PageIO(page, LdrPage, writeop, loclEcode);
+                      end
+                      else if (ptrHentry^.name <> name) then
+                      begin
+                        (* Re-insert the catalog entry with the new name *)
+                        ClearCatRec;
+                        deleteSFDB := FALSE;  (* save for pass 2 *)
+                      end{if};
+                    end{if};
+
+                    (* Unlink and dispose of the current SFDB *)
+                    if deleteSFDB then
+                    begin
+{$IFC SDEBUG}
+                      if trace(FS,STRACE) then
+                      writeln('*  ',sfile:4,'  ',name);
+{$ENDC}
+                      UnlinkCell(gptrSfList, ptrPred, ptrSFDB);
+                      FreeCell(ptrSFDB);
+                    end{if};
+                  end{if};
+                end{if};
+              end{with};
+
+              ptrCatRec := pointer(ord(ptrCatRec) + sizeof(centry));
+              actual := actual - sizeof(centry);
+            end{while};
+
+            (* Write this chunk of the catalog file *)
+            if cdirty then
+            begin
+              curpage := savePage;
+              curoffset := saveOffset;
+              FileIO(ecode, ptrCatFCB, ExtentBuf.address, nbytes, actual,
+                     curpage, curoffset, writeop);
+            end{if};
+
+          until finished;
+
+    1:
+          signal_sem(semgp);
+        end{with};
+
+    end{proc FlatScan};
+
+
+  begin
+      (* Mount the volume *)
+      FS_Mount(ecode, gdevice);
+      if ecode > OK then exit(CatScanII);
+
+      ptrCatFCB := rootptr[gdevice];
+      ptrDCB := mounttable[gdevice];
+      ptrHentry := @LdrPage.Data;
+
+{$IFC SDEBUG}
+      if trace(FS,STRACE) then
+      begin
+      writeln; writeln('Rebuild Volume Catalog'); writeln;
+      end;
+{$ENDC}
+      if gflatCat then
+        FlatScan
+      else
+        TreeScan;
+
+      if ecode <= OK then Remnants;
+
+      (* Unmount the volume *)
+      FS_Unmount(loclEcode, gdevice);
+  end{proc CatScanII};
+
+
+
+
+  procedure  Initialize ( var ecode : integer );
+
+  const
+       SCRATCHSZ = 1024;
+
+  var
+       ptrRef    : ^integer;
+       segPath   : Pathname;
+       i         : integer;
+       loclEcode : integer;
+
+  begin
+      ecode := OK;
+
+      (*
+       *  Unbind all LDSN's in the range FIRSTLDSN..LASTLDSN.  These LDSN's
+       *  are used to map the Scavenger heap segment and I/O buffer segment.
+       *  The refnums of the data segments being unbound are saved in the
+       *  SavedRefnum array.
+       *)
+      i := FIRSTLDSN;
+      repeat
+        ptrRef := @SavedRefnum[i];
+        Info_LDSN(loclEcode, i, ptrRef^);
+        if loclEcode > OK then
+          (* LDSN i is not bound to a data segment *)
+          ptrRef^ := BAD
+        else
+          (* Unbind LDSN i *)
+          Unbind_Dataseg(loclEcode, ptrRef^);
+        i := i + 1;
+      until i > LASTLDSN;
+
+      (* Create the I/O buffer segment *)
+      segPath := 'ScavengerBuffer';
+      with ExtentBuf do
+      begin
+        Make_Dataseg(ecode, segPath, ord4(BUFBLOCKS)*DEFBLKSIZE, 0, refnum,
+                     address, LASTLDSN, ds_private);
+        if ecode > OK then exit(Initialize);
+        readB := TRUE;
+        dataOnly := FALSE;
+        ptrPl := pointer(BAD);
+      end{with};
+
+      (* Create the Scratch Segment *)
+      segPath := 'ScavengerScratch';
+      with Scratch do
+      begin
+        Make_Dataseg(ecode, segPath, SCRATCHSZ, 0, refnum, address, LASTLDSN-1,
+                     ds_private);
+        if ecode > OK then exit(Initialize);
+        size := SCRATCHSZ;
+        used := 0;
+      end{with};
+
+      (* Create the heap segment *)
+      HeapInit(ecode);
+      if ecode > OK then exit(Initialize);
+
+      (* Initialize the null (bad data) page *)
+      ClearMem(ord(@NullPage), sizeof(NullPage));
+      NullPage.Labl.datastat := databad;
+
+      (* Prepare the device driver *)
+      Up(ecode, configinfo[gdevice], nil);
+
+      (*
+       *  Set the standard disk I/O mode.  Bad blocks will be remapped and data
+       *  that required one or more retries to read will be rewritten.
+       *  Verification of write operations is disabled for performance
+       *  reasons.
+       *)
+      with SaveDiskCntrl do
+      begin
+        spare := 1;  reread := 0;  rewrite := 1;
+      end{with};
+      SetDiskMode(SaveDiskCntrl);
+
+      (* List of SFDB's is empty *)
+      gptrSfList := pointer(BAD);
+      (* List of free disk extents is empty *)
+      gptrFreeList := pointer(BAD);
+
+      gnfiles := 3;  (* primitive s-files *)
+      gemptyFile := MAXINT;
+      gptrMDDF := pointer(BAD);
+
+      ExtentBuf.writeB := FALSE;
+
+{$IFC STATS}
+      for i := 0 to IXSTATS do AllocStats[i].size := 0;
+{$ENDC}
+
+  end{proc Initialize};
+
+
+
+
+  procedure  Cleanup ( var ecode : integer );
+
+  var
+       i         : integer;
+       loclEcode : integer;
+
+  begin
+      ecode := OK;
+
+      (* Close/kill the resident I/O buffer segment (unbinds LASTLDSN) *)
+      Close_Dataseg(loclEcode, ExtentBuf.refnum);
+
+      (* Close/kill the resident scratch segment (unbinds LASTLDSN-1) *)
+      Close_Dataseg(loclEcode, Scratch.refnum);
+
+      with Heap do
+      begin
+        (* Close/kill the resident heap segment (unbinds FIRSTLDSN) *)
+        Close_Dataseg(loclEcode, refnum);
+
+        (* Rebind the data segments that were unbound to free LDSN's *)
+        i := FIRSTLDSN;
+        repeat
+          if SavedRefnum[i] <> BAD then Bind_Dataseg(loclEcode, SavedRefnum[i]);
+          i := i + 1;
+        until i > LASTLDSN;
+      end{with};
+
+      (* Restore disk I/O mode *)
+      SetDiskMode(SaveDiskCntrl);
+  end{proc Cleanup};
+
+
+
+
+
+  (**************************************************************************)
+  (*                                                                        *)
+  (*                         Scavenger Entry Point                          *)
+  (*                                                                        *)
+  (**************************************************************************)
+
+  procedure  Scavenge (* var ecode   : integer;
+                             devName : e_name;
+                             options : ScvOptions *);
+
+  label  1;
+
+  var
+       loclEcode : integer;
+{$IFC SDEBUG}
+       c : char;
+{$ENDC}
+
+  begin
+      ecode := OK;
+
+      (* Map the device name to a device number *)
+      gdevice := CheckDevice(devName, ecode);
+      if ecode > OK then exit(Scavenge);
+
+      Initialize(ecode);
+      if ecode > OK then goto 1;
+
+      (* Record the options in effect *)
+      with Option do
+      begin
+        saveRemnants := (no_discard in options);
+        killPipes := (no_pipes in options);
+        reviveDead := (no_kill in options);
+        goForIt := (no_abort in options);
+      end{with};
+
+{$IFC SDEBUG}
+      gwriteFlag := TRUE;
+      if trace(FS,STRACE) then
+      begin
+      write('Disable writing? '); read(c); writeln;
+      if (c = 'y') or (c = 'Y') then gwriteFlag := FALSE;
+      end;
+{$ENDC}
+
+      (* Read the volume MDDF *)
+      ReadMDDF(MDDFPRIMARY, ecode);
+      if ecode > OK then
+      begin
+        (* Volume MDDF is bad; so read the backup volume MDDF *)
+        ReadMDDF(MDDFBACKUP, ecode);
+        if ecode > OK then goto 1;
+      end{if};
+
+      ScanVolume(ecode);
+      if ecode > OK then goto 1;
+
+      RebuildSfiles(ecode);
+      if ecode > OK then goto 1;
+
+      UpdateBitmap(ecode);
+      if ecode > OK then goto 1;
+
+      WriteMDDF(ecode);
+      if ecode > OK then goto 1;
+
+      CatScanII(ecode);
+
+  1:  (* cleanup exit *)
+      Cleanup(loclEcode);
+
+  end{proc Scavenge};
+
+
+END.
+ÿ

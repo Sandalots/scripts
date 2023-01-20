@@ -1,0 +1,519 @@
+                                   {Copyright 1983, 1984, Apple Computer Inc.}
+UNIT USOROC; INTRINSIC;
+
+INTERFACE
+
+USES
+    {$U tklib}             UObject,
+    {$U sys1lib}           QuickDraw,
+    {$U tklib}             UDraw,
+    {$U tklib}             UABC,
+    {$U tklib}             UTKUniversalText,
+
+    {$U tklib}             UText,
+    {$U tklib}             UDialog,
+
+    {$U iospaslib}         Blkiointr,                  {paslib's unit, should not be before UObject,
+                                                        needed to compile UStdTerm}
+    {$U libqp/UStdTerm}    UStdTerm;
+
+
+
+CONST
+   maxI  = 3;       {maximum number of intermediate characters in an escape sequence}
+
+TYPE
+   states =  (q0,q1,q2,q3,q4,q6);                 {States in FSA (Finite State Acceptor)}
+   Ilist =   ARRAY [1..maxI] OF CHAR;             {Storage for Intermediate characters  }
+   smallstr = STRING [10];                        {string for misc. uses                }
+
+   TSOROC = SUBCLASS OF TStdTerm
+       state            : states;      {current state of FSA                   }
+       I                : Ilist;       {Intermediate characters                }
+       newline          : BOOLEAN;     {newline mode?                          }
+       params,                         {number of parameters                   }
+       pos,                            {misc. string index                     }
+       top,bottom,rmarg : INTEGER;     {top, bottom, right margins             }
+       vReadBuff        : TString;     {VRead buffer }
+
+       FUNCTION  {TSOROC.}CREATE (object : TObject; heap : Theap) : TSOROC;
+                                        {All subclass create must have these two parameters.}
+      {PROCEDURE  TSOROC. VWrite(VAR str : Tstr255);}
+      {PROCEDURE  TSOROC. VRead (VAR ach: char; VAR keycap : Byte; VAR applekey, shiftkey,
+                                                                       optionkey : BOOLEAN);}
+                                        {All terminal emulator subclass must have at least these 2 methods.}
+       END;
+
+
+IMPLEMENTATION
+
+{$IFC fRngQP}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC fSymQP}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+
+{$S sQPortTE}
+
+CONST
+    bmarg = 23;      {bottom margin}
+    tmarg = 0;       {top margin}
+
+    keyCtrS = 19;
+    VT     = 11;     {Up line--vertical tab        }
+    RT     = 12;     {Non-destructive space        }
+    BS     =  8;     {Back space (non-destructive) }
+    CR     = 13;     {Carriage return              }
+    LF     = 10;     {Line feed                    }
+    ESC    = 27;     {Escape                       }
+    HOME   = 30;     {curosr home                  }
+
+{*********************************************************************************}
+
+
+METHODS OF TSOROC;
+FUNCTION  {TSOROC.}CREATE {(object : TObject; heap : Theap) : TSOROC};
+{initialize parameters for TSOROC}
+
+VAR
+   astring : TString;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF object = NIL THEN
+       object := NewObject (heap, THISCLASS);
+   SELF := TSOROC (TStdTerm.CREATE (object, heap));
+
+   astring := TString.CREATE (NIL, heap, 20);
+
+   WITH SELF DO
+   BEGIN
+      vReadBuff := astring;        {init read buffer                  }
+      params := 0;                 {no parameters yet                 }
+      rmarg := 79;                 {80 column output                  }
+      top := tmarg;                {default top margin                }
+      bottom := bmarg;             {default bottom margin             }
+      state := q0;                 {Starting state for FSA            }
+      wrapAround := TRUE;          {Wrap around at the END of a line. }
+      newline := TRUE;             {Line feed WITH carriage return.   }
+
+      {Initialize variables in tstdterm}
+      {NOTE: THE FOLLOWING VARIABLES MAY ONLY BE SET DIRECTLY HERE!!}
+      maxColumns := 80;            {maximum number of colums 80       }
+      maxlines := 24;              {maximum number of lines 24        }
+      cursorXY.x := 0;             {cursor at origin                  }
+      cursorXY.y := 0;
+      stopOutputKey     := CHR (keyCtrS);
+      startOutputKey    := CHR (keyCtrS);
+   END;              {WITH SELF DO...}
+   {$IFC fTrace}EP;{$ENDC}
+END;           {Create}
+
+
+{*********************************************************************************}
+
+PROCEDURE {TSOROC.}VWrite{(VAR str : Tstr255)};
+
+VAR
+   len,                            {length of input string}
+   a,                              {loop control variable}
+   n,                              {input string index}
+   m                : INTEGER;     {output string index}
+   noControl        : BOOLEAN;     {no control characters in input?}
+   outstr           : Tstr255;     {Output string (No escape/control character)}
+   ch               : CHAR;
+
+{*********************************************************************************}
+
+FUNCTION FeChar(ch : CHAR) : BOOLEAN;
+{Returns TRUE iff ch is an element of the set of escape sequence terminators.}
+const
+   first = '0';
+   last = '~';
+
+BEGIN
+   FeChar := (ch <= last) AND (ch >= first) OR (ch = '*')
+   {Note this inclusion of the '*' character as a final escape character
+   is unique to the SOROC design.  The normal set of final escape characters
+   is the set ('0'..'~').}
+END;                {FeChar}
+
+{*********************************************************************************}
+
+FUNCTION XChar(ch : CHAR):BOOLEAN;
+{Returns TRUE iff ch is a member of the set {chr(32)..chr(126)}
+BEGIN
+   XChar := (ch >= chr(32)) AND (ch <= chr(126))
+END;                {XChar}
+
+{*********************************************************************************}
+
+PROCEDURE GetChar(str : Tstr255; VAR ch : CHAR; VAR indx : INTEGER);
+{IF indx < length(string) Increment indx AND return str[indx] in ch, o.w. return nul}
+BEGIN
+   indx := indx + 1;
+   IF (indx <= length(str)) THEN
+      ch := str[indx]
+   ELSE ch := chr(0);
+END;      {GetChar}
+
+{*********************************************************************************}
+
+PROCEDURE SOROC_FSA(VAR state : states; ch : CHAR);
+{This is a state machine built to recognize all two character escape sequences
+AND the cludge sequence which the SOROC video terminal uses to allow direct
+cursor addressing.  The accepting state for normal escape sequences is q6 AND
+the accepting state for the cludge sequence is q4.}
+BEGIN
+   CASE state OF
+      q0 : IF (ch = chr(ESC)) THEN
+              state := q1;              {BEGIN escape sequence}
+      q1 : IF (ch = '=') THEN
+              state := q2               {Must be the cludge}
+           ELSE IF FeChar(ch) THEN
+              state := q6               {Valid format escape sequence}
+           ELSE state := q0;            {Trap to initial state}
+      q2 : IF XChar(ch) THEN
+              state := q3               {Sure looks like the cludge}
+           ELSE state := q0;            {Trap to initial state}
+      q3 : IF XChar(ch) THEN
+              state := q4               {It was!  It was the cludge!}
+           ELSE state := q0;            {Trap to initial state}
+      END;               {CASE}
+END;           {SOROC_FSA}
+
+{*********************************************************************************}
+
+FUNCTION Digit(ch : CHAR) : BOOLEAN;
+{Returns TRUE iff ch is a digit.  }
+BEGIN
+   Digit := (ch <= '9') AND (ch >= '0')
+END;
+
+{*********************************************************************************}
+
+PROCEDURE MyMoveCursor(vert,scroll:BOOLEAN;distance:INTEGER);
+{Overwrite of the version which exists in standard terminal unit.  This PROCEDURE
+is overwritten so that I can take care of all scrolling situations, i.e. all vertical
+movement.}
+VAR
+   toBeScrolled : INTEGER;
+   line : Tstr255;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF vert THEN
+   WITH SELF DO
+   BEGIN                 {Vertical cursor movement}
+      IF (cursorXY.y < top) OR (cursorXY.y > bottom) THEN
+      BEGIN   {$H-}                                         {outside scrolling region}
+         IF (distance < 0) THEN
+         BEGIN                                         {cursor up}
+            IF (cursorXY.y + distance >= tmarg) THEN
+               VGotoXY (cursorXY.x, cursorXY.y + distance)
+            ELSE VGotoXY (cursorXY.x, tmarg)
+         END
+         ELSE IF (distance > 0) THEN
+         BEGIN
+            IF (cursorXY.y + distance <= bmarg) THEN
+               VGotoXY (cursorXY.x, cursorXY.y + distance)
+            ELSE VGotoXY (cursorXY.x, bmarg)
+         END
+      END                                              {outside scrolling region}
+      ELSE BEGIN                                       {inside scrolling region}
+         IF (distance < 0) THEN                        {cursor up}
+         BEGIN
+            toBeScrolled := top - (cursorXY.y + distance);
+            IF (toBeScrolled > 0) THEN
+            BEGIN
+               VGotoXY (SELF.cursorXY.x, top);
+               IF scroll THEN
+               repeat                                     {scroll down}
+                  VGetLine (tmarg - 1,line,TRUE);     {get most recently inserted line from buffer}
+                  VPutLine (SELF.top,line,TRUE);      {put the line at the top of the scrolling region}
+                  toBeScrolled := toBeScrolled - 1;
+               until (toBeScrolled = 0);
+            END
+            ELSE VGotoXY (cursorXY.x, cursorXY.y + distance);
+         END
+         ELSE BEGIN                                        {cursor down}
+            toBeScrolled := cursorXY.y + distance - bottom;
+            IF (toBeScrolled > 0) THEN
+            BEGIN
+               VGotoXY (cursorXY.x, bottom);
+               IF scroll THEN
+               repeat                                     {scroll up}
+                  VGetLine (top,line,TRUE);            {get line from top of scrolling region}
+                  VPutLine (tmarg - 1,line,TRUE);      {AND put it in buffer}
+                  line := '';
+                  VPutline (SELF.bottom,line,TRUE);    {Insert blank line}
+                  toBeScrolled := toBeScrolled - 1;
+               until (toBeScrolled = 0);
+            END
+            ELSE VGotoXY (cursorXY.x, cursorXY.y + distance);  {$H+}
+         END        {ELSE BEGIN}
+      END           {inside scrolling region}
+   END              {IF vert}
+   ELSE             {let stdterm handle horiz. moves}
+      MoveCursor (scroll,distance, 0);
+   {$IFC fTrace}EP;{$ENDC}
+END;                {MyMoveCursor}
+
+{*********************************************************************************}
+
+(* Not needed in this Soroc emulator.
+PROCEDURE Push(str:smallstr; ch:CHAR; addchar:BOOLEAN);
+{Insert the elements of str THEN, IF addchar, also insert ch onto the FIFO stack.  }
+
+VAR
+   len, indx : INTEGER;
+   pChar : ptr;
+   character : CHAR;
+
+BEGIN
+   len := length(str);
+   FOR indx := 1 TO len DO
+   BEGIN
+      character := str[indx];
+      pChar := @character;
+      SELF.vReadBuff.InsLast(pChar)
+   END;
+   IF addchar THEN
+   BEGIN
+      pChar := @ch;
+      SELF.vReadBuff.InsLast(pChar)
+   END
+END;                {Push}
+*)
+
+{*********************************************************************************}
+
+PROCEDURE DoSOROC(F : CHAR;I : Ilist;count : INTEGER);
+{Interpret valid SOROC escape sequences AND make calls to standard terminal unit
+in order to emulate the effect of sequences supported.}
+VAR
+   line, col : INTEGER;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   IF (count = 0) THEN
+      CASE F OF
+             '*' : ClearScreen (sclearScreen);           {Erase entire screen               }
+             'Y' : ClearScreen(sclearEScreen);           {Erase to end of screen.           }
+             'T' : ClearScreen(sclearELine);             {Erase to end of line.             }
+              OTHERWISE  ;                        {Invalid SOROC two character escape seq.}
+       END        {CASE F OF...}
+   ELSE CASE F OF                                 {three or more character esc sequences}
+             '=' : IF (count = 3) THEN
+                   WITH SELF DO
+                   BEGIN                          {Direct cursor addressing}
+                      line := ord(I[2]) - 32;
+                      col := ord(I[3]) - 32;
+                      IF (line > bottom) THEN
+                         line := cursorXY.y;           {Value out of range ignored}
+                      IF (col > rmarg) THEN
+                         col := cursorXY.x;            {Value out of range ignored}
+                {$H-} VGotoXY (col, line);  {$H+}
+                   END;
+          OTHERWISE  ;  {Invalid SOROC escape seq.}
+        END;             {CASE F}
+   {$IFC fTrace}EP;{$ENDC}
+END;      {DoSOROC}
+
+{*********************************************************************************}
+
+
+PROCEDURE Purge(str : Tstr255;VAR size : INTEGER);
+{Assure that the length field of str has the same value as size.  Pass str to
+VWrite}
+VAR
+   a : INTEGER;
+   tempstr : Tstr255;
+
+BEGIN
+   {$IFC fTrace}BP(30);{$ENDC}
+   str [0] := CHR (size);
+   repeat
+      a := SELF.rmarg - SELF.cursorXY.x + 1;           {number of columns left on this line}
+      IF (length(str) > a) THEN
+      BEGIN                                            {There are more characters than columns left}
+         IF NOT SELF.wrapAround THEN
+         BEGIN                                         {Overwrite last character}
+            str[a] := str[length(str)];
+            str [0] := CHR (a);
+            VStrWrite(str);
+            str := '';
+         END
+         ELSE BEGIN                                    {Wraparound}
+            tempstr := copy(str,1,a);
+            Delete(str,1,a);
+            VStrWrite(tempstr);
+            MyMoveCursor(TRUE,TRUE,1);
+            SELF.CtrKeyWrite(chr(CR));
+         END        {ELSE BEGIN}
+      END
+      ELSE BEGIN
+         VStrWrite(str);
+         str := '';
+      END
+   until (str = '');
+   size := 0;
+   {$IFC fTrace}EP;{$ENDC}
+END;           {purge}
+
+{*********************************************************************************}
+
+         {Look at characters one at a time, putting them into outstr.  Purge outstr
+         when:  1)  All charcters in str have been looked at.  2)  A control character
+         is encountered.  IF the escape character is encountered use SOROC finite state
+         acceptor to determine whether the characters to
+         come form a sequence of SOROC form.  IF the form of a sequence is correct
+         THEN send the parameters (intermediate characters) along WITH the
+         final character to the appropriate PROCEDURE (DoSoroc).
+         IF the sequence would be responded to by a SOROC AND IF the action which the
+         sequence would produce is implemented appropriate calls to the standard terminal
+         unit are made in order to simulate said action in the window.  Note that IF there
+         are no control characters in the string THEN the string is simply passed to
+         standard terminal's method.}
+
+BEGIN                    {VWrite}
+   {$IFC fTrace}BP(30);{$ENDC}
+   len := length(str);
+   noControl := TRUE;
+   FOR a := 1 TO len DO
+      IF (ord(str[a]) < 32) THEN
+         noControl := FALSE;
+   IF noControl AND (SELF.state = q0) THEN
+      VStrWrite(str)
+   ELSE
+      IF (len = 1) and (ord(str[1]) = CR) then   {Handle Just a carrage return}
+      BEGIN
+         SELF.CtrKeyWrite(chr(CR));
+         IF SELF.newLine then
+            SELF.CtrKeyWrite(CHR (LF))
+      END
+   ELSE BEGIN
+      outstr := '';              {nil output string}
+      n := 0;                    {in string length 0}
+      m := 0;                    {out string length 0}
+      WHILE (n < len) DO
+      BEGIN
+         GetChar(str,ch,n);           {Get a character from the input string}
+         IF (ord(ch) <= 31) THEN      {IF character is a control character.}
+         BEGIN                        {Respond to a control character right away}
+            IF (m > 0) THEN           {purge output string}
+               Purge(outstr,m);
+            CASE ord(ch) OF
+               ESC     : BEGIN                  {start a new sequence}
+                            SELF.state := q1;
+                            SELF.params := 0
+                         END;
+               CR      : BEGIN
+                            SELF.CtrKeyWrite(ch);
+                            IF SELF.newline THEN
+                               MyMoveCursor(TRUE,TRUE,1)     {move cursor down one line}
+                         END;
+               LF       : MyMoveCursor(TRUE,TRUE,1);         {move cursor down one line}
+               BS       : MyMoveCursor(FALSE,FALSE,-1);      {Move cursor back one character}
+               VT       : MyMoveCursor(TRUE,TRUE,-1);        {move cursor up one column}
+               RT       : MyMoveCursor(FALSE,FALSE,1);       {nondestructive space}
+               HOME     : VGotoXY(0,0);                      {cursor home}
+               OTHERWISE SELF.CtrKeyWrite(ch);
+            END       {CASE}
+         END           {IF character is a control character}
+         ELSE IF (SELF.state <> q0) THEN                   {IF in the midst of processing an escape seq.}
+         WITH SELF DO
+         BEGIN
+      {$H-} SOROC_FSA(SELF.state,ch);  {$H+}
+            CASE SELF.state OF
+               q1 : IF (m > 0) THEN                       {purge output string}
+                 {$H-} Purge(outstr,m);  {$H+}
+            q2,q3 : BEGIN
+                       params := params + 1;    {record parameter}
+                       I[params] := ch;
+                    END;
+               q4 : BEGIN       {valid SOROC escape format}
+                       params := params + 1;
+                       I[params] := ch;
+                {$H-}  DoSOROC(I[1],I,params);  {$H+}
+                       params := 0;
+                       state := q0;
+                    END;
+               q6 : BEGIN       {valid SOROC escape format}
+                 {$H-} DoSOROC(ch,SELF.I,SELF.params);  {$H+}
+                       state := q0;
+                    END
+               END        {CASE state OF...}
+         END          {ELSE IF (SELF.state <> q0) BEGIN}
+         ELSE
+            BEGIN  {State is q0 so build output string}
+               m := m + 1;
+               outstr[m] := ch;
+            END
+      END;      {WHILE (n <> len)}
+      IF (m <> 0) THEN    {purge output string}
+         Purge(outstr,m);
+   END;         {ELSE BEGIN}
+   {$IFC fTrace}EP;{$ENDC}
+END;         {VWrite}
+
+{*********************************************************************************}
+
+
+PROCEDURE {TSOROC.}VRead {(VAR ach: char; VAR keycap : Byte; VAR applekey, shiftkey, optionkey : BOOLEAN)};
+{Over-write of paslib's VRead.  Input for VRead can be buffered}
+
+CONST
+  FS = $1c;         {left arrow}
+  GS = $1d;         {right arrow}
+  RS = $1e;         {up arrow}
+  US = $1f;         {down arrow}
+
+{*********************************************************************************}
+
+PROCEDURE Pop(VAR ch:CHAR);
+{Return the data from the first node on the FIFO stack}
+BEGIN
+   ch := SELF.vReadBuff.First;
+   SELF.vReadBuff.DelFirst;
+END;                {Pop}
+
+{*********************************************************************************}
+
+BEGIN                    {VRead}
+   {$IFC fTrace}BP(30);{$ENDC}
+{  In the future:  IF provision is made to send back cursor coordinates
+   THEN the following two lines should be put back in.
+
+   IF (SELF.vReadBuff.size > 0) THEN
+      Pop(ach)
+   ELSE
+ }
+      SUPERSELF.VRead (ach,keycap,appleKey,shiftKey, optionkey);
+      CASE ORD (ach) OF                           {map to Soroc's arrow keys}
+        FS : ach := CHR (BS);                     {left arrow}
+        GS : ach := CHR (RT);                     {right arrow}
+        RS : ach := CHR (VT);                     {up arrow}
+        US : ach := CHR (LF);                     {down arrow}
+      END;
+
+   {$IFC fTrace}EP;{$ENDC}
+END;                     {VRead}
+
+{*********************************************************************************}
+
+
+BEGIN  {TSOROC init routine}
+    Consterm := TSOROC.CREATE (NIL, mainHeap);       {Terminal subclass has to assign its own CREATE to
+                                                      Consterm in its class init routine like this.}
+END;      {METHODS OF TSOROC}
+END.      {OF UNIT}
+ÿ

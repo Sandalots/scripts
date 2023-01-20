@@ -1,0 +1,683 @@
+;Copyright 1983, 1984, Apple Computer Inc.
+
+;File: source/starasm1; startup assembler living in the blank segment
+
+
+        .INCLUDE        SOURCE/PASCALDEFS.TEXT
+        .INCLUDE        SOURCE/LDEQU.TEXT
+
+
+        .func   pascalinit
+       ;*************************************************************)
+       ;* Function PASCALINIT : ^integer;
+       ;*
+       ;* Description:
+       ;*    Continue the language initializations for pascal, and
+       ;*       locate the loader's memory map.
+       ;*
+       ;*    On entry:
+       ;*      1) A5 points into the user area,
+       ;*
+       ;*    On exit:
+       ;*      1) The A5 register is re-directed to sysglobal,
+       ;*      2) Some read/write ptrs are copied into sysglobal,
+       ;*
+       ;* Output Parameters:
+       ;*    Pascalinit - returns the address of the loader mem map.
+       ;*
+       ;* Implicit Data:
+       ;*    Adrparamptr - the address of the pointer to the first
+       ;*       word of the loader's memory map.
+       ;*
+       ;*    Esysglobal- the offset within the loader mem map to the
+       ;*       variable pointing to the end of the global variable
+       ;*       region.  Since the intrinsic ptrs are immediately
+       ;*       after the global var area, this is actually the
+       ;*       offset to that region.
+       ;*
+       ;*************************************************************)
+esysgloboff     equ     28
+
+
+trap7           equ     156     ;low-core cell pointing to trap 7 handler.
+
+        move.l  adrparamptr,a2  ;a2 := address of start of loader parms
+
+;copy 32 bytes below a5 (in user stack) into sysglobal area, leaving
+;  a5 pointing to the 32th byte in sysglobal:
+        move.l  a2,a1           ;a0 := b_sysglobal + globals
+        sub.l   #esysgloboff,a1 ;
+        move.l  (a1),a0
+
+        add.l   #32,a5          ;position a5 to other side of transfer data
+        move.w  #7,d0           ;move the 32 bytes, leaving a5 positioned
+loopr                           ; after the 32nd byte in sysglobal, the
+        move.l  -(a5),-(a0)     ; same offset a5 used to have in the user
+        dbra    d0,loopr        ; stack segment.
+
+        move.l  a0,a5           ;move global var ptr in sysglobal
+
+        clr.l   8(a5)           ;force readln/writeln to use soroc
+        clr.l   12(a5)
+
+       ;Initialize soroc's uart (both channels), which is critical
+       ; if the Lisabug option has been assembled out, and so hasn't
+       ; already done the same thing.
+       ;
+       ; (initstdio needs trap7 defined in the usual way: move d0 into sr,
+       ;                                                   and return via a0.)
+        lea     trap7hand,a1    ;install trap7 handler
+        move.l  a1,trap7
+        .ref    %initstdio
+        jsr     %initstdio
+        bsr.s   mapiospace      ;open a trapdoor
+
+;place parameter adr onto stack prior to returning:
+        move.l  (sp)+,a0        ;get return address
+        move.l  a2,(sp)         ;return function value
+        jmp     (a0)            ;thats all folks
+
+
+
+trap7hand                       ;trap 7 handler, redundant handler takes over later!
+        addq    #6,SP           ;clear stack from trap
+        move    d0,SR           ;load SR from d0 param
+        jmp     (a0)
+
+
+
+    ;**********
+    ;*  Mapiospace -- Init trap 8 as a trap door for the laser printer boys:
+    ;*
+    ;*  Usage:
+    ;*    To unmap the io space from the caller's domain and enable interrupts:
+    ;*          clr.w   d0           ;function code of 0
+    ;*          trap    #8
+    ;*
+    ;*    To map the io space in the callers domain and disable interrupts:
+    ;*          moveq   #1,d0        ;function code of 1
+    ;*          trap    #8
+    ;*
+    ;*  Implemention Notes:
+    ;*    The traps can only be used from a user program.
+    ;*
+    ;*    No attention is paid to the previous interrupt state for either call.
+    ;*
+    ;**********
+mapiospace
+
+trap8adr        equ     160
+
+        lea     fiddler,a0      ;point trap 8 to fiddler
+        move.l  a0,trap8adr
+        rts
+
+
+    ;**********
+    ;*
+    ;*  Trap 8 handler:
+    ;*     (function code is passed in d0)
+    ;**********
+fiddler
+        movem.l d0-d7/a0-a6,-(SP);save ALL regs
+
+;Sup stack looks like:
+;lomem:
+;SP  --->   saved regs          (60 bytes)
+;           caller's SR         (2 bytes)
+;           caller's return adr (4 bytes)
+        tst     d0
+        bne.s   its1
+
+;handle function 0 case:
+its0    move    #0,60(SP)       ;enable interrupts within caller's SR
+        move    #$C00,d1        ;param to proc to unmap io
+        bra.s   fiddled
+
+;handle function 1 or 2 case:
+its1    subq    #1,d0
+        bne.s   its2
+
+;function 1 case:
+        move    #$700,60(SP)    ;disable interrupts within caller's SR
+        move    #$900,d1        ;param to proc to map io
+        bra.s   fiddled
+
+;function 2 case:
+its2    move    #$900,d1        ;param to proc to map io
+
+fiddled                         ;exit path
+        bsr     change_iospace
+        movem.l (SP)+,d0-d7/a0-a6;restore regs
+        rte                     ;end of trap 8 handling
+
+    ;**********
+    ; Change_Iospace Utility -- value in d1 goes into access
+    ;   field of iospace mmu of the current domain.
+    ;**********
+change_iospace                   ;d1 has value to write to smt[domain, iospace]
+        move.l  sglobal,a0       ;get b_sysglobal ptr
+        move.l  c_pcb_ptr(a0),a1 ;a1 := pcb ptr
+        clr.l   d2               ;d2 := current domain
+        move.b  domain(a1),d2
+        move.l  smt_addr(a0),a2  ;a2 := System Mapping Table base
+;a3 := adr smt[domain, iospace].access
+        move    #512,d0          ; (d0 := size of single domain in smt)
+        mulu    d2,d0            ; (d0 := smt offset to current domain)
+        adda.w  d0,a2
+        move    #iospacemmu,d4   ; (d4 := smt offset to iospace mmu,
+        lsl.w   #2,d4            ;   4 bytes per smt entry)
+        adda.w  d4,a2
+;smt[domain, iospace].access := value passed to change_iospace
+        move    d1,2(a2)         ; (with offset for '.access' field)
+;simulate progmmu call:          ;(d2 already has target domain number)
+        move    d2,d0            ;d0 := return domain is the caller's
+        moveq   #1,d1            ;d1 := number of mmus to program
+        move    #iospacemmu,d3   ;d3 := mmu you want to program
+        trap    #6               ;DOIT !!!
+        rts                      ;end of change_iospace procedure
+
+;********************************************************
+;****end of mapping iospace utility section**************
+;********************************************************
+
+
+
+        .proc   prog_mmu
+       ;*************************************************************)
+       ;* Procedure PROG_MMU(index,domain,count,rtn_domain:integer);
+       ;*
+       ;* Description:
+       ;*   Gets control to do_an_mmu, where actual mmu programming
+       ;*      takes place.
+       ;*
+       ;* Input Parameters:
+       ;*    Index - Which mmu segment is being changed,
+       ;*    Domain - Which domain's mmu to change.
+       ;*    Count - number of mmus to program.
+       ;*    Ret_Domain - which domain to return to
+       ;*
+       ;* Special Conditions of Use:
+       ;*    The same copy of this program is shared by both the loader
+       ;*     and the final OS environment.  It is not re-loaded as part
+       ;*     of the OS.
+       ;*
+       ;*************************************************************)
+        move.l  (SP)+,a0        ;a0 := return address
+        movem.w (SP)+,d0-d3     ;d0 := the domain to return to
+                                ;d1 := mmucount
+                                ;d2 := target domain
+                                ;d3 := mmu index
+        movem.l a3/d4-d7,-(SP)  ;save registers committed to compiler optim.
+        trap    #6              ;enter do_an_mmu
+        movem.l (SP)+,a3/d4-d7  ;restore registers before returning
+        jmp     (a0)
+
+
+
+        .def    SET_DOMAIN
+       ;*************************************************************)
+       ;* Procedure SET_DOMAIN(domain: domainRange {0..3});
+       ;*
+       ;* Description:
+       ;*   Change domains.
+       ;*
+       ;* Input Parameters:
+       ;*    Domain - which domain is selected
+       ;*
+       ;* Special Conditions of Use:
+       ;*    Can only be called from the supervisor stack.
+       ;*
+       ;*************************************************************)
+set_domain
+
+;memory locations to change mmu domain, ie domain 2
+;  is established by touching ct2on and ct1off,
+;   a binary '1', '0' selection.
+ctbit1on        equ     $FCE00A
+ctbit1off       equ     $FCE008
+ctbit2on        equ     $FCE00E
+ctbit2off       equ     $FCE00C
+
+        move.l  (sp)+,a0        ;get return address
+        move.b  (sp)+,d1        ;get domain
+
+;establish the requested context:
+        btst    #0,d1           ;bit one on?
+        bne     b1on
+        move.b  d0,ctbit1off    ;  bit 1 off!
+        bra     bit2next
+b1on    move.b  d0,ctbit1on     ;  bit 1 on!
+bit2next
+        btst    #1,d1           ;bit two on?
+        bne     b2on
+        move.b  d0,ctbit2off    ;  bit 2 off!
+        bra     ctxdone
+b2on    move.b  d0,ctbit2on     ;  bit 2 on!
+ctxdone
+        jmp     (a0)            ;return
+
+
+
+        .def    VERSN_PROM
+       ;*************************************************************)
+       ;* Function VERSN_PROM;
+       ;*
+       ;* Description:
+       ;*    Returns the (integer) boot prom version number.
+       ;*
+       ;*************************************************************)
+versn_prom
+
+prom_sn         equ     $fe3ffc         ;place storing prom's version number
+
+        move.l  (SP)+,a0                ;get return address
+        move.w  prom_sn,(SP)            ;return version number
+        jmp     (a0)                    ;return
+
+
+
+        .def    DISP_MESSAGE
+       ;*************************************************************)
+       ;*  procedure DISP_MESSAGE(      row, col : integer;
+       ;*                           var jingo    : e_name;
+       ;*                               err      : integer);
+       ;*
+       ;* Description:
+       ;*    Display a message (using prom facilities) on the alternate screen.
+       ;*
+       ;* Input Parameters:
+       ;*   Row - where the message starts
+       ;*   Col - column where the message starts
+       ;*   Jingo - text message
+       ;*   Err - error number to be printed following the message.
+       ;*
+       ;* Note:
+       ;*   Jingo can only have upper case letters, numbers and blank chars,
+       ;*   all other characters are printed as blanks.
+       ;*
+       ;*   Also sets screen latches to alternate screen, and clears it.
+       ;*
+       ;*************************************************************)
+disp_message
+prom_message    equ     $fe0088 ;address of prom's display string facility
+prom_value      equ     $fe00b0 ;address of prom's display value facility
+
+;get parameters into known registers:
+        move.l  (SP)+,a0        ;get return adr
+        move.w  (SP)+,d0        ;d0 := err number
+        move.l  (SP)+,a2        ;a2 := address of pascal string
+        move.w  (SP)+,d1        ;d1 := starting column
+        move.w  (SP)+,d2        ;d2 := starting row
+        move.l  a0,-(SP)        ;return adr goes back on CLEAN stack
+
+        movem.l d0-d7/a3-a6,-(SP) ;save all interesting registers
+
+;clear the screen:
+        move.w  #screensize,d3  ;how much to copy
+        lsr.w   #2,d3           ; 4-bytes at a go
+        subq.l  #3,d3           ; (-1 for dbra, -2 for retrace region)
+        move.l  prom_screen,a1  ;starting where prom thinks screen is
+looper  clr.l   (a1)+
+        dbra    d3,looper
+
+;force page latches to alternate screen so writeln's will be visible
+        move.l  altscreenptr,d3 ;based on unmapped adr of alternate screen
+        add.l   prom_byte0,d3   ;adjusted for the psuedo-adr of byte 0
+        lsr.l   #8,d3
+        lsr.l   #7,d3
+        move.b  d3,vidlatch
+
+;init parameter registers and enter prom:
+        move.l  a2,a3           ;save starting string address
+        move.b  (a2),d3         ;get string length in order to satisfy
+        ext.w   d3              ; proms desire for a string terminator of 0.
+        clr.b   0(a2,d3.w)
+        adda    #1,a3           ;pass prom the addr of first char of string in a3
+        move    d2,d5
+        move    d1,d6
+        move    d6,d4           ;(establish left margin, just in case)
+        jsr     prom_message
+
+        movem.l (SP)+,d0-d7/a3-a6 ;restore AND re-save registers (ie,
+        movem.l d4-d7/a3-a6,-(SP) ; those promised to be preserved by pascal)
+
+;pass row/col/errnumb parameters to the prom:
+        move    d2,d5           ;pass row and
+        mulu    #10,d5          ;   (adjust row to be specified in pixels)
+        move    d1,d4           ;   (establish left margin, just in case)
+        move    d1,d6           ; column, AS FUNCTION OF THE PREVIOUS STRING.
+        move.b  (a2),d1
+        ext.w   d1
+        add     d1,d6
+        jsr     prom_value      ; (error number is already in d0)
+
+        movem.l (SP)+,d4-d7/a3-a6 ;restore registers
+        rts                     ;return
+
+
+
+        .def    DISP_ERROR
+       ;*************************************************************)
+       ;* PROCEDURE DISP_ERROR(errnum : integer);
+       ;*
+       ;* Description:
+       ;*    Display the error number and re-enter boot prom
+       ;*
+       ;*************************************************************)
+adr_ioboard     equ      $fcc031;  ;stores whether ioboard is a lisa:
+                                   ;   >= 0 means lisa
+                                   ;   <  0 means some sort of pepsi
+pepsi_icon:
+          .BYTE $0C,$03,$C0,$07,$80,$02,$E0,$03
+          .BYTE $0E,$80,$02,$DF,$FF,$FF,$00,$F6
+          .BYTE $C0,$07,$B7,$FF,$FF,$DB,$E0,$00
+          .BYTE $0C,$B7,$FF,$E7,$DB,$B0,$01,$ED
+          .BYTE $50,$FF,$F7,$6F,$80,$1B,$07,$04
+          .BYTE $6F,$80,$0D,$80,$05,$BF,$80,$41
+          .BYTE $06,$C0,$05,$BF,$80,$03,$10,$60
+          .BYTE $0E,$FF,$80,$01,$B0,$0B,$0F,$D8
+          .BYTE $26,$03,$80,$E3,$6C,$6C,$FF,$08
+          .BYTE $36,$C8,$FF,$01,$FF,$ED,$70,$40
+          .BYTE $03,$80,$0C,$FF,$F9,$20,$30,$00
+          .BYTE $07,$FF,$F9,$3F,$FF,$E0,$03,$FF
+          .BYTE $00,$F6,$DF,$FF,$C0,$03,$FF,$F6
+          .BYTE $DF,$00,$FF,$E0,$07,$FF,$DB,$B7
+          .BYTE $FF,$F0,$61,$AA,$CE,$E6,$95,$FF
+          .BYTE $18,$3F,$F9,$9F,$5E,$7F,$FE,$86
+          .BYTE $1F,$09,$EA,$AD,$95,$20,$F8,$06
+          .BYTE $C0,$06,$C0,$DB,$FB,$00,$7F,$FD
+          .BYTE $BF,$F0,$35,$ED,$FF,$FF,$B0,$6F
+          .BYTE $E0,$1B,$36,$D8,$2C,$0D,$EC,$6C
+          .BYTE $06,$D8,$CB,$36,$03,$30,$32,$1B
+          .BYTE $01,$E0,$0E,$80
+lisa_icon:
+          .BYTE $0C,$03,$C0,$07,$80,$02,$E0,$03 ;compressed data for 'system error'
+          .BYTE $0E,$80,$02,$BF,$FF,$FF,$00,$FA ;   icon (picture of lisa with
+          .BYTE $C0,$07,$D7,$FF,$FF,$D7,$E0,$00 ;   an 'X' across it)
+          .BYTE $0C,$AF,$FF,$E0,$6C,$30,$01,$F5
+          .BYTE $50,$FF,$F0,$DF,$80,$1B,$03,$86
+          .BYTE $AF,$0D,$80,$01,$7F,$41,$06,$C0
+          .BYTE $06,$C7,$80,$03,$18,$60,$0D,$80
+          .BYTE $01,$B0,$0B,$0F,$D8,$36,$0F,$80
+          .BYTE $E3,$6C,$6F,$F7,$08,$36,$DB,$F7
+          .BYTE $01,$FF,$EB,$B0,$40,$0F,$80,$0C
+          .BYTE $FF,$FD,$E0,$30,$00,$07,$FF,$FA
+          .BYTE $BF,$FF,$E0,$03,$FF,$00,$F7,$5F
+          .BYTE $FF,$C0,$03,$FF,$FB,$BF,$00,$FF
+          .BYTE $C0,$07,$FF,$D6,$D7,$FF,$E0,$61
+          .BYTE $AA,$6E,$ED,$2A,$FE,$18,$DF,$F7
+          .BYTE $3E,$5D,$BF,$FB,$86,$3E,$0B,$6A
+          .BYTE $AD,$AA,$20,$F8,$06,$C0,$06,$C0
+          .BYTE $DB,$FD,$00,$7F,$FD,$7F,$E0,$35
+          .BYTE $EB,$FF,$FF,$B0,$AF,$C0,$1B,$36
+          .BYTE $D8,$2C,$0D,$EC,$6C,$06,$D8,$CB
+          .BYTE $36,$03,$30,$32,$1B,$01,$E0,$0E
+          .BYTE $80,0
+disp_error
+        move.l  mainscreenptr,d0        ;tell prom where the main screen is,
+        move.l  d0,prom_screen          ;  in unmapped terminology
+        lea     pepsi_icon,a2           ;Choose appropriate icon:
+        move.b  adr_ioboard,d0          ;  use a pepsi system error icon,
+        bmi.s   is_pepsi
+        lea     lisa_icon,a2            ;  or use the lisa icon.
+is_pepsi
+        suba.l  a3,a3                   ;no messages
+        move.l  (SP)+,d1                ;TOSS return address
+        move.w  (SP)+,d1                ;get the error number
+        move    #$2700,d0               ;get to sup stack, with ints off:
+        lea     *+6,a0                  ;get return address for trap 7
+        trap    #7                      ; (puts d0 into SR)
+        move    d1,d0                   ;prom wants error number in d0
+        move    #-1,$10000              ;turn off debug mode for next boot, if any.
+        jmp     prom_monitor            ;BYE-BYE time
+
+
+
+     .proc count_span
+   ;******************
+   ;*
+   ;* function COUNT_SPAN(base: bitmapptr;
+   ;*                  search_start,
+   ;*                  search_leng: longint;
+   ;*                  want_value:boolean) : longint;
+   ;*
+   ;* Description:
+   ;*    Counts the number of contiguous cells of a (packed) bit array with
+   ;*    a given value, from a SINGLE position, up to a maximum/desired number.
+   ;*
+   ;* Input Parameters:
+   ;*    Base - Address of the bit array.  The bit array must be declared to
+   ;*             index from 0, but the maximum isn't important here.
+   ;*    Search_start - Index of cell where count starts.
+   ;*    Search_length - Maximum number of cells to examine.
+   ;*    What_value - Value of cells that qualify for counting.
+   ;*
+   ;* Output Parameter:
+   ;*    Count_span - returns the actual number found at that position.
+   ;*
+   ;*
+   ;* Implementation:
+   ;*
+   ;*     label 5, 10, 15;
+   ;*     type byte = -128..127;
+   ;*     var
+   ;*        count: longint;
+   ;*        byte_value : byte;
+   ;*        itsy: ^byte;           {pointer for accessing bit array as a byte array}
+   ;*     begin
+   ;*        count := 0;
+   ;*       {calculate byte value for byte-sized consecutive want_value's}
+   ;*        if want_value then byte_value := -128 else byte_value := 0;
+   ;*        if (search_start mod 8 = 0) {on byte boundary} then goto 10;
+   ;*     5:
+   ;*      {check a bit at a time until enough found, search failed,
+   ;*                  or get to page boundary}
+   ;*        repeat
+   ;*           if (base^[search_start]<>want_value) then goto 15;
+   ;*           count := count+1;
+   ;*           if (count=search_leng) then goto 15;
+   ;*           search_start := search_start+1;
+   ;*        until (search_start mod 8 = 0);
+   ;*     10:
+   ;*      {check for entire bytes of hits}
+   ;*        itsy := pointer(ord4(base) + (search_start DIV 8) );
+   ;*        repeat
+   ;*           if (itsy^<>byte_value) then
+   ;*              goto 5; {to claim smaller chunks in last byte}
+   ;*           count := count + 8;
+   ;*           search_start := search_start + 8;
+   ;*           itsy := pointer(ord4(itsy) + 1);
+   ;*        until  count>=search_leng;
+   ;*        if count>search_leng then count := search_leng; {found more than wanted}
+   ;*     15:
+   ;*        count_span := count;
+   ;*     end; {of count_span}
+   ;*
+   ;*
+   ;* Implementation Notes:
+   ;*   Labels and 'system programming' are appropriate in the pascal code, above,
+   ;*   since it's a pascal DESCRIPTION of an assembler function.  (The description
+   ;*   was tested before the assembler was coded.)
+   ;*
+   ;*   This implementation is supposed to be called for LONG searches, ie
+   ;*   when you need a byte of more of booleans.  It's optimized for
+   ;*   that situation, but isn't too bad for requests of less, either.
+   ;*
+   ;*   The pascal representation of packed array of boolean is stored in
+   ;*   sequential bytes.  It looks like this:
+   ;*
+   ;*   bit number:      7  6  5  4  3  2  1  0
+   ;*                  +------------------------+
+   ;*   array element  ! 7  6  5  4  3  2  1  0 ! <--- array base (byte adr)
+   ;*                  !15 14 13 12 11 10  9  8 !
+   ;*                  !                     16 !
+   ;*                  !        etc.            !
+   ;*                  +------------------------+
+   ;*
+   ;******************
+     move.l    (sp)+,a0       ;a0 := return address
+     move.b    (sp)+,d0       ;d0 := true/false search pattern       (want_value)
+     move.l    (sp)+,d1       ;d1 := search length                  (search_leng)
+     move.l    (sp)+,d2       ;d2 := search start index            (search_start)
+     move.l    (sp)+,a1       ;a1 := address of the base of the bit array  (base)
+                              ;a2 := byte alligned poker into bit array    (itsy)
+                              ;d3 := number of pages found so far         (count)
+                              ;d0 := a bit-extened want_value        (byte_value)
+                              ;a7 points to where the function return goes
+     movem.l   d4-d5,-(sp)    ; (stash needed register)
+     move.w    #7,d4          ;d4 := mask checking byte boundry(index mod 8 = 0)
+                              ; (d5 is only scratch register)
+     clr.l     d3             ;count := 0;
+     btst      #0,d0          ;if want_value then byte_value := -128
+     sne       d0             ;else byte_value := 0; (over-writes 'want_value')
+count_until
+     move      d2,d5          ;if (search_start mod 8 = 0) then
+     and       d4,d5
+     beq.s     count_10       ;   goto 10;
+count_5                       ;5:
+                              ;repeat
+     move.l    d2,d5          ;   if base^[search_start]
+     asr.l     #3,d5
+     btst      d2,$0(a1,d5)
+     sne       d5             ;      <> want_value then
+     cmp.b     d5,d0
+     bne.s     count_15       ;         goto 15;
+     addq.l    #1,d3          ;   count := count + 1;
+     cmp.l     d1,d3          ;   if count=search_leng then
+     beq.s     count_15       ;      goto 15;
+     addq.l    #1,d2          ;   search_start := search_start + 1;
+     bra.s     count_until    ;until search_start mod 8 = 0; (Loop termination
+                              ;                                not quite literal.)
+count_10                      ;10:
+     move.l    a1,a2          ;itsy := base +
+     move.l    d2,d5          ;      search_start DIV 8;
+     asr.l     #3,d5
+     add.l     d5,a2
+@3                            ;repeat
+     move.b    (a2),d5        ;   if (itsy^<>byte_value) then
+     cmp.b     d0,d5
+     bne.s     count_5        ;      goto 5;
+     addq.l    #8,d3          ;   count := count + 8;
+     addq.l    #8,d2          ;   search_start := search_start + 8;
+     addq.l    #1,a2          ;   itsy := itsy + 1;
+     cmp.l     d1,d3          ;until count>=search_leng;
+     blt.s     @3
+     cmp.l     d1,d3          ;if count>search_leng then
+     ble.s     count_15
+     move.l    d1,d3          ;   then count := search_leng;
+count_15
+     movem.l   (sp)+,d4-d5    ; (restore registers)
+     move.l    d3,(sp)        ;count_span := count;
+     jmp       (a0)           ;end; {of count_span}
+
+
+
+     .def fill_span
+   ;*************************************
+   ;*
+   ;*     procedure FILL_SPAN(base: bitmapptr;
+   ;*                   fill_start,
+   ;*                   fill_length: longint;
+   ;*                   fill_value: boolean);
+   ;*
+   ;* Description:
+   ;*    Fills a range of cells of a (packed) bit array with a value.
+   ;*
+   ;* Input Parameters:
+   ;*    Base - Address of the bit array.  The bit array must be declared to
+   ;*             index from 0, but the maximum isn't important here.
+   ;*    Fill_start - Index of first cell to fill.
+   ;*    Fill_length - Number of cells to fill.
+   ;*    Fill_value - Value to fill into the array
+   ;*
+   ;*
+   ;*  Implementation:
+   ;*
+   ;*     label 5, 10;
+   ;*     type byte = -128..127;
+   ;*     var
+   ;*        byte_value : byte;
+   ;*        itsy: ^byte;           {pointer for accessing bit array as a byte array}
+   ;*     begin
+   ;*      {calculate byte value for byte-sized consecutive want_value's}
+   ;*        if fill_value then byte_value := -128 else byte_value := 0;
+   ;*        if (fill_start mod 8) = 0 then goto 10;
+   ;*     5:
+   ;*        repeat
+   ;*           if (fill_length<=0) then EXIT(fill_span);
+   ;*           base^[fill_start] := fill_value;
+   ;*           fill_length := fill_length - 1;
+   ;*           fill_start := fill_start + 1;
+   ;*        until (fill_start mod 8 = 0);
+   ;*     10:
+   ;*        itsy := pointer(ord4(base) + (fill_start DIV 8) );
+   ;*        repeat
+   ;*           if (fill_length<8) then goto 5;
+   ;*           itsy^ := byte_value;
+   ;*           fill_length := fill_length - 8;
+   ;*           fill_start := fill_start + 8;
+   ;*           itsy := pointer(ord4(itsy) + 1);
+   ;*        until false {never};
+   ;*     end; {of fill_span}
+   ;*
+   ;*
+   ;* IMPLEMENTATION NOTES:
+   ;*    See Count_span for the pascal representation of packed array of boolean.
+   ;*
+   ;*************************************
+fill_span
+     move.l    (sp)+,a0       ;a0 := return address
+     move.b    (sp)+,d0       ;d0 := true/false search pattern       (fill_value)
+     move.l    (sp)+,d1       ;d1 := fill length                    (fill_length)
+     move.l    (sp)+,d2       ;d2 := fill start index                (fill_start)
+     move.l    (sp)+,a1       ;a1 := address of the base of the bit array  (base)
+                              ;a2 := byte alligned poker into bit array    (itsy)
+                              ;d0 := a bit-extended want_value       (byte_value)
+     movem.l    d4-d6,-(sp)   ; (stash needed registers)
+                              ; (d3 is only scratch register)
+     move.w    #7,d4          ;d4 := mask checking byte boundry(index mod 8 = 0)
+     clr.l     d5             ;d5 holds handy zero (for comparing <= 0)
+     move.l    #8,d6          ;d6 := handy 8, for checking whether done with bytes
+     btst      #0,d0          ;if fill_value then byte_value := -128
+     sne       d0             ;else byte_value := 0; (over-writes 'want_value')
+fill_until
+     move      d2,d3          ;if (fill_start mod 8 = 0) then
+     and       d4,d3
+     beq.s     fill_10        ;   goto 10;
+fill_5                        ;5:
+                              ;repeat
+     cmp.l     d5,d1          ;   if fill_length<=0 then
+     ble.s     fill_exit      ;      EXIT(fill_span);
+     move.l    d2,d3          ;   base^[fill_start] := fill_value;
+     asr.l     #3,d3
+     cmp.b     d5,d0
+     beq.s     @0
+     bset      d2,$0(a1,d3)
+     bra.s     @1
+@0   bclr      d2,$0(a1,d3)
+@1   subq.l    #1,d1          ;   fill_length := fill_length - 1;
+     addq.l    #1,d2          ;   fill_start := fill_start + 1;
+     bra.s     fill_until     ;until (fill_start mod 8 = 0); (Loop termination not
+                              ;                                  quite literal.)
+fill_10                       ;10:
+     move.l    a1,a2          ;itsy := base + (fill_start DIV 8);
+     move.l    d2,d3
+     asr.l     #3,d3
+     add.l     d3,a2
+                              ;repeat
+@3   cmp.l     d6,d1          ;   if (fill_length<8) then
+     blt.s     fill_5         ;      goto 5;
+     move.b    d0,(a2)        ;   itsy^ := fill_value;
+     subq.l    #8,d1          ;   fill_length := fill_length - 8;
+     addq.l    #8,d2          ;   fill_start := fill_start + 8;
+     addq.l    #1,a2          ;   itsy := itsy + 1;
+     bra.s     @3             ;until false {never};
+fill_exit
+     movem.l   (sp)+,d4-d6    ; (restore registers)
+     jmp       (a0)           ;end; {of fill_span}
+
+
+
+        .END
+ÿ

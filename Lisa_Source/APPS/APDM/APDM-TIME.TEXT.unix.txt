@@ -1,0 +1,510 @@
+
+UNIT DmTime; { 30-June-83 }  { Copyright 1983, 1984, Apple Computer Inc. }
+
+            { This unit is called by the filer }
+
+INTERFACE
+
+USES
+     {$U HwInt       }  HwInt,
+     {$U UnitStd     }  UnitStd,
+     {$U UnitHz      }  UnitHz,
+     {$U Storage     }  Storage,
+     {$U LibOS/SysCall  }  SysCall,
+     {$U LibOS/PSysCall }  PSysCall,
+     {$U QuickDraw   }  QuickDraw,
+     {$U FontMgr     }  FontMgr,
+     {$U WM.Events   }  Events,
+     {$U WM.Folders  }  Folders,
+     {$U WM.Menus    }  Menus,
+     {$U WmlStd      }  WmlStd,
+     {$U WmlCrs      }  WmlCrs,
+     {$U WmlGrow     }  WmlGrow,
+     {$U WmlSb       }  WmlSb,
+     {$U AlertMgr    }  AlertMgr,
+     {$U PMDecl      }  PMDecl,
+     {$U PMM         }  PMM,
+     {$U PrStdInfo   }  PrStdInfo,
+     {$U PrPublic    }  PrPublic,
+     {$U ApDM/Globals }  DmGlobals,
+     {$IFC flrDebug}
+     {$U apdm/tracecalls.obj} tracecalls,
+     {$ENDC}
+     {$U FilerComm   }  FilerComm;
+
+
+{$SETC FTDebug := fDbgOk }      { <------fDbgOk------      }
+{$SETC FTSymbols := fSymOk }    { <------fSymOk------      }
+
+TYPE
+
+    TTimeStr     =  STRING[20];
+
+
+PROCEDURE InitTime(timeAlert, dateAlert: TTimeStr);        { scans timeAlert and dateAlert,
+                                                             set display offsets }
+
+
+PROCEDURE TimeToStr(currentTime:BOOLEAN; theTime:LONGINT;  { edits curTime or theTime into time/dateStr}
+                    VAR dateStr,timeStr: TTimeStr);
+
+
+IMPLEMENTATION
+
+
+{$IFC FTSymbols }
+{$D+ }
+{$ELSEC }
+{$D- }
+{$ENDC }
+
+{$IFC FTDebug }
+{$R+ }
+{$ELSEC }
+{$R- }
+{$ENDC }
+
+CONST
+
+
+   endJa = 31;           { Julian conversion aids, cumulative days             }
+   endFe = 59;
+   endMr = 90;
+   endAp = 120;
+   endMy = 151;
+   endJn = 181;
+   endJl = 212;
+   endAu = 243;
+   endSe = 273;
+   endOc = 304;
+   endNo = 334;
+   endDe = 365;
+
+{$IFC FTDebug }
+   dbgFTime     = TRUE;
+{$ELSEC }
+   dbgFTime     = FALSE;
+{$ENDC }
+
+
+VAR
+
+    errnum:        INTEGER;
+
+    hourOffset:    INTEGER;
+    minOffset:     INTEGER;
+
+    leadTOffset:   INTEGER;
+    sepTOffset:    INTEGER;
+    trailTOffset:  INTEGER;
+    ampmOffset:    INTEGER;
+
+    dayOffset:     INTEGER;
+    moOffset:      INTEGER;
+    yearOffset:    INTEGER;
+
+    firstDFOffset: INTEGER;
+    secDFOffset:   INTEGER;
+    thirdDFOffset: INTEGER;
+
+    sep1DOffset:   INTEGER;
+    sep2DOffset:   INTEGER;
+
+    leadTStr:      TTimeStr;
+    sepTStr:       TTimeStr;
+    trailT24Str:   TTimeStr;
+
+    amStr:         TTimeStr;
+    pmStr:         TTimeStr;
+
+    sep1DStr:      TTimeStr;
+    sep2DStr:      TTimeStr;
+
+    ampm24Switch:  BOOLEAN;      { TRUE: 12-hour clock }
+    showZero:      BOOLEAN;      { TRUE: zeroes are shown }
+
+
+      { State Information }
+
+    curTime:    Time_Rec;  { Result of most recent OS call, GMT, not converted   }
+    osErr:      INTEGER;
+    err:        INTEGER;
+    i:          INTEGER;
+
+       { Calendar Information }
+
+
+    julianDays: ARRAY [0..12] OF INTEGER; { Cumulative days by month              }
+    leapYear:   BOOLEAN;        { TRUE if year MOD 4 = 0                          }
+
+
+{--------------------------------------------------------------------------}
+{  JulianToMoDay                                                           }
+{--------------------------------------------------------------------------}
+
+{$S flrDm1 }
+PROCEDURE JulianToMoDay(julian: INTEGER; leapYear: BOOLEAN; VAR mo, day: INTEGER);
+VAR feb29:  BOOLEAN;
+    i:      INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF dbgFTime THEN WRITELN ('JulianToMoDay: ', julian:1);
+
+feb29 := FALSE;
+IF leapYear AND (julian > endFe)
+THEN BEGIN
+  IF julian = endFe + 1 THEN feb29 := TRUE;
+  julian := julian - 1;                           { keep in month }
+  END;
+
+i := 12;
+WHILE julianDays[i] >= julian DO i := i - 1;
+mo := i+1;
+IF feb29
+THEN day := 29
+ELSE day := julian - julianDays[i];
+
+
+IF dbgFTime THEN WRITELN ('   exit JulianToMoDay: mo is ',mo:1,', day is ',day:1);
+END;
+
+
+
+{-------------------------------------------------------------------------------}
+{   InitTime                                                                    }
+{-------------------------------------------------------------------------------}
+{$S  }
+PROCEDURE InitTime{timeAlert, dateAlert: TTimeStr};
+
+     LABEL 100;          { restart after scanned timeStr being too long }
+
+     CONST
+
+          defTimeStr =   '/://am/pm/12';     { default: US format }
+          defDateStr =   'mdy0/';            { default: US format }
+          maxTimeChar =  4;                  { for good looks in the filer }
+
+     VAR
+
+          str:           TTimeStr;
+          part:          TTimeStr;
+          tmpStr:        TTimeStr;
+          sequ:          INTEGER;
+          currOffset:    INTEGER;
+          count:         INTEGER;
+
+
+     PROCEDURE GetPart(VAR str:TTimeStr; VAR part:TTimeStr);
+     VAR  chPos:         INTEGER;
+     BEGIN
+     chPos     := POS('/', str);
+     IF chPos = 0 then
+          BEGIN
+          part := str;
+          str := '';
+          END
+     ELSE
+          BEGIN
+          part := COPY(str, 1, chPos-1);
+          DELETE(str, 1, chPos);
+          END;
+     END; { of GetPart }
+
+
+     BEGIN   { of InitTime }
+     {$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+     IF dbgFTime THEN  WRITELN('InitTime');
+
+     julianDays[0] := 0;
+     julianDays[1] := endJa;
+     julianDays[2] := endFe;
+     julianDays[3] := endMr;
+     julianDays[4] := endAp;
+     julianDays[5] := endMy;
+     julianDays[6] := endJn;
+     julianDays[7] := endJl;
+     julianDays[8] := endAu;
+     julianDays[9] := endSe;
+     julianDays[10] := endOc;
+     julianDays[11] := endNo;
+     julianDays[12] := endDe;
+
+     firstDFOffset := 0;      { offsets in dateStr }
+     secDFOffset   := 3;
+     thirdDFOffset := 6;
+
+     errnum := 0;             { scanning timeAlert and dateAlert }
+
+     count := 0;              { symbols in timeAlert without '/'-characters }
+
+     str := timeAlert;          {============ get time format =====================}
+
+     if length(str) < 7       { Mininum : 5 times '/' + 2 char's for '12' or '24' }
+     then begin errnum := errnum + 1;
+                str := defTimeStr;          { default: US format }
+          end;
+
+ 100:
+     IF dbgFTime THEN  WRITELN('   timeAlert: ', timeAlert);
+
+
+     GetPart(str, part);
+     leadTStr := part;
+
+     GetPart(str, part);
+     sepTStr := part;
+
+     GetPart(str, part);
+     trailT24Str := part;
+
+     GetPart(str, part);
+     amStr := part;
+
+     GetPart(str, part);
+     pmStr := part;
+
+     IF dbgFTime THEN  WRITELN('   str', str);
+
+     GetPart(str, part);
+     tmpStr := COPY(part,1,2);
+     if tmpStr = '12' then ampm24Switch := TRUE
+     else
+     if tmpStr = '24' then ampm24Switch := FALSE
+                              else           { default: US 12-hour clock }
+                                   BEGIN
+                                        ampm24Switch := TRUE;
+                                        errnum := errnum + 4;
+                                   END;
+
+     IF dbgFTime THEN  WRITELN('   errnum:', errnum);
+
+     if ampm24Switch then if length(pmStr) > length(amStr)
+                             then count := length(pmStr)
+                             else count := length(amStr)
+                     else count := length(trailT24Str);
+     count := count + length(leadTStr) + length(sepTStr);
+     if count > maxTimeChar then begin str := defTimeStr;
+                                       errnum := errnum + 2;
+                                       goto 100;
+                                 end;
+
+     IF dbgFTime THEN  WRITELN('   count:', count);
+
+     str := dateAlert;         { ==============get date format======== }
+
+     if (length(str) < 3) or (length(str) > 5) then str := defDateStr;
+                                                       { default: US date format  }
+     if length(str) = 3 then str := CONCAT(str, '  '); { add lost 'Run Alert' blanks }
+     if length(str) = 4 then str := CONCAT(str, ' ');
+
+     tmpStr := COPY(str, 1, 3);
+
+     IF dbgFTime THEN  WRITELN('   dateAlert:', dateAlert);
+
+     sequ := 0;
+     if (tmpStr = 'dmy') then sequ := 1;
+     if (tmpStr = 'mdy') then sequ := 2;
+     if (tmpStr = 'ymd') then sequ := 3;
+     if (tmpStr = 'DMY') then sequ := 1;
+     if (tmpStr = 'MDY') then sequ := 2;
+     if (tmpStr = 'YMD') then sequ := 3;
+     if sequ = 0 then
+          begin errnum := errnum + 8;
+                sequ := 2;              { default: US format }
+          end;
+
+     tmpStr := COPY(str, 4, 1);          { showZero }
+     if (tmpStr = '0') or
+        (tmpStr = 'O') or
+        (tmpStr = 'o') or
+        (tmpStr = 'y') or
+        (tmpStr = 'Y')
+     then showZero := true
+     else if (tmpStr = ' ') or
+             (tmpStr = 'n') or
+             (tmpStr = 'N')
+          then showZero := false
+          else begin errnum := errnum + 16;
+                     showZero := true;     { default: ISO-Standard shows zeroes }
+               end;
+
+     IF dbgFTime THEN  WRITELN('   errnum:', errnum);
+
+     tmpStr := COPY(str, 5, 1);
+     sep1DStr := tmpStr;
+     sep2DStr := tmpStr;
+
+                                           { calculate time offsets }
+
+     currOffset := 0;
+
+     leadTOffset := currOffset;
+     if length(leadTStr) > 0 then currOffset := currOffset + length(leadTStr) + 1;
+
+     hourOffset := currOffset;
+     currOffset := currOffset + 2;
+                                        { => 1 blank in front of hours' display
+                                             2 spaces for hours }
+
+     sepTOffset := currOffset;
+     currOffset := currOffset + length(sepTStr);
+
+     minOffset := currOffset;
+     currOffset := currOffset + 3;     { 2 spaces for minutes
+                                         1 trailing blank }
+
+
+     trailTOffset := 0;
+     ampmOffset := 0;
+     if ampm24Switch then ampmOffset := currOffset
+                     else trailTOffset := currOffset;
+
+     {$IFC FTDebug }
+     IF dbgFTime THEN  WRITELN('   hourOffset:', hourOffset);
+     IF dbgFTime THEN  WRITELN('   minOffset:', minOffset);
+     IF dbgFTime THEN  WRITELN('   trailTOffset:', trailTOffset);
+     IF dbgFTime THEN  WRITELN('   ampmOffset:', ampmOffset);
+     {$ENDC }
+                                       { ======== calculate date offsets ======= }
+
+     sep1DOffset := secDFOffset - 1;
+     sep2DOffset := thirdDFOffset - 1;
+
+     CASE sequ OF
+     1:   begin dayOffset  := firstDFOffset;
+                moOffset   := secDFOffset;
+                yearOffset := thirdDFOffset;
+          end;
+
+     2:   begin moOffset  := firstDFOffset;
+                dayOffset   := secDFOffset;
+                yearOffset := thirdDFOffset;
+          end;
+
+     3:   begin yearOffset  := firstDFOffset;
+                moOffset   := secDFOffset;
+                dayOffset := thirdDFOffset;
+          end;
+
+     OTHERWISE  begin
+                end;
+
+     END; { CASE sequ }
+
+     {$IFC FTDebug }
+     IF dbgFTime THEN  WRITELN('   dayOffset:', dayOffset);
+     IF dbgFTime THEN  WRITELN('   moOffset:', moOffset);
+     IF dbgFTime THEN  WRITELN('   yearOffset:', yearOffset);
+
+     IF dbgFTime THEN  WRITELN('exit InitTime');
+     {$ENDC }
+
+     END; { PROCEDURE InitTime }
+
+
+{--------------------------------------------------------------------------}
+{  TimeToStr                                                               }
+{--------------------------------------------------------------------------}
+{$S flrDm1 }
+PROCEDURE TimeToStr{currentTime:BOOLEAN; theTime:LONGINT;
+                    VAR dateStr,timeStr: TTimeStr};
+
+VAR i:        INTEGER;
+    mo:       INTEGER;
+    day:      INTEGER;
+    osErr:    INTEGER;
+    strVal:   NumberStr;
+    date:     DateArray;
+    curTime:  Time_Rec;
+
+  PROCEDURE InsertStr (VAR str:TTimeStr; offset: INTEGER);
+  VAR i:    INTEGER;
+      lgth: INTEGER;
+  BEGIN
+  lgth := LENGTH(strVal);
+  FOR i := 1 TO lgth
+  DO str[offset+2+i-lgth] := strVal[i];
+  END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF dbgFTime THEN WRITELN ('TimeToStr');
+
+                              { == bring invariant char's into edit string ===== }
+
+
+IF LENGTH(leadTStr) > 0 THEN timeStr := CONCAT(leadTStr, '   ', sepTstr, '  ')
+                        ELSE timeStr := CONCAT('  ', sepTstr, '  ');
+
+IF (NOT ampm24Switch) AND (LENGTH(trailT24Str) > 0)
+     THEN timeStr := CONCAT(timeStr, ' ', trailT24Str);
+
+dateStr := CONCAT('  ',sep1DStr, '  ', sep2DStr, '  ');
+
+
+                              { =============  convert OS time =========== }
+
+IF currentTime
+THEN Get_Time (osErr, curTime)
+ELSE BEGIN
+  TimeToDate(theTime,date);
+  curTime.year := date.year-1900;
+  curTime.day := date.day;
+  curTime.hour := date.hour;
+  curTime.minute := date.minute;
+  curTime.second := date.second;
+  END;
+Convert_Time (osErr, curTime, curTime, FALSE{gmt to local});
+leapYear := ((curTime.year MOD 4) = 0);
+IF dbgFTime THEN WRITELN ('   LeapYear is ',leapYear);
+IF ampm24Switch THEN
+BEGIN
+IF curTime.hour > 11
+THEN BEGIN
+  strVal :=  pmStr;
+  IF curTime.hour > 12 THEN curTime.hour := curTime.hour - 12;
+  END
+ELSE BEGIN
+  IF curTime.hour = 0 THEN curTime.hour := 12;
+  strVal := amStr;
+  END;
+IF dbgFTime THEN WRITELN ('   set am/pm: ',strVal);
+IF LENGTH(strVal) > 0 THEN timeStr := CONCAT(timeStr, ' ', strVal);
+END;
+
+IntToStr (curTime.hour, strVal);
+IF dbgFTime THEN WRITELN ('   set hour: ',strVal);
+InsertStr (timeStr, hourOffset);
+
+IntToStr (curTime.minute, strVal);
+IF dbgFTime THEN WRITELN ('   set minute: ',strVal);
+InsertStr (timeStr, minOffset);
+IF timeStr[minOffset+1] = ' ' THEN timeStr[minOffset+1] := '0';
+
+JulianToMoDay (curTime.day, leapYear, mo, day);
+IntToStr (mo, strVal);
+IF dbgFTime THEN WRITELN ('   set month: ',strVal);
+InsertStr (dateStr, moOffset);
+IF showZero and (dateStr[moOffset+1] = ' ') THEN dateStr[moOffset+1] := '0';
+
+IntToStr (day, strVal);
+IF dbgFTime THEN WRITELN ('   set day: ',strVal);
+InsertStr (dateStr, dayOffset);
+IF showZero and (dateStr[dayOffset+1] = ' ') THEN dateStr[dayOffset+1] := '0';
+
+IntToStr (curTime.year, strVal);
+DELETE (strVal, 1, LENGTH(strVal)-2);
+IF dbgFTime THEN WRITELN ('   set year: ',strVal);
+InsertStr (dateStr, yearOffset);
+IF showZero and (dateStr[yearOffset+1] = ' ') THEN dateStr[yearOffset+1] := '0';
+
+
+IF dbgFTime THEN WRITELN ('   exit TimeToStr');
+END;
+
+END.
+
+
+ÿ

@@ -1,0 +1,1338 @@
+
+                            {'Copyright 1983, 1984, Apple Computer Inc.'}
+
+(***************************************.*******.********************************************************
+   rstr - converts a real value NUMBER into a string RESULT.  if DATAINREG is true, the
+          number to be converted is taken from FP register 0 and NUMBER is not looked
+          at all.  The conversion is dictated by the current FORMAT code number and
+          NUMDIGITS passed to the routine.  The format can be as follows:
+             0  - fixed point with overflow into scientific notation.  if the
+                  number is outside the usable range, return display overflow.
+             1  - scientific notation with fixed # of digits after decimal
+                  with DECPLACES = # of digits
+             2  - integer rounding
+             3  - fixed # digits after decimal with DECPLACES = # of digits
+             4  - integer rounded money, with (no $ or ,)
+             5  - integer rounded money, with commas (no $)
+             6  - integer rounded money, with dollar sign (no ,)
+             7  - integer rounded money, with dollar sign and commas
+             8  - money, with (no $ or ,)
+             9  - money, with commas (no $)
+             10 - money, with dollar sign (no ,)
+             11 - money, with dollar sign and commas
+             12 - special formatting used for money values in the formula display
+             13 - special formatting used for values with overflow into scientific
+                  format with no display overflow (similar to format 0).
+             14 - similar to format 13 except a dollar sign is put in the begining.
+             15 - similar to format 13 except that values less than VofTenths will be displayed
+                  in scientific notation.
+          A flag, SCIENTIFIC is returned which is true if the value had to be displayed
+          in scientific notation instead the notation state by FORMAT.
+****************************************.*******.*******************************************************)
+(*$S x80format *)
+procedure rstr
+  (* number         : extended;                 {the number to be formatted}
+     var result     : resultStr;                {the resulting string}
+     decplaces,                                 {# digits to the right of the dec. pt}
+     format         : byte;                     {format code number}
+     numDigits      : integer;                  {# digits desired}
+     var scientific : boolean                   {value was displayed in sci. notation? }
+  *);
+type FP_format = (FP_e, FP_i, FP_f, FP_lisa, FP_zero);
+var spot       : integer;                       {index into RESULT}
+    fixpoint   : boolean;                       {displayed in fixed point? }
+    error      : boolean;                       {formatting error occured? }
+    sgn        : integer;                       {sgn during a class check}
+
+    (*
+       search - searches the RESULT string looking for a specific character CH
+                and returning true if CH was found with POSITION set to the index
+                from the start of the string.
+    *)
+    (*$S x80format *)
+    function search(ch : char; var position : integer) : boolean;
+    var done : boolean;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       position := length(result) + 1;
+       repeat
+          position := position - 1;
+          done     := (result[position] = ch)
+       until done or (position = 1);
+       search := done
+    end;
+
+
+    (*
+       dodollar - places a dollar sign infront of the RESULT string if the
+                  result is not in scientific notation.
+    *)
+    (*$S x80format *)
+    procedure dodollar;
+    var ch : str80;
+        x  : integer;
+        pt : integer;
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if fixpoint then begin
+          if dataFormat.dSignPos then begin
+             pt := 1;
+             ch := '';
+             for x := 1 to Cmin(sizeof(result)-2, numDigits-length(result)) - length(dataFormat.dSign) do ch := concat(ch, ' ');
+             insert(ch, result, 1)
+          end
+          else pt := length(result) + 1;
+          insert(dataFormat.dSign, result, pt)
+       end
+    end;
+
+
+    (*
+       donegative - inserts the negative sign around the value if < 0
+    *)
+    (*$S x80format *)
+    procedure donegative;
+    var ch : string[1];
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if fixpoint then begin
+          ch := ' ';
+          if result[1] = '-' then
+             if length(dataFormat.dollarBracket) = 2 then begin
+                result[1] := dataFormat.dollarBracket[1];
+                ch[1] := dataFormat.dollarBracket[2]
+             end;
+          result := concat(result, ch)
+       end
+    end;
+
+
+    (*
+       docomma - inserts commas into the RESULT string if the result is
+                 not in scientific notation.
+    *)
+    (*$S x80format *)
+    procedure docomma;
+    var sPos     : integer;                     {position to s at}
+        spacepos : integer;                     {position of first space to the left}
+        pos      : integer;                     {current position}
+        ch       : string[1];
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       if fixpoint then begin
+          if not search(dataFormat.decPt, pos) then pos := length(result) + 1;
+          ch    := ' ';
+          ch[1] := dataFormat.tSep;
+          sPos  := ord(result[1] = '-');
+          if not search(' ', spacepos) then spacepos := sPos;
+          while pos - 3 > sPos do begin
+             pos := pos - 3;
+             if pos > spacepos+1 then insert(ch, result, pos)
+          end
+       end
+    end;
+
+
+    (*
+       formatnumber - determines if the conversion to string was successful.  If not,
+                      sets the scientific notation  & error flag if FORMAT is set for
+                      for default or special formatting.  The RESULT string is
+                      removed of possible trailing blanks and is left justified.
+    *)
+    (*$S x80format *)
+    procedure formatnumber(width, before, after : integer; nFormat : FP_Format);
+    var spot       : integer;
+        myFormat   : free_format;
+        mystr      : decstr;
+        myDecForm  : DecForm;
+        myDecimal  : Decimal;
+        absXnumber : extended;
+        expStr     : resultStr;
+        decPtStr   : string[1];
+        eSign      : string[2];
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       ClearXcps;
+       if nFormat = FP_lisa then begin
+          with myFormat do begin
+             maxsig      := 14;
+             trail_point := false;
+             int_eform   := false;
+             plus_eform  := false;
+
+             {this is a Kludge in order to determine if number >= 1}
+             spot := number[0];
+             if spot < 0 then spot := spot + $8000;        {remove sign of x}
+             spot := spot - $3fff;                         {remove bias}
+             sig_fform   := (spot >= 0)
+          end;
+          if ClassX(number, sgn) = zero then myStr := '0'
+          else fp_free_ascii(number, width, myFormat, mystr);
+          error  := (mystr[1] = '?')
+       end
+       else begin
+               with myDecForm do begin
+                  if nFormat = FP_e then style := FloatDecimal
+                  else style := FixedDecimal;
+                  digits := after
+               end;
+               X2Dec(myDecForm, number, myDecimal);
+               with myDecimal do begin
+                  if sgn = 0 then result := ''
+                  else result := '-';
+                  case sig[1] of
+                     '?' : error   := true;
+                     '0' : nFormat := FP_zero
+                  end;
+                  decPtStr    := '.';
+                  decPtStr[1] := dataFormat.decpt;
+
+                  case nFormat of
+                     FP_e    : begin
+                                  spot := length(sig) + exp - 1;
+                                  SfromN(expStr, abs(spot), 10, '0');
+                                  if spot >= 0 then eSign := 'E+'
+                                  else eSign := 'E-';
+                                  myStr := concat(result, copy(sig, 1, 1), decPtStr, copy(sig, 2, length(sig) - 1), eSign, expStr)
+                               end;
+                     FP_zero : begin
+                                  if after = 0 then myStr := '0'
+                                  else myStr := '0.0';
+                                  for spot := 2 to after do myStr := concat(myStr, ' ')
+                               end;
+                     otherwise if exp >= 0 then begin
+                                  myStr := concat(result, sig);
+                                  for spot := 1 to exp do myStr := concat(myStr, '0');
+                                  if nFormat = FP_f then myStr := concat(myStr, decPtStr)
+                               end
+                               else if -exp < length(sig) then begin
+                                       myStr := concat(result, sig);
+                                       insert(decPtStr, myStr, length(sig) + exp + 1 + sgn)
+                                    end
+                               else begin
+                                       myStr := concat(result, decPtStr);
+                                       for spot := 1 to -(length(sig) + exp) do myStr := concat(myStr, '0');
+                                       myStr := concat(myStr, sig)
+                                    end
+                  end
+               end
+            end;
+       if length(myStr) < sizeof(result) - 1 then result := myStr
+       else error := true;
+
+
+(*$IFC DEBUGVERSION *)
+       if debug[18] then begin
+          writeln('FPmoveP: ',result,' f,w,b,a,nF,err: ',format:1,',',width:1,',',before:1,',',after:1,',');
+          write('exc: ',wexc,'  ');
+          case nFormat of
+             FP_lisa : with myFormat do write('FP_Lisa  ',maxSig:1,' ',sig_fform,' ',trail_point,' ',
+                       int_eForm,' ',plus_eform,'  ');
+             FP_e    : write('FP_e');
+             FP_i    : write('FP_i');
+             FP_f    : write('FP_f');
+          end;
+          if nFormat <> FP_lisa then begin
+             with myDecForm do
+                write('  style: ',ord(style):1,'  digits: ',digits:1);
+             with myDecimal do
+                write('  sgn: ',sgn:1,'   exp:  ',exp:1,'   sig: ',sig);
+             writeln
+          end;
+          writeln('  FPresult(',length(result):1,'): ',result)
+       end;
+(*$ENDC *)
+       if error and ((format = 0) or (format = 12)) then begin
+          scientific := true;
+          result := '*'
+       end
+       else begin
+               scientific := scientific or  search('E', spot);
+               if search('.', spot) then result[spot] := dataformat.decPt
+            end;
+
+       if scientific and (format = 0) then begin
+          absXnumber := number;
+          AbsX(absXnumber);
+          if RelX(absXnumber, VofTens) <> GT then begin
+             scientific := false;
+             error      := true;
+             result     := '*'
+          end
+       end
+    end;
+
+(*$S x80format *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   fixpoint   := true;
+   error      := false;
+   scientific := (format = 1);
+   case format of
+      1    : begin
+                fixpoint := false;
+                formatnumber(numDigits, 1, decplaces + 1, FP_e)
+             end;
+      2    : formatnumber(numDigits, numDigits, 0, FP_i);
+      3    : formatnumber(numDigits, numDigits-decplaces-2, decplaces, FP_f);
+      4,5,6,
+      7    : begin
+                formatnumber(numDigits, numDigits, 0, FP_i);
+                if not error then begin
+                   if odd(format) then docomma;
+                   donegative;
+                   if format >= 6 then dodollar
+                 end
+             end;
+      8,9,10,
+      11   : begin
+                formatnumber(numDigits, numDigits-2-2, 2, FP_f);
+                if odd(format) then docomma;
+                donegative;
+                if format >= 10 then dodollar
+             end;
+      12   : begin
+                if ClassX(number, sgn) <> zero then begin
+                   formatnumber(maxDecPlaces, 4, 2, FP_f);
+                   if numDigits < 0 then docomma;
+                end
+                else result := '0.00';
+                numDigits := length(result)
+             end;
+      14   : begin
+                formatnumber(numDigits, 0, 0, FP_lisa);
+                if dataFormat.dSignPos then result := concat(dataFormat.dsign, result)
+                else result := concat(result, dataFormat.dsign)
+             end;
+      15   : if ClassX(number, sgn) = zero then result := '0'
+             else if RelX(number, VofTenths) = LT then formatnumber(numDigits, 1, FPaccurracy, FP_e)
+             else formatnumber(numdigits, 0, 0, FP_lisa);
+      otherwise
+             formatnumber(numDigits, 0, 0, FP_lisa)
+   end;
+
+   {determine if the whole string can be displayed}
+   if (length(result) > numDigits) or (length(result) = 0) then error := true;
+
+   {if a formatting error exist, return a string of stars out to the number
+    of requested digits NUMDIGITS
+   }
+   if error then begin
+      for spot := 1 to numDigits do result[spot] := '*';
+      result[0] := chr(numDigits)
+   end
+(*$IFC DEBUGVERSION *)
+   ;if debug[18] then writeln('   RSTR result: ',result)
+(*$ENDC *)
+end;
+
+
+(***************************************.*******.********************************************************
+   WRITE ROUTINES - these routines allows a text string to be created from either
+                    text, numbers, lexemes or coordinates and store them  in the
+                    message buffer supplied by the user.
+
+        "startwrite"    - initializes the user supplied meesage buffer.  The user
+                          passes a ptr to the message buffer MESSAGE and the maximum
+                          number of character to be put there MAXLEN.
+        "writechar"     - inserts a single character CH
+        "writestring"   - inserts a string of characters MESSAGE
+        "writeword"     - inserts the word from the WORD array for a given LEXEME
+        "writenum"      - inserts a NUMBER in fixed format
+        "writefnum"     - inserts a formatted NUMBER with 2 digits after the decimal
+                          point with the possible addition of commas (DOCOMMAs)
+        "writecoord"    - inserts a coordinate COORD
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure writechar(* ch : char *);
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   if messagelen < messagemax - 1 then begin
+      messagelen := messagelen + 1;
+      messageptr^[messagelen] := ord(ch)
+   end
+end;
+
+
+(*$S compile *)
+procedure startwrite(* message : ptrData; maxlen : integer *);
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   messageptr := message;
+   messagemax := maxlen;
+   messagelen := -1
+end;
+
+
+(*$S compile *)
+procedure writestring(* message : str80 *);
+var x : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   for x := 1 to length(message) do writechar(message[x])
+end;
+
+
+(*$S compile *)
+procedure writeword(* lexeme : symbol *);
+var word : str40;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   WordFromLexeme(lexeme, 40, @word);
+   writestring(word)
+end;
+
+
+(*$S compile *)
+procedure writenum(* number : extended *);
+var result : resultStr;
+    enote  : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   rstr(number, result, 0, 15, maxDecPlaces, enote);
+   writestring(result)
+end;
+
+
+(*$S compile *)
+procedure writefnum(* number : extended; docommas : boolean *);
+var result : resultStr;
+    enote  : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   rstr(number, result, 0, 12, -ord(docommas), enote);
+   writestring(result)
+end;
+
+
+(*$S compile *)
+procedure writecoord(* coord : pident; var colwidth : integer *);
+var col1      : integer;
+    col2      : integer;
+    bias      : integer;
+    temp      : integer;
+    xRowCoord : extended;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   colwidth := messagelen;
+   col1 := (coord.start - 1) div 26;
+   col2 := coord.start mod 26;
+   bias := ord('A') - 1;
+   if col1 > 0 then writechar(chr(col1 + bias));
+   if col2 = 0 then temp := 26
+   else temp := col2;
+   writechar(chr(temp + bias));
+   colwidth := messagelen - colwidth;
+   I2X(coord.length, xRowCoord);
+   writenum(xRowCoord)
+end;
+
+
+(***************************************.*******.********************************************************
+  letterEq -
+****************************************.*******.*******************************************************)
+(*$S compile *)
+function letterEq(ch1, ch2 : integer) : boolean;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   letterEq := CompareChar(chr(ch1), chr(ch2), CompVeryWeak)
+end;
+
+
+(***************************************.*******.********************************************************
+   lookupsym - Does symbol table lookup.  Function returns an index into the FUNCNAME
+               table if the entry's name matches the identifier in ID (disregrading
+               upper/lower case differences and spaces).  If a symbol table entry is
+               not found, returns -1.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+function lookupsym(id : ident) : integer;
+label 2;
+var entry : str40;                      {function name stripped of spaces}
+    x,y   : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   if debug[0] then begin
+      write('lookingup: ');
+      writeident(id)
+   end;
+(*$ENDC *)
+
+   lookupsym := -1;
+   for x := 0 to numfunc do begin
+      WordFromLexeme(funcname[x].lexeme, 40, @entry);
+
+      {remove any spaces }
+      y := 1;
+      repeat
+         if entry[y] = ' ' then delete(entry, y, 1)
+         else y := y + 1
+      until y > length(entry);
+
+      {do comparision if the length of the two match}
+      if length(entry) = id.length then begin
+(*$IFC DEBUGVERSION *)
+         if debug[0] then writeln('comparing with: ',entry);
+(*$ENDC *)
+         for y := 1 to id.length do
+            if not(letterEQ(ord(entry[y]), ord(cChr(textline^[id.start + y - 1])))) then goto 2;
+
+         {match was found, time to get out}
+         lookupsym := x;
+         exit(lookupsym);
+      2:
+      end
+   end
+end;
+
+
+(***************************************.*******.********************************************************
+  getch - Returns the next 3 characters from the TEXTLINE.  The first
+          character is returned in the global LASTCH, the next 2 characters in
+          NEXT1CH, NEXT2CH.  If the last character has been read from the TEXTLINE,
+          further GETCH will leave LASTCH equal to the eof character (this will
+          also happen with NEXT1CH and NEXT2CH).  LASTBUFPT is the index to the
+          last character returned from the TEXTLINE.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure getch;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   if lastch <> chr(eofchar) then begin
+      lastbufpt := lastbufpt + 1;
+      lastch    := chr(eofchar);
+      if lastbufpt <= textlength - 1 then begin
+         lastch  := cChr(textline^[lastbufpt]);
+         next1ch := chr(eofchar);
+         next2ch := chr(eofchar);
+         if lastbufpt < textlength - 1 then next1ch := cChr(textline^[lastbufpt + 1]);
+         if lastbufpt < textlength - 2 then next2ch := cChr(textline^[lastbufpt + 2])
+      end
+   end
+
+(*$IFC DEBUGVERSION *)
+   ;if debug[0] and debug[4] then
+       writeln('getCh: ',lastCh,next1ch, next2ch,'  (',ord(lastch):1,',',ord(next1ch):1,',',ord(next2ch):1,')');
+(*$ENDC *)
+end;
+
+
+(***************************************.*******.********************************************************
+  CheckDollarSign - Returns true if a dollar sign is found.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+function CheckDollarSign(chgLastch : boolean) : boolean;
+var dSign   : boolean;
+    secondM : boolean;
+    thirdM  : boolean;
+    tempch  : char;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   dSign := letterEq(ord(dataformat.dsign[1]), ord(lastch));
+   if length(dataformat.dSign) < 3 then secondM := letterEq(ord(dataformat.dsign[2]), ord(next1ch));
+   if length(dataformat.dSign) = 3 then thirdM  := letterEq(ord(dataformat.dsign[3]), ord(next2ch));
+   tempch  := lastch;
+   case length(dataformat.dSign) of
+      2 : begin
+             dSign := dSign and secondM;
+             if dSign then getch;
+             if chgLastch then lastch := tempch
+          end;
+      3 : begin
+             dSign := dSign and secondM and thirdM;
+             if dSign then begin
+                getch; getch
+             end;
+             if chgLastch then lastch := tempch
+          end
+   end;
+   CheckDollarSign := dSign
+end;
+
+
+(***************************************.*******.********************************************************
+   digitprocess - constructs a real number from characters in the TEXTLINE.  Sets LASTLEXEME to be either
+                  a NUMBERop, DOLLARop, PERCENTop, CDOLLARop (dollar value punctuated with commas).
+                  Additionally, LASTVALTYPE will be set to PENNYop or RNUMBERop to signal the type of
+                  value.  LASTVALUE will be set to a real number equivalent to the value scanned.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure digitprocess(parseFlag : boolean; var lexemeCnt : integer; var posDate : boolean);
+var dsign     : boolean;                        {dollar sign present flag}
+    scram     : boolean;                        {scramble date cache}
+    commasBad : boolean;                        {comma punctuation is bad}
+    commaseen : integer;                        {comma detected flag & counter}
+    x         : integer;
+    decimalpt : integer;                        {location of the decimal point}
+    number    : resultStr;                      {conversion string}
+    i,d,e     : ptrs;                           {integer/decimal/exponent parts}
+    punc      : array [0..1] of integer;
+    puncCnt   : integer;
+    commaPt   : record
+                   inNumber : integer;             {location of the bad comma punctuation}
+                   inBuffer : integer
+                end;
+
+(*$IFC DEBUGVERSION *)
+    en        : environ;
+(*$ENDC *)
+
+    (*
+       skipdigits - skips over digits and/or commas until a non-numeric is
+                    found.  Sets PART.S to point to the start of the digit stream
+                    and PART.E to point to the end of the stream.  The digits that
+                    are skipped over are copied into the NUMBER string for later
+                    conversion (not the commas).
+    *)
+    (*$S compile *)
+    procedure skipdigits(var part : ptrs; takecommas : boolean);
+    var digitCnt : integer;
+
+        (*$S compile *)
+        procedure CheckCommas;
+        begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+           if takecommas and not commasBad then
+              if (digitCnt < 1) or (digitCnt > 3) or ((commaseen <> 0) and (digitCnt < 3)) then begin
+                 commasBad := true;
+                 commaPt.inBuffer := lastBufPt - digitCnt - 1;
+                 commapt.inNumber := messageLen
+              end
+        end;
+
+    (*$S compile *)
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       part.s   := lastbufpt;
+       digitCnt := 0;
+       while (chrclass[lastch] = digit) or (takecommas and (lastch = dataFormat.tSep)) do begin
+          if lastch <> dataFormat.tSep then begin
+             digitCnt := digitCnt + 1;
+             writechar(lastch)
+          end
+          else begin
+                  punc[puncCnt] := messageLen + 1;
+                  puncCnt       := (puncCnt + 1) mod 2;
+                  CheckCommas;
+                  commaseen     := commaseen + 1;
+                  digitCnt      := 0
+               end;
+          getch
+       end;
+       CheckCommas;
+       part.e := lastbufpt - 1
+    end;
+
+
+    (*$S dateCalc *)
+    function CheckForDate(sameAsDecPt : boolean) : boolean;
+    var bufPt    : integer;
+        tempStr  : str40;
+        sCH      : string[1];
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+       writeln(chr(7),'Check for Date: ',sameAsDecPt);
+
+      for bufPt := 0 to 5 do
+         with cacheLex[bufPt] do begin
+            lexCh := '-';
+            value.lrealVar := vofzero
+         end;
+(*$ENDC *)
+
+       Str2D(copy(number, 1, punc[0]), cacheLex[0].value.lrealvar);
+
+       if sameAsDecPt then punc[1] := length(number);
+       Str2D(copy(number, punc[0] + 1, punc[1] - punc[0]), cacheLex[2].value.lrealvar);
+
+       cacheLex[1].lexch := dataFormat.dateFormat[4];
+       cacheLex[3].lexch := dataFormat.dateFormat[4];
+       if sameAsDecPt then begin
+           bufPt   := lastBufpt;
+           tempstr := '';
+           sCH     := ' ';
+           getch;
+           while chrclass[lastch] = digit do begin
+              sCH[1]  := lastch;
+              tempStr := concat(tempStr, sCH);
+              getch
+           end
+        end
+        else tempStr := copy(number, punc[1] + 1, length(number) - punc[1] - 1);
+        Str2D(tempStr, cacheLex[4].value.lrealvar);
+
+(*$IFC DEBUGVERSION *)
+        if debug[0] and debug[4] then begin
+           write('CheckForDate: ');
+           dumpCache
+        end;
+(*$ENDC *)
+
+        if validDate(false) then begin
+           posDate   := true;
+           cacheCnt  := cacheSize;
+           lexemecnt := cacheSize + 1;
+           commaSeen := 0
+        end;
+        if (sameAsDecPt and parseFlag) or not posDate then begin
+           lastbufpt := bufpt - 1;
+           lastch    := '0';
+           getch
+        end;
+        CheckForDate := posDate
+    end;
+
+
+(*$S compile *)
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   {start up number conversion string}
+   startwrite(pointer(ord(@number) + 1), sizeof(number)-4);
+
+   {detemine if a dollar value s to be checked or plain numeric}
+   dsign       := false;
+   posDate     := false;
+   commasBad   := false;
+   commaseen   := 0;
+   decimalpt   := -1;
+   lastvaltype := RNUMBERop;
+   puncCnt     := 0;
+
+   if lastch = dataFormat.dSign[1] then begin
+      getch;
+      if (chrclass[lastch] <> digit) and not((lastch = dataFormat.decpt) and (chrclass[next1ch] = digit)) then begin
+         lastlexeme := sopchar['$'];
+         exit(digitprocess)
+      end
+      else begin
+              lastlexeme := DOLLARop;
+              dsign := true
+           end
+   end
+   else lastlexeme := RNUMBERop;
+
+   d.s := 0;
+   d.e := -1;
+   e   := d;
+   skipdigits(i, lastParseOp = PValue);  (* get integer part *)
+
+   (* check for possible decimal point *)
+   if lastch = dataFormat.decpt then begin
+      writechar('.');
+      punc[puncCnt] := messageLen + 1;
+      puncCnt       := (puncCnt + 1) mod 2;
+      decimalpt     := messagelen + 1;
+      getch;
+      skipdigits(d, false);             (* get decimal part *)
+      if (i.e < i.s) and (d.e < d.s) then begin
+         lastlexeme := sopchar['.'];
+         exit(digitprocess)
+      end
+   end;
+
+   (* check for possible exponent *)
+   if ((lastch = 'E') or (lastch = 'e')) then
+      if (chrclass[next1ch] = digit) or (((next1ch = '+') or (next1ch = '-'))
+         and (chrclass[next2ch] = digit)) then begin
+         writechar(lastch);
+         getch;
+         (* check for signed exponent *)
+         case lastch of
+            '-',
+            '+' : begin
+                     writechar(lastch);
+                     getch
+                  end
+         end;
+         skipdigits(e, false)           (* get exponent part *)
+      end;
+
+   if not dataFormat.dSignPos then
+      if CheckDollarSign(false) then begin
+         getch;
+         lastLexeme := DOLLARop;
+         dSign := true
+      end;
+
+   {convert number string to an actual real number}
+   number[0] := chr(messagelen + 1);
+
+   {scramble the date cache if a dollar sign, commas or scientific notation is used}
+   scram := ((commaSeen > 0) and (dataFormat.tSep <> dataFormat.dateFormat[4])) or dSign or (e.e >= e.s);
+   if scram then begin
+      for x := 0 to cacheSize do
+         cachelex[x].lexCH := chr(eofchar);
+      if cacheCnt = 1 then cacheCnt := 2
+      else cacheCnt := 1
+   end;
+
+   (*
+      check for possible date punctuation and set up local flags correctly if so.  The check involves:
+
+        1. The cache is empty
+
+        2. Check to see if date punctuation is equal to the decimal point character.
+           Is the last character scanned a date punctuation character (decimal point in this case) and
+           the character after that is a digit.
+           Insure that scientific notation or thousand separators or dollar signs have not been used.
+
+        3. Check to see if the date punctuation is equal to the thousands separator.
+           Does the number of thousand separators equal two for the two date separators
+
+    *)
+    if cacheCnt = 0 then
+       with dataFormat do
+          if (decpt = lastch) and (lastch = dateFormat[4]) and (chrclass[next1ch] = digit) and not scram then begin
+             if CheckForDate(true) then exit(digitProcess)
+          end
+          else if (tSep = dateFormat[4]) and (commaseen = 2) and (decimalPt < 0) then begin
+                  if CheckForDate(false) then exit(digitProcess)
+               end;
+
+   (* check for correct comma punctuation *)
+   if commaseen <> 0 then begin
+      if commasBad then begin
+         lastBufPt := commaPt.inBuffer;
+         lastch    := '0';
+         dSign     := false;
+         number[0] := chr(commapt.inNumber + 1);
+         getch
+      end;
+      if dsign then lastlexeme := CDOLLARop
+   end;
+
+   {convert number string to an actual real number}
+(*$IFC DEBUGVERSION *)
+   if debug[0] then write('DigitString: ',number);
+(*$ENDC *)
+
+   ClearXcps;
+   Str2D(number, lastvalue);
+
+(*$IFC DEBUGVERSION *)
+   if debug[0] then begin
+      writeln('  num: ',wnum(lastValue));
+      GetEnv(en);
+      dumpenv(en);
+   end;
+(*$ENDC *)
+   if TestXcp(INVALID) then lastlexeme := ERRORop
+   else if TestXcp(OVERFLOW) then lastlexeme := PINFop
+end;
+
+
+(***************************************.*******.********************************************************
+   SingleProcess - returns LASTLEXEME equal to the lexeme for the character in LASTCH.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure SingleProcess;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   lastlexeme := sopchar[lastch];
+   if lastch = '.' then
+      if lastParseOp = PValue then lastLexeme := DIVop;
+   getch
+end;
+
+
+(***************************************.*******.********************************************************
+   DualProcess - returns LASTLEXEME equal to the lexeme for the last two
+                 character operators (LASTCH, NEXT1CH) if they form a double
+                 character operator.  If they do not, calls "SingleProcess" to
+                 check for a single character operator.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure DualProcess;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   if (next1ch >= dopMin) and (next1ch <= dopMax) then begin
+      lastlexeme := dopchar[lastch, next1ch];
+      if lastlexeme <> JUNKop then begin
+         getch; getch
+      end
+      else SingleProcess
+   end
+   else SingleProcess
+end;
+
+
+(***************************************.*******.********************************************************
+   identifiers - scans the TEXTLINE until the end of the identifier
+                 is found.  LASTIDENT will be a pointer into the TEXTLINE pointing
+                 out the identifer.  While the identifier is scanned it is being
+                 checked for the possibility of being a matrix coordinate.  If it
+                 is a matrix coordinate LASTLEXEME will be set for coordinate
+                 lexeme and the coordinate stored in LASTCOORD.  Otherwise, the
+                 identifier is checked if it is in the symbol table.  If it is in
+                 the symbol table, LASTLEXEME while be set to the type of the
+                 identifier and LASTSYM will be set to point and the symbol table
+                 entry.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure identifiers;
+var seenletters : boolean;
+    seendigits  : boolean;
+    error       : boolean;
+    done        : boolean;
+    temp        : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   lastcoord.length := 0;
+   lastcoord.start  := 0;
+   lastident.length := 0;
+   lastident.start  := lastbufpt;
+   seendigits := false;
+   done       := false;
+   error      := false;
+
+   repeat
+      (* accumlate coordinate statistics *)
+      case chrClass[lastch] of
+         junk,
+         letter  : if lastch <> ' ' then begin
+                      seenletters := true;
+                      temp        := lastcoord.start * 26 + ord(lastch) mod 32;
+                      if temp <= idmax then lastcoord.start := temp
+                      else error := true
+                   end
+                   else done := true;
+         digit   : begin
+                      if seenletters and (lastident.length <= 2) then
+                         seenletters := false;
+                      seendigits  := true;
+                      temp        := lastcoord.length*10 + ord(lastch)-ord('0');
+                      if temp <= idmax then lastcoord.length := temp
+                      else error := true
+                   end;
+         otherwise done := true
+      end;
+
+      (* continue scanning until a non alphanumeric is encountered *)
+      if not done then begin
+         getch;
+         lastident.length := lastident.length + 1
+      end
+   until done;
+
+   if error then lastcoord.start := 0;
+   if seendigits and not seenletters then lastlexeme := COORDop
+   else begin
+           lastsym := lookupsym(lastident);
+           if lastsym >= 0 then begin
+              lastlexeme := funcname[lastsym].lexeme;
+              if lastlexeme = EDGEop then begin
+                 lastvalue := VofOne;
+                 lastcoord.start  := 1;
+                 lastcoord.length := 255
+              end
+              else if lastlexeme = PERCENTop then lastlexeme := IDENTop
+           end
+           else lastlexeme := IDENTop
+        end
+end;
+
+
+(***************************************.*******.********************************************************
+   lex - Reads next lexeme from the TEXTLINE being parsed and sets the following
+         global variables:
+
+            lastlexeme  : last SYMBOL scanned
+            lastcoord   : last matrix coordinate scanned
+            lastvalue   : last numeric value scanned
+            lastvaltype : the type of the last numeric value scanned
+            lastsym     : index into FUNCNAME for the last table entry scanned
+            lastident   : index to last identifier scanned from TEXTLINE
+            lastdate    : last date value scanned
+            lastParseOp : last parsing operation
+
+         any errors deteced while the lexeme is being scanned will produce
+         an error message but will not prevent further scanning.
+
+         Lex uses the following arrays to obtain information about the charaters
+         it sees:
+
+              ChrClass : character class information.  Each character belongs to a
+                         class.  The classes are those listed in letterclass.  Most
+                         characters are JUNKop's except for alphabetic characters
+                         which are of class LETTER, digit characters = DIGIT, single
+                         character operators (i.e., + - * / ) = SOPS, double character
+                         operators (i.e., <> >= ) which are of class DOPS.  "$" and
+                         "." are of class OTHER because the can be used to start a
+                         number but cannot exist by themselves.  A quotation mark (")
+                         is of a special class QUOTE which is used to quote strings
+                         of characters.  BOUNDop is of a special class ENDFILE which
+                         signals the end of the line being parsed.  To get the class
+                         information for a character, CHRCLASS is indexed by the
+                         character.
+
+              SopChar  : single character operator information.  Once a character is
+                         known to be a single character operator, the lexeme
+                         associated with the character can be obtained by indexing
+                         into SOPCHAR with the character itself.
+
+              DopChar  : double character operator information.  Once two characters
+                         are known to be a double character operator, the lexeme
+                         associated with the characters can be obtained by indexing
+                         DOPCHAR with the two characters.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure lex(operation : parseKind; var errorNum : integer);
+var quoteMode : boolean;
+    setIdent  : boolean;
+    posDate   : boolean;
+    textStart : integer;
+    lexemeCnt : integer;
+    pChar     : char;
+    x : integer;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   setIdent    := false;
+   quoteMode   := false;
+   errorNum    := ok;
+   lexemeCnt   := 0;
+   lastParseOp := operation;
+
+   repeat
+      (* skip leading blanks *)
+      while (lastch = ' ') or (lastch = chr(202)) do getch;
+      if not quoteMode then textStart := lastbufpt;
+      prevbufpt := lastbufpt;
+      pChar     := lastch;
+      posDate   := false;
+
+      (* determine class of next character and process it *)
+      case chrclass[lastch] of
+         junk,
+         letter  : if dataformat.dSignPos then begin
+                      if CheckDollarSign(true) then digitprocess(false, lexemeCnt, posDate)
+                      else identifiers
+                   end
+                   else identifiers;
+         other,
+         digit   : if (lastch <> '.') or (dataFormat.decPt = '.') then
+                      digitprocess((lastParseOp = PFormula) and not quoteMode, lexemeCnt, posDate)
+                   else SingleProcess;
+         dops    : DualProcess;
+         sops    : if (lastch = ';') and not dataFormat.useSColon then begin
+                      getch;
+                      lastLexeme := JUNKop
+                   end
+                   else if dataFormat.decPt <> lastch then SingleProcess
+                   else digitprocess(false, lexemeCnt, posDate);
+         quote   : if lastParseOp <> PCoordinate then begin
+                      quoteMode := not quoteMode;
+                      setIdent  := true;
+                      getch;
+                      if quoteMode then cachecnt := cachesize
+                      else if (lastParseOp <> PValue) and (lexemeCnt = cachesize + 1) then
+                              if validDate(true) then begin
+                                 setIdent    := false;
+                                 lastlexeme  := DATEop;
+                                 lastvaltype := DATEop
+                              end
+                   end
+                   else begin
+                           getch;
+                           errorNum := 5008
+                        end;
+         endfile : begin
+                      if quoteMode then begin
+                         errorNum := 5011;
+                         setIdent := true
+                      end
+                      else lastlexeme := BOUNDop;
+                      quoteMode  := false
+                   end
+      end;
+      if not posDate then begin
+         with cachelex[cachecnt] do begin
+            lexCH  := pChar;
+            value.lrealvar := lastvalue
+         end;
+         cachecnt  := (cachecnt + 1) mod (cachesize + 1);
+         lexemeCnt := lexemeCnt + 1
+      end;
+(*$IFC DEBUGVERSION *)
+      ;if debug[0] and debug[4] then begin
+         write('lexemeCnt: ',lexemeCnt:1,'   chr(',ord(pChar):1,'): ',pChar,'  posDate: ',posDate,'  ');
+         dumpCache
+      end;
+(*$ENDC *)
+   until not quoteMode;
+
+   if setIdent then begin
+      lastlexeme := IDENTop;
+      prevbufpt  := textStart;
+      lastident.start  := textStart + 1;
+      lastident.length := lastbufpt - textStart - 2
+   end
+
+(*$IFC DEBUGVERSION *)
+   ;if debug[0] then dumplexeme
+(*$ENDC *)
+end;
+
+
+(*$S dateCalc *)
+function LeapYear
+   (* year : integer
+   ) : integer *);
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   LeapYear := 0;
+   if year mod 4 = 0 then begin
+      LeapYear := 1;
+      if (year mod 100 = 0) and (year mod 400 <> 0) then leapYear := 0
+   end
+end;
+
+
+(***************************************.*******.********************************************************
+   packnum - takes a real value NUMBER and determines if it can be packed in to a
+             long real, short real, integer, byte or is not a number.  NUMTYPE is
+             returned as the type of the packing possible.
+****************************************.*******.*******************************************************)
+(*$S compile *)
+procedure packnum
+  (* number        : longreal;                  {number to be packed}
+     var numValue  : variantType;
+     var typeOfNum : numType                    {type of packing}
+  *);
+var xNumber    : extended;
+    sgn        : integer;
+    class      : numClass;
+    size       : fp_type;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+(*$IFC DEBUGVERSION *)
+   if debug[10] and not debug[23] then timestart(9);
+(*$ENDC *)
+
+   D2X(number, xNumber);
+   fp_size(xNumber, sgn, class, size);
+
+   case class of
+      INFINITE,
+      SNAN,
+      QNAN    : begin
+                   numValue.lrealvar := number;
+                   typeOfNum := nanKind
+                end;
+      otherwise case size of
+                   tfp_byte    : begin
+                                    X2I(xNumber, numValue.intvar);
+                                    numValue.bytevar := numValue.intvar;
+                                    typeOfNum := byteKind
+                                 end;
+                   tfp_integer : begin
+                                    X2I(xNumber, numValue.intvar);
+                                    typeOfNum := intKind
+                                 end;
+                   tfp_real    : begin
+                                    X2S(xNumber, numValue.srealvar);
+                                    typeOfNum := sRealKind
+                                 end;
+                   otherwise     begin
+                                    numValue.lrealvar := number;
+                                    typeOfNum := lRealKind
+                                 end
+                end
+   end
+
+(*$IFC DEBUGVERSION *)
+   ;if debug[10] and not debug[23] then timepeak(9);
+   if debug[3] then begin
+      writeln('PackNum:   num: ',wxnum(xNumber),'  size: ',ord(size):1,'/',ord(typeOfNum):1,'  class: ',ord(class):1);
+      writeln('byte: ',numValue.bytevar:1,'  int: ',numValue.intvar:1,'  real: ',numValue.srealvar:10:10,
+              '  long: ',wnum(numValue.lrealvar))
+   end;
+(*$ENDC *)
+end;
+
+
+(***************************************.*******.********************************************************
+   initArrays - initializes all the Lisacalc tables from a core image disk file
+                LisaCalcTables.  This form of initialization uses the block reading
+                (and writing) routines used when saving a LisaCalc matrix.  The
+                values that these arrays are initialized to can be seen in the
+                "initKeys", "initlex", and "initNaErrs" routines and any routines they
+                might call.  Note: these routines are only needed to re-write the
+                initialized values if a change is made to any of them.  MODE is used
+                to determine if the values are to be read or written out to
+                LisaCalcTables.  In the case of MODE = mmRead, the values are all read
+                in and no calls to any of the initialization routine (i.e., "initkeys')
+                need be made.  If MODE = mmWrite, all the tables should have been
+                initialized first using the initlaization routines and then written
+                out to LisaCalcTables.  The tables which are in the file are:
+
+                   words                - index into word buffer for lexemes
+                   wordLen              - length of word buffer
+                   wordBuffer           - word buffer
+                   token                - tokens for lexemes
+                   pcodesize            - # bytes for needed for eacj pcode
+                   NaErrs               -
+                   except               - parsing table: exceptions
+                   action               - parsing table:
+                   paction              - parsing table:
+                   prodgoto             - parsing table: parse state goto's
+                   lhs                  - parsing table: # elements on Left Hand Side
+                   numrhs               - parsing table: # elements on Right Hand Side
+                   chk                  - parsing table:
+                   def                  - parsing table:
+                   sopchar              - lexeme table: single character operators
+                   dopchar              - lexeme table: double character operators
+                   chrclass             - lexeme table: character classes
+                   funcname & numFunc   - lexeme table: function information
+                   monthLen             - information on the length of months
+                   VofTens              - floating point overflow constant
+                   VofTenths            - floating point
+                   VofNan               - floating point nan
+                   VofPinf              - floating point positive infinifty
+                   VofMinf              - flaoting point minus infinity
+                   VofZero              - floating point zero
+                   VofOne               - floating point one
+                   VofHalf              - floating point 0.5
+                   xVofZero             - floating point extended zero
+                   VofPI                - floating point 3.1415926...
+                   VofLOG10             - floating point ln(10)
+****************************************.*******.*******************************************************)
+(*$S initial *)
+procedure initArrays(* mode : IOmodeType; var status : integer *);
+var filename  : str40;
+    dataLen   : integer;
+    Proc_Info : ProcInfoRec;
+    wordLen   : integer;
+
+    (*$S initial *)
+    procedure stuff(ptrToData : ptrData);
+    begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+       FBufStuff(fRawData, ptrToData, dataLen, status)
+    end;
+
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   Info_Process(status, My_ID, Proc_Info);
+   if status <> 0 then begin
+{$IFC DEBUGVERSION }
+      writeln(chr(7),'Init_Process in initarrays- error: ',status:1);
+{$ENDC }
+      exit(initArrays)
+   end;
+   status := 1;
+   repeat
+      status := status + 1
+   until Proc_info.ProgPathName[status] = '-';
+   Proc_info.ProgPathName := copy(Proc_info.ProgPathName, 1, status);
+
+   if app.LisaCalc then filename := '{T3}TABLES'
+   else filename := '{T2}TABLES';
+   filename := concat(Proc_Info.progPathName, filename);
+
+(*$IFC MMINITCODE or DEBUGVERSION *)
+   if mode = mmWrite then
+      writeln('writing new tables file to: ',fileName);
+(*$ENDC *)
+
+   if mode = mmWrite then wordLen := CbDataOfH(theHeap, @WordBuffer^);
+
+   FBufInit(mode, oDisk, @filename, false, status);
+   dataLen := sizeof(words);            stuff(@words);
+   dataLen := sizeof(wordLen);          stuff(@wordLen);
+   if mode = mmRead then begin
+      WordBuffer := pointer(ord(HAllocate(theHeap, wordLen)));
+      if ord(WordBuffer) = ord(hnil) then status := OutOfMem
+   end;
+   dataLen := wordLen;                  if status <> OutOfMem then stuff(@wordBuffer^^);
+   dataLen := sizeof(token);            stuff(@token);
+   dataLen := sizeof(pcodesize);        stuff(@pcodesize);
+   dataLen := sizeof(NaErrs);           stuff(@NaErrs);
+   dataLen := sizeof(except);           stuff(@except);
+   dataLen := sizeof(action);           stuff(@action);
+   dataLen := sizeof(paction);          stuff(@paction);
+   dataLen := sizeof(prodgoto);         stuff(@prodgoto);
+   dataLen := sizeof(lhs);              stuff(@lhs);
+   dataLen := sizeof(numrhs);           stuff(@numrhs);
+   dataLen := sizeof(chk);              stuff(@chk);
+   dataLen := sizeof(def);              stuff(@def);
+   dataLen := sizeof(sopchar);          stuff(@sopchar);
+   dataLen := sizeof(dopchar);          stuff(@dopchar);
+   dataLen := sizeof(chrclass);         stuff(@chrclass);
+   dataLen := sizeof(funcname);         stuff(@funcname);
+   dataLen := sizeof(numfunc);          stuff(@numfunc);
+   dataLen := sizeof(monthLens);        stuff(@monthLens);
+   dataLen := sizeof(VofTens);          stuff(@VofTens);
+   dataLen := sizeof(VofTenths);        stuff(@VofTenths);
+   dataLen := sizeof(VofNan);           stuff(@VofNan);
+   dataLen := sizeof(VofPinf);          stuff(@VofPinf);
+   dataLen := sizeof(VofMinf);          stuff(@VofMinf);
+   dataLen := sizeof(VofZero);          stuff(@VofZero);
+   dataLen := sizeof(VofOne);           stuff(@VofOne);
+   dataLen := sizeof(VofHalf);          stuff(@VofHalf);
+   dataLen := sizeof(xVofZero);         stuff(@xVofZero);
+   dataLen := sizeof(VofPI);            stuff(@VofPI);
+   dataLen := sizeof(VofLOG10);         stuff(@VofLOG10);
+   FBufClose(status)
+(*$IFC DEBUGVERSION *)
+   ;StatusMess(status)
+(*$ENDC *)
+end;
+
+
+(*$S compile *)
+procedure CellRange
+  (* coordinate : ptrData;              {ptr to range characters}
+     numBytes   : integer;              {max # of chrs /actual # chrs returned}
+     var result : range;                {resulting range from parsing}
+     var status : integer;              {error status number}
+     var error  : errRecord             {error message information}
+  *);
+var rinfo : rgX;
+begin
+(*$IFC fTraceLC *) LogCall; (*$ENDC *)
+
+   status := ok;
+   if parse(PCoordinate, coordinate, numBytes, -1, -1, error) then begin
+      rinfo  := @eval[2];
+      result := rinfo^
+   end
+   else if error.status = BlankLine then begin
+           result.rkind   := aNullRg;
+           FixRange(result)
+        end
+   else status := ParseErr
+end;
+
+
+ÿ

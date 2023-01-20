@@ -1,0 +1,3270 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT fs_primitives;
+
+INTERFACE
+
+  USES
+
+    {$U object/driverdefs.obj }       driverdefs,
+    {$U object/hwint.obj      }       hwint,
+    {$U object/sysglobal.obj  }       globalda,
+    {$U object/procprims.obj  }       proc_prims,
+    {$U object/mmprim.obj     }       mmprimitives,
+    {$U object/asynctr.obj    }       asynctr,
+    {$U object/genio.obj      }       genio,
+    {$U object/twiggy.obj     }       twiggy,
+    {$U object/vmstuff.obj    }       vmstuff,
+    {$U object/sfileio.obj    }       sfileio,
+    {$U object/fsdir.obj      }       fs_directory;
+
+
+const
+      E_PASSWORD       =  1294;  (* password mismatch *)
+      W_NO_PASSWORD    = -1293;  (* file is not password protected *)
+      W_OS_CLOSED      = -1173;
+      W_SCAVENGED      = -1175;
+      W_LEFT_OPEN      = -1174;
+      W_DATA_ALTERED   = -1176;
+
+type {e_name = string [max_ename]; moved to driverdefs}
+
+     Str8 = string[8];
+
+     Build_Control = record
+                       release_number : integer;  (* public release number *)
+                       build_number   : integer;  (* internal build membership *)
+                       compatibility_level : integer; (* local compatibility level *)
+                       revision_level : integer;  (* iteration of file *)
+                     end;
+
+     sfcb = record
+              head     : linkage;    (* linkage to other open s-files on device *)
+              sfilenum : integer;
+              curdev   : integer;
+              curpage  : longint;    (* for pipes and system use of s-files *)
+              curoffset: integer;    (* for pipes and system use of s-files *)
+              phys_size: longint;    (* physical size in bytes *)
+              sent     : s_entry;
+              nreaders : integer;    (* number of current readers of this file *)
+              nwriters : integer;    (* number of current writers of this file *)
+              nusers   : integer;    (* number of current users of this file   *)
+              fileuid  : UID;        (* unique identifier for this file        *)
+              ftype    : filetype;   (* type of s-file this is supposed to be  *)
+              user_type : integer;   (* user-defined file type field *)
+              user_subtype : integer;(* extension to user-defined type field *)
+              system_type : integer; (* file type field for system objects *)
+              fname    : e_name;     (* entry name for this s-file             *)
+              parID    : NodeIdent;  (* identifier of parent directory object *)
+              asyncreqlink : linkage;   (* for asynchronous I/O req block*)
+              DTC      : longint;    (* date/time created            *)
+              DTA      : longint;    (* date/time last accessed      *)
+              DTM      : longint;    (* date/time last modified      *)
+              DTB      : longint; (* date/time last backup copy made *)
+              DTS      : longint;    (* date/time last scavenged     *)
+              access_ptr : absptr;   (* pointer to access list (future) *)
+              semgp    : semaphore;  (* general purpose semaphore for this s-file
+                                        - used for ui-level indivisible operation *)
+              semio    : semaphore;  (* io semaphore for this s-file - used for
+                                        lower-level indivisible io operation *)
+              mid      : longint;    (* for protection, machine allowing open *)
+              result_scavenge : integer; (* effect on this file of last Scavenge *)
+              sfcb_protected : boolean; (* is protection on for this file *)
+              sfcb_master : boolean;    (* if so, is this a master file *)
+              sswitch  : boolean;    (* safety switch setting                  *)
+              kswitch  : boolean;    (* kill switch setting, for kill in progress *)
+              private_in_use : boolean;  (* in use as a private access file    *)
+              file_locked : boolean;   (* file lock setting (for application) *)
+              scav_flag : boolean;  (* file scavenged since last close *)
+              OS_close_flag : boolean;  (* OS forced file to be closed (proc term) *)
+              file_still_open : boolean; (* file was left open (system crash) *)
+              OS_c_request : boolean; (* OS is requesting close (proc. term) *)
+              time_dirty : boolean;  (* dirty bit for the modify timestamp *)
+              vm_error : integer; (* save error writing buffered page of this file *)
+              fmap : smallmap;
+              file_portion : integer;     (* portion of large file split across media *)
+              build_info : Build_Control; (* build version information *)
+              password : Str8;  (* password protecting this file *)
+              fsOverhead : integer;
+            end;
+     sfcb_ptr = ^sfcb;
+
+     hentry = record       (* format for the entry in the first relpage of hints *)
+                name : e_name;
+                unique_ID : UID;
+                version : integer;
+                ftype: filetype;
+                DTC      : longint;    (* date/time created            *)
+                DTA      : longint;    (* date/time last accessed      *)
+                DTM      : longint;    (* date/time last modified      *)
+                DTB      : longint;    (* date/time last backup copy made *)
+                DTS      : longint;    (* date/time scavenged          *)
+                machine_id : longint;  (* where file can be opened (protection) *)
+                killed : boolean;
+                safety_on : boolean;
+                protected : boolean;   (* enforce theft protection on this file *)
+                master    : boolean;   (* protected master, can be opened anywhere *)
+                scavenged : boolean;   (* if scavenger passed over this file *)
+                closed_by_OS : boolean;(* if closed by OS when process terminates *)
+                file_open : boolean;   (* set when file is open; used by scavenger*)
+                result_scavenge : integer;  (* how file altered by Scavenger *)
+                unusedi1 : integer;     (* unused field, reserved for future use *)
+                system_type : integer;  (* type for system objects *)
+                user_type : integer;    (* user-settable type for user objects *)
+                user_subtype : integer; (* reserved for future use *)
+                build_info : Build_Control; (* build version information *)
+                file_portion : integer;     (* portion of large file split across media *)
+                password : Str8;  (* file password *)
+                parentID : NodeIdent;
+                fsOverhead : integer;
+              end;
+
+     centry = record     (* format for entries in the data part of a catalog sfile *)
+                name   : e_name;
+                case cetype : entrytype of
+                  emptyentry,
+                  direntry,
+                  fileentry,
+                  pipeentry,
+                  ecentry,
+                  killedentry,
+                  linkentry,
+                  removed:
+                   (sfile  : integer;
+                    attributes : longint;  (* reserved for future use *)
+                    readpage: longint;       (* logical beginning of pipe *)
+                    readoffset:integer;
+                    writepage: longint;      (* logical end of pipe *)
+                    writeoffset:integer;)
+              end;
+
+
+var rootptr : array [0..maxdev] of sfcb_ptr;
+                        (* these are the s-file control block pointers to     *)
+                        (* the root catalogs on the Lisa File System volumes. *)
+                        (* They are initialized when the root is opened in    *)
+                        (* UIINIT in unit fs_interface                        *)
+
+
+
+function PRIMVERSION : integer;
+
+procedure INITFS ( var ecode:error);
+
+procedure DISINITFS ( var ecode:error );
+
+function ABSPAGE ( var ecode   : integer;
+                       relpage : longint;
+                       ptrFCB  : sfcb_ptr ) : longint;
+
+procedure  ALLOCPAGES ( var ecode   : integer;
+                        ptrSFCB     : sfcb_ptr;
+                        delta_pages : longint );
+
+procedure SOPENCHECK (var ecode : error;
+                         devnum : integer;
+                          sfile : integer;
+                     var fcbptr : sfcb_ptr);
+
+procedure  open_temp ( var ecode  : integer;
+                           device : integer;
+                       var ptrFCB : SFCB_ptr );
+
+procedure  close_temp ( var ecode  : integer;
+                            ptrFCB : SFCB_ptr );
+
+procedure  UpgradeFile ( device : integer;
+                         page   : longint );
+
+procedure OPEN_SFILE (var ecode:error; sfile, devnum:integer; var fcbptr:sfcb_ptr);
+
+procedure CLOSE_SFILE (var ecode:error; var fcbptr:sfcb_ptr);
+
+procedure DIRECT_IO (var ecode : error;
+                          fptr : sfcb_ptr;
+                          addr : absptr;
+                       absbyte : longint;
+                         count : longint;
+                    var actual : longint;
+                            op : ioop);
+
+procedure FILEIO (var ecode : error;        (* for sequential I/O using sfcb *)
+                       fptr : sfcb_ptr;
+                       addr : absptr;
+                    reqsize : longint;
+                 var actual : longint;
+                     var ip : longint;
+                     var io : integer;
+                         op : ioop);
+
+procedure HENTRY_IO ( var ecode : error;
+                         device : integer;
+                       hintaddr : longint;
+                          var h : hentry;
+                             op : ioop);
+
+function hash (var istring : e_name; maxindex : integer ) : integer;
+
+procedure LOOKUP_BY_ENAME (var ecode:error;
+                                name:e_name;
+                              catptr:sfcb_ptr;
+                        var catentry:centry);
+
+procedure MAKE_ROOTCAT (var ecode:error; device : integer);
+
+procedure Make_Entry ( var ecode    : error;
+                           device   : integer;
+                           parID    : NodeIdent;
+                       var path     : pathname;
+                           objType  : entrytype;
+                           passwd   : e_name );
+
+procedure KILL_ENTRY ( var ecode  : error;
+                           device : integer;
+                           parID  : NodeIdent;
+                       var path   : pathname;
+                           passwd : e_name );
+
+procedure ZERO_TIME (var t : longint);
+
+procedure UPSHIFT ( ptrStr : pathnm_ptr );
+
+procedure  crypt ( var passwd : e_name );
+
+procedure  CheckPasswd ( var ecode  : integer;
+                         var passwd : e_name;
+                         var H      : hentry );
+
+procedure  GetPathname (     ptrFCB : SFCB_ptr;
+                         var pathn  : pathname );
+
+
+
+IMPLEMENTATION
+
+(*$S kr_fs *)
+(*$IFC NOT DEBUG2*)
+(*$R-*)
+(*$ENDC*)
+
+
+const vercode = 8;    (* version of this unit *)
+
+      (* Error codes *)
+
+      W_FLUSH          = -876;
+      E1_VOLUME_FULL   =  826;
+      E_FMAP_SHORT     =  840;
+      E_PAST_PEOF      =  861;
+      E_FCB_NOSPACE    =  872;
+      E_NO_DEV_MOUNTED =  874;
+      E_FCBPTR_BAD     =  900;
+      E2_VOLUME_FULL   =  901;
+      E_EOF            =  848;
+      E1_SENTRY_BAD    =  871;
+      E_OPEN_PRIVATE   =  873;
+      E2_SENTRY_BAD    =  875;
+      E_PAST_LEOF      =  879;
+      E3_VOLUME_FULL   =  882;
+      E_READ_PAST_LEOF =  883;    (* can this error be generated? *)
+      E_NO_SYSLOCAL    =  886;
+      E_UPDATE_SENTRY  =  885;
+      E_NOT_FOUND      =  888;
+      E1_NAME_ILLEGAL  =  892;
+      E_ENTRY_EXISTS   =  890;
+      E_CATALOG_FULL   =  891;
+      E2_NAME_ILLEGAL  =  895;
+      E_NO_ENTRY       =  894;
+      E_SAFETY_ON      =  896;
+      E_FILEIO_ARG     =  1191;
+      E_EOF_EARLY      =  1193;
+      E_FLAT_OP        =  1285;
+
+
+(* process mgmt procedure to unload loaded program file(s) *)
+procedure  Free_LPs ( var fcbptr : sfcb_ptr; device : integer );  external;
+
+
+
+
+
+
+(*$S kr_fs *)
+function PRIMVERSION;
+begin
+  primversion := vercode;
+end; (* of procedure PRIMVERSION *)
+
+
+
+
+
+(*$S fs1 *)
+procedure ZERO_TIME (* var t : longint *);
+begin
+  t := 0;
+end;  (* of procedure ZERO_TIME *)
+
+
+
+
+procedure  UPSHIFT (* ptrStr : pathnm_ptr *);
+
+var i, diff : integer;
+    c : char;
+
+begin
+  diff := ord('a') - ord('A');
+  for i := 1 to length(ptrStr^) do
+  begin
+    c := ptrStr^[i];
+    if (c >= 'a') and (c <= 'z') then
+      ptrStr^[i] := chr(ord(c) - diff);
+  end;
+end;    (* of procedure upshift *)
+
+
+
+
+
+(*$S fs3 *)
+procedure INITFS (* var ecode:error*);
+
+const perrbase = 43;
+
+var i : integer;
+    s1 : string [2];
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 12) then writeln ('INITFS:  request to initialize the file system');
+(*$ENDC*)
+
+
+  ecode := 0;
+
+  boot_dcbptr := badptr1;    (* boot vol NOT temp_unmounted *)
+  boot_rootptr := badptr2;
+
+  for i := 0 to maxdev do
+  begin
+    mounttable [i] := pointer (badptr1); (* clear mount table *)
+    rootptr [i] := pointer (badptr2);
+  end;
+
+  {if (ecode > 0) and (ecode < 100) then
+                            ecode := INTERRBASE + SFERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 12) then writeln ('INITFS:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end; (* of procedure initfs *)
+
+
+
+
+
+
+
+
+
+
+
+(*$S fs3 *)
+procedure disinitfs (* var ecode:error *);
+
+label 1;
+
+const perrbase = 43;
+
+var i : integer;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 12) then writeln ('DISINITFS:  request to shut down file system');
+(*$ENDC*)
+
+  for i := 0 to maxdev do
+  begin
+    if mounttable [i] <> pointer (badptr1) then
+    begin
+      real_unmount (ecode, i);    (* unmount all mounted devices *)
+      if ecode <> 0 then goto 1;
+    end;
+  end;
+
+1:
+
+  {if (ecode > 0) and (ecode < 100) then
+                             ecode := INTERRBASE + SFERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 12) then writeln ('DISINITFS:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end; (* procedure disinitfs *)
+
+
+
+
+
+
+
+
+(*$S kr_fs *)
+(*
+ *  performance
+ *  1.  Recoded to deal with cached file maps
+ *)
+function ABSPAGE (* var ecode   : integer;
+                        relpage : longint;
+                        ptrFCB  : sfcb_ptr ) : longint *);
+
+const PERRBASE = 36;
+
+var
+     ptrFmap  : flmap_ptr;
+     abs_page : longint;
+
+begin
+
+with ptrFCB^ do
+begin
+  if old_volume(curdev) and (sfilenum <> TEMP_SFILE) then
+    ptrFmap := NIL
+  else
+    ptrFmap := @fmap;
+  fmap_mgr(ecode, curdev, sfilenum, ptrFmap, @sent, FMABSPAGE, relpage, abs_page);
+  if abs_page <= 0 then ecode := E_PAST_PEOF;
+end;
+
+(*$IFC DEBUG2*)
+  if trace(FS,64) then
+  writeln ('ABSPAGE:  ',ptrFCB^.fname,'  relpage = ',relpage:5,
+           '  abspage = ',abs_page:5);
+(*$ENDC*)
+
+  ABSPAGE := abs_page;
+  {if (ecode > 0) and (ecode < 100) then
+                            ecode := INTERRBASE + SFERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 20) then writeln ('ABSPAGE:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of function ABSPAGE *)
+
+
+
+
+
+(*$S kr_fs *)
+(*
+ *  performance
+ *  1.  Gets file physical size from control block
+ *  2.  Passes file map ptr to appendpages
+ *  3.  Uses new abspage procedure
+ *)
+procedure  AllocPages (* var ecode   : integer;
+                         ptrSFCB     : sfcb_ptr;
+                         delta_pages : longint *);
+
+label   1;
+
+const
+     NONCONTIG = false;
+     PERRBASE  = 28;
+
+var
+     actual, new_page, old_psize, append_to, last_relpg : longint;
+{$IFC not BLK512}
+     data_bytes : integer;
+{$ENDC}
+     ptrFmap : flmap_ptr;
+     old_style : boolean;
+
+begin
+(*$IFC DEBUG2*)
+  if trace(FS, 25) then writeln('ALLOCPAGES: request to allocate ',
+       delta_pages,' pages for s-file ',ptrSFCB^.sfilenum:4,' / ',
+       ptrSFCB^.fname);
+(*$ENDC*)
+
+     if ptrSFCB = pointer(badptr2) then
+     begin
+       (* Somebody's trying to palm off a bad FCB ptr *)
+       ecode := E_FCBPTR_BAD;
+       goto 1;
+     end;
+
+     with ptrSFCB^ do
+     begin
+       wait_sem(semgp, []);  (* exclude access to the s-file control block *)
+{$IFC not BLK512}
+       data_bytes := mounttable[curdev]^.MDDFdata^.datasize;  (* per page *)
+{$ENDC}
+       (* Calculate relpage number of first page to allocate/deallocate *)
+       old_psize := phys_size;
+{$IFC BLK512}
+       Pg(old_psize, last_relpg);
+       last_relpg := last_relpg - 1;
+{$ELSEC}
+       last_relpg := (old_psize div data_bytes) - 1;
+{$ENDC}
+       old_style := (old_volume(curdev) and (sfilenum <> TEMP_SFILE));
+
+       (* Is file map cached for this file? *)
+       if old_style then
+         ptrFmap := NIL
+       else
+         ptrFmap := @fmap;
+
+       if delta_pages > 0 then
+       begin
+         (*
+          *  Continue appending contiguous chunks until the request is
+          *  satisfied, or it becomes apparent that the request cannot be
+          *  satisfied.  Try to append contiguous to the existing file pages.
+          *)
+         if last_relpg >= 0 then
+           append_to := abspage(ecode, last_relpg, ptrSFCB)
+         else
+           append_to := 0;
+
+         repeat
+           appendpages(append_to, curdev, delta_pages, NONCONTIG, new_page,
+                       actual, sfilenum, @sent, ptrFmap, ecode);
+           delta_pages := delta_pages - actual;
+
+         until ( delta_pages <= 0 ) or    (* satisfied the request   *)
+               ( actual <= 0      ) or    (* no more space available *)
+               ( ecode > 0        );      (* trouble *)
+
+         if delta_pages > 0 then
+         begin
+           (*
+            *  Couldn't get ALL the space that was needed; so reverse the
+            *  allocation and return an error.
+            *)
+{$IFC BLK512}
+           Pg(old_psize, new_page);
+{$ELSEC}
+           new_page := old_psize div data_bytes;
+{$ENDC}
+           releasepages(ecode, curdev, sfilenum, new_page, ptrFmap, @sent);
+           ecode := E2_VOLUME_FULL;
+         end;
+       end
+       else if delta_pages < 0 then
+       begin
+         (*
+          *  Deallocating pages from end of file.  If this operation screws-up,
+          *  we don't care (i.e., not all-or-none).
+          *)
+         releasepages(ecode, curdev, sfilenum, last_relpg+delta_pages+1,
+                      ptrFmap, @sent);
+       end;
+
+       (* Update physical size in FCB *)
+       if old_style then
+         phys_size := get_psize(ecode, curdev, sfilenum)
+       else
+{$IFC BLK512}
+         phys_size := fmap.size * DEFPGDATASIZE;
+{$ELSEC}
+         phys_size := fmap.size * data_bytes;
+{$ENDC}
+
+       (* Update LEOF if deallocation truncated it *)
+       with sent do
+         if filesize > phys_size then filesize := phys_size;
+
+1:
+      signal_sem(semgp);
+     end;
+
+(*$IFC DEBUG2*)
+  if trace(FS, 25) then writeln('ALLOCPAGES: returning with ecode of ',ecode);
+(*$ENDC*)
+end;
+
+
+
+
+
+
+
+(*$S fs1 *)
+procedure sopencheck (*var ecode : error;
+                         devnum : integer;
+                          sfile : integer;
+                     var fcbptr : sfcb_ptr*);
+
+var found : boolean;
+    i : integer;
+
+begin
+  found := false;
+
+  with mounttable [devnum]^ do
+  begin
+    fcbptr := pointer (sfcbchain.fwd_link + b_sysglobal_ptr);
+
+    i := 0;
+    while (i < opencount) and (not found) do
+    begin
+      if fcbptr^.sfilenum = sfile then found := true
+      else
+      begin
+        fcbptr := pointer (fcbptr^.head.fwd_link + b_sysglobal_ptr);
+        i := i + 1;
+      end;
+    end;
+  end;
+
+  if not found then fcbptr := pointer (badptr2);
+  ecode := 0;   (* no errors detected *)
+
+end;
+
+
+
+
+
+
+
+(*$S fs1 *)
+function  GetFCB (     device : integer;
+                       sfile  : integer;
+                   var ptrFCB : SFCB_ptr ) : boolean;
+
+var
+     addrFCB : absptr;
+
+begin
+  if not getspace(sizeof(sfcb), b_sysglobal_ptr, addrFCB) then
+  begin
+    GetFCB := FALSE;
+    exit(GetFCB);
+  end;
+
+  ptrFCB := pointer(addrFCB);
+
+  with ptrFCB^ do
+  begin
+    with mounttable[device]^ do
+    begin
+      enqueue (head, sfcbchain, b_sysglobal_ptr);  (* link new sfcb onto dcb chain *)
+      opencount := opencount + 1;
+    end;
+
+    (* init run-time info : all the entries that do not depend on hint entry *)
+    (* should be done before any io, especially nusers must be set up before *)
+    (* the process gets blocked, so that the next open or close will see the *)
+    (* correct nusers value *)
+
+    sfilenum := sfile;
+    curdev := device;
+    curpage := REDLIGHT;
+    curoffset := 0;
+    nreaders := 0;
+    nwriters := 0;
+    nusers := 1;              (* this sfcb has one user for sure *)
+    access_ptr := badptr1;   (* pointer to access list (future) *)
+    asyncreqlink.fwd_link := ord(@asyncreqlink) - b_sysglobal_ptr;
+    asyncreqlink.bkwd_link := asyncreqlink.fwd_link;
+    kswitch := false;
+    private_in_use := false;
+    file_locked := false;
+    OS_c_request := false;
+    time_dirty := false;
+    vm_error := 0;
+
+    init_sem(semgp, 1);      (* init semaphore to be used by write_data,
+                                         allocate, and compact *)
+    init_sem(semio, 1);      (* init io semaphore to be used by lower-level io *)
+  end;
+
+  GetFCB := TRUE;
+end;
+
+
+(*$S fs1 *)
+procedure  open_temp (* var ecode  : integer;
+                            device : integer;
+                        var ptrFCB : SFCB_ptr *);
+
+var
+     i : integer;
+     ptrEntry : fment_ptr;
+
+begin
+{$IFC DEBUG2}
+  if trace(FS,64) then
+    writeln('OPEN_TEMP:  temp file on device ',device:3);
+{$ENDC}
+
+  ecode := 0;
+
+  if mounttable[device] <> pointer(badptr1) then
+  begin
+    wait_sem(mounttable[device]^.semio, []);  (* exclude unmount *)
+
+    if GetFCB(device, TEMP_SFILE, ptrFCB) then with ptrFCB^ do
+    begin
+      with sent do
+      begin
+        filesize := 0;
+        hintaddr := REDLIGHT;
+        version := 0;
+      end;
+      phys_size := 0;
+      fname := '';
+      ftype := tempfile;
+      kswitch := TRUE;   (* so FS can clean-up after the less-clean portions *)
+                         (* of the otherwise sterile OS *)
+      with fmap do
+      begin
+        max_entries := MAXSMALLINDEX;
+        size := 0;
+        ecount := 0;
+        ptrEntry := @map[0];
+        for i := 0 to MAXSMALLINDEX do with ptrEntry^ do
+        begin
+          address := 0;
+          cpages := 0;
+          ptrEntry := pointer(ord(ptrEntry) + sizeof(mapentry));
+        end;
+      end;
+    end
+    else
+      ecode := E_FCB_NOSPACE;
+
+    signal_sem(mounttable[device]^.semio);
+  end
+  else
+    ecode := E_NO_DEV_MOUNTED;
+
+{$IFC DEBUG2}
+  if trace(FS,64) then
+    writeln('OPEN_TEMP:  exit with ecode =  ',ecode,'   FCB ptr ',ord(ptrFCB));
+{$ENDC}
+end;
+
+
+
+
+(*$S fs1 *)
+procedure  close_temp (* var ecode  : integer;
+                             ptrFCB : SFCB_ptr *);
+
+var
+     device : integer;
+     count  : longint;
+
+begin
+{$IFC DEBUG2}
+  if trace(FS,64) then
+    writeln('CLOSE_TEMP:  FCB ptr ',ord(ptrFCB));
+{$ENDC}
+
+  device := ptrFCB^.curdev;
+  wait_sem(mounttable[device]^.semio, []);  (* exclude unmount *)
+  with ptrFCB^ do
+  begin
+    fmap_mgr(ecode, device, sfilenum, @fmap, @sent, FMRELEASE, 0 {from pg}, count);
+    dequeue(head, b_sysglobal_ptr);
+    relspace(ord(ptrFCB), b_sysglobal_ptr);
+  end;
+  with mounttable[device]^ do
+    opencount := opencount - 1;
+  signal_sem(mounttable[device]^.semio);
+
+{$IFC DEBUG2}
+  if trace(FS,64) then
+    writeln('CLOSE_TEMP:  exit with ecode =  ',ecode);
+{$ENDC}
+end;
+
+
+
+
+
+{$S fs1}
+procedure  UpgradeFile (* device : integer;
+                          page   : longint *);
+
+var
+     locl_ecode : integer;
+     ptrHint    : ^hentry;
+     actual     : longint;
+     saveParID  : integer;
+     Buf        : array[0..511] of byte;
+
+begin
+    (* Read the leader page *)
+    ptrHint := @Buf;
+    vm(locl_ecode, device, page, sizeof(pagelabel), ord(@Buf), DEFPGDATASIZE, readop);
+    (* Clear the area following the Hint entry *)
+    if ptrHint^.version <= PEPSI_VERSION then
+      ClearMem(ord(@Buf)+88, 40)
+    else  (* version = 16 *)
+    begin
+      saveParID := ptrHint^.parentID;
+      ClearMem(ord(@Buf)+108, 20); (* clear parentID *)
+      if not flat_catalog(device) then
+        ptrHint^.parentID := saveParID;
+    end{if};
+    (* Update the file version *)
+    ptrHint^.version := CUR_VERSION;
+    if ptrHint^.version <= REL1_VERSION then
+      ptrHint^.fsOverhead := 2
+    else
+      ptrHint^.fsOverhead := 1;
+    (* Clear the area following the small file map *)
+    ClearMem(ord(@Buf)+196, 188);
+    vm(locl_ecode, device, page, sizeof(pagelabel), ord(@Buf), DEFPGDATASIZE, writeop);
+end{proc UpgradeFile};
+
+
+
+
+(*$S fs1 *)
+(*
+ *  performance
+ *  1.  Reads and caches the small file map
+ *)
+procedure OPEN_SFILE (*var ecode:error;sfile, devnum:integer;var fcbptr:sfcb_ptr*);
+
+label 1, 2;
+
+const perrbase = 0;
+
+var sentry : s_entry;
+    h : hentry;
+    temp_addr : absptr;
+    i : integer;
+    locecode : error;
+    must_signal : boolean;
+    Fm : filemap;
+    lfcbptr : sfcb_ptr;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 25) then writeln ('OPEN_SFILE:  request to open sfile ',sfile,
+                                                         ' on device ',devnum);
+(*$ENDC*)
+
+  must_signal := false;
+
+  if mounttable [devnum] = pointer (badptr1) then
+  begin
+    ecode := E_NO_DEV_MOUNTED;    (* specified device is not mounted yet *)
+    goto 1;
+  end;
+
+  wait_sem (mounttable [devnum]^.semio, []);  (* to exclude unmount *)
+  must_signal := true;
+
+  sopencheck (ecode, devnum, sfile, lfcbptr);  (* is file currently open? *)
+  if ecode > 0 then
+  begin
+    goto 1;      (* system failure checking for open file on device *)
+  end
+  else
+  begin
+    if lfcbptr <> pointer (badptr2) then with lfcbptr^ do
+    begin           (* file was already open, see if private access *)
+      nusers := nusers + 1;                    (* another opening, another show   *)
+                                (* this must be done before wait_sem so that *)
+                                (* close_sfile will not release the sfcb prematurely *)
+      wait_sem (semio, []);       (* wait for the first open to complete *)
+      signal_sem (semio);         (* let other waiters to continue *)
+      if private_in_use then
+      begin
+        ecode := E_OPEN_PRIVATE;   (* already open for private access *)
+        nusers := nusers - 1;
+        goto 1;
+      end;
+      goto 2;  (* this section avoids slist_io if file already opened *)
+    end;
+  end;
+
+  (* either the sfile was not opened, or it was a bad sfile number *)
+
+  slist_io (ecode, devnum, sfile, readop, sentry); (* could block, so get info now *)
+  if (ecode > 0) or (sentry.hintaddr <= 0) then
+  begin
+    ecode := E1_SENTRY_BAD;   (* not a valid sfile *)
+    goto 1;
+  end;
+
+  (* valid s-file, check again if already open on the device *)
+
+  sopencheck (ecode, devnum, sfile, lfcbptr); (* check again, since we might have blocked *)
+  if ecode > 0 then
+  begin
+    goto 1;      (* system failure checking for open file on device *)
+  end;
+
+  if lfcbptr = pointer (badptr2) then
+             (* unopened sfile entry, so get a file control block for this file *)
+  begin
+    if not GetFCB(devnum, sfile, lfcbptr) then
+    begin
+      ecode := E_FCB_NOSPACE;
+      goto 1;
+    end;
+
+    with lfcbptr^ do
+    begin
+      curpage := sentry.fileaddr;
+
+      wait_sem (semio, []);     (* lock the sfcb before any io to disallow any
+                                   close or another open to proceed *)
+
+      (*  read the small file map and cache in control block *)
+      hentry_io (ecode, devnum, sentry.hintaddr, h, readop); (* read hint entry *)
+      if ecode <= 0 then  (* read small file map for new files *)
+        if not old_volume(devnum) then
+          fmap_io(ecode, devnum, sentry.hintaddr, 0, @fmap, READOP);
+
+      if (ecode > 0) or (length (h.name) > max_ename) then
+      begin
+        signal_sem (semio);
+        dequeue (head, b_sysglobal_ptr);
+        relspace (ord(lfcbptr), b_sysglobal);      (* release the sfcb space *)
+        with mounttable[devnum]^ do
+             opencount := opencount - 1;
+        if ecode = 0 then ecode := E1_SENTRY_BAD;   (* not a valid sfile *)
+        goto 1;
+      end;
+
+      if h.version < cur_file_version then
+      begin
+        UpgradeFile(devnum, sentry.hintaddr);
+        (* Now reread the hint entry *)
+        hentry_io (ecode, devnum, sentry.hintaddr, h, readop);
+      end;
+
+      sent := sentry;   (* only hints (and maybe fileaddr) should be used *)
+      if old_volume(devnum) then
+        phys_size := get_psize(ecode, devnum, sfile)
+      else
+        phys_size := fmap.size * mounttable[devnum]^.MDDFdata^.datasize;
+
+      (* get info from hints *)
+
+      fname := h.name;
+      fileuid := h.unique_ID;    (* unique identifier for this file *)
+      ftype := h.ftype;
+      user_type := h.user_type;
+      user_subtype := h.user_subtype;
+      system_type := h.system_type;
+      DTC := h.DTC;     (* date/time created                      *)
+      DTA := timestamp; (* date/time last accessed                *)
+      DTM := h.DTM;     (* date/time last modified                *)
+      DTB := h.DTB;     (* date/time last backup copy was made    *)
+      DTS := h.DTS;     (* date/time last scavenge                *)
+      mid := h.machine_id;    (* for protection, machine allowing open *)
+      result_scavenge := h.result_scavenge;
+      sfcb_protected := h.protected; (* is protection on for this file *)
+      sfcb_master := h.master;    (* if so, is this a master file *)
+      sswitch := h.safety_on;
+      scav_flag := h.scavenged;
+      OS_close_flag := h.closed_by_OS;
+      file_still_open := h.file_open;
+
+      (* now set file open flag, date accessed in hints and write out *)
+      parID := h.parentID;
+      fsOverhead := h.fsOverhead;
+      build_info := h.build_info;
+      file_portion := h.file_portion;
+      password := h.password;
+
+      h.file_open := true;
+      h.DTA := DTA;
+      hentry_io (ecode, devnum, sentry.hintaddr, h, writeop); (* write hint entry *)
+
+      signal_sem (semio);
+    end;
+  end
+  else
+  with lfcbptr^ do
+  begin           (* file was already open, see if private access *)
+    nusers := nusers + 1;                    (* another opening, another show   *)
+                              (* this must be done before wait_sem so that *)
+                              (* close_sfile will not release the sfcb prematurely *)
+    wait_sem (semio, []);       (* wait for the first open to complete *)
+    signal_sem (semio);         (* let other waiters to continue *)
+    if private_in_use then
+    begin
+      ecode := E_OPEN_PRIVATE;   (* already open for private access *)
+      nusers := nusers - 1;
+      goto 1;
+    end;
+  end;
+
+2:
+
+  with lfcbptr^ do
+  begin
+    if OS_close_flag then ecode := W_OS_CLOSED;   (* OS closed this file (proc term) *)
+    if file_still_open then ecode := W_LEFT_OPEN; (* file was left open              *)
+    if scav_flag then ecode := W_SCAVENGED;       (* file was scavenged              *)
+
+    (* check the scavenge result field and return a specific warning code where *)
+    (* appropriate                                                              *)
+    case result_scavenge of
+         1:     ecode := W_DATA_ALTERED;  (* file was explicitly corrupted by Scavenger *)
+         otherwise
+    end;
+  end;
+
+
+1:    (* error exit or normal fall through *)
+
+  if must_signal then  (* root catalog is open *)
+  begin
+    signal_sem (mounttable [devnum]^.semio);  (* to exclude unmount *)
+  end;
+
+  if ecode <= 0 then fcbptr := lfcbptr;
+
+(*$IFC DEBUG2*)
+  if trace (FS, 25) then writeln ('OPEN_SFILE:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of procedure OPEN_SFILE *)
+
+
+
+
+
+
+
+
+
+(*$S fs1 *)
+procedure  ChkVmErrors ( var ecode  : integer );
+
+var
+     i      : integer;
+     ptrFCB : SFCB_ptr;
+
+begin
+     ecode := 0;
+     for i := 0 to pVmErr-1 do
+     begin
+          with VmErrList[i] do
+          begin
+               sopencheck(ecode, device, abs(sfile), ptrFCB);
+               if ptrFCB <> pointer(BADPTR2) then
+                    ptrFCB^.vm_error := error;
+          end;
+     end;
+     pVmErr := 0;
+end;
+
+
+
+(*$S fs1 *)
+procedure CLOSE_SFILE (*var ecode:error; var lfcbptr:sfcb_ptr*);
+
+const perrbase = 4;
+
+var sent : s_entry;
+    h    : hentry;
+    killed, must_signal : boolean;
+    devnum : integer;
+    flusherr : integer;
+    locl_ecode : integer;
+    found : boolean;
+    ptrBuf : buffer_ptr;
+    ptrEntry : entry_ptr;
+    key : RecKey;
+
+begin
+(*$IFC DEBUG2*)
+  if trace (FS, 25) then writeln ('CLOSE_SFILE:  request to close sfile ',
+                                                         fcbptr^.sfilenum);
+(*$ENDC*)
+
+  must_signal := false;
+  devnum := fcbptr^.curdev;
+
+  (* removed if rootptr[devnum] <> pointer(badptr2) *)
+  (* assumes the root catalog is open!! *)
+  wait_sem (mounttable [devnum]^.semio, []);  (* to exclude unmount *)
+  must_signal := true;
+
+  slist_io (ecode, fcbptr^.curdev, fcbptr^.sfilenum, readop, sent);
+  if (ecode > 0) or (sent.hintaddr <= 0) then
+  begin
+    ecode := E2_SENTRY_BAD;   (* not a valid sfile *)
+  end
+  else
+  begin      (* valid s-file, close it *)
+    with fcbptr^ do
+    begin
+      nusers := nusers - 1;      (* this must be in critical region, so that no
+                                   other close_sfile can change this value. *)
+      if OS_c_request then
+           OS_close_flag := true;    (* in fcb   *)
+
+      killed := false;    (* initialize *)
+
+      hentry_io (ecode, curdev, sent.hintaddr, h, readop); (* read hint entry *)
+
+      h.closed_by_OS := OS_close_flag;   (* update value in hints *)
+
+      DTA := timestamp;  (* update time last accessed *)
+      if time_dirty then
+      begin
+        DTM := DTA;      (* and time modified if appropriate *)
+        time_dirty := false;
+      end;
+
+      h.DTC := DTC;    (* date/time created                      *)
+      h.DTA := DTA;    (* date/time last accessed                *)
+      h.DTM := DTM;    (* date/time last modified                *)
+      h.DTB := DTB;    (* date/time last backup copy was made    *)
+      h.DTS := DTS;    (* date/time last scavenge                *)
+
+      (*
+       *  File-still-open is written back to the hints with the value taken
+       *  from the FCB.  This value is either the original value taken from
+       *  the hints at open time, or a value altered by the user.  The same
+       *  applies to the scavenged flag.
+       *)
+      h.scavenged := scav_flag;
+
+      OS_c_request := false;            (* reset    *)
+
+      (* write the small file map for new files (make disk consistent for KILL) *)
+      if not old_volume(curdev) then
+        fmap_io(ecode, curdev, sent.hintaddr, 0, @fmap, writeop);
+
+      if nusers = 0 then
+      begin
+        if kswitch then
+        begin      (* last user closed the file, and it is waiting to be killed *)
+          kill_sfile(ecode, curdev, sfilenum);
+          killed := true;
+        end
+        else
+        begin
+          h.file_open := file_still_open;   (* reset from fcb on final close *)
+        end;
+
+        with mounttable[curdev]^ do
+          opencount := opencount - 1;
+
+      end;       (* of nusers = 0                 *)
+
+      if not killed then
+      begin
+        hentry_io (ecode, curdev, sent.hintaddr, h, writeop); (* write hint entry *)
+        if not flat_catalog(curdev) then
+        begin
+          (* Update the catalog entry *)
+          MakeKey(parID, @fname, @key);
+          E_Search(mounttable[curdev], @key, ptrBuf, ptrEntry, found, locl_ecode);
+          if locl_ecode <= 0 then
+          begin
+            if found then with ptrEntry^ do
+            begin
+              fileDTC := h.DTC;
+              fileDTM := h.DTM;
+              size := sent.filesize;
+              physSize := phys_size;
+              fsOvrhd := h.fsOverhead;
+              flags[fMaster] := h.master;
+              flags[fProtect] := h.protected;
+              flags[fSafety] := h.safety_on;
+              flags[fCrashed] := h.file_open;
+              flags[fScavenged] := h.scavenged;
+              flags[fClosed] := h.closed_by_OS;
+              ptrBuf^.dirty := TRUE;
+            end{if};
+            FreeBuf(ptrBuf);
+          end{if};
+        end{if};
+      end{if};
+
+      (* flush the file system *)
+      if flush_level <= closeFlush then flushfs(locl_ecode);
+      (* process buffer write errors *)
+      if pVmErr > 0 then ChkVmErrors(ecode);
+      (* notice a buffer write error on this file *)
+      if vm_error > 0 then
+        flusherr := W_FLUSH  (* return a warning code *)
+      else
+        flusherr := 0;
+
+      if nusers = 0 then
+      begin
+        if fcbptr = rootptr [devnum] then
+        begin
+          signal_sem (mounttable [devnum]^.semio);  (* to exclude unmount *)
+          must_signal := false;
+        end;
+
+        (* unused sfile entry, so release the file control block for this file *)
+        dequeue (head, b_sysglobal_ptr);   (* dequeue the sfcb *)
+
+        relspace (ord (fcbptr), b_sysglobal_ptr);  (* release the sfcb space *)
+        fcbptr := pointer (badptr2);
+      end;
+    end;       (* of with fcbptr^               *)
+  end;       (* of valid sfile                *)
+
+  if must_signal then
+    signal_sem (mounttable [devnum]^.semio);  (* to exclude unmount *)
+
+  if ecode <= 0 then ecode := flusherr;
+  {if (ecode > 0) and (ecode < 100) then
+                           ecode := INTERRBASE + PRIMERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 25) then writeln ('CLOSE_SFILE:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;   (* of procedure CLOSE_SFILE *)
+
+
+
+
+
+
+
+
+
+
+(*$S kr_fs *)
+(*
+ *  performance
+ *  1.  Uses new abspage procedure
+ *)
+procedure DIRECT_IO (*var ecode : error;
+                          fptr : sfcb_ptr;
+                          addr : absptr;
+                       absbyte : longint;
+                         count : longint;
+                    var actual : longint;
+                            op : ioop*);
+
+label 1;
+
+const perrbase = 8;
+
+var relpage, apage, firstillegal : longint;
+    poffset, pgdatasize : integer;
+    normal_case : boolean;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 24) then
+  begin
+    write ('DIRECT_IO:  request to ');
+    if op=readop then write ('read ') else if op=writeop then write ('write ') else
+                                                                   write ('????? ');
+    writeln (count,' bytes using sfile ',fptr^.sfilenum,
+             ' ',fptr^.fname,' at absbyte ',absbyte);
+  end;
+(*$ENDC*)
+
+  actual := 0;
+
+  pgdatasize := mounttable [fptr^.curdev]^.MDDFdata^.datasize;
+
+  firstillegal := fptr^.sent.filesize;    (* index of first byte past LEOF *)
+  if op=writeop then firstillegal := firstillegal + 1;  (* OK to WRITE just past EOF *)
+  if absbyte > firstillegal then
+  begin       (* access beyond end of file is not allowed *)
+    ecode := E_PAST_LEOF;
+    goto 1;
+  end;
+
+{$IFC BLK512}
+  PgOffset(absbyte, relpage, poffset);
+{$ELSEC}
+  relpage := absbyte div pgdatasize;
+  poffset := absbyte mod pgdatasize;
+{$ENDC}
+                           (* map rel to abs page *)
+  apage := abspage(ecode, relpage, fptr);
+  if ecode = 0 then
+  begin                         (* abspage and page offset set up OK, so do the I/O *)
+    normal_case := fptr <> rootptr [fptr^.curdev];
+                       (* to protect this sfcb change and fileio *)
+    if normal_case then wait_sem (fptr^.semio, []);
+    fptr^.curpage := apage;          (* set up current file access address in sfcb *)
+    fptr^.curoffset := poffset;
+    fileio (ecode, fptr, addr, count, actual, fptr^.curpage, fptr^.curoffset, op);
+    if normal_case then signal_sem (fptr^.semio);
+  end;
+
+1:
+
+
+  {if (ecode > 0) and (ecode < 100) then
+                          ecode := INTERRBASE + PRIMERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 24) then writeln ('DIRECT_IO:  xfer of ',actual,' bytes, ecode of ',
+                                                                              ecode);
+(*$ENDC*)
+
+end;   (* of procedure DIRECT_IO *)
+
+
+
+
+
+
+
+
+
+(*$S kr_fs *)
+procedure FILEIO (* var ecode : error;
+                         fptr : sfcb_ptr;
+                         addr : absptr;
+                      reqsize : longint;
+                   var actual : longint;
+                       var ip : longint;
+                       var io : integer;
+                           op : ioop      *);
+
+label 1;
+
+const perrbase = 10;
+
+type iocommand = (unused, partio, wholeIO, debug, test, noop);
+
+     ioreqp = ^ioreq;
+
+     ioreq = record
+               flink : ioreqp;
+               pflink : longint;
+               pblink : longint;
+               case cmd : iocommand of
+                 partio :
+                     (absp      : longint;
+                      relp      : longint;
+                      boffset   : integer;
+                      bcount    : integer;
+                      d1addr    : absptr);
+                 wholeIO :
+                     (fabsp     : longint;
+                      frelp     : longint;
+                      pcount    : integer;
+                      d2addr    : absptr);
+                 noop,
+                 unused,
+                 test,
+                 debug :   ()
+               end;
+
+
+var irelpage, currelpage, curabspage, lastrelpage, curmappage, xfercount,
+                prepage, filepages, newbtotal, fspages, expected, dataptr,
+                firstblock, pgsneeded, pgsavail, middlepages, nextcontig,
+                firstbyte, lastbyte, lastavail, saverp, savebp : longint;
+
+    pgdatasize, devnum, fmentry, entryindex, firstpage, lastpage : integer;
+
+    slisterr : error;
+    emptyfile, pgxing, eof, expanding, pldirty : boolean;
+    firstioreqp, nextioreqp : ioreqp;
+    pl : pagelabel;
+    fm : filemap;
+    save_warning : integer;
+    ptrEntry : fment_ptr;
+    FMinfo : FmapInfo;
+    update_link : boolean;  (* flag indicates if request's flink must be updated *)
+                            (* when its successor chunk is processed *)
+    junk : longint;
+    reqExtra : integer;
+
+
+
+
+
+
+
+procedure remreq ( var reqptr : ioreqp );
+
+(* removes the request pointed to by reqptr; should be first one, since *)
+(* no linkages are changed; returns flink, however                      *)
+
+var reqaddr : absptr;
+    tempptr : ioreqp;
+
+begin
+  reqaddr := ord (reqptr);
+  reqptr := reqptr^.flink;
+  relspace (reqaddr, b_syslocal_ptr);
+end;   (* of procedure remreq *)
+
+
+
+
+
+
+
+
+procedure remallreq ( reqptr : ioreqp );
+(* removes request pointed to by reqptr, and all fwd linked ones also *)
+begin
+  while reqptr <> nil do remreq (reqptr);
+end;  (* of procedure remallreq *)
+
+
+
+
+
+
+
+
+
+
+procedure addreq ( var reqptr : ioreqp);
+
+(* reqptr points to existing req if any, to be linked to       *)
+(* new request is inserted after existing one                  *)
+(* returns pointer to new request                              *)
+(* if no space, removes existing requests and exits with error *)
+
+var reqaddr : absptr;
+    tempptr : ioreqp;
+
+begin
+  if not getspace (sizeof (ioreq), b_syslocal_ptr, reqaddr) then
+  begin
+    remallreq (firstioreqp);
+    ecode := E_NO_SYSLOCAL;
+    goto 1;
+  end
+  else
+  begin
+    tempptr := pointer (reqaddr);
+    if reqptr <> nil then            (* link to existing chain *)
+    begin
+      tempptr^.flink := reqptr^.flink;
+      reqptr^.flink := tempptr;
+    end
+    else
+    begin
+      tempptr^.flink := nil;         (* first request *)
+    end;
+    tempptr^.cmd := noop;            (* initial case *)
+    reqptr := tempptr;   (* return req ptr to new request *)
+  end;
+end;   (* of procedure addreq *)
+
+
+
+
+
+
+
+
+procedure doit;
+
+var plrec : plrect;
+    plrecp : plrecpt;
+    actualpx : longint;
+
+procedure abortio (errcode : error);
+begin
+  remallreq (firstioreqp);
+  ecode := errcode;   (* passed back to global caller *)
+  goto 1;
+end;
+
+begin
+  plrecp := @plrec;
+  while firstioreqp <> nil do
+  begin
+    with firstioreqp^ do
+    begin
+      case cmd of
+        partio :
+          begin
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then
+  begin
+    write ('FILEIO-doit/partio:  request to ');
+    if op=readop then write ('read ') else if op=writeop then write ('write ') else
+                                                                   write ('????? ');
+    writeln (bcount,' bytes using page ',absp);
+  end;
+(*$ENDC*)
+            vm(ecode, devnum, absp, boffset+sizeof(pagelabel), d1addr, bcount, op);
+            if ecode > 0 then
+            begin
+              (* save first non-abortive error *)
+              if save_warning <= 0 then save_warning := ecode;
+              if (ecode <> E_DATABAD) and
+                 (ecode <> E_CHECKSUM) then abortio (ecode)
+                                       else ecode := 0;  (* reset ecode *)
+            end;
+            if save_warning = 0 then save_warning := ecode; (* save first warning *)
+
+            xfercount := xfercount + bcount;
+            if (op=writeop) then
+            begin
+              if pblink <> 0 then with pl do  (* setting up pglabel for first time *)
+              begin
+                volume := 0;
+                datastat := dataok;
+                version := fptr^.sent.version;
+                fileid := fptr^.sfilenum;
+                dataused := bcount;
+                abspage := absp;
+                relpage := relp;
+                fwdlink := pflink;
+                bkwdlink := pblink;
+                pglblio (pl, devnum, absp, writeop, ecode); (* pg already in mem *)
+              end
+              else                              (* check for file expansion *)
+              begin                             (* writing partial page *)
+                if expanding then with pl do
+                begin
+                  pglblio (pl, devnum, absp, readop, ecode);
+                  if ecode <> 0 then abortio (ecode);
+                  pldirty := false;
+                  if boffset+bcount>dataused then (* writing past leof on page *)
+                  begin
+                    dataused := boffset+bcount;
+                    pldirty := true;
+                  end;
+                  if pflink <> 0 then           (* expanding across page bndry *)
+                  begin
+                    fwdlink := pflink;
+                    pldirty := true;
+                  end;
+                  if pldirty then               (* modified page label, write out *)
+                  begin
+                    pglblio (pl, devnum, absp, writeop, ecode);
+                  end;
+                end;
+              end;
+            end;
+          end;   (* of partread, partwrite case *)
+        wholeIO :
+          begin
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then
+  begin
+    write ('FILEIO-doit/wholeio:  request to ');
+    if op=readop then write ('read ') else if op=writeop then write ('write ') else
+                                                                   write ('????? ');
+    writeln (pcount,' contig. pages from page ',fabsp);
+  end;
+(*$ENDC*)
+            actualpx := 0;
+            with plrecp^ do with plabel do (* set up initial page label contents *)
+            begin
+              volume := 0;
+              datastat := dataok;
+              version := fptr^.sent.version;
+              fileid := fptr^.sfilenum;
+              dataused := pgdatasize;
+              abspage := fabsp;
+              relpage := frelp;
+              if pcount = 1 then         (* driver ignores pflink on one block *)
+                fwdlink := pflink (* writes; so set-up fwdlink properly *)
+              else
+                fwdlink := fabsp+1;
+              bkwdlink := pblink;
+              lflink := pflink;
+              ldataused := pgdatasize;
+            end;
+            fabsp := fabsp + firstblock;   (* map for low-level i/o *)
+            if op = readop then
+            begin
+              lisaio (ecode, devnum, d2addr, fabsp, pcount, actualpx,
+                                                chained_hdrs, plrecp, readop);
+            end
+            else
+            begin
+              lisaio (ecode, devnum, d2addr, fabsp, pcount, actualpx,
+                                                with_header, plrecp, writeop);
+            end;
+
+            if (ecode > 0) then
+            begin
+              (* save first error *)
+              if save_warning <= 0 then save_warning := ecode;
+              if (ecode <> E_DATABAD) and
+                 (ecode <> E_CHECKSUM) then abortio (ecode)
+                                       else ecode := 0;  (* reset ecode *)
+            end;
+            if save_warning = 0 then save_warning := ecode; (* save first warning *)
+
+            xfercount := xfercount + actualpx * pgdatasize;
+          end;   (* of wholeIO case *)
+        noop,
+        unused,
+        test,
+        debug :
+          begin
+          end;   (* of noop, unused, test, debug case *)
+      end;  (* of case cmd of *)
+    end;    (* of with firstioreqp^ do *)
+    remreq (firstioreqp);
+  end;      (* of while firstioreqp <> nil do *)
+  actual := xfercount;                          (* return actual count of xfer *)
+  if actual < expected then                     (* probably I/O errors to disk *)
+  begin
+    newbtotal := newbtotal - (expected - actual); (* adjust for missing bytes *)
+  end;
+end;        (* of procedure doit *)
+
+
+
+
+
+
+
+procedure init_fmap;
+
+var
+     old_style : boolean;
+
+begin
+  with fptr^, FMinfo do
+  begin
+    device := curdev;
+    if old_volume(curdev) and (sfilenum <> TEMP_SFILE) then
+      ptrFmap := NIL
+    else
+      ptrFmap := @fmap;
+    ptrSent := @sent;
+    addrFbuf := ord(@fm);
+    sfile := sfilenum;
+    expand := FALSE;
+    ResetFmap(@FMinfo, ecode);
+    entryindex := 1;
+    ptrEntry := GetMapEntry(@FMinfo, ecode);
+    if ptrEntry = NIL then
+      ecode := E_FMAP_SHORT;
+  end;
+end;  (* of procedure init_fmap *)
+
+
+
+(* Map absolute page number to relative page number *)
+function  GetRelPage ( abs_page : longint ) : longint;
+
+var
+     rel_page : longint;
+     ptrFmap  : flmap_ptr;
+
+begin
+  with fptr^ do
+  begin
+    if old_volume(curdev) and (sfilenum <> TEMP_SFILE) then
+      ptrFmap := NIL
+    else
+      ptrFmap := @fmap;
+    fmap_mgr(ecode, curdev, sfilenum, ptrFmap, @sent, FMRELPAGE, abs_page, rel_page);
+  end;
+  GetRelPage := rel_page;
+
+(*$IFC DEBUG2*)
+if trace(FS,64) then
+begin
+writeln('FILEIO  ',fptr^.fname,' abspg = ',abs_page:4,
+        '   relpg = ',rel_page:4);
+end;
+(*$ENDC*)
+end;
+
+
+
+procedure nextviamap;  (* uses global variables, update abs and relpage values *)
+
+begin
+  prepage := curabspage;                        (* update on each cycle *)
+  if currelpage = filepages-1 then
+  begin     (* ran out of allocated pages *)
+    curabspage := redlight;
+  end
+  else
+  begin
+    entryindex := entryindex + 1;
+    if entryindex > ptrEntry^.cpages then
+    begin
+      ptrEntry := GetMapEntry(@FMinfo, ecode);
+      if ptrEntry = NIL then
+        curabspage := REDLIGHT   (* bad EOF *)
+      else
+        curabspage := ptrEntry^.address;
+      entryindex := 1;
+    end
+    else
+    begin
+      curabspage := curabspage + 1;
+    end;
+    currelpage := currelpage + 1;
+  end;
+end;    (* of procedure nextviamap *)
+
+
+
+
+
+
+
+
+
+procedure allocpages (var pagecount : longint);
+
+var ec, loc_ec : error;
+    newp, pactual, append_to : longint;
+    ptrFmap : flmap_ptr;
+    psize : longint;
+
+begin
+  ec := 0;
+  with fptr^ do
+  begin
+    if old_volume(curdev) and (sfilenum <> TEMP_SFILE) then
+    begin
+      ptrFmap := NIL;
+{$IFC BLK512}
+      Pg(phys_size, psize);
+{$ELSEC}
+      psize := phys_size div mounttable[curdev]^.MDDFdata^.datasize;
+{$ENDC}
+    end
+    else
+    begin
+      ptrFmap := @fmap;
+      psize := fmap.size;
+    end;
+    if phys_size > 0 then
+      (* try to append contiguous to end of existing data pages *)
+      append_to := abspage(loc_ec, psize-1, fptr)
+    else
+      append_to := 0;
+
+    while (pagecount > 0) AND (ec = 0) do
+    begin
+      appendpages (append_to, devnum, pagecount, false, newp, pactual,
+                   sfilenum, @sent, ptrFmap, ec);
+             (* NOTE: since sfnum>0, ip value doesn't matter *)
+      pagecount := pagecount - pactual;
+
+      (* update file physical size in control block *)
+      if old_volume(curdev) then
+        phys_size := get_psize(loc_ec, curdev, sfilenum)
+      else
+        phys_size := fmap.size * mounttable[curdev]^.MDDFdata^.datasize;
+    end;
+  end;
+end;  (* of procedure allocpages *)
+
+
+
+
+
+
+
+
+
+
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then
+  begin
+    write ('FILEIO:  request to ');
+    if op=readop then write ('read ') else if op=writeop then write ('write ') else
+                                                                   write ('????? ');
+    writeln (reqsize,' bytes using sfile ',fptr^.sfilenum,' / ',
+             fptr^.fname);
+  end;
+(*$ENDC*)
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               INITIALIZE SOME GLOBALS AND SET UP STATES                    *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+  ecode := 0;
+  save_warning := 0;
+  actual := 0;
+  eof := false;
+  expanding := false;
+  newbtotal := 0;
+  xfercount := 0;                (* accumulating transfer count *)
+
+  if reqsize <= 0 then goto 1;   (* no work to do *)
+
+  devnum := fptr^.curdev;
+
+  fspages := mounttable [devnum]^.MDDFdata^.geography.lastfspage + 1;
+
+
+  (* check for legal page/offset parameters *)
+
+  pgdatasize := mounttable [devnum]^.MDDFdata^.datasize;
+
+  if (ip>fspages) or (io<0) or (io>=pgdatasize) then
+  begin
+    ecode := E_FILEIO_ARG;
+    goto 1;
+  end;
+
+  if (fptr^.sent.fileaddr = 0) or
+     (fptr^.sent.filesize = 0) then  (* no data written yet *)
+  begin
+    emptyfile := true;
+  end
+  else
+  begin
+    emptyfile := false;
+  end;
+
+  if ip = redlight then  (* page crossing - boundary condition *)
+  begin
+    pgxing := true;
+  end
+  else
+  begin
+    pgxing := false;
+  end;
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               RECONCILE REQUEST WITH ACTUAL RESOURCES                      *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+ if (op = readop) then
+  begin
+    if emptyfile OR pgxing then
+    begin
+      ecode := E_EOF;   (* logical EOF on reading - no more available data *)
+      goto 1;
+    end;
+    (* ip is now known to be > 0; get rel page and check for eof condition *)
+    irelpage := GetRelPage(ip);
+    firstbyte := irelpage * pgdatasize + io;        (* bytes numbered from 0 *)
+    lastbyte := firstbyte + reqsize - 1;            (* last byte we want to read *)
+    lastavail := fptr^.sent.filesize - 1;     (* last available byte for reading *)
+    if lastbyte > lastavail then
+    begin
+      eof := true;     (* we will not be able to read all requested bytes *)
+      reqsize := reqsize - (lastbyte - lastavail);  (* adjust to max available *)
+    end;
+  end   (* of op = readop conditions *)
+  else
+  begin (* op = writeop *)
+    if emptyfile OR pgxing then       (* first write to a file or boundary case *)
+    begin
+{$IFC BLK512}
+      Pg(reqsize-1, pgsneeded);
+      pgsneeded := pgsneeded + 1;
+{$ELSEC}
+      pgsneeded := ((reqsize-1) div pgdatasize) + 1;   (* pages for whole request *)
+{$ENDC}
+                               (* calculate number of pages currently allocated *)
+      if emptyfile then
+      begin
+        firstbyte := 0;
+      end
+      else
+      begin
+        firstbyte := fptr^.sent.filesize;   (* will be a multiple of pgdatasize *)
+      end;
+{$IFC BLK512}
+      Pg(firstbyte, irelpage);
+      Pg(fptr^.phys_size-firstbyte, pgsavail);
+{$ELSEC}
+      irelpage := firstbyte div pgdatasize;
+      pgsavail := (fptr^.phys_size - firstbyte) div pgdatasize;
+{$ENDC}
+      if pgsavail >= pgsneeded then pgsneeded := 0 else
+                     pgsneeded := pgsneeded - pgsavail; (* additional requirement *)
+                                                        (* get the needed pages *)
+      if pgsneeded > 0 then allocpages (pgsneeded);
+      if pgsneeded > 0 then                         (* couldn't get all of them *)
+      begin
+        eof := true;   (* ran out of disk space *)
+{$IFC BLK512}
+        PgOffset(reqsize, junk, reqExtra);
+        reqsize := (reqsize - ((pgsneeded-1) * DEFPGDATASIZE)) - reqExtra;
+{$ELSEC}
+        reqsize := reqsize - ((pgsneeded-1) * pgdatasize) - reqsize mod pgdatasize;
+{$ENDC}
+      end;
+    end    (* of emptyfile or pgxing write case *)
+    else
+    begin  (* ip is now known to be > 0; get relpage and chk for need to alloc *)
+      irelpage := GetRelPage(ip);
+      firstbyte := irelpage * pgdatasize + io;        (* bytes numbered from 0 *)
+      lastbyte := firstbyte + reqsize - 1;            (* last byte we want to write *)
+      lastavail := fptr^.phys_size - 1;     (* last available byte for writing *)
+      if lastbyte > lastavail then
+      begin
+{$IFC BLK512}
+        Pg((lastbyte-lastavail)-1, pgsneeded);
+        pgsneeded := pgsneeded + 1;
+{$ELSEC}
+        pgsneeded := (((lastbyte - lastavail) - 1) div pgdatasize) + 1; (* !!! *)
+{$ENDC}
+      end
+      else pgsneeded := 0;
+      if pgsneeded > 0 then allocpages (pgsneeded);  (* get the needed pages *)
+      if pgsneeded > 0 then                          (* couldn't get them *)
+      begin
+        eof := true;   (* ran out of disk space *)
+{$IFC BLK512}
+        PgOffset(lastbyte+1, junk, reqExtra);
+        reqsize := (reqsize - ((pgsneeded-1) * DEFPGDATASIZE)) - reqExtra;
+{$ELSEC}
+        reqsize := reqsize - ((pgsneeded-1) * pgdatasize) -  (* whole pages *)
+                             ((lastbyte+1) mod pgdatasize);  (* partial page *)
+{$ENDC}
+      end;
+    end;   (* of ip > 0 write check for need to allocate additional pages *)
+    lastbyte := firstbyte + reqsize - 1;        (* last byte we want to write *)
+    lastavail := fptr^.sent.filesize - 1; (* last available byte already written *)
+    if lastbyte > lastavail then
+    begin
+      expanding := true;     (* we are expanding size of file by writing *)
+      newbtotal := lastbyte - lastavail;  (* amount of expansion we should see *)
+    end;
+  end;  (* of op = writeop conditions *)
+
+  if reqsize <= 0 then goto 1;      (* in case we were positioned right at eof *)
+
+  (* there is now available data part of file for reqsize transfer *)
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               DETERMINE FIRST, MIDDLE, LAST REQUESTS                       *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+  expected := reqsize;              (* expected total transfer count *)
+  dataptr := addr;                  (* initialize data pointer to caller buffer *)
+
+  firstpage := pgdatasize-io;       (* data bytes left on current page *)
+
+  if firstpage >= reqsize then      (* enough space on current page *)
+  begin
+    firstpage := reqsize;           (* actual number of bytes to transfer *)
+  end;
+
+  reqsize := reqsize - firstpage;   (* remaining bytes to transfer, used later *)
+{$IFC BLK512}
+  PgOffset(reqsize, middlepages, lastpage);
+{$ELSEC}
+  middlepages := reqsize div pgdatasize;  (* whole pages to transfer *)
+  lastpage := reqsize mod pgdatasize;     (* remainder bytes to transfer *)
+{$ENDC}
+
+  if firstpage = pgdatasize then    (* optimization *)
+  begin
+    middlepages := middlepages + 1;
+    reqsize := reqsize + pgdatasize;
+    firstpage := 0;
+  end;
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               INITIALIZE FOR BUILDING REQUEST LISTS                        *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+  (*
+   *  Page allocation for the file has been completed; so bring in the
+   *  current file map
+   *)
+  init_fmap;
+  if ecode > 0 then goto 1;
+
+  currelpage := 0;
+  filepages := FMinfo.ptrFmap^.size;
+  if filepages > 0 then
+    curabspage := ptrEntry^.address
+  else
+    curabspage := redlight;
+  prepage := redlight;
+
+  {irelpage is file relpage where I/O will now start}
+{$IFC DEBUG2}
+  if trace(FS,64) then
+    writeln('position to relpage ',irelpage:5);
+{$ENDC}
+                                                         (* position in map *)
+  while (curabspage <> redlight) AND (currelpage <> irelpage) do
+  begin
+    nextviamap;
+  end;
+
+  if curabspage = redlight then
+  begin
+    ecode := E_EOF_EARLY;
+    goto 1;    (* should not happen *)
+  end;
+
+  if fptr^.sent.filesize = 0 then lastrelpage := 0 else
+{$IFC BLK512}
+    Pg(fptr^.sent.filesize-1, lastrelpage);
+{$ELSEC}
+    lastrelpage := (fptr^.sent.filesize - 1) div pgdatasize;
+{$ENDC}
+                                                (* relpage where leof is *)
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               UPDATE FILE POINTERS IN BOUNDARY CASES                       *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+  if (op = writeop) AND (emptyfile OR pgxing) then  (* set up initial ip, etc. *)
+  begin
+    ip := curabspage;  (* initialize for new first page *)
+    io := 0;
+    if emptyfile then
+    begin
+      with fptr^ do
+      begin
+        sent.fileaddr := curabspage;
+        curpage := curabspage;             (* initialize in file ctrl block *)
+        curoffset := 0;                    (* initialize in file ctrl block *)
+        {wrcurpage := curpage;}              (* initialize in file ctrl block *)
+          (* could postpone slist_io, since we will write out later for new *)
+          (* filesize, but by then it may not be in system buffers          *)
+        if sfilenum <> TEMP_SFILE then
+          slist_io (ecode, devnum, sfilenum, writeop, sent);  (* write new s_entry *)
+        with pl do
+        begin
+          volume := 0;
+          datastat := dataok;
+          version := sent.version;
+          fileid := sfilenum;
+          if expected > pgdatasize then  (* only chance to update dataused field *)
+            dataused := pgdatasize    (* on relpage zero if it's in the cache *)
+          else
+            dataused := expected;
+          abspage := curabspage;
+          relpage := 0;
+          fwdlink := redlight;
+          bkwdlink := redlight;
+          pglblio (pl, devnum, curabspage, writeop, ecode);
+                       (* write out a correct first page label for data *)
+        end;
+      end;
+    end
+    else
+    begin                                       (* pgxing case *)
+      if fptr^.curpage = redlight then fptr^.curpage := ip; (* for pipe read update *)
+      if irelpage > lastrelpage then   (* setting up pglabel for first time *)
+      begin
+        pglblio (pl, devnum, prepage, readop, ecode); (* backlink leof page *)
+        pl.fwdlink := ip;
+        pglblio (pl, devnum, prepage, writeop, ecode);
+      end;
+    end;
+  end;
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               BUILD THE FIRST ACTUAL REQUEST LIST                          *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+  update_link := false;
+  firstioreqp := nil;                   (* no requests yet *)
+
+  addreq (firstioreqp);                 (* build I/O request list *)
+  nextioreqp := firstioreqp;
+  with nextioreqp^ do                   (* set up first request block *)
+  begin
+    if firstpage > 0 then
+    begin
+      cmd := partio;                    (* partial page I/O *)
+      absp := ip;                       (* may update ip later *)
+      boffset := io;                    (* may update io later *)
+      bcount := firstpage;              (* amount requested; could lead to eof *)
+      d1addr := dataptr;                (* address of user's buffer *)
+      relp := currelpage;               (* relpage for page label, if needed *)
+      dataptr := dataptr + bcount;      (* where I/O should continue *)
+      update_link := true;              (* remember to update forward link *)
+
+      (* If this relpage is past leof relpage (pgxing case) then we already    *)
+      (* linked leof relpage (prepage) to this (new) data page.                *)
+      (* If this relpage (currelpage) is past                                  *)
+      (* the leof relpage, then we need to set its links; set pblink to prepage*)
+      (* so partio will know to set up a complete page label for this page,    *)
+      (* and set fwdlink to redlight.  Will be set to curabspage later if nec. *)
+      (* If the page is not past leof relpage, do not change links.            *)
+
+      if currelpage > lastrelpage then
+      begin
+        pblink := prepage;
+        pflink := redlight;      (* will be set to curabspage later if necessary *)
+      end
+      else
+      begin
+        pblink := 0;      (* 0 means do not change existing value *)
+        pflink := 0;
+      end;
+
+      nextviamap;                       (* move on to next page *)
+
+      if reqsize = 0 then               (* this will be only transfer, so update *)
+      begin
+        io := io + bcount;
+        if io = pgdatasize then         (* boundary condition *)
+        begin
+          if relp >= lastrelpage then ip := redlight else ip := curabspage;
+          io := 0;
+        end;
+      end;
+    end;                                (* cmd := noop; default *)
+  end;  (* of with nextioreqp^ do *)
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               BUILD THE MIDDLE ACTUAL REQUEST LISTS                        *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+  if middlepages > 0 then    (* will be doing whole i/o, so set up offset *)
+  begin
+    firstblock := mounttable [devnum]^.MDDFdata^.geography.firstblock;
+    if (currelpage > lastrelpage) and update_link then    (* connect lastrelpage to new pages *)
+    begin
+      nextioreqp^.pflink := curabspage; (* writing a new pflink *)
+      update_link := false;             (* link has now been updated *)
+    end;
+  end;
+
+  nextcontig := 0;
+
+  while middlepages > 0 do
+  begin
+    if invm (devnum, curabspage, FALSE) then  (* assumes if in vm, pglabel OK *)
+    begin
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then
+  begin
+    write ('FILEIO-invm:  request to ');
+    if op=readop then write ('read ') else if op=writeop then write ('write ') else
+                                                                   write ('????? ');
+    writeln (' page ', curabspage, ' using sys buffers.');
+  end;
+(*$ENDC*)
+                (* in case other middle contig pgs. need to link to this pg *)
+      if (currelpage > lastrelpage) and update_link then    (* connect lastrelpage to new pages *)
+      begin
+        nextioreqp^.pflink := curabspage; (* writing a new pflink *)
+        update_link := false;             (* link has now been updated *)
+      end;
+
+      vm (ecode, devnum, curabspage, sizeof(pagelabel), dataptr, pgdatasize, op);
+      if ecode > 0 then
+      begin
+        (* save first error *)
+        if save_warning <= 0 then save_warning := ecode;
+        if (ecode <> E_DATABAD) and
+           (ecode <> E_CHECKSUM) then goto 1
+                                 else ecode := 0;  (* reset ecode *)
+      end;
+      if save_warning = 0 then save_warning := ecode; (* save first warning *)
+      xfercount := xfercount + pgdatasize;
+      savebp := prepage;
+      nextviamap;                       (* move on to next curabspage, etc. *)
+      if (op=writeop) then
+      begin
+        if currelpage > lastrelpage then
+        begin                               (* need to adjust page labels *)
+          pglblio (pl, devnum, prepage, readop, ecode);
+          if ecode > 0 then goto 1;
+          pl.dataused := pgdatasize;        (* writing entire page *)
+          if (middlepages = 1) and (lastpage = 0) then
+            pl.fwdlink := redlight
+          else
+            pl.fwdlink := curabspage;
+
+          (*  update the entire page label -- the page may have belonged
+           *  to another s-file when it was brought into the cache.
+           *)
+          pl.volume := 0;
+          pl.datastat := dataok;
+          pl.version := fptr^.sent.version;
+          pl.fileid := fptr^.sfilenum;
+          pl.abspage := prepage;   (* adjusted because of nextviamap increment *)
+          if curabspage = redlight then
+            pl.relpage := currelpage  (* nextviamap didn't do relpage increment *)
+          else
+            pl.relpage := currelpage - 1; (* nextviamap did do relpg increment *)
+          pl.bkwdlink := savebp;
+
+          pglblio (pl, devnum, prepage, writeop, ecode);
+        end;  (* of if expanding *)
+      end;  (* of if op = writeop *)
+      nextcontig := 0;   (* can't be contiguous if part in vm buffers *)
+    end   (* of vm buffer access *)
+    else
+    begin
+      if curabspage = nextcontig then
+      begin
+        nextioreqp^.pcount := nextioreqp^.pcount + 1;  (* contiguous piece *)
+        nextcontig := curabspage + 1;
+      end    (* of contiguous case *)
+      else
+      begin
+        addreq (nextioreqp);            (* set up a new request block *)
+        nextioreqp^.pblink := prepage;  (* set back link in new request block *)
+        nextioreqp^.frelp := currelpage;
+        nextioreqp^.fabsp := curabspage;
+        nextioreqp^.pcount := 1;
+        nextioreqp^.d2addr := dataptr;
+        nextioreqp^.cmd := wholeIO;
+        nextcontig := curabspage + 1;
+        update_link := true;            (* remember to update forward link *)
+      end; (* of new request block for non-contiguous case *)
+      nextviamap;    (* get next abspage so we can set pflink in request *)
+      if currelpage <= lastrelpage then       (* re-writing existing pages *)
+      begin
+        nextioreqp^.pflink := curabspage;
+      end
+      else
+      begin
+        nextioreqp^.pflink := redlight;       (* linking to page for first time *)
+      end;
+    end;   (* of disk access setup *)
+    dataptr := dataptr + pgdatasize;
+    middlepages := middlepages - 1;
+    saverp := currelpage - 1;           (* save for possible ip update later *)
+  end;    (* of while middlepages > 0 do *)
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               BUILD THE LAST ACTUAL REQUEST LIST                           *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+  if lastpage > 0 then
+  begin
+    if (currelpage > lastrelpage) and update_link then
+    begin
+      nextioreqp^.pflink := curabspage; (* writing a new pflink *)
+      update_link := false;             (* link has now been updated *)
+    end;
+    addreq (nextioreqp);
+    with nextioreqp^ do                 (* set up final request block *)
+    begin
+      if currelpage > lastrelpage then
+      begin
+        pblink := prepage;
+        pflink := redlight;             (* current leof page *)
+      end
+      else
+      begin
+        pblink := 0;
+        pflink := 0;                    (* 0 means do not change existing value *)
+      end;
+      cmd := partio;                    (* partial page I/O - final *)
+      absp := curabspage;
+      relp := currelpage;
+      boffset := 0;
+      bcount := lastpage;
+      d1addr := dataptr;                (* address of user's buffer *)
+     {dataptr := dataptr + bcount;}     (* where I/O should continue *)
+    end;
+    io := lastpage;                     (* where I/O continues, < pgdatasize *)
+    ip := curabspage;
+  end
+  else                                  (* lastpage = 0 *)
+  begin
+    if reqsize > 0 then                 (* some middle pages were used *)
+    begin                               (* set ip to where i/o should continue *)
+      if saverp >= lastrelpage then ip := redlight else ip := curabspage;
+      io := 0;
+    end;
+  end;
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               EXECUTE ALL ACTUAL REQUESTS                                  *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+
+  doit;
+
+
+
+
+
+  (******************************************************************************)
+  (*                                                                            *)
+  (*               UPDATE FILE ACCESS INFO                                      *)
+  (*                                                                            *)
+  (******************************************************************************)
+
+
+
+
+
+  {fptr^.DTA := timestamp;   (* get latest date/time of access *)}
+
+                                        (* no room for hints = no room, period *)
+  if ecode = E1_VOLUME_FULL (* no room on device *) then ecode := E3_VOLUME_FULL;
+
+  (* update s_entry if file might have automatically expanded *)
+  if op=writeop then
+  begin
+    with fptr^ do
+    begin
+      (*
+       *  A write to an object clears the three status bits;  assumption is
+       *  that a writer is attempting to "fix" the object.
+       *)
+      scav_flag := false;
+      OS_close_flag := false;
+      (*
+       *  Don't clear the file left open flag on the rootcatalog, since it
+       *  is really the volume left mounted flag.
+       *)
+      if sfilenum <> mounttable[devnum]^.MDDFdata^.rootsnum then
+        file_still_open := false;
+
+      {DTM := DTA;     (* access was a modification (write) *)}
+      time_dirty := true;  (* reminder to update modify timestamp *)
+      if (newbtotal > 0) then
+      begin                (* we wrote new bytes past eof, so update s-list *)
+                           (* calculate new eof *)
+        sent.filesize := sent.filesize + newbtotal;
+                           (* update the s-list *)
+        if sfilenum <> TEMP_SFILE then
+        begin
+          slist_io (slisterr, devnum, sfilenum, writeop, sent);
+          if slisterr <> 0 then ecode := E_UPDATE_SENTRY;   (* couldn't update s_entry *)
+        end;
+      end;
+    end;
+  end;
+
+
+1:
+
+  if ecode <= 0 then ecode := save_warning;
+  if eof and (save_warning <= 0) then ecode := E_EOF;
+
+  {if (ecode > 0) and (ecode < 100) then
+                          ecode := INTERRBASE + PRIMERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then writeln ('FILEIO:  xfer of ',actual,' bytes, ecode of ',
+                                                                              ecode);
+(*$ENDC*)
+
+end;    (* of procedure FILEIO *)
+
+
+
+
+
+
+
+
+
+
+
+
+
+(*$S kr_fs *)
+procedure HENTRY_IO (* var ecode:error; device:integer;
+                                      hintaddr:longint; var h:hentry; op:ioop*);
+
+const perrbase = 14;
+
+var tpage : longint;
+    toff  : integer;
+    actual : longint;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 22) then writeln ('HENTRY_IO:  request for hintaddr ',hintaddr);
+(*$ENDC*)
+
+  tpage := hintaddr;
+  toff := sizeof (pagelabel) + mounttable[device]^.MDDFdata^.hentry_offset;
+                           (* read hint entry *)
+  vm(ecode, device, tpage, toff, ord(@h), sizeof (hentry), op);
+
+(*$IFC DEBUG2*)
+  if trace (FS, 22) then writeln ('HENTRY_IO:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end; (* of procedure HENTRY_IO *)
+
+
+
+
+
+
+(*$S fs1 *)
+function hash (*var istring : e_name; maxindex : integer ) : integer *);
+
+var temp : longint;
+    l, m : integer;
+
+begin
+  l := length (istring);
+  if l <= 0 then hash := 0
+  else
+  begin
+    temp := ord (istring [1]) * (ord (istring [l]) + 1); (* fibonacci-like series *)
+    if l > 2 then m := l - 2 else m := 0;    (* number of middle characters *)
+    while m > 0 do
+    begin
+      temp := temp + (ord (istring [m+1]) * (ord (istring [m+2]) + 1));
+      m := m - 1;
+    end;
+    if temp < 0 then temp := -temp;
+    hash := (temp mod maxindex);
+  end;
+end;   (* of function hash *)
+
+
+
+
+(*$S fs1 *)
+procedure LOOKUP_BY_ENAME (*var ecode:error;
+                                name:e_name;
+                              catptr:sfcb_ptr;
+                        var catentry:centry*);
+
+label 1;
+
+const perrbase = 16;
+
+var h : hentry;
+    actual, prepage, ceaddr, tpage : longint;
+    preoffset, device, cenum, ecount, toffset : integer;
+    uc_ename, uc_uname : e_name;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then writeln ('LOOKUP_BY_ENAME:  looking for ',name);
+(*$ENDC*)
+
+  device := catptr^.curdev;    (* device on which catalog resides *)
+
+
+  (* make sure the open catalog  sfile is a catalog type *)
+
+{   ASSUME PASSED POINTER POINTS TO A ROOT CATALOG
+
+  hentry_io (ecode, device, catptr^.sent.hintaddr, h, readop);
+  if h.ftype <> rootcat then
+  begin
+    ecode := 1;          (* only one level of catalog, the root, legal for now *)
+    goto 1;
+  end;
+}
+
+  uc_uname := name;     (* local copy *)
+  upshift (@uc_uname);   (* upper case user name *)
+  ecount := mounttable [device]^.MDDFdata^.rootmaxentries;
+  cenum := hash (uc_uname, ecount);           (* hash name to an entry number *)
+  ceaddr := ord4 (cenum) * sizeof (centry);   (* convert to file pointer *)
+  catentry.cetype := killedentry;             (* initialize *)
+
+  (* search the names in the catalog until the requested one is found *)
+
+  wait_sem (mounttable[catptr^.curdev]^.semio, []);      (* to protect this sfcb change and fileio *)
+                                     (* position to first entry *)
+  if ceaddr = 0 then         (* special case to avoid abspage I/O in direct_io *)
+  begin
+    catptr^.curpage := catptr^.sent.fileaddr; (* start at beginning of file *)
+    catptr^.curoffset := 0;
+  end
+  else
+  begin
+    direct_io (ecode, catptr, ord(@catentry), ceaddr, 0, actual, readop);
+    if ecode > 0 then
+    begin
+      signal_sem(mounttable[catptr^.curdev]^.semio);
+      goto 1;
+    end;
+  end;
+
+  tpage := 0;     (* initialize *)
+
+  repeat
+    prepage := catptr^.curpage;
+    preoffset := catptr^.curoffset;
+    fileio (ecode, catptr, ord(@catentry), sizeof (centry), actual,
+                                     catptr^.curpage, catptr^.curoffset, readop);
+    if ecode <= 0 then
+    begin
+      uc_ename := catentry.name;
+      if catentry.cetype = removed then   (* remember an available removed slot *)
+      begin
+        if tpage = 0 then                 (* this is the first time *)
+        begin
+          tpage := prepage;               (* addresses of the removed slot *)
+          toffset := preoffset;
+        end;
+      end;
+    end
+    else
+    begin
+      if (ecode = E_READ_PAST_LEOF) OR (ecode = E_EOF) then  (* attempt to read past eof *)
+      begin
+        catptr^.curpage := catptr^.sent.fileaddr; (* start at beginning of file *)
+        catptr^.curoffset := 0;
+        ecount := ecount + 1;   (* don't count this try *)
+      end
+      else
+      begin
+        ecount := 1;   (* give up, unrecoverable error *)
+      end;
+      uc_ename := '';
+    end;
+    upshift (@uc_ename);           (* upper case entry name *)
+    ecount := ecount - 1;
+  UNTIL (uc_ename = uc_uname)
+    OR (catentry.cetype = emptyentry)
+    OR (ecount = 0);
+
+  signal_sem (mounttable[catptr^.curdev]^.semio);
+
+  catptr^.curpage := prepage;       (* return the address where the entry can *)
+  catptr^.curoffset := preoffset;   (* be read or written sequentially on return *)
+
+  if (ecode <= 0) AND (uc_ename <> uc_uname) then (* no errors, but still no match *)
+  begin
+    ecode := E_NOT_FOUND;            (* could not find an entry of that name *)
+    if tpage > 0 then
+    begin
+      catptr^.curpage := tpage;     (* return the address where a new entry can *)
+      catptr^.curoffset := toffset; (* be read or written sequentially on return *)
+      catentry.cetype := emptyentry;(* fake an available slot *)
+    end;
+  end;
+
+1:
+
+
+  {if (ecode > 0) and (ecode < 100) then
+                         ecode := INTERRBASE + PRIMERRBASE + PERRBASE + ecode;}
+
+(*$IFC DEBUG2*)
+  if trace (FS, 23) then writeln ('LOOKUP_BY_ENAME:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of procedure LOOKUP_BY_ENAME *)
+
+
+
+
+
+
+
+(*$S fs4 *)
+procedure MAKE_ROOTCAT (*var ecode:error; device : integer*);
+
+label 1;
+
+var snum : integer;
+    s : s_entry;
+    h : hentry;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 17) then writeln ('MAKE_ROOTCAT:  request to create the root cat');
+(*$ENDC*)
+
+  new_sfile (ecode, device, snum);   (* create an s-file for the root catalog *)
+  if ecode<=0 then
+  begin
+    mounttable [device]^.MDDFdata^.rootsnum := snum; (* store s-file number in MDDF *)
+    mounttable [device]^.MDDFdirty := true;
+  end
+  else goto 1;
+
+  slist_io (ecode, device, snum, readop, s); (* read s_entry for new root cat *)
+  if ecode > 0 then
+  begin
+    goto 1;
+  end;
+
+  (* write hint entry for root cat *)
+
+  with h do
+  begin
+    name := 'rootcatalog';
+    ftype := rootcat;
+    DTC := timestamp;
+    zero_time (DTA);
+    zero_time (DTM);
+    zero_time (DTB);
+    zero_time (DTS);
+    machine_id := serial_no;
+    killed := false;
+    safety_on := true;
+    protected := true;
+    master := false;
+    scavenged := false;
+    closed_by_OS := false;
+    file_open := false;
+    result_scavenge := 0;
+    system_type := 0;
+    user_type := 0;
+    user_subtype := 0;
+  end;
+
+  hentry_io (ecode, device, s.hintaddr, h, writeop);
+
+1:
+
+(*$IFC DEBUG2*)
+  if trace (FS, 17) then writeln ('MAKE_ROOTCAT:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;
+
+
+
+
+{$S fs3}
+(* Simple encryption *)
+(* From 32 char password to 8 char encrypted password *)
+procedure  crypt (* var passwd : e_name *);
+
+var
+     i : integer;
+
+begin
+    i := 0;
+    while i < length(passwd) do
+    begin
+      passwd[(i mod 8) + 1] := chr((ord(passwd[i + 1]) + i) mod 256);
+      i := i + 1;
+    end;
+    delete(passwd, 9, 32);  (* truncate to 8 chars *)
+end;
+
+
+
+{$S fs3}
+procedure  CheckPasswd (* var ecode  : integer;
+                          var passwd : e_name;
+                          var H      : hentry *);
+
+begin
+  ecode := 0;
+  (* Check for access restriction by password *)
+  if H.password <> '' then
+  begin
+    (* the file is password protected *)
+    crypt(passwd);  (* zaps the password that was passed *)
+    if H.password <> passwd then
+      (* the passwords do not match *)
+      ecode := E_PASSWORD;
+  end
+  else    (* not password protected *)
+    if passwd <> '' then
+      ecode := W_NO_PASSWORD;  (* secure kill on a file w/ null password *)
+end{proc CheckPasswd};
+
+
+
+
+{$S fs2 }
+procedure Make_Entry (* var ecode    : error;
+                            device   : integer;
+                            parID    : NodeIdent;
+                        var path     : pathname;
+                            objType  : entrytype;
+                            passwd   : e_name *);
+
+label 1, 2;
+
+var
+    C           : centry;
+    NewRec      : ObjRec;
+    H           : hentry;
+    S           : s_entry;
+    actual      : longint;
+    savepage    : longint;
+    saveoffset  : integer;
+    locl_ecode  : integer;
+    catptr      : SFCB_ptr;
+    ptrDCB      : DCBptr;
+    dateCreated : longint;
+    found       : boolean;
+    ptrBuf      : buffer_ptr;
+    ptrEntry    : entry_ptr;
+    name        : e_name;
+    nullName    : e_name;
+    junk        : integer;
+    recSize     : integer;
+    objParID    : NodeIdent;
+
+begin
+
+{$IFC DEBUG2}
+  if trace(FS, 27) then
+     writeln ('MAKE_ENTRY  dev = ',device,'   ',path);
+(*$ENDC*)
+
+  catptr := rootptr[device];
+  ptrDCB := mounttable[device];
+
+  if flat_catalog(device) then
+  begin
+    if pos ('-', path) <> 0 then
+    begin       (*  '-' not allowed in entry name. *)
+      ecode := E1_NAME_ILLEGAL;
+      goto 1;
+    end;
+    if objType = direntry then
+    begin
+      ecode := E_FLAT_OP;
+      goto 1;
+    end;
+  end;
+
+  if length(path) > max_ename then
+    name := copy(path, 1, max_ename)
+  else
+    name := path;
+  dateCreated := timestamp;
+
+  wait_sem(ptrDCB^.volSem, []);
+
+  if flat_catalog(device) then
+  begin
+    lookup_by_ename (ecode, name, catptr, c);    (* find requested entry *)
+    (*
+     *  Must save the IO pointer into the root catalog.
+     *  There is no semaphore protection from here until the actual write
+     *  of the new entry takes place.
+     *)
+    with catptr^ do
+    begin
+      savepage := curpage;
+      saveoffset := curoffset;
+    end;
+
+    if (ecode <= 0) then
+    begin
+      ecode := E_ENTRY_EXISTS;     (* error, there is already an entry by that name *)
+      goto 2;
+    end
+    else
+    if (ecode <> E_NOT_FOUND) OR (c.cetype <> emptyentry) then
+    begin
+      ecode := E_CATALOG_FULL;   (* no empty entries, catalog is full, or catptr was not a cat *)
+      goto 2;
+    end;
+  end
+  else
+  begin
+    PathSearch(ptrDCB, parID, path, @NewRec, ptrBuf, ptrEntry, found, ecode);
+    if found then
+    begin
+      ecode := E_ENTRY_EXISTS;
+      FreeBuf(ptrBuf);
+    end{if};
+    if ecode = E_TREE_EMPTY then
+      ptrBuf := NIL  (* force insert to search *)
+    else if ecode > 0 then goto 2;
+  end{if};
+
+  if objType <> direntry then
+  begin
+    ecode := 0;    (* in case we had an ecode 888 from lookup_by_ename *)
+    new_sfile (ecode, device, c.sfile);     (* create an s-file for this entry *)
+
+    if ecode > 0 then
+    begin
+      if not flat_catalog(device) then FreeBuf(ptrBuf);
+      goto 2;
+    end;
+
+    slist_io (ecode, device, c.sfile, readop, s);  (* read s-list to get hint address *)
+  end{if};
+
+  if flat_catalog(device) then
+  begin
+    c.name := name;
+    c.cetype := objType;
+    c.readpage := 0;     (* pipe read/write ptrs *)
+    c.readoffset := 0;
+    c.writepage := 0;
+    c.writeoffset := 0;
+    c.attributes := 0;   (* reserved field *)
+
+           (* write new catalog entry to the catalog *)
+    fileio (ecode, catptr, ord(@c), sizeof(centry), actual,
+                                   savepage, saveoffset, writeop);
+    objParID := ROOT_NID;
+  end
+  else
+  begin
+    (* build the record to be inserted *)
+    nullName := '';
+    ptrEntry := @NewRec;
+    ClearMem(ord(@NewRec)+sizeof(RecKey), sizeof(NewRec)-sizeof(RecKey));
+    with ptrEntry^ do
+    begin
+      eType := objType;
+      case eType of
+        fileentry:
+        begin
+          sfile := c.sfile;  (* from new_sfile *)
+          fileDTC := dateCreated;
+          zero_time(fileDTM);
+          fsOvrhd := 1;
+          recSize := sizeof(ObjectRec);
+          (* other fields, notably flags, zeroed by ClearMem *)
+        end;
+        direntry:
+        begin
+          with ptrDCB^.MDDFdata^ do
+          begin
+            node_id := node_id + 1;
+            id := node_id;
+          end{with};
+          dirDTC := dateCreated;
+          recSize := sizeof(DirectRec);
+        end;
+      end{case};
+    end{with};
+    {
+    (* Install user attributes *)
+    ptrEntry := pointer(ord(ptrEntry) + sizeof(ObjRec));
+    moveleft(ptrAttr^, ptrEntry^, attrSize);
+    }
+    Insert(ptrDCB, @NewRec, recSize, ptrBuf, ecode);
+    if ecode > 0 then goto 2;
+    DecompKey(@NewRec, @name, objParID);  (* get name for hentry *)
+
+    if objType = direntry then
+    begin
+      (* Install key in record buffer *)
+      MakeKey(ptrEntry^.id, @nullName, @NewRec);
+      ptrEntry^.myName := name;
+      ptrEntry^.parID := objParID;
+      ptrEntry^.eType := threadentry;
+
+      Insert(ptrDCB, @NewRec, sizeof(ThreadRec), NIL, ecode);
+      if ecode > 0 then
+        Ddelete(ptrDCB, @NewRec, NIL, junk, locl_ecode);
+      goto 2;  (* exit early *)
+    end{if};
+
+    if ecode > 0 then goto 2;
+
+  end{if};
+
+  ClearMem(ord(@h), sizeof(hentry));
+  h.name := name;
+  getid(h.unique_ID);    (* get a unique ID for this object *)
+  with h do
+  begin
+    version := cur_file_version;  (* fs version identifier *)
+    crypt(passwd);
+    moveleft(passwd, password, sizeof(Str8));
+    case objType of
+      emptyentry: ftype := undefined;
+      direntry:   ftype := userdir;
+      linkentry:  ftype := undefined;       (* link doesn't have a file type   *)
+      fileentry:  ftype := userfile;        (* assume user file for time being *)
+      pipeentry:  ftype := pipe;
+      ecentry:    ftype := pipe;            (* since ec uses pipes for time being *)
+    end;
+
+    DTC := dateCreated;   (* time of creation *)
+    zero_time (DTA);
+    zero_time (DTM);
+    zero_time (DTB);
+    zero_time (DTS);
+    parentID := objParID;
+    fsOverhead := 1;
+{  This stuff already zeroed
+    machine_id := 0;
+    killed := false;
+    safety_on := false;
+    protected := false;
+    master := false;
+    scavenged := false;
+    closed_by_OS := false;
+    file_open := false;
+    result_scavenge := 0;
+    system_type := 0;
+    user_type := 0;
+    user_subtype := 0;
+    file_portion := 0;
+    with build_info do
+    begin
+      release_number := 0;
+      build_number := 0;
+      compatibility_level := 0;
+      revision_level := 0;
+    end;
+    }
+  end;
+
+  hentry_io (ecode, device, s.hintaddr, h, writeop); (* write catalog entry to hints *)
+
+  if flush_level <= makeFlush then flushfs(locl_ecode);
+
+2:
+  signal_sem (ptrDCB^.volSem);
+
+1:
+
+(*$IFC DEBUG2*)
+  if trace (FS, 27) then writeln ('MAKE_ENTRY:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of procedure MAKE_ENTRY *)
+
+
+
+
+
+
+
+
+(*$S fs2 *)
+(*
+ *  performance
+ *  1.  call to unload loaded program file
+ *)
+procedure KILL_ENTRY (* var ecode  : error;
+                            device : integer;
+                            parID  : NodeIdent;
+                        var path   : pathname;
+                            passwd : e_name *);
+
+label 1, 2;
+
+var s:s_entry;
+    c:centry;
+    h:hentry;
+    actual : longint;
+    filenum : integer;
+    fptr : sfcb_ptr;   (* for sfile to be killed, if currently open *)
+    reloffset : longint;
+    pgdatasz : integer;
+    savepage : longint;
+    saveoffset : integer;
+    locl_ecode : integer;
+    wcode : integer;
+    ptrDCB : DCBptr;
+    NewRec : ObjRec;
+    size : integer;
+    catptr : SFCB_ptr;
+    nullName : e_name;
+    dotdotKey : RecKey;
+    ptrBuf : buffer_ptr;
+    found : boolean;
+    junk : integer;
+    NextRec : ObjRec;
+    seqName : e_name;
+    seqID : integer;
+    name : e_name;
+    dirObject : boolean;
+    ptrEntry  : entry_ptr;
+
+begin
+
+(*$IFC DEBUG2*)
+  if trace (FS, 27) then writeln ('KILL_ENTRY:  request to kill entry called ',name);
+(*$ENDC*)
+
+  ecode := 0;
+  wcode := 0;
+  nullName := '';
+  ptrDCB := mounttable[device];
+  catptr := rootptr[device];
+  wait_sem (ptrDCB^.volSem, []);         (* allow only one kill entry at a time *)
+
+  if flat_catalog(device) then
+  begin
+    dirObject := FALSE;
+    name := path;
+    lookup_by_ename (ecode, name, catptr, c);    (* find requested entry *)
+    with catptr^ do
+    begin
+      savepage := curpage;
+      saveoffset := curoffset;
+    end;
+  end
+  else
+  begin
+    PathSearch(ptrDCB, parID, path, @NewRec, ptrBuf, ptrEntry, found, ecode);
+    if ecode <= 0 then
+    begin
+      if not found then
+      begin
+        ecode := E_NO_ENTRY;
+        FreeBuf(ptrBuf);
+        goto 2;
+      end{if};
+      Ddelete(ptrDCB, @NewRec, ptrBuf, size, ecode);
+      filenum := NewRec.sfile;
+      dirObject := (NewRec.eType = direntry);
+    end{if};
+  end;
+
+  if ecode > 0 then
+  begin
+    ecode := E_NO_ENTRY;   (* could not find the named entry, or catptr was not a cat *)
+    goto 2;
+  end;
+
+  if flat_catalog(device) then
+  begin
+    with catptr^ do
+    begin
+      filenum := c.sfile;         (* s-file number to kill on that device  *)
+      pgdatasz := mounttable[device]^.MDDFdata^.datasize;  (* data bytes per page *)
+        (* relative offset of catalog entry *)
+      reloffset := (curpage * pgdatasz) + curoffset;
+    end;
+  end;
+
+  if not dirObject then
+  begin
+    slist_io (ecode, device, filenum, readop, s); (* get s-entry to find hints *)
+    if ecode > 0 then goto 2;
+
+    if s.hintaddr <= 0 then
+    begin
+      ecode := E_BADSENTRY;
+      goto 2;
+    end;
+
+    hentry_io (ecode, device, s.hintaddr, h, readop); (* get hints *)
+    if (ecode > 0) or (length(h.name) > max_ename) then goto 2;
+
+    if h.safety_on then        (* should we be allowed to kill this entry? *)
+    begin
+      ecode := E_SAFETY_ON;
+      if not flat_catalog(device) then
+        (* restore the deleted entry *)
+        Insert(ptrDCB, @NewRec, size, NIL, locl_ecode);
+      goto 2;
+    end;
+
+    if h.version < cur_file_version then
+    begin
+      UpgradeFile(device, s.hintaddr);
+      (* Now reread the hint entry *)
+      hentry_io (ecode, device, s.hintaddr, h, readop);
+    end;
+
+    CheckPasswd(ecode, passwd, h);
+    if ecode > 0 then
+    begin
+      if not flat_catalog(device) then
+        (* restore the deleted entry *)
+        Insert(ptrDCB, @NewRec, size, NIL, locl_ecode);
+      goto 2;
+    end;
+    wcode := ecode;  (* save possible warning *)
+
+    sopencheck (ecode, device, filenum, fptr);  (* is sfile open? *)
+    if ecode > 0 then goto 2;
+
+    if fptr <> pointer(badptr2) then
+    begin
+      fptr^.kswitch := true;   (* defer kill until last close *)
+      h.killed := true;        (* use hints we already read in *)
+      (* write catalog entry to hints *)
+      hentry_io (ecode, device, fptr^.sent.hintaddr, h, writeop);
+    end
+    else
+    begin
+      (* there should not be any users of this s-file now! *)
+      kill_sfile (ecode, device, filenum);
+    end;
+  end;
+
+  if flat_catalog(device) then
+  begin
+    with catptr^, c do
+    begin
+      cetype := removed;
+      (*
+       *  The entry following the killed entry is on the same page.  See if
+       *  the following entry is empty before marking the killed entry with
+       *  the special removed type.
+       *)
+      if (curoffset+(sizeof(centry)*2)) <= pgdatasz then
+      begin
+        (*
+         *  Do not probe the entry following the last entry in the catalog.
+         *)
+        if reloffset < (sent.filesize - sizeof(centry)) then
+        begin
+          vm(ecode, device, curpage, sizeof(pagelabel)+curoffset+sizeof(centry),
+             ord(@c), sizeof(centry), readop);
+          if (ecode > 0) or (cetype <> emptyentry) then
+            cetype := removed
+          else
+            cetype := emptyentry;
+        end;
+      end;
+
+      name := '';    (* clear entry with an empty name *)
+      sfile := 0;    (* and an empty sfile number, etc.*)
+      readpage := 0;
+      readoffset := 0;
+      writepage := 0;
+      writeoffset := 0;
+
+           (* write cleared catalog entry to the catalog *)
+      fileio (ecode, catptr, ord(@c), sizeof(centry), actual,
+                                   savepage, saveoffset, writeop);
+    end;
+  end
+  else
+  begin
+    if dirObject then
+    begin
+      MakeKey(NewRec.id, @nullName, @dotdotKey);
+      Search(ptrDCB, @dotdotKey, ptrBuf, found, ecode);
+      if found then
+      begin
+        SeqRec(ptrDCB, ptrBuf, NodeStack[ptrDCB^.MDDFdata^.tree_depth].index, @NextRec, ecode);
+        if (ecode > 0) and (ecode <> E_EOF) then
+        begin
+          Insert(ptrDCB, @NewRec, size, NIL, ecode);
+          goto 2;
+        end;
+        if ecode <> E_EOF then
+        begin
+          FreeBuf(ptrBuf);
+          DecompKey(@NextRec.key, @seqName, seqID);
+          if seqID = NewRec.id then
+          begin
+            Insert(ptrDCB, @NewRec, size, NIL, ecode);
+            ecode := E_DIR_NOT_EMPTY;
+            goto 2;
+          end{if};
+        end{if};
+
+        Ddelete(ptrDCB, @dotdotKey, NIL, junk, ecode);
+      end
+      {
+      else
+        ecode := E_TREE_MUNCHED;
+      }
+    end{if};
+  end{if};
+
+
+  (* could clear hints, but don't bother now to save time *)
+
+  if flush_level <= makeFlush then flushfs(locl_ecode);
+
+2:
+  signal_sem (ptrDCB^.volSem);
+
+  if ecode <= 0 then
+    if fptr <> pointer(badptr2) then
+      (* let process mgmt see if this is a program file requiring unloading *)
+      (* the file will be killed if Free_LPs does last close *)
+      Free_LPs(fptr, -1);
+
+1:
+
+  if ecode = 0 then ecode := wcode;
+
+(*$IFC DEBUG2*)
+  if trace (FS, 27) then writeln ('KILL_ENTRY:  returning with ecode of ',ecode);
+(*$ENDC*)
+
+end;  (* of procedure KILL_ENTRY *)
+
+
+
+(*$S fs2 *)
+procedure  GetPathname (*     ptrFCB : SFCB_ptr;
+                          var pathn  : pathname *);
+
+begin
+    pathn := concat('-',configinfo[ptrFCB^.curdev]^.devname,'-',ptrFCB^.fname);
+end{proc GetPathname};
+
+
+
+END.
+
+ÿ

@@ -1,0 +1,981 @@
+(* ********************************************************************* *)
+
+(* CopyRight 1983, Apple Computer Inc. *)
+(* GE Unit CTR Include File - Event Handling Routines *)
+
+(* ********************************************************************* *)
+
+(* Filer Events *)
+(*$S FLR*)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure GetFName(VAR n: PathName);
+    var dLen: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        dLen := Length(curDoc.fName^^);
+        MoveLeft(curDoc.fName^^,n,dLen+1);
+    end; (* GetFName *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    function  NewDoc(who: GrafPtr; pName: PathName; VAR errNum: Integer): TDocHnd;
+    const
+        (* LDSN assignments *)
+        geHLdsn     = 1;        (* reserve 1&2 for geHHz, maximum size is
+                                   256K, big enough for 32K objects in
+                                   selection plus 128K left over for misc
+                                   and LisaGraf regions. *)
+        docPLdsn    = 3;        (* reserve 3-6 for non-relocatable doc Hz,
+                                   maximum size is 512K, big enough for
+                                   12,000 objects. *)
+        docHLdsn    = 7;        (* reserve 7-11 for relocatable doc Hz,
+                                   maximum size is 640K, big enough for
+                                   800-100 point polygons. *)
+        (* starting sizes for heap zones *)
+        pSize   = $1000;   (* 4K *)
+        hSize   = $1000;   (* 4K *)
+    var nDoc: TDocHnd;
+        hz: THz;
+        ref:  Integer;
+        pLen: Integer;
+        eNum: Integer;
+        thisSLst: TSelHnd;
+        thisHandle: TH;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            writeln('NewDoc(',Ord(who):8,',',pName,')');
+
+        (* allocate the doc *)
+        nDoc := Pointer(Ord(HAllocate(geHHz,SizeOf(TDocInfo))));
+        (* set defaults *)
+        nDoc^^       := stdDoc;
+        thisSLst     := NewSLst(geHHz);
+        nDoc^^.sLst  := thisSLst;
+        InitSLst(nDoc^^.sLst);
+        nDoc^^.fldr  := who;
+        pLen := Length(pName)+1;
+        thisHandle := HAllocate(geHHz,pLen);
+        nDoc^^.fName := Pointer(Ord(thisHandle));
+        MoveLeft(pName,nDoc^^.fName^^,pLen);
+        NewGEHz(pName,pSize,pSize,docPLdsn,@GrowDocHz,hz,ref,errNum);
+        if errNum>0 then Exit(NewDoc);
+        nDoc^^.pHz   := hz;
+        nDoc^^.pRef  := ref;
+        NewGEHz(pName,hSize,hSize,docHLdsn,@GrowDocHz,hz,ref,errNum);
+        if errNum>0 then begin
+            Close_DataSeg(eNum,nDoc^^.pRef);
+            Exit(NewDoc);
+        end;
+        nDoc^^.hHz   := hz;
+        nDoc^^.hRef  := ref;
+        (* allocate print data structures *)
+        thisHandle := Pointer(Ord(NewHPrRec));
+        nDoc^^.hPrRec := Pointer(Ord(thisHandle));
+
+        if traceFio then
+            DumpDoc(nDoc);
+
+        NewDoc := nDoc;
+    end; (* NewDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure FreeDoc(VAR doc: TDocHnd);
+    var errNum: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* docs are always in geHHz *)
+        Close_DataSeg(errNum,doc^^.pRef);
+        if rangeOn then
+            if errNum<>0 then
+                Error('FreeDoc-Close pDataSeg',errNum,NONFATAL);
+        Close_DataSeg(errNum,doc^^.hRef);
+        if rangeOn then
+            if errNum<>0 then
+                Error('FreeDoc-Close hDataSeg',errNum,NONFATAL);
+        FreeSLst(doc^^.sLst);
+        FreeH(geHHz,Pointer(Ord(doc^^.fName)));
+        FreeH(geHHz,Pointer(Ord(doc^^.hPrRec)));
+        FreeH(geHHz,Pointer(Ord(doc)));
+        doc := NIL;
+    end; (* FreeDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure SetCurDoc(doc: TDocHnd);
+    var i,errNum: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            writeln('SetCurDoc(',Ord(doc):8,')');
+
+        curDoc := doc^^;
+        (* set all screen boxes relative to doc *)
+        SetGEBox(FALSE);
+        (* remember port for key events *)
+        keyPort   := curDoc.fldr;
+        (* bind in the doc dataSegs *)
+        Bind_DataSeg(errNum,curDoc.pRef);
+        Bind_DataSeg(errNum,curDoc.hRef);
+    end; (* SetCurDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure UnBindCurDoc;
+    var errNum: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* make sure cFld is closed so no references to data in doc.hhz *)
+        CloseCFld;
+        (* unbind the dataSegs *)
+        UnBind_DataSeg(errNum,curDoc.pRef);
+        UnBind_DataSeg(errNum,curDoc.hRef);
+    end; (* UnBindCurDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure InitGEDoc(who: GrafPtr; pName: PathName; VAR errNum: Integer);
+    const cDocGrow = 16;        (* grow docLst by four docs *)
+    var lstSize: Integer;
+        nDoc: TDocHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on filer openDoc event, creates a new document,
+           binds its data segs, sets curDoc to it, and puts it in docLst,
+           expanding its size *)
+
+        if traceFio then
+            writeln('InitGEDoc(',Ord(who):8,',',pName,')');
+
+        (* unbind the current doc *)
+        if docLst^^.cnt>0 then
+            UnBindCurDoc;
+
+        nDoc := NewDoc(who,pName,errNum);
+        if errNum>0 then
+            Exit(InitGEDoc);
+
+        (* expand docLst to handle new doc *)
+        lstSize := CbDataOfH(geHHz,Pointer(Ord(docLst)));
+        if lstSize<docLst^^.cnt*SizeOf(TDocHnd)+SizeOf(TDocLst) then
+            ChangeSizeH(geHHz,Pointer(Ord(docLst)),lstSize+cDocGrow);
+
+        (* put new doc in docLst *)
+        with docLst^^ do begin
+            cnt := cnt+1;
+            cur := cnt;
+            (*$R-*)
+            lst[cur] := nDoc;
+            (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+        end;
+        SetCurDoc(nDoc);
+
+        (* check the heap integrity *)
+        if traceHeap then
+            CkGEHz('NewDoc');
+    end; (* InitGEDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure UpdateDocLst;
+    VAR i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if docsOpen>0 then begin
+            (* update curDoc lst entry *)
+            with docLst^^ do
+                (*$R-*)
+                lst[cur]^^ := curDoc;
+                (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+        end;
+    end; (* UpdateDocLst *)
+
+(* ********************************************************************* *)
+(*$S Ring*)
+    procedure BindGEDoc(who: GrafPtr);
+    var i,errNum,docIndx: Integer;
+        doc: TDocHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on activate event to bind in the document data segs
+           and set curDoc to who *)
+
+        if traceFio then
+            writeln('BindGEDoc(',Ord(who):8,')');
+
+        if who<>curDoc.fldr then begin
+            (* see if fldr who is in docLst *)
+            docIndx := 0;
+            with docLst^^ do
+                for i := 1 to cnt do
+                    (*$R-*)
+                    if lst[i]^^.fldr=who then begin
+                        docIndx := i;
+                        i := cnt;
+                    end;
+                    (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+
+            if rangeOn then
+                if docIndx=0 then
+                    Error('BindFldr - who not in docLst',0,NONFATAL);
+
+            if traceFio then
+                writeln('    curDoc=',docLst^^.cur:2,', docIndx=',docIndx:2);
+
+            (* unbind curDoc, bind who *)
+            UnBindCurDoc;
+            UpdateDocLst;
+            with docLst^^ do begin
+                (*$R-*)
+                cur := docIndx;
+                doc := lst[cur];
+                (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+            end;
+            SetCurDoc(doc);
+        end;
+    end; (* BindGEDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure KillGEDoc;
+    var i: Integer;
+        doc: TDocHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* called on filer closeDoc event, unbinds dataSegs, removes
+           who from docLst, and sets curDoc to the first doc in docLst *)
+
+        if traceFio then
+            writeln('KillGEDoc');
+
+        (* remove doc from lst *)
+        with docLst^^ do
+        if cur>0 then begin
+            UnBindCurDoc;
+
+            (*$R-*)
+            doc := lst[cur];
+            for i := cur+1 to cnt do
+                lst[i-1] := lst[i];
+            lst[cnt] := NIL;
+            (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+
+            cnt := cnt-1;
+            cur := CMin(cnt,1);
+            (* make sure we don't reference freed doc *)
+            curDoc.sLst:= NIL;
+            curDoc.pHz := NIL;
+            curDoc.hHz := NIL;
+            if cur>0 then
+                SetCurDoc(lst[1])
+            else
+                curDoc := stdDoc;
+
+            (* dispose of doc *)
+            FreeDoc(doc);
+        end;
+    end; (* KillGEDoc; *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure InitGEFldr(who: GrafPtr);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* remember port *)
+        curDoc.fldr    := who;
+        keyPort   := curDoc.fldr;
+
+        (* set all screen boxes relative to folder size *)
+        SetGEBox(TRUE);
+
+        (* init drawing mode and cursor *)
+        curDoc.proto  := iObjNil;
+        lastProto := iObjRect;
+        geCrsCur  := iCrsInactive;
+        SetStdCursor(iCrsEscape);
+        SetStdCursor(geCrsCur);
+        if curDoc.atr.grdOn then
+            geCrsIBeam := iCrsIBeam
+        else
+            geCrsIBeam := iCrsGEIBeam;
+
+        (* multi-click flags *)
+        ckMultiClk := FALSE;
+        numClk     := 1;
+        mseMoved   := FALSE;
+    end; (* InitGEFldr *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure CkFile(VAR pName: PathName; suffix: PathName; VAR exists: BOOLEAN);
+    var errNum: Integer;
+        fileAttr: FS_Info;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        pName := Concat(pName,suffix);
+        LookUp(errNum,pName,fileAttr);
+        exists := errNum=0;
+        if traceFio then
+            Writeln('    CkFile(',pName,',',suffix,')=',exists);
+    end; (* CkFile *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure SaveTheDoc(dName:     PathName;
+                         fOp:       FilerOp;
+                         needAlert: Boolean;
+                         VAR fMsg:  FReply;
+                         VAR fWhy:  FReason);
+    var errNum,fileRefNum: Integer;
+        pName: PathName;
+        dwgSuspended,dwgCrashed: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* set up reply *)
+        fMsg := docClosd;
+        fWhy := allOK;
+
+        (* commit any pending ops *)
+        CommitLastOp;
+
+        (*XXX NOTE: this can be done faster by setting a flag when open dwg *)
+        (* see if ever crashed *)
+        pName := dName;
+        CkFile(pName,'.CRASH',dwgCrashed);
+        Kill_Secure(errNum,pName,curDoc.password);
+        (* or suspended *)
+        pName := dName;
+        CkFile(pName,'.SUSPEND',dwgSuspended);
+        Kill_Secure(errNum,pName,curDoc.password);
+
+        if traceFio then
+            Writeln('SaveTheDoc("',dName,'") dwg=',Ord(curDoc.dwgChgd):2,
+                     ' hdr=',Ord(curDoc.hdrChgd):2,' sus=',Ord(dwgSuspended):2,
+                     ' crs=',Ord(dwgCrashed):2);
+
+        (* save the file and close the doc *)
+        if curDoc.dwgChgd or curDoc.hdrChgd
+        or dwgCrashed
+        or (dwgSuspended and ((fOp=fcClose) OR (fOp=fcSuspend)))
+        or (fOp=fcCopy) or (fOp=fcPut) then begin
+            (* open the file for writing *)
+            if fOp in [fcCopy,fcPut,fcClose] then begin
+                (* kill base file *)
+                pName := dName;
+                Kill_Secure(errNum,pName,curDoc.password);
+            end else if fOp=fcSuspend then
+                pName := Concat(dName,'.SUSPEND');
+
+            Make_Secure(errNum,pName,curDoc.password);
+            Open_Secure(errNum,pName,fileRefNum,[dWrite],curDoc.password);
+
+            (* check errors on open *)
+            if errNum=0 then begin
+                SaveCmd(fileRefNum,needAlert,errNum);
+                if errNum<>0 then begin
+                    Error('SaveTheDoc',errNum,NONFATAL);
+                    (* assume no disk space *)
+                    fMsg := docNotClosed;
+                    fWhy := cantWrite;
+                end;
+                (* set dirtyFlag *)
+                curDoc.dwgChgd := FALSE;
+                curDoc.hdrChgd := FALSE;
+            end else begin
+                (* couldn't create it, Assume no disk space for now *)
+                Error('SaveTheDoc couldn''t open file',errNum,NONFATAL);
+                fMsg := docNotClosed;
+                fWhy := noDiskSpace;
+            end;
+            Truncate(errNum,fileRefNum);
+            Close_Object(errNum,fileRefNum);
+        end;
+    end; (* SaveTheDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure LoadTheDoc(dName: PathName; VAR docOpened: Boolean);
+    CONST
+        iNoteLVers  = 122;
+    VAR errNum,fileRefNum: Integer;
+        bytesRead: LONGINT;
+        pName:     PathName;
+        tempPrRec: TPrRec;
+
+    (* ***************************************************************** *)
+
+        procedure OpenErr(tWhy: FReason);
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            if traceFio then
+                writeln('  CantRdDoc(',errnum,')');
+            docOpened := FALSE;
+            Close_Object(errNum,fileRefNum);
+            TellFiler(errNum,docClosd,tWhy,curDoc.fldr);
+            (* OS might object, but that's ok *)
+            inCrash := FALSE;
+            Exit(LoadTheDoc);
+        end; (* OpenErr *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            writeln('LoadTheDoc: "',dName,'"');
+
+        (* set up reply *)
+        docOpened := TRUE;
+
+        (* set dirtyFlag *)
+        curDoc.dwgChgd := FALSE;
+        curDoc.hdrChgd := FALSE;
+
+        (* try to open crashed version of file first *)
+        pName := Concat(dName,'.CRASH');
+        Open_Secure(errNum,pName,fileRefNum,[dRead],curDoc.password);
+        if errNum<>0 then begin
+            (*
+              Crashed version of doc exists, read it in.
+              Set flag stating that we are trying to open crashed version,
+              so that if we crash on trying to open it, we don't try to
+              save a crashed version again in CrashSuspend
+            *)
+            inCrash := TRUE;
+        end;
+        (* if doesn't exist, then try suspend version   *)
+        if errNum=948 then begin
+            pName := Concat(dName,'.SUSPEND');
+            Open_Secure(errNum,pName,fileRefNum,[dRead],curDoc.password);
+        end;
+        (* if doesn't exist, then try normal version   *)
+        if errNum=948 then begin
+            pName := dName;
+            Open_Secure(errNum,pName,fileRefNum,[dRead],curDoc.password);
+        end;
+        if errNum<=0 then begin
+            if traceFio then
+                writeln('  doc exists (',errNum:1,'), read it in...');
+            (* document exists, read in the data *)
+            LoadCmd(fileRefNum,TRUE,errNum);
+            if errNum=iNoteLVers then
+                OpenErr(newerDoc)
+            else if errNum=iStopDisk then
+                OpenErr(noDiskSpace)
+            else if errNum=iStopMem then
+                OpenErr(noMemory)
+            else if errNum=1294 then
+                OpenErr(wrongPassword)
+            else if errNum<>0 then
+                OpenErr(cantRead)
+            else begin
+                tempPrRec := curDoc.hPrRec^^;
+                If NOT FPrPrfValid(tempPrRec) then begin
+                    PrPrfDefault(tempPrRec);
+                    curDoc.hPrRec^^ := tempPrRec;
+                    SetGeStl;
+                end;
+            end;
+        end else if errNum=948 then begin
+            if traceFio then
+                writeln('  doc doesn''t exist, create...');
+            (* document doesn't exist, create new one *)
+            pName := dName;
+            Make_Secure(errNum,pName,curDoc.password);
+            Open_Secure(errNum,pName,fileRefNum,[dRead,dWrite],curDoc.password);
+            if errNum=0 then begin
+                (* New doc created, initialize it. *)
+                SaveCmd(fileRefNum,FALSE,errNum);
+                if errNum<>0 then
+                    OpenErr(cantWrite);
+                PrPrfDefault(tempPrRec);
+                curDoc.hPrRec^^ := tempPrRec;
+                SetGeStl;
+
+            end else if errNum=1294 then
+                OpenErr(wrongPassword)
+            else
+                OpenErr(noDiskSpace);
+        end else (* some unknown error *)
+            OpenErr(internalError);
+
+        (* Attempt to display the document. If problems, either:
+                   1) reply docClosed/badData or
+                   2) reply docOpened/ok, wait to be activated to tell user,
+                       and maybe send a docClosd message later.  *)
+
+        if traceFio then
+            Writeln('    File "',pName,'" opened, refNum=',fileRefNum);
+
+        (* redraw folder *)
+        InvalRect(curDoc.fldr^.portRect);
+        { drawing before we get an activate causes problems in trying to verify
+          whether pgSz and dwgSz are valid.  Let them get verified in PrCkPrf
+          on activate and then update.
+        DrwGEFldr;
+        ValidRect(curDoc.fldr^.portRect);
+        }
+
+        (* close the file, since may write out to different name *)
+        Close_Object(errNum,fileRefNum);
+        inCrash := FALSE;
+    end; (* LoadTheDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    Procedure OpenTheDoc(who: GrafPtr; dName: PathName;password: E_Name);
+    var docOpened: Boolean;
+        errNum: Integer;
+        tWhy: FReason;
+        heapCheck:  TF;
+        cBkStd:     TC;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        If traceFio then begin
+            Writeln('OpenTheDoc("',Ord(who):8,',',dName,'")');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+        (* init curDoc.fldr *)
+        UpdateDocLst;
+        InitGEDoc(who,dName,errNum);
+
+        If traceFio then begin
+            Writeln('OpenTheDoc("',Ord(who):8,',',dName,'")');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+
+        curDoc.password := password;
+        (* redirect user input to GE *)
+        TakeWindow(who);
+        if errNum>0 then begin
+            if errNum in [309,311,312] then
+                tWhy := noDiskSpace
+            else if errNum=315 then
+                tWhy := noMemory
+            else
+                tWhy := internalError;
+            TellFiler(errNum,docClosd,tWhy,who);
+        end else begin
+            InitGEFldr(who);
+
+            (* open the document *)
+            LoadTheDoc(dName,docOpened);
+
+            (* count docs opened *)
+            if docOpened then
+                docsOpen := docsOpen+1
+            else
+                KillGEDoc;
+        end;
+
+        If traceFio then begin
+            Writeln('OpenTheDoc("',Ord(who):8,',',dName,'")');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+
+    end; (* OpenTheDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    Procedure CloseTheDoc(fOp:      FilerOp;
+                          VAR fMsg: FReply;
+                          VAR fWhy: FReason);
+    var dName: pathName;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetFName(dName);
+        if traceFio then
+            Writeln('CloseTheDoc("',dName,'")');
+
+        if docsOpen=0 then begin
+            (* There is no document opened! *)
+            fMsg := docNotClosed;
+            fWhy := internalError;
+        end else begin
+            (* save the file and close the doc *)
+            SaveTheDoc(dName,fOp,TRUE,fMsg,fWhy);
+
+            if (fMsg=docClosd) or (fOp=fcShred) then begin
+                (* bump doc count *)
+                docsOpen := docsOpen-1;
+                (* set dirtyFlag *)
+                curDoc.dwgChgd := FALSE;
+                (* unBind and dispose of doc *)
+                KillGEDoc;
+            end;
+        end;
+
+        (* never refuse on shred *)
+        if fOp=fcShred then begin
+            fMsg := docClosd;
+            fWhy := allOk;
+        end;
+    end; (* CloseTheDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    Procedure CopyTheDoc(nPrfx: Pathname;
+                         fOp:   FilerOp;
+                         VAR fMsg: FReply;
+                         VAR fWhy: FReason);
+
+       (* Handles the "docCopy" event from the filer.  Copies the document
+         in it's current state using the fileName prefix "nPrfx".
+         All document changes are to be permanent in the copy,
+         i.e., "Undo all changes" will have no affect immediately after
+         pulling the copy. *)
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            Writeln('CopyTheDoc(',nPrfx,')');
+
+        SaveTheDoc(nPrfx,fOp,FALSE,fMsg,fWhy);
+        if fMsg=docClosd then begin
+            fMsg := docXfered;
+            if fOp=fcPut then begin
+                (* bump doc count *)
+                docsOpen := docsOpen-1;
+                (* set dirtyFlag *)
+                curDoc.dwgChgd := FALSE;
+                (* unBind and dispose of doc *)
+                KillGEDoc;
+            end;
+        end;
+        fWhy := allOK;
+    end; (* CopyTheDoc *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure GETellFiler(fMsg: FReply; fWhy: FReason; fldr: GrafPtr);
+    var errNum: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        TellFiler(errNum,fMsg,fWhy,fldr);
+        if rangeOn then
+            if errNum<>0 then
+                Error('TellFiler',errNum,FATAL);
+    end; (* GETellFiler *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure PutAwayCmd;
+    var fWhy: FReason;
+        fMsg: FReply;
+        fldr: GrafPtr;
+        heapCheck:  TF;
+        cBkStd:     TC;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        CommitLastOp;
+        MkScrapPic;   {Before curDoc.hHz is lost}
+        fldr := curDoc.fldr;
+        CloseTheDoc(fcClose,fMsg,fWhy);
+        (* notify filer only if successful, alert already up otherwise *)
+        if fMsg=docClosd then begin
+            (* deactivate sequence *)
+            fActive := FALSE;
+            TxtTerminate;
+            (* tell the filer *)
+            fWhy := docPutBack;
+            GETellFiler(fMsg,fWhy,fldr);
+
+        end;
+        If traceFio then begin
+            WriteLn('PutAwayCmd');
+            heapCheck := FCheckHzOk(geHHz,cBkStd);
+            WriteLn('heapCheck = ',heapCheck: 8, 'cBkStd = ',cBkStd);
+        end;
+    end; (* PutAwayCmd *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure SaveContCmd;
+    VAR fMsg:  FReply;
+        fWhy:  FReason;
+        dName: PathName;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetFName(dName);
+        SaveTheDoc(dName,fcClose,TRUE,fMsg,fWhy);
+    end; (* SaveContCmd *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure RevertCmd;
+    var fileAttr: FS_Info;
+        whenString: Str255;
+        errNum: Integer;
+        doRevert: Boolean;
+        pName,sName,dName: PathName;
+        n: Str255;
+        docOpened: Boolean;
+        dwgSuspended,dwgCrashed: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* commit any pending ops *)
+        CommitLastOp;
+
+        GetFName(dName);
+        (*XXX NOTE: this can be done faster by setting a flag when open dwg *)
+        (* see if ever crashed *)
+        dwgCrashed   := FALSE;
+        dwgSuspended := FALSE;
+        sName := dName;
+        CkFile(sName,'.CRASH',dwgCrashed);
+        (* or suspended *)
+        if NOT dwgCrashed then begin
+            sName := dName;
+            CkFile(sName,'.SUSPEND',dwgSuspended);
+        end;
+
+        if dwgCrashed or dwgSuspended
+        or curDoc.dwgChgd or curDoc.hdrChgd then begin
+            (* get date and time info on file that we are reverting to *)
+            pName := dName;
+            if dwgCrashed then
+                pName := Concat(dName,'.SUSPEND');
+            LookUp(errNum,pName,fileAttr);
+            if dwgCrashed then
+                if errNum>0 then begin
+                    pName := dName;
+                    LookUp(errNum,pName,fileAttr);
+                end;
+
+            (* put up the date and time alert *)
+            GEDTAlert(fileAttr.DTM,whenString);
+            GetFldrTitle(activeFolder,n);
+            param1 := n;
+            param2 := whenString;
+            if GECaution(iCtnRevert) then begin
+                (* kill the most suspended version of the file *)
+                Kill_Secure(errNum,sName,curDoc.password);
+                (* revert to the previous file *)
+                LoadTheDoc(pName,docOpened);
+            end;
+        end else
+            GEAlert(iStopRvrt);
+    end; (* RevertCmd *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure CrashSuspend;
+    var i,eNum: Integer;
+        dLst: TDocLst;
+        cFldr,tFldr: GrafPtr;
+        cName: PathName;
+
+    (* ***************************************************************** *)
+
+        procedure SaveCrashDoc;
+        var errNum,fileRefNum: Integer;
+            fileAttr: FS_Info;
+            dName: PathName;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            GetFName(dName);
+            if traceFio then
+                Writeln('SaveCrashDoc("',dName,'") dwg=',Ord(curDoc.dwgChgd):2,
+                         ' hdr=',Ord(curDoc.hdrChgd):2);
+
+            (* save the file if anything has changed *)
+            if curDoc.dwgChgd or curDoc.hdrChgd then begin
+                (* open the file for writing *)
+                dName := Concat(dName,'.CRASH');
+                (* make sure no other crash files exist *)
+                Kill_Secure(errNum,dName,curDoc.password);
+                (* make and open the file *)
+                Make_Secure(errNum,dName,curDoc.password);
+                Open_Secure(errNum,dName,fileRefNum,[dWrite],curDoc.password);
+
+                (* check errors on open *)
+                if errNum=0 then begin
+                    SaveGEFile(fileRefNum,errNum);
+                    {
+                    SaveCmd(fileRefNum,TRUE,errNum);
+                    if errNum<>0 then begin
+                        (* assume no disk space *)
+                        Error('SaveCrashDoc',errNum,NONFATAL);
+                    end;
+                    }
+                    (* set dirtyFlag *)
+                    curDoc.dwgChgd := FALSE;
+                    curDoc.hdrChgd := FALSE;
+                end else begin
+                     If errNum=1294 then
+                         TellFiler(errNum,docClosd,wrongPassword,curDoc.fldr);
+                    (* couldn't create it, Assume no disk space for now *)
+                    (* figure out what to do... *)
+                end;
+                Truncate(errNum,fileRefNum);
+                Close_Object(errNum,fileRefNum);
+            end;
+        end; (* SaveCrashDoc *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceFio then
+            DumpDocLst('CrashSuspend');
+        (*
+           Save crash version of all docs, current doc last, since
+           the crash may have been caused by inconsistent state of current
+           doc data structures, and trying to save it may cause another crash,
+           making it impossible to save remaining docs.
+        *)
+        cFldr := curDoc.fldr;
+        dLst := docLst^^;
+        for i := 1 to dLst.cnt do begin
+            (*$R-*)
+            tFldr := docLst^^.lst[i]^^.fldr;
+            (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+            if tFldr<>cFldr then begin
+                BindGEDoc(tFldr);
+                SaveCrashDoc;
+            end;
+        end;
+        BindGEDoc(cFldr);
+        (*
+           If we didn't crash on opening a crashed doc, then save the current doc.
+           Otherwise, delete crashed doc file so we don't try to open it again.
+        *)
+        if NOT inCrash then
+            SaveCrashDoc
+        else begin
+            GetFName(cName);
+            cName := Concat(cName,'.CRASH');
+            Kill_Secure(eNum,cName,curDoc.password);
+        end;
+    end; (* CrashSuspend *)
+
+(* ********************************************************************* *)
+(*$S DeBug*)
+
+    procedure WrtFlrEvt(fParams: FilerExt);
+    var sWhat:   String80;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceOn then begin
+            sWhat := 'Unknown';
+            case fParams.theFlrOp of
+                fcClose:        sWhat := 'fcClose  ';
+                fcCopy:         sWhat := 'fcCopy   ';
+                fcDfClose:      sWhat := 'fcDfClose';
+                fcNone:         sWhat := 'fcNone ';
+                fcPut:          sWhat := 'fcPut    ';
+                fcResume:       sWhat := 'fcResume ';
+                fcShred:        sWhat := 'fcShred  ';
+                fcSuspend:      sWhat := 'fcSuspend';
+                fcTerminate:    sWhat := 'fcTerminate';
+            end; (* case *)
+            writeln('GEFilerEvent ',sWhat,' "',fParams.thePrefix,'"');
+        end;
+    end; (* WrtFlrEvt *)
+
+(* ********************************************************************* *)
+(*$S IO*)
+    procedure DoActivateStuff(thisEvent: EventRec);
+    Var i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        With thisEvent do begin
+            fActive := TRUE;
+
+            if traceFio then
+                DumpDocLst('    Start activate...');
+
+            BindGEDoc(who);
+            SetTxtState(curDoc.fState);
+            (* install menus and DrawMenuBar *)
+            for i := iMnuFirst to lastMenu do
+                InsertMenu(geMenus[i],0);
+            DrawMenuBar;
+            (* hilite the current selection *)
+            HiliteSel(TRUE);
+            ShowProto(curDoc.proto,TRUE);
+            (* draw scroll bars *)
+            DrwGESBars(curDoc.fldr^.portRect);
+            (* init cursor *)
+            geCrsCur := geCrsVal[curDoc.proto];
+            ShowCursor;
+            SetStdCursor(iCrsInactive);
+            SetStdCursor(geCrsCur);
+            SetMseLmt(sizeLBox);
+            (* set pen, text modes *)
+            SetPort(curDoc.fldr);
+            TextMode(srcXor);
+            PenMode(patXor);
+        end;
+    end;{DoActivateStuff}
+
+(* ********************************************************************* *)
+(*$S IO*)
+
+    procedure GEFilerEvent(thisEvent: EventRec);
+    var errNum:   Integer;
+        fParams:  FilerExt;
+        fWhy:     FReason;
+        fMsg:     FReply;
+        cFldr:    GrafPtr;
+        password: E_Name;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GetAddParams(errNum,thisEvent,fParams);
+        password := fParams.thePassword;
+        If traceEvt then
+            WrtFlrEvt(fParams);
+
+        case fParams.theFlrOp of
+            fcResume:
+                begin
+
+                    If (thisEvent.who = activeFolder) then cFldr := thisEvent.who
+                    else cFldr := curDoc.fldr;
+                    OpenTheDoc(thisEvent.who,fParams.thePrefix,password);
+                    If (thisEvent.who = activeFolder) then begin
+                        SetPort(thisEvent.who);
+                        SetWrkOrigin;
+                        GEClipRect(dwgLBox);
+                        DoActivateStuff(thisEvent);
+                    end;
+                    If (cFldr<>thisEvent.who) AND (cFldr<>NIL) then
+                        BindGEDoc(cFldr);
+                end;
+            fcShred,
+            fcClose,
+            fcSuspend:
+                begin
+                    cFldr := curDoc.fldr;
+                    BindGEDoc(thisEvent.who);
+                    CloseTheDoc(fParams.theFlrOp,fMsg,fWhy);
+                    GETellFiler(fMsg,fWhy,thisEvent.who);
+                    if cFldr<>thisEvent.who then
+                        BindGEDoc(cFldr);
+                end;
+            fcCopy,
+            fcPut:
+                begin
+                    cFldr := curDoc.fldr;
+                    BindGEDoc(thisEvent.who);
+                    CopyTheDoc(fParams.thePrefix,fParams.theFlrOp,fMsg,fWhy);
+                    GETellFiler(fMsg,fWhy,thisEvent.who);
+                    if cFldr<>thisEvent.who then
+                        BindGEDoc(cFldr);
+                end;
+            fcTerminate:
+                quitFlag := TRUE;
+            fcDfClose:
+                (* close auxiliary files, applicable to WP only *)
+                GETellFiler(dfNotClosed,internalError,thisEvent.who);
+            fcNone:
+                GETellFiler(docClosd,noMoreDocs,thisEvent.who);
+        end; (* case *)
+    end; (* GeFilerEvent *)
+
+ÿ

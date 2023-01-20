@@ -1,0 +1,829 @@
+{#F     libdb/scancode.text }
+{$S access }
+{****************************************************************************
+
+                            scanidbad
+
+        returns true iff scanid corresponds to an open scan.
+
+        Input Parameters:
+                scanid - scanid of some scan
+
+        Output Parameters:
+                return result
+
+****************************************************************************}
+
+{$S access }
+function scanidbad{(scanid : integer) : boolean};
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if (scanid >= 0) and (scanid < nscans) then
+            scanidbad := pscantable^[scanid] = nil
+        else scanidbad := true;
+end;
+{****************************************************************************
+
+                            SParmsBad
+
+        see interface.
+
+
+                noerr
+                badscanid
+                oddrecsize
+                badrecaddress
+                badwhich
+                badnsearch
+
+
+**************************************************************************}
+
+{$S access }
+function SParmsBad{(scanid : integer;
+                   which : integer;
+                   nsearch : integer;
+                   pentry : ptrdata) : integer};
+var
+        maxsearch,
+        lresult : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        lresult := noerr;
+        if scanidbad(scanid) then lresult := badscanid
+        else if (which < first) or (which > next) then lresult := badwhich
+        else if (which = approx) or (which = exact) then
+            begin
+            if odd(ord(pentry))or(pentry = nil) then lresult:=badrecaddress
+            else if (which = approx) then
+                with pscantable^[scanid]^ do
+                    begin
+                    if intent >= labelreadonly then maxsearch := labelflds
+                    else maxsearch := pfiletable^[viafile]^.nfields;
+                    if (nsearch <= 0) or (nsearch > maxsearch) then
+                        lresult := badnsearch;
+                    end;
+            end;
+        SParmsBad := lresult;
+end; { SParmsBad }
+{^E}
+{*****************************************************************************
+
+                                 cosvalidate
+
+        if scan's cos page has been touched, cosvalidate refinds the
+        proper page and index.  the cos page can be untouched (a state of
+        grace), touched_by_vltree (disturbed by some update operation of
+        unknown character and so our page and index are unreliable) or
+        touched_by_delete (the cos record was deleted, but we still have
+        an exact page and index for the record immediately following)
+
+        Input Parameters
+                pscan - the scan descriptor
+
+        Output Parameters
+                sresult - return result
+                buffer - buffer contains cos page
+                index - index of cos record
+                pos - the position that trying to find the cos record
+                    found us in
+
+        Return Results
+                noerr
+                ioerr
+                notfound
+                eos
+                fileempty
+
+*****************************************************************************}
+{$S access }
+procedure cosvalidate(var sresult : integer;
+                          pscan : ptrscandesc;
+                      var buffer,
+                          index,
+                          pos : integer);
+var
+        psdesc : ptrrecptr;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif scandebug then
+            begin
+            writeln(dumpfile,'cosval');
+            printcos(pscan);
+            end;*)
+
+        with pscan^ do
+            begin
+            pos := position;
+            if touched = touch_by_vltree then { need to refind our pos }
+                begin
+                if (pos = first) or (pos = last) then
+                    findkeyed(sresult,pos,0,viafile,nil,ptrcos,buffer,index)
+                else
+                    begin
+                    if onfile = viafile then psdesc := nil
+                    else psdesc := pfiletable^[viafile]^.pkdesc;
+                    findkeyed(sresult,exact,0,viafile,psdesc,
+                              ptrcos,buffer,index);
+                    if sresult = notfound then
+                        begin
+                        nextprior(sresult,viafile,buffer,index,next);
+                        if sresult = noerr then
+                            begin
+                            sresult := notfound;
+                            pos := prior;
+                            end
+                        else if sresult = eos then pos := last;
+                        end;
+                    end;
+                end
+            else if touched = touch_delete then { just get next }
+                begin
+                getpage(sresult,buffer,viafile,keypage,true);
+                if sresult = noerr then
+                    begin
+                    index := keyindex;
+                    nextprior(sresult,viafile,buffer,index,next);
+                    if sresult = noerr then pos := prior
+                    else if sresult = eos then pos := last;
+                    end;
+                end
+            else { keyindex and keypage are still valid }
+                begin
+                getpage(sresult,buffer,viafile,keypage,true);
+                index := keyindex;
+                pos := position;
+                end;
+            end; { with }
+
+        (*dbif scandebug then printcos(pscan);*)
+end; { cosvalidate }
+{************************************************************************
+
+                                pstack_validate
+
+        makes sure that pstack is big enough to handle maxlevel.  we
+        keep pstack deep enough for the deepest tree open plus one
+        level for a possible split.
+
+*************************************************************************}
+{$S access }
+procedure pstack_validate{(var sresult : integer)};
+label
+        100;
+var
+        loc_compact_state : states_de_compact;
+        tstack : ptrpagestack;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        if curdepth < maxdepth then
+             begin
+             loc_compact_state := init_compact_state;
+
+     100:    {  retry point for compact }
+
+             sresult := nnew(@czone,(maxdepth+1)*sizeof(stackrec),@tstack);
+             if sresult = noerr then
+                 begin
+                 ndispose(@czone,@pstack^);
+                 pstack := tstack;
+                 curdepth := maxdepth;
+                 end;
+             if retry_compact(sresult,loc_compact_state) then goto 100;
+             end
+         else sresult := noerr;
+end; { pstack_validate }
+{^T20}
+{**************************************************************************
+
+                                  efetch
+
+        depending on the value of which, fetches the proper entry on
+        pscan :
+
+        see interface
+
+**************************************************************************}
+
+{$S access }
+procedure efetch{(var sresult : integer;
+                      scanid : integer;
+                      which : integer;
+                      nsearch : integer;
+                      pentry : ptrdata)};
+label
+        1,2,3,4,100;
+var
+        loc_compact_state : states_de_compact;
+        php : heapptr;
+        pnew,
+        prec : ptrdata;
+        offoffset,
+        esize,
+        dindex,
+        pos,
+        index,
+        i,
+        buffer,
+        lresult,
+        tresult,
+        dbuffer : integer;
+        po : ptroffsets;
+        pd : ptrpagedesc;
+        pb : ptrdata;
+        psdesc : ptrrecptr;
+        pvia,
+        pon : ptrfiledesc;
+        pscan : ptrscandesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif scandebug then writeln(dumpfile,'efet:',which:6,scanid:6);*)
+
+    {   the goal is to only update the cos if we can set it to another
+        valid position, thus we don't mess with pscantable^[scanid]^ until
+        we have everthing set up }
+
+        lresult := SParmsBad(scanid,which,nsearch,pentry);
+        if lresult = noerr then
+            begin
+
+            if which = current then
+                with pscantable^[scanid]^ do
+                    begin
+                    if touched = untouched then
+                        begin
+                        pos := position;
+                        if (pos = first) or (pos = last) then lresult := eos
+                        else if pos <> exact then lresult := notfound;
+                        goto 1;
+                        end;
+                    end;
+
+            pstack_validate(lresult);
+            if lresult <> noerr then goto 1;
+
+            loc_compact_state := init_compact_state;
+
+100:    {  retry point for compact }
+
+            pscan := pscantable^[scanid];
+            pon := pfiletable^[pscan^.onfile];
+            pvia := pfiletable^[pscan^.viafile];
+            offoffset := pon^.pagesize-sizeof(pagedesc)-sizeof(integer);
+            with pscan^ do
+                begin
+
+            {   position the scan  }
+
+                if (which = approx) or (which = exact) then
+                    begin
+                    with pvia^ do
+                        begin
+                        if onfile = viafile then psdesc := nil
+                        else psdesc := pkdesc;
+                        findkeyed(lresult,which,nsearch,viafile,psdesc,
+                                  pentry,buffer,index);
+                        if lresult = notfound then
+                            begin
+                            nextprior(lresult,viafile,buffer,index,next);
+                            if lresult = noerr then
+                                begin
+                                lresult := notfound;
+                                pos := prior;
+                                end
+                            else if lresult = eos then pos := last;
+                            end
+                        else if lresult = noerr then pos := exact;
+                        end; { with }
+                    end
+                else if (which = next) or (which = prior) then
+                    begin
+
+                {   first find out where we are and then fetch next/prior }
+
+                    cosvalidate(lresult,pscan,buffer,index,pos);
+                    if lresult <= eos then
+                        begin
+                        if which = prior then index := index-1
+                        else if pos = exact then index := index+1;
+                        nextprior(lresult,viafile,buffer,index,which);
+                        if lresult = noerr then pos := exact
+                        else if lresult = eos then
+                            begin
+                            if which = next then pos := last
+                            else pos := first;
+                            end;
+                        end;
+                    end
+                else if (which = current) then
+                    begin
+                    cosvalidate(lresult,pscan,buffer,index,pos);
+                    end
+                else { first or last }
+                    begin
+                    pos := which;
+                    findkeyed(lresult,which,0,viafile,nil,
+                              ptrcos,buffer,index);
+                    end;
+
+                {  fileempty errors are mapped into eos }
+
+                if lresult > eos then
+                    begin
+                    if lresult = fileempty then
+                        begin
+
+                    {   position at first and set touched since we
+                        obviously cant set keypage and keyindex }
+
+                        lresult := eos;
+                        position := first;
+                        touched := touch_by_vltree;
+                        end;
+                    goto 2;
+                    end;
+
+            {   if necessary, get the on file record }
+
+                if onfile <> viafile then  { scan via index }
+                    begin
+                    if (pos = exact) or (pos = prior) then
+                        begin
+                        with pvia^ do
+                            begin
+                            pb := buffpool^[buffer].pbuff;
+                            po := pointer(ord(pb)+offoffset);
+                            findkeyed(lresult,exact,0,onfile,
+                                      @pedesc^[nfields-pon^.nkeys],
+                                      pointer(ord(pb)+po^[-index]),
+                                      dbuffer,dindex);
+                            if lresult = notfound then
+                                begin
+                                lresult := inconsistent;
+                                goto 4;
+                                end
+                            else if lresult <> noerr then goto 3;
+                            end; {with}
+                        end;
+                    end
+                else { scan file directly }
+                    begin
+                    dbuffer := buffer;
+                    dindex := index;
+                    end;
+
+            {   if necessary free the old cos record and substitute the new cos
+                else just copy in the new record }
+
+                if (pos <> first) and (pos <> last) then with pon^ do
+                    begin
+                    with buffpool^[dbuffer] do
+                        begin
+                        pb := pbuff;
+                        qpage := page;
+                        end;
+                    qindex := dindex;
+                    po := pointer(ord(pb)+offoffset);
+                    esize := po^[-dindex-1] - po^[-dindex];
+
+                    if ptrcos <> nil then
+                        begin
+                        php := pointer(ord(ptrcos)-lhead);
+                        if (esize+allocover) <= php^.size then pnew := ptrcos
+                        else
+                            begin
+                            lresult := nnew(@czone,esize,@pnew);
+                            if lresult <> noerr then goto 4;
+                            ndispose(@czone,@ptrcos^);
+                            end;
+                        end
+                    else
+                        begin
+                        lresult := nnew(@czone,esize,@pnew);
+                        if lresult <> noerr then goto 4;
+                        end;
+
+                    movelf(pointer(ord(pb)+po^[-dindex]),pnew,esize);
+                    ptrcos := pnew;
+                    cossize := esize;
+                    end;
+                if (pos = first) or (pos = last) then lresult := eos
+                else if pos <> exact then lresult := notfound;
+                keypage := buffpool^[buffer].page;
+                keyindex := index;
+                position := pos;
+                touched := untouched;
+
+            {   release buffers }
+
+4 :             if (onfile <> viafile) and
+                   ((pos = exact) or (pos = prior)) then
+                    begin
+                    relbuff(tresult,dbuffer,isleaf);
+                    if tresult <> noerr then lresult := tresult;
+                    end;
+3 :             relbuff(tresult,buffer,isleaf);
+                if tresult <> noerr then lresult := tresult;
+                end; { with }
+2 :         if retry_compact(lresult,loc_compact_state) then goto 100;
+            end; { if }
+
+1 :     sresult := lresult;
+        (*dbif scandebug then writeln(dumpfile,'efet:',sresult:6);*)
+end; { efetch }
+{^T20}
+{**************************************************************************
+
+                                  eupdate
+
+        updates cos of scanid:
+
+        - updates indexes
+
+
+**************************************************************************}
+{$S access }
+procedure eupdate{(var sresult : integer;
+                   var offender : integer;
+                      scanid : integer;
+                      which : integer;
+                      nsearch : integer;
+                      pentry : ptrdata;
+                      pnewrec : ptrdata;
+                      size : integer)};
+label
+        1,2,100;
+var
+        loc_compact_state : states_de_compact;
+        ipage : fileptr;
+        iindex : integer;
+        pscan : ptrscandesc;
+        pt1,
+        pt2 : ptrdata;
+        php : heapptr;
+        pnew : ptrdata;
+        lresult,
+        tresult,
+        i,
+        dbuffer,
+        index : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif scandebug then writeln(dumpfile,'eup:',scanid:7);*)
+
+    {   first we attempt to find the record designated for update }
+
+        efetch(lresult,scanid,which,nsearch,pentry);
+
+        if odd(size) then lresult := oddrecsize
+        else if odd(ord(pnewrec)) or (pnewrec = nil) then
+             lresult := badrecaddress;
+
+
+        if lresult <> noerr then goto 1;
+
+        loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+        (*dbif scandebug then writeln('l_c_s:',ord(loc_compact_state));*)
+
+    {   the goal is to only update the cos if we can set it to another
+        valid position, thus we don't fuck with pscantable^[scanid]^ until
+        we have everthing set up.  note that we cleverly remember where
+        the new record got stuck so we can record an accurate keypage
+        and keyindex  }
+
+
+        pscan := pscantable^[scanid];
+        with pscan^,pfiletable^[onfile]^ do
+            begin
+
+        {   figure out which fields have changed and make sure the ticket
+            field (if any) hasn't changed }
+
+            if pkeyfiles = fnilval then { just check ticket }
+                begin
+                if ticketfld >= 0 then
+                    begin
+                    with pedesc^[ticketfld] do
+                        begin
+                        pt1 := pointer(ord(ptrcos)+offset);
+                        pt2 := pointer(ord(pnewrec)+offset);
+                        for i := 0 to size-1 do
+                            if pt1^[i] <> pt2^[i] then lresult := ticketchanged;
+                        end;
+                    end
+                end
+            else if findchanges(pedesc,nfields,ptrcos,pnewrec,@ufldset) then
+                lresult := ticketchanged;
+
+            (*dbif scandebug then dumpset(@ufldset,nfields);*)
+
+            if lresult <> noerr then goto 2;
+
+        {   1) if necessary, allocate space for the new record
+            2) delete the cos record
+            3) insert the replacement record
+            4) update all the indexes that have a modified field in them
+            5) if all is successfull, record the new cos }
+
+
+            php := pointer(ord(ptrcos)-lhead);
+            if (size+allocover) <= php^.size then pnew := ptrcos
+            else lresult := nnew(@czone,size,@pnew);
+
+            if lresult = noerr then
+                begin
+                if quickUpdate(lresult,onfile,pnewrec,size,qpage,qindex) then
+                    begin
+                    ipage := qpage;
+                    iindex := qindex;
+                    end
+                else
+                    begin
+                    deletekeyed(lresult,onfile,ptrcos,ipage,iindex);
+                    if lresult <> noerr then goto 2;
+
+                    insertkeyed(lresult,onfile,pnewrec,size,ipage,iindex);
+                    end;
+                if lresult <> noerr then
+                    begin
+                    offender := onfile;
+                    insertkeyed(tresult,onfile,ptrcos,cossize,ipage,iindex);
+                    if tresult <> noerr then fstatus := inconsistent;
+                    end
+                else
+                    begin
+                    indexupdate(lresult,offender,pscan,ptrcos,pnewrec,
+                                ipage,iindex);
+                    if lresult <> noerr then
+                        begin
+                        deletekeyed(tresult,onfile,pnewrec,ipage,iindex);
+                        if tresult <> noerr then fstatus := inconsistent;
+                        insertkeyed(tresult,onfile,ptrcos,cossize,
+                                    ipage,iindex);
+                        if tresult <> noerr then fstatus := inconsistent;
+                        end
+                    else
+                        begin
+                        movelf(pnewrec,pnew,size);
+                        if pnew <> ptrcos then ndispose(@czone,@ptrcos^);
+                        cossize := size;
+                        ptrcos := pnew;
+                        if touched <> untouched then
+                            begin
+                            keypage := ipage;
+                            keyindex := iindex;
+                            touched := untouched;
+                            end;
+                        end; { if }
+                    end; { if }
+                if lresult <> noerr then
+                    if pnew <> ptrcos then ndispose(@czone,@pnew^);
+                end; { if }
+            end; { with pscan^ }
+
+2 :     if retry_compact(lresult,loc_compact_state) then goto 100;
+1 :     sresult := lresult;
+        (*dbif scandebug then writeln(dumpfile,'eup:',sresult : 6);*)
+end; { eupdate }
+{^T20}
+{*****************************************************************************
+
+                               edelete
+
+        deletes cos from a file (after optional repositioning of scan).
+        indexes are maintained.
+
+        positioning is as per efetch
+
+*****************************************************************************}
+
+{$S access }
+procedure edelete{(var sresult : integer;
+                       scanid : integer;
+                       which : integer;
+                       nsearch : integer;
+                       pentry : ptrdata)};
+label
+        100;
+var
+        loc_compact_state : states_de_compact;
+        dpage : fileptr;
+        dindex : integer;
+        lresult,
+        tresult : integer;
+        pscan : ptrscandesc;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif scandebug then writeln(dumpfile,'edel:',scanid);*)
+
+    {   first we attempt to find the record designated for update }
+
+        efetch(lresult,scanid,which,nsearch,pentry);
+        if lresult = noerr then
+            begin
+            loc_compact_state := init_compact_state;
+
+    100 :   {  compact retry point }
+
+        {   the goal is to only update the cos if we can set it to another
+            valid position, thus we don't fuck with pscantable^[scanid]^ until
+            we have everthing set up.  note that we cleverly remember where
+            the new record got stuck so we can record an accurate keypage
+            and keyindex for a touch_delete trip.  also note that if the record
+            was the only record on the page and its page had no siblings (for
+            example, was the last record in the tree) then deletekeyed will return
+            dpage = nilptr and so we can't do the optimization }
+
+
+            pscan := pscantable^[scanid];
+            with pscan^ do
+                begin
+
+            {   1) delete the cos record
+                2) update all the indexes
+                5) if all is successfull, record the new cos }
+
+                if quickDelete(lresult,onfile,qpage,qindex) then
+                    begin
+                    dpage := qpage;
+                    dindex := qindex;
+                    end
+                else deletekeyed(lresult,onfile,ptrcos,dpage,dindex);
+                if lresult = noerr then
+                    begin
+                    indexdelete(lresult,pscan,ptrcos,dpage,dindex);
+                    if lresult <> noerr then
+                        begin
+                        insertkeyed(tresult,onfile,ptrcos,cossize,
+                                    dpage,dindex);
+                        if tresult <> noerr then
+                            pfiletable^[onfile]^.fstatus := inconsistent;
+                        end
+                    else
+                        begin
+                        if pfiletable^[onfile]^.root = nilptr then
+                            begin
+                            position := first;
+                            touched := touch_by_vltree;
+                            end
+                        else
+                            begin
+                            if dpage = nilptr then touched := touch_by_vltree
+                            else touched := touch_delete;
+                            keypage := dpage;
+                            keyindex := dindex;
+                            position := prior;
+                            end;
+                        end;
+                    end;
+                end;
+            if retry_compact(lresult,loc_compact_state) then goto 100;
+            end;
+        sresult := lresult;
+        (*dbif scandebug then writeln(dumpfile,'edel:',sresult:6);*)
+end; { edelete }
+{^T 20}
+{*****************************************************************************
+
+                               einsert
+
+        inserts an entry into a file, via a scan.
+        new entry is made cos.
+
+        see interface
+
+*****************************************************************************}
+
+{$S access }
+procedure einsert{(var sresult : integer;
+                   var offender : integer;
+                       scanid : integer;
+                       pentry  : ptrdata;
+                       size : integer;
+                       newticket : boolean)};
+label
+        1,2,100;
+var
+        loc_compact_state : states_de_compact;
+        ipage : fileptr;
+        i,
+        toff,
+        tsize ,
+        iindex : integer;
+        pticket : ptrdata;
+        pscan : ptrscandesc;
+        lresult,
+        tresult : integer;
+        php : heapptr;
+        pnewrec : ptrdata;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        (*dbif scandebug then writeln(dumpfile,'eins:',scanid:7,size);*)
+
+        lresult := SParmsBad(scanid,exact,0,pentry);
+
+        if odd(size) then lresult := oddrecsize;
+
+        if lresult = noerr then
+            begin
+
+            pstack_validate(lresult);
+            if lresult <> noerr then goto 1;
+
+            loc_compact_state := init_compact_state;
+
+100 :   {  compact retry point }
+
+       {   the goal is to only update the cos if we can set it to another
+           valid position, thus we don't fuck with pscantable^[scanid]^ until
+           we have everthing set up.  note that we cleverly remember where
+           the new record got stuck so we can record an accurate keypage
+           and keyindex  }
+
+
+            pscan := pscantable^[scanid];
+            with pscan^ do
+                begin
+
+            {   1) if there's a ticket, compute the next ticket and check
+                   for ticket overflow
+                2) if necessary, allocate space for the new cos
+                3) insert new record
+                4) update all indexes
+                5) if all goes well, update cos }
+
+                with pfiletable^[onfile]^ do
+                    begin
+                    if newticket and (ticketfld <> -1) then
+                        begin
+                        with pedesc^[ticketfld] do
+                            begin
+                            tsize := size;
+                            toff := offset;
+                            end;
+                        pticket := pointer(ord(@tickets)+sizeof(ticket)-tsize);
+                        lresult := ticketoverflow;
+                        for i := 0 to tsize-1 do
+                            if pticket^[i] <> -1 then lresult := noerr;
+                        if lresult = ticketoverflow then goto 2;
+                        movelg(pticket,pointer(ord(pentry)+toff), tsize);
+                        end;
+                    end; { with }
+
+                if ptrcos <> nil then
+                    begin
+                    php := pointer(ord(ptrcos)-lhead);
+                    if (size+allocover) <= php^.size then pnewrec := ptrcos
+                    else lresult := nnew(@czone,size,@pnewrec);
+                    end
+                else lresult := nnew(@czone,size,@pnewrec);
+
+                if lresult = noerr then
+                    begin
+                    offender := onfile;
+                    insertkeyed(lresult,onfile,pentry,size,ipage,iindex);
+                    if lresult = noerr then
+                        begin
+                        indexinsert(lresult,offender,pscan,pentry,
+                                    ipage,iindex);
+                        if lresult <> noerr then
+                            begin
+                            deletekeyed(tresult,onfile,pentry,ipage,iindex);
+                            if tresult <> noerr then
+                                pfiletable^[onfile]^.fstatus := inconsistent;
+                            end
+                        else
+                            begin
+                            if ptrcos <> pnewrec then
+                                if ptrcos <> nil then ndispose(@czone,@ptrcos^);
+                            movelf(pentry,pnewrec,size);
+                            cossize := size;
+                            ptrcos := pnewrec;
+                            position := exact;
+                            keypage := ipage;
+                            keyindex := iindex;
+                            touched := untouched;
+                            if newticket then
+                                with pfiletable^[onfile]^.tickets do
+                                    begin
+                                    low := low + 1;
+                                    if low = 0 then high := high + 1;
+                                    end;
+                            end; { if }
+                        end; { if }
+                    if lresult <> noerr then
+                        if ptrcos <> pnewrec then ndispose(@czone,@pnewrec^);
+                    end; { if }
+                end; { with }
+2 :         if retry_compact(lresult,loc_compact_state) then goto 100;
+            end; { if }
+
+1 :     sresult := lresult;
+        (*dbif scandebug then writeln(dumpfile,'eins:',sresult:6);*)
+end; { einsert }
+
+
+ÿ

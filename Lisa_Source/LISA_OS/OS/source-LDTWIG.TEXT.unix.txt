@@ -1,0 +1,489 @@
+;Copyright 1983, 1984, Apple Computer Inc.
+
+;file source1:ldtwig
+
+        .proc   LDRLDR          ;twiggy loader-loader
+
+
+        .INCLUDE        SOURCE/LDEQU.TEXT
+
+
+    ;**********
+    ;* Description:
+    ;*   This is the copy of the loader loader with a TWIGGY device driver.
+    ;*
+    ;* Input Parameters:
+    ;*   The prom tells the size and base address of physical memory, and
+    ;*   where we are booting from.  WBT deposits information into a small
+    ;*   data area at the front of this block, showing the amount of the loader's
+    ;*   global data and code, the offset to the loader's entrypoint, and the
+    ;*   block address of the first page of the filesystem, ie, the MDDF.
+    ;*
+    ;* Output Parameters:
+    ;*   The loader loader reports to the loader the block address of MDDF, the
+    ;*   logical volume number of the boot device (though that's only used for
+    ;*   twiggy, the type of device we are booting from, and the block address
+    ;*   of the first usable page of the boot volume (exclusive of this block).
+    ;*
+    ;**********
+
+;device codes for top and bottom twiggy, depending whether the new or old
+;  prom is being used:
+top_twig        equ     0
+bot_twig        equ     1
+
+top_drive       equ     0               ;drive select parameters to
+bot_drive       equ     1               ;  the rwts command
+top_side        equ     0               ;head parameters to rwts command
+bot_side        equ     1
+
+trk_blocks      equ     $16             ;blocks per track, for tracks 0-3.
+
+timeout         equ     $300000         ;timeout corresponding to 20 seconds
+header_size     equ     24              ;size of a block (soft) header
+
+twig_base       equ     $fcc001         ;start of twiggy controller area
+prom_via1       equ     $fcdd81         ;garbage, required for twiggy call to prom
+diskdiag        equ     6               ;bit number of disk-diag function with
+                                        ;  'disk_control' register
+
+dskbase         equ     $fcc000         ;start of twiggy controller area
+command         equ     1
+drvslct         equ     5
+rwtscmd         equ     3
+zapall          equ     -1
+unclamp         equ     2
+either_eject    equ     $22
+eject           equ     2
+stat            equ     $5f
+dorwts          equ     $81
+clearall        equ     $85
+
+
+
+;**********
+;*
+;* Here begins the body of loader-loader.
+;*
+;**********
+ldr_base
+        jmp     over_ldr_data           ;dont execute loader data
+                                        ; written by boot track writer
+
+;**********
+;*
+;* reserve enough space for the 'write_boot_tracks'
+;*  to store primitive config information here:
+;*
+;**********
+        .word boot_id,ldr_version       ;note loader version and that it's bootable
+        .word 0,0,0,0                   ;save bytes for loader self-description space
+
+over_ldr_data                           ; execution continues from here
+
+;pick where to re-position the loader
+        move.l  prom_realsize,d0
+        lsr.l   #1,d0                   ;use midpoint
+        move.l  d0,ldbaseptr            ;remember our choice (both in D0 and in
+                                        ;     ldbaseptr)
+; Relocate the loader to ldbase
+        move.l  d0,a1                   ; a1 := destination ptr (D0 has ldbase)
+        move.l  #prom_assumes,a2        ; a2 := source ptr
+        lea     ldr_base,a3             ; a3 := end marker
+        add.l   #preloaded,a3
+move_loop
+        cmpa.l  a3,a2
+        bgt.s   exit_loop
+        move.l  (a2)+,(a1)+
+        bra.s   move_loop
+exit_loop
+        lea     real_code,a4            ;get into code just copied to ldbase
+        add.l   d0,a4                   ; (D0 has ldbase)
+        sub.l   #prom_assumes,a4
+        jmp     (a4)                    ; (distance from where the prom has
+real_code                               ;  loaded the loader to where I've
+                                        ;  relocated it.)
+;----
+; here begins the REAL ldrldr functions:
+;----
+        move.l  d0,a7                   ;get a fresh stack
+        sub     #init_sp,a7
+
+; Define (and initialize) some registers:
+;    a6 - pointer to the next byte to load the loader into
+;    d6 - amount of code still to be loaded
+;    d5 - current drive (byte var)
+;    d4 - current track (byte var)
+;    d7 - current block (byte var)
+;      (side is always 0)
+        lea     ldr_base,a0             ;A0 := base of ldrldr
+        move.l  a0,a6                   ; (one sector already loaded)
+        add.l   #preloaded,a6
+        move    codesize(a0),d6
+        sub     #preloaded,d6
+        move.b  #top_drive,d5           ;d0 := drive #, start assuming top
+        cmp.b   #top_twig,prom_bootdev
+        beq.s   is_top                  ;if drive not top, then it must
+        move.b  #bot_drive,d5           ;  be the bottom
+is_top
+        clr.b   d4                      ;start at track 0
+        move.b  #1,d7                   ;start at block 1
+
+; do configuration record initialization:
+        ext.w   d5                      ;bulk up drive number
+        move    d5,log_volume           ;pass boot volume name
+        move    fs_block0(a0),ld_fs_block0  ;pass MDDF location to loader
+        move    #dev_twig,dev_type      ;note boot is from twiggy
+        clr.w   vol_starts
+
+;MAIN LOOP STARTS HERE: (while codesize>0 do)
+main_loop:
+        move    d6,d6
+        bmi     start_pascal            ;exit once negative
+        jsr     ldr_read_block
+        add     #block_size,a6          ;increment destination address
+        sub     #block_size,d6          ;decrement bytes still to be read
+        bra.s   main_loop
+
+
+;****
+;*  Display a diagnostic and then re-enter prom.
+;*      (expects error number, if any, in a3)
+;****
+bootbomb
+        move.l  d0,d6                   ;stash prom's io error number in bomb shelter
+
+        move.l  prom_realsize,d0        ;tell prom where the main screen is,
+        sub.l   #screensize,d0          ;   (top of mem minus screensize)
+        move.l  d0,prom_screen
+
+        suba.l  a2,a2                   ;no icons
+        move.l  a3,d0                   ;error number, new format
+        move.l  d0,d1                   ;error number, old format
+        suba.l  a3,a3                   ;no textual messages, please.
+        jmp     prom_monitor            ;BYE-BYE time
+                                        ;(never returns!)
+
+
+
+;****
+;*  Wait for disk driver to be receptive of a command
+;*
+;*     (EXPECTS: ptr (dskbase) to twiggy logic in a0)
+;****
+wait_twig
+        movem.l a1/d0,-(SP)             ;clobber no registers
+        move.l  #disk_control,a1        ;get ptr to base of control logic
+await_ready
+        tst.b   command(a0)             ;wait until ready
+        beq.s   waitdun
+bwait_ready
+        move.b  0(a1),d0                ;wait until disk-diag also ready
+        btst    #diskdiag,d0
+        beq.s   bwait_ready
+        bra     await_ready
+waitdun movem.l (SP)+,a1/d0             ;that's all folks
+        rts
+
+
+
+        .def    shutdown
+;******
+;* procedure shutdown(device:integer);
+;*
+;*    de-activate boot device, esp. eject booting twiggy drive
+;*      (device values :  0-top twiggy, 1-bottom twiggy.
+;*
+;******
+shutdown
+        move.l  (SP)+,a1
+        move.l  #dskbase,a0
+        bsr.s   wait_twig               ;dont shout until twiggy is listening
+        move.b  #zapall,rwtscmd(a0)     ;clear all interrupts
+        move.b  #clearall,command(a0)
+        bsr.s   wait_twig               ;loop until ready
+        move    (SP)+,d0
+        ror.b   #1,d0                   ;convert drive to 0/$80 format
+        move.b  d0,drvslct(a0)
+        move.b  #unclamp,rwtscmd(a0)
+        move.b  #dorwts,command(a0)
+@1      btst    #4,$fcdd81              ;wait for unclamped interrupt
+        beq     @1
+        move.b  #$77,rwtscmd(a0)        ;clear interrupts
+        move.b  #$85,command(a0)
+        bsr.s   wait_twig               ;wait till cleared
+        move.b  #$88,rwtscmd(a0)        ;then disable
+        move.b  #$87,command(a0)
+        jmp     (a1)
+
+
+
+;****************************
+;*
+;*  TWIG_ENABLE - terminates boot if the 'eject' button was pressed,
+;*    and clears interrupts if eject wasn't pressed.
+;*
+;****************************
+twig_enable
+        movem.l d0/a0,-(SP)             ;clobber no registers
+        move.l  #dskbase,a0
+        move.b  stat(a0),d0
+        and     #either_eject,d0        ;any eject pressed?
+        beq.s   no_eject
+
+;select drive, eject it, and terminate boot:  (dont care about zapping d1)
+        move    #1,d1                   ;assume drive 1
+        and     #eject,d0
+        beq.s   not_drv0
+        clr.w   d1                      ;change to drive 0
+not_drv0
+        move    d1,-(SP)                ;pass drive to eject
+        jsr     shutdown
+        suba.l  a3,a3                   ;no error code, since eject isn't an error
+        bra     bootbomb
+
+no_eject
+        bsr     wait_twig
+        move.b  #zapall,rwtscmd(a0)     ;clear all interrupts
+        move.b  #clearall,command(a0)
+        bsr     wait_twig
+
+        movem.l  (SP)+,d0/a0            ;restore registers
+        rts
+
+
+
+;****************************
+;*
+;*  LDR_READ_BLOCK - reads one block to memory.  Also, steps across
+;*    track boundaries and increments the block number after reading it.
+;*
+;*    (track boundary transitions only works for tracks 0 to 4, )
+;*    (  ie, track 4 has a different number of blocks.)
+;*
+;*    Parameters are:
+;*        A6 - the destination address.  First the data and next the header
+;*                part of the block are written there.
+;*        d4 - track
+;*        d5 - drive (top/bot)
+;*        d7 - block (in track)
+;*
+;*   Prom expects -
+;*        a1 - address for header part of block
+;*        a2 - address for data part of block
+;*        d0 - 0 (drive speed)
+;*        d1 - Packed drive/side/block/trk
+;*        d2 - timeout
+;*      plus:
+;*        a0 - twiggy control logic base
+;*        a3 - prom_via1
+;*
+;*    Note :
+;*      The header read in is the PACKED/unintelligible format, not
+;*      the ultimate representation.
+;*
+;*      Two different drivers exists for the same device so that one can be small
+;*      and simpleminded and fit in the first block (ldr_read_block), while the
+;*      second (asm_read_block) can still do header handling.
+;*
+;****************************
+ldr_read_block
+        cmp.b   #trk_blocks,d7          ;step across track boundary, if approp.
+        bne     same_track
+        clr.b   d7                      ;clear block (in track)
+        add.b   #1,d4                   ;incr track
+same_track
+
+;phrase parms in terms known by prom:
+        move.l  a6,a2                   ;data adr := destination data adr
+        move.l  a6,a1                   ;header adr is offset by blocksize to
+        add     #block_size,a1          ; discard it.
+
+        clr.l   d1                      ; (side always 0)
+        move.b  d5,d1                   ;convert drive to 0/$80 format
+        ror.l   #1,d1
+        move.b  d7,d0                   ;align block to central byte
+        lsl.w   #8,d0
+        or.b    d4,d0                   ;fold in track
+        or.w    d0,d1
+
+        move.l  #prom_via1,a3                ;satisfy prom requirements
+        move.l  #twig_base,a0           ; (more requirements)
+        clr.l   d0                      ; (yawn)
+        move.l  #timeout,d2             ; (ridiculously long)
+
+        movem.l d4-d7/a6,-(SP)          ;save registers
+        jsr     twig_enable
+        jsr     twig_entry
+        movem.l (SP)+,d4-d7/a6          ;restore registers
+
+        bcc     got_it                  ;carry set by prom if error
+                                        ;eject disk:
+        clr.w   -(SP)                   ;assume drive 0
+        move.b  d5,d5                   ;check whether drive really zero
+        beq.s   drv_is_0                ;   but if it's not
+        move.w  #1,(SP)                 ;   then change to drive #1.
+drv_is_0
+        jsr     shutdown                ;alias for 'shutdown'
+        move.l  #bombed,a3              ;generic error code number
+        bra     bootbomb                ;curse god and die!
+got_it  add.b   #1,d7                   ;finally, increment block
+        rts
+
+
+
+;*****
+;* This is the end of the code that has to be included
+;*   in the first block.
+;*****
+
+
+;*****
+;* ENTER EXECUTION OF THE LOADER
+;*****
+start_pascal
+        clr.l   -(SP)                   ;clear 'C'
+        clr.l   -(SP)                   ;clear 'V'
+        clr.l   -(SP)                   ;clear 'os/mon flag'
+        lea     ldr_base,a0
+        move.w  globalsize(a0),a1       ;tell pascal how much global data
+        move.l  a1,-(SP)                ;pass 'commonsize'
+
+        clr.l   -(SP)                   ;init output buffer addresses
+        clr.l   -(SP)                   ;init input buffer addresses
+
+        clr.l   -(SP)                   ;enter nil return address
+        adda    pc_offset(a0),a0        ;enter pascal
+        jmp     (a0)
+
+
+
+        .DEF    ASM_READ_BLOCK
+;****************************
+;*
+;*        PROCEDURE ASM_READ_BLOCK(VAR RC:INTEGER;
+;*                                BLOCK:LONGINT; VAR BUFFER, HEADER:INTEGER)
+;*
+;*        The data is read in from block 'block', to address buffer.
+;*        'BLOCK' is encoded as 4 bytes holding (packed) drive/side/block/trk.
+;*
+;*        Twiggy headers dont have a 'abspage' field any more, so the caller
+;*        is responsible for reconstructing it's value.
+;*
+;*        The only values of 'RC', ie, return codes, are 0 (for success,
+;*         and non-zero, for failure.
+;*
+;*   Prom expects -
+;*        a1 - address for header part of block
+;*        a2 - address for data part of block
+;*        d0 - 0 (drive speed)
+;*        d1 - Packed drive/side/block/trk
+;*        d2 - timeout
+;*      plus:
+;*        a0 - twiggy control logic base
+;*        a3 - prom_via1
+;*
+;* Note:
+;*   Two different drivers exists for the same device so that one can be small
+;*   and simpleminded and fit in the first block (ldr_read_block), while the
+;*   second (asm_read_block) can still do header handling.
+;*
+;****************************
+asm_read_block
+
+twig_hdr  equ   $fcc3e8                 ;base of hdr part twiggy data area
+
+        move.l  (SP)+,a0                ;get return address
+        move.l  (SP)+,a1                ;a1 := header adr
+        move.l  (SP)+,a2                ;a2 := data adr
+        move.l  (SP)+,d1                ;d1 := drive/side/block/trk
+
+        movem.l a0-a6/d4-d7,-(SP)       ;dont clobber (even with 'prom_via1') pascal regs
+        move.l  #prom_via1,a3                ;satisfy prom requirements
+        move.l  #twig_base,a0           ; (more requirements)
+        clr.l   d0                      ; (yawn)
+        move.l  #timeout,d2             ; (ridiculously long time)
+        jsr     twig_enable
+        jsr     twig_entry
+        bcc     is_ok                   ;carry set by prom if error
+        move.w  #-1,d0                  ;error return path
+        bra     exit_path
+is_ok
+
+;unpack header to full 24-byte representation
+;    (a1 points to hdr at end of data)
+        movea.l #twig_hdr,a2            ;12-byte header area
+        movep.l 1(a2),d0                ;version and volume
+        movep.w 9(a2),d1
+        swap    d1                      ;fileid in left word
+                                        ;dont know abspage yet
+        movep.w 13(a2),d3
+        ext.l   d3                      ;relpage
+        movep.w 17(a2),d4               ;fwdlink w/dataused
+        movep.w 21(a2),d5               ;bkwdlink w/ dataused
+        move    d5,d1                   ;assemble dataused into low word of d1
+        lsr     #5,d1
+        move    d4,d6
+        and     #$f800,d6
+        add     d6,d1
+        lsr     #6,d1
+        move    #$07ff,d6               ;unpack bkwdlink and fwdlink
+        and     d6,d4
+        cmp     d6,d4
+        bne.s   @2
+        ext.w   d4                      ;7ff => ffffffff
+@2      ext.l   d4
+        and     d6,d5
+        cmp     d6,d5
+        bne.s   @3
+        ext.w   d5                      ;7ff => ffffffff
+@3      ext.l   d5
+        movem.l d0-d5,(a1)
+
+        clr.w   d0                      ;signal success
+exit_path
+        movem.l (SP)+,a0-a6/d4-d7       ;restore all those registers, saved above
+                                        ;(also gets return address into a0)
+        move.l  (SP)+,a1                ;set return code
+        move    d0,(a1)
+        jmp     (a0)                    ;thats all folks
+
+
+
+        .def    init_twig_table
+;******************
+;*   INIT_TWIG_TABLE(adr : absptr);
+;*
+;*  Initialize an array of twiggy track start sector addresses,
+;*    starting at addresss ADR.
+;******************
+init_twig_table
+table_len       equ     93
+        move.l  (SP)+,a0                ;a0 := return address
+        move.l  (SP)+,a1                ;a1 := table base
+        lea     first_block,a2          ;a2 := table ptr
+        move    #table_len-1,d0         ;d0 := table move count (length-1)
+more_and_more
+        move.w  (a2)+,(a1)+
+        dbra    d0,more_and_more
+        jmp     (a0)                    ;goodbye
+
+first_block
+        .word     $0,  $16,  $2c,  $42,  $58,  $6d,  $82,  $97,  $ac,  $c1
+        .word    $d6,  $eb,  $ff, $113, $127, $13b, $14f, $163, $176, $189
+        .word   $19c, $1af, $1c2, $1d5, $1e7, $1f9, $20b, $21d, $22f, $241
+        .word   $252, $263, $274, $285, $296, $2a7, $2b7, $2c7, $2d7, $2e7
+        .word   $2f7, $307, $317, $326, $335, $344, $353, $362, $371, $380
+        .word   $38f, $39f, $3af, $3bf, $3cf, $3df, $3ef, $3ff, $410, $421
+        .word   $432, $443, $454, $465, $477, $489, $49b, $4ad, $4BF, $4BF
+        .word   $4d2, $4e5, $4f8, $50b, $51e, $531, $545, $559, $56d, $581
+        .word   $595, $5a9, $5be, $5d3, $5e8, $5fd, $612, $627, $63c, $652
+        .word   $668, $67e, $694
+
+
+
+        .END
+
+
+
+ÿ

@@ -1,0 +1,932 @@
+
+(* ********************************************************************* *)
+
+(* CopyRight 1983,1984 Apple Computer Inc. *)
+(* GE Select Routines *)
+
+(* ********************************************************************* *)
+
+UNIT Sel;
+
+(* Segment UTL *)
+INTERFACE
+USES
+    (*$U UNITSTD *)    UnitStd,    (* interface dependency  *)
+    (*$U UNITHZ*)      UnitHz,
+    (*$U STORAGE*)     Storage,
+    (*$U QUICKDRAW*)   QuickDraw,
+    (*$U FONTMGR*)     FontMgr,
+    (*$U LibOS/Syscall *)    Syscall,
+    {$U LibPm/PmDecL}      PmDecL,
+    {$U PrStdInfo}     PrStdInfo,
+    {$U PrPublic}      PrPublic,
+    (*$U ApLd/HDR*)      Hdr,
+    {$IFC sampcalls}
+    {$U apld/tracecalls.obj}  tracecalls,
+    {$ENDC}
+                                          (* used only for ElapsTime *)
+    (*$U WM.EVENTS*)   Events,
+
+    (*$U ApLd/DAT*)      Dat,        (* implementation units  *)
+    (*$U ApLd/DRW*)      Drw,
+    (*$U ApLd/UTL*)      Utl;
+
+CONST
+    cSelGrow    = 200;        (* room for 50 objects selected *)
+
+    (* hit zones *)
+    iZoneHot    = 2;
+    iZoneWrm    = 1;
+    iZoneCld    = 0;
+
+    (* Selection List Management *)
+    function  NewSLst  (hz: THz): TSelHnd;
+    procedure FreeSLst (VAR sLst: TSelHnd);
+    function  CurSelObj(sIndx: Integer): TObjPtr;
+    function  GetSelObj(sel: TSelHnd; sIndx: Integer): TObjPtr;
+    procedure SetSelObj(sel: TSelHnd; sIndx: Integer; obj: TObjPtr);
+    procedure AddToSEnd(var sel: TSelHnd; obj: TObjPtr);
+    procedure CopySLst (src: TSelHnd; var dst: TSelHnd);
+    procedure MarkCSel (sel: TSelHnd; selVal: Integer);
+    procedure MarkPSel (sel: TSelHnd; selVal: Integer);
+    procedure ResetSLst(var sel: TSelHnd);
+    procedure SetSLst  (var sel: TSelHnd; obj: TObjPtr; selVal: Integer);
+    procedure InitSLst (var sel: TSelHnd);
+    procedure GetSelRect(sel: TSelHnd; var selRect: Rect);
+
+    (* Hit Detection *)
+    function  PtNearObj   (pt: Point; obj: TObjPtr): boolean;
+    Function  PtInSelRect (pt: Point; selRect: Rect): Boolean;
+    function  PtOnObjKnob (VAR pt: Point; obj: TObjPtr;
+                           var knob: Integer): Integer;
+
+    (* Misc *)
+    procedure InitSel;
+
+(* ********************************************************************* *)
+
+IMPLEMENTATION
+
+
+(* ********************************************************************* *)
+
+const
+    dxKnob      = 3.0;    (* half-width of a knob *)
+    dyKnob      = 2.0;    (* half-height of a knob *)
+type
+    TObjHnd     = ^TObjPtr;
+var
+    minSelSize: Integer;
+
+    procedure GetSBBox(var sel: TSelHnd);       EXTERNAL;  (* in UOP *)
+
+(* ********************************************************************* *)
+
+(* Tracing *)
+
+(* ********************************************************************* *)
+(*$S Core*)
+    procedure GetCLstRgn(cLst: TCLstHnd; var rgn: RgnHandle);
+    (* returns a region described by the cLst or nilRect is too big*)
+    var savePen: PenState;
+        thisPoly: PolyHandle;
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('GetCLstRgn');
+
+        (* save pen *)
+        GetPenState(savePen);
+        (* turn off pen *)
+        PenNormal;
+        PenMode(srcCopy);
+
+        (* construct poly *)
+        thisPoly := OpenPoly;
+        DrwCLst(cLst);
+        ClosePoly;
+
+        {XXX when implemented, use PtInPoly; for now, construct rgn and
+         use PtInRgn }
+
+        OpenRgn;
+        If OkFillPoly(thisPoly) then begin
+            FramePoly(thisPoly);
+            with thisPoly^^.polyPoints[0] do   {polyStart no longer in QD}
+                LineTo(h,v);
+        end else
+            FrameRect(nilRect);
+        rgn := NewRgn;
+        CloseRgn(rgn);
+
+        (* free poly *)
+        KillPoly(thisPoly);
+        (* restore pen *)
+        SetPenState(savePen);
+    end; (* GetCLstRgn *)
+
+(* ********************************************************************* *)
+
+(* Selection List Management *)
+
+(* ********************************************************************* *)
+
+    function  SelSize(sel: TSelHnd): Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        SelSize := CbDataOfH(HzFromH(Pointer(Ord(sel))),Pointer(Ord(sel)));
+    end; (* SelSize *)
+
+(* ********************************************************************* *)
+
+    function  NewSLst(* hz: THz): TSelHnd *);
+    var nSel: TSelHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        nSel := Pointer(Ord(HAllocate(hz,SizeOf(TSelLst))));
+        InitSLst(nSel);
+        NewSLst := nSel;
+    end; (* NewSLst *)
+
+(* ********************************************************************* *)
+
+    procedure FreeSLst(* VAR sLst: TSelHnd *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* sLst may be in various heaps *)
+        FreeH(HzFromH(Pointer(Ord(sLst))),Pointer(Ord(sLst)));
+        sLst := NIL;
+    end; (*  FreeSLst *)
+
+(* ********************************************************************* *)
+{
+
+    function  GetSelPtr(sel: TSelHnd; sIndx: LongInt): TObjHnd;
+    begin
+        sIndx := sIndx-1;
+        GetSelPtr := Pointer(Ord(@sel^^.lst)+sIndx*4);
+    end; (* GetSelPtr *)
+
+}
+(* ********************************************************************* *)
+
+    function  GetSelObj(* sel: TSelHnd; sIndx: Integer): TObjPtr *);
+    var dst: TObjHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        dst := GetSelPtr(sel,sIndx);
+        GetSelObj := dst^;
+        *)
+        (*$R-*)
+        GetSelObj := sel^^.lst[sIndx];
+        (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* SelObj *)
+
+(* ********************************************************************* *)
+
+    function  CurSelObj(* sIndx: Integer): TObjPtr *);
+    var dst: TObjHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        dst := GetSelPtr(curDoc.sLst,sIndx);
+        CurSelObj := dst^;
+        *)
+        (*$R-*)
+        CurSelObj := curDoc.sLst^^.lst[sIndx];
+        (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* SelObj *)
+
+(* ********************************************************************* *)
+
+    procedure SetSelObj(* sel: TSelHnd; sIndx: Integer; obj: TObjPtr *);
+    var dst:   TObjHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        dst := GetSelPtr(sel,sIndx);
+        dst^ := obj;
+        *)
+        (*$R-*)
+        sel^^.lst[sIndx] := obj;
+        (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* SetSelObj *)
+
+(* ********************************************************************* *)
+
+    procedure AddToSEnd(* var sel: TSelHnd; obj: TObjPtr *);
+    var thisObj: TObjPtr;
+        cnt,size: Integer;
+        r: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('AddToSEnd(',Ord(sel):8,',',Ord(obj):8,')');
+
+        (* adds obj to sel, growing sLst if needed *)
+
+        cnt :=sel^^.sCnt + 1;   {Insure memore allocation test below is correct}
+        (* 8000 is largest size for data structure allowed by our compiler *)
+        if cnt<8000 then begin
+            (* check for trfoObj *)
+            thisObj := obj;
+            if obj=trfoObj then
+                thisObj := trfoRef;
+
+            (* increase size of sel *)
+            size := SelSize(sel);
+            if size<SizeOf(TSelLst)+cnt*SizeOf(TObjPtr) then
+                ChangeSizeH(HzFromH(Pointer(Ord(sel))),
+                            Pointer(Ord(sel)),size+cSelGrow);
+
+            (* put obj in sLst *)
+            with sel^^ do begin
+                sCnt := sCnt+1;
+                SetSelObj(sel,sCnt,thisObj);
+                {
+                (*$R-*)
+                lst[sCnt] := thisObj;
+                (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+                }
+            end;
+
+            (* update sel with trfoObj bBox *)
+            with obj^,sel^^ do begin
+                if sCnt=1 then begin
+                    sState := oDat.kind;
+                    sBBox  := bBox;
+                end else begin
+                    sState := iSSTGrp;
+                    r := sBBox;
+                    UnionRect(r,bBox,r);
+                    sBBox := r;
+                end;
+                sSiz := sSiz+SizeOfObj(obj);
+                sTot := sTot+CntOfObj(obj);
+            end;
+        end;
+    end; (* AddToSEnd *)
+
+(* ********************************************************************* *)
+
+    procedure CopySLst(* src: TSelHnd; var dst: TSelHnd *);
+    var srcSize,dstSize,i: Integer;
+        sAddr,dAddr: TObjHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* copies src to dst, making sure dst is same size as src *)
+
+        (* make sure dst is big enough *)
+        srcSize := SelSize(src);
+        dstSize := SelSize(dst);
+        if srcSize<>dstSize then
+            ChangeSizeH(HzFromH(Pointer(Ord(dst))),
+                        Pointer(Ord(dst)),srcSize);
+
+        (* copy the data *)
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        dst^^ := src^^;
+        sAddr := Pointer(Ord(@src^^.lst));
+        dAddr := Pointer(Ord(@dst^^.lst));
+        for i := 1 to src^^.sCnt do begin
+            dAddr^ := sAddr^;
+            dAddr := Pointer(Ord(dAddr)+4);
+            sAddr := Pointer(Ord(sAddr)+4);
+        end;
+        *)
+        dst^^ := src^^;
+        for i := 2 to src^^.sCnt do
+            (*$R-*)
+            dst^^.lst[i] := src^^.lst[i];
+            (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* CopySLst *)
+
+(* ********************************************************************* *)
+
+    procedure MarkCSel(* sel: TSelHnd; selVal: Integer *);
+    var i: Integer;
+        sAddr: TObjHnd;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        sAddr := Pointer(Ord(@sel^^.lst));
+        for i := 1 to sel^^.sCnt do begin
+            sAddr^^.cSel := selVal;
+            sAddr := Pointer(Ord(sAddr)+4);
+        end;
+        *)
+        with sel^^ do
+        for i := 1 to sCnt do
+            (*$R-*)
+            lst[i]^.cSel := selVal;
+            (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* MarkCSel *)
+
+(* ********************************************************************* *)
+
+    procedure MarkPSel(* sel: TSelHnd; selVal: Integer *);
+    var i: Integer;
+        {sAddr: TObjHnd;}
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* doesn't do any good to do pointer arithmetic since cant have
+           hz objects > 32K anyway!
+        sAddr := Pointer(Ord(@sel^^.lst));
+        for i := 1 to sel^^.sCnt do begin
+            sAddr^^.pSel := selVal;
+            sAddr := Pointer(Ord(sAddr)+4);
+        end;
+        *)
+        With sel^^ do
+            For i := 1 to sCnt do
+                (*$R-*)
+                lst[i]^.pSel := selVal;
+                (*$IfC rangeOn*) (*$R+*) (*$EndC*)
+    end; (* MarkPSel *)
+
+(* ********************************************************************* *)
+
+    procedure ResetSLst(* var sel: TSelHnd *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        MarkCSel(sel,iSelNil);
+        InitSLst(sel);
+    end; (* ResetSLst *)
+
+(* ********************************************************************* *)
+
+    procedure SetSLst(* var sel: TSelHnd; obj: TObjPtr; selVal: Integer *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        InitSLst(sel);
+        AddToSEnd(sel,obj);
+        MarkCSel(sel,selVal);
+    end; (* SetSLst *)
+
+(* ********************************************************************* *)
+
+    procedure InitSLst(* var sel: TSelHnd *);
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with sel^^ do begin
+            sBBox   := nilRect;
+            sState  := iObjNIL;
+            sCnt    := 0;
+            sTot    := 0;
+            sSiz    := 0;
+        end;
+        if SelSize(sel)>cSelGrow then
+            ChangeSizeH(HzFromH(Pointer(Ord(sel))),
+                        Pointer(Ord(sel)),cSelGrow);
+    end; (* InitSLst *)
+
+(* ********************************************************************* *)
+
+    procedure GetSelRect(* sel: TSelHnd; var selRect: Rect *);
+    var knobSize: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with sel^^ do begin
+            selRect := sBBox;
+            if (sState=iSStGrp) or (sState>iObjNil) then
+                InSetRect(selRect,-zoomKnobSz.h,-zoomKnobSz.v)
+        end;
+    end; (* GetSelRect *)
+
+(* ********************************************************************* *)
+
+(* Hit Detection *)
+
+(* ********************************************************************* *)
+
+    function PtNearLine(pt: Point; obj: TObjPtr): boolean;
+    (* test whether a point is within knob distance of a line segment *)
+    (* uses algorithm from Newmann/Sproul on page 494 *)
+    var a,b,c,t,tolSqrd: real;
+        pt1,pt2: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        PtNearLine:=TRUE;
+        WldToScrn(obj^.oDat.p1,pt1);
+        WldToScrn(obj^.oDat.p2,pt2);
+        if not (EqualPt(pt,pt1) or EqualPt(pt,pt2)) then
+            with obj^.oDat do begin
+                (* calc a,b,c homogeneous line eqn. *)
+                (* Use real arithmetic to avoid overflow *)
+                a:=p1.y-p2.y;
+                b:=p2.x-p1.x;
+                c:=p2.y*p1.x-p2.x*p1.y;
+
+                (* compare square of distance to square of tolerance *)
+                tolSqrd:=zoomKnobSz.h+penSizes[inf.pnSiz].h div 2;
+                tolSqrd:=tolSqrd*tolSqrd;
+                t:=a*pt.h + b*pt.v + c;
+                t:=(t*t)/(a*a + b*b);
+                IF t > tolSqrd then
+                    PtNearLine := False;
+            end;
+    end; (* PtNearLine *)
+
+(* ********************************************************************* *)
+
+    function PtNearRLin(pt: Point; obj: TObjPtr): boolean;
+    (* test whether a point is within knob distance of a horizontal or *)
+    (* vertical line segment *)
+    var thisObj: TObjRec;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        with obj^,oDat do begin
+            PtNearRLin := TRUE;
+            if inf.dat<>0 then begin
+                thisObj := obj^;
+                thisObj.oDat.inf.dat := 0;
+                GetBBox(@thisObj);
+                InsetRect(thisObj.bBox,-zoomKnobSz.h,-zoomKnobSz.v);
+                PtNearRLin := PtInRect(pt,thisObj.bBox);
+            end;
+        end;
+    end; (* PtNearRLin *)
+
+(* ********************************************************************* *)
+
+    function  PtNearRect(pt: Point; obj: TObjPtr): boolean;
+    var tstRect: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        PtNearRect := TRUE;
+        with obj^,oDat do
+        if inf.flPat=iFillClear then with penSizes[inf.pnSiz] do begin
+            tstRect := bBox;
+            InsetRect(tstRect,zoomKnobSz.h+h Div 2,
+                              zoomKnobSz.v+v Div 2);
+            if PtInRect(pt,tstRect) then
+                PtNearRect := FALSE;
+        end;
+    end; (* PtNearRect *)
+
+(* ********************************************************************* *)
+
+    function  PtNearOval(pt: Point; obj: TObjPtr): boolean;
+    Type
+        Oval2D =
+                record
+                    center: Point2D;
+                    radius: Point2D;
+                end;
+
+    var val,z: real;
+        w2D,dPen: Point2D;
+        o2D: Oval2D;
+
+        procedure GetVal;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            (* eqn of oval is xSqrd/rxSqrd + ySqrd/rySqrd = 1 *)
+            (* here we evaluate left side of this equation    *)
+            with o2D do
+            val := w2D.x/(radius.x*radius.x) + w2D.y/(radius.y*radius.y);
+        end; (* GetVal *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('PtNearOval(',pt.h:2,',',pt.v:2,',',Ord(obj):8,')');
+
+        (* put oval data in form easier to work with *)
+        ScrnToWld(penSizes[obj^.oDat.inf.pnSiz],dPen);
+        with obj^.oDat.r2D,o2D do begin
+            radius.x := (xR-xL)/2;
+            radius.y := (yB-yT)/2;
+            center.x := xL+radius.x;
+            center.y := yT+radius.y;
+            radius.x := radius.x+dPen.x/2+zoomKnobSz.h;
+            radius.y := radius.y+dPen.y/2+zoomKnobSz.v;
+        end;
+        with o2D do begin
+            ScrnToWld(pt,w2D);
+            SubPt2D(center,w2D);
+            with w2D do begin
+               { z := Abs(x);
+                if z>zoomKnobSz.h then
+                    x := z-zoomKnobSz.h
+                else
+                    x := 0;
+                z := Abs(y);
+                if z>zoomKnobSz.v then
+                    y := z-zoomKnobSz.v
+                else
+                    y := 0;}
+                x := x*x;
+                y := y*y;
+            end;
+            GetVal;
+            if val>1 then
+                PtNearOval := FALSE
+            else begin
+                PtNearOval := TRUE;
+                if obj^.oDat.inf.flPat=iFillClear then begin
+                    dPen.x := dPen.x+2*zoomKnobSz.h;
+                    dPen.y := dPen.y+2*zoomKnobSz.v;
+                    SubPt2D(dPen,radius);
+                    if (radius.x<=0) or (radius.y<=0) then
+                        PtNearOval := TRUE
+                    else begin
+                        GetVal;
+                        PtNearOval := val>=1;
+                    end;
+                end;
+            end;
+        end;
+    end; (* PtNearOval *)
+
+(* ********************************************************************* *)
+
+    function  PtNearArc(pt: Point; obj: TObjPtr): boolean;
+    var ovalObj: TObjRec;
+        arcRgn:  RgnHandle;
+        angle,a1,a2: Integer;
+        r: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        ovalObj := obj^;
+        with ovalObj.oDat do begin
+            kind := iObjOval;
+            r2D := obj^.oDat.arc^^.aR2D;
+        end;
+        if PtNearOval(pt,@ovalObj) then begin
+            R2DToRect(ovalObj.oDat.r2D,r);
+            PtToAngle(r,pt,angle);
+            with obj^.oDat.arc^^ do
+                GetAngles(aStart,aAngle,a1,a2);
+
+            if traceCmd then
+                writeln('PtNearArc:',angle:4,',',a1:4,',',a2:4);
+
+            PtNearArc := ((angle>=a1) and (angle<=a2)) or
+                         ((angle+360>=a1) and (angle+360<=a2));
+        end else
+            PtNearArc := FALSE;
+    end; (* PtNearArc *)
+
+(* ********************************************************************* *)
+
+    function  PtNearCLst(pt:Point; obj: TObjPtr): Boolean;
+    var nearCLst: Boolean;
+        cLstRgn: RgnHandle;
+
+    (* ***************************************************************** *)
+
+        function  PtOnCLst(pt: Point; obj: TObjPtr): boolean;
+        var nearPt: boolean;
+            thisRect: Rect;
+            thisObj: TObjRec;
+            crdPt,lastPt,dp,begPt: Point;
+            node: Integer;
+            thisCLst: TCLstRec;
+
+        (* ************************************************************* *)
+
+            function  PtNearSeg: Boolean;
+            begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+                PtNearSeg := FALSE;
+                Pt2Rect(crdPt,lastPt,thisRect);
+                AddPt(dp,thisRect.botRight);
+                InSetRect(thisRect,-zoomKnobSz.h,-zoomKnobSz.v);
+                if PtInRect(pt,thisRect) then begin
+                    ScrnToWld(lastPt,thisObj.oDat.p1);
+                    ScrnToWld(crdPt,thisObj.oDat.p2);
+                    PtNearSeg := PtNearLine(pt,@thisObj);
+                end;
+            end; (* PtNearSeg *)
+
+        (* ***************************************************************** *)
+
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            nearPt := FALSE;
+            thisObj := obj^;
+            thisObj.oDat.kind := iObjSLin;
+            with penSizes[obj^.oDat.inf.pnSiz] do begin
+                dp.h := h div 2;
+                dp.v := v div 2;
+            end;
+            with obj^.oDat do begin
+                thisCLst := cLst^^;
+                GetNode(cLst,0,begPt);
+                crdPt := begPt;
+                for node := 1 to thisCLst.crdCnt do begin
+                    lastPt := crdPt;
+                    GetNode(cLst,node,crdPt);
+                    if PtNearSeg then begin
+                        nearPt := TRUE;
+                        node := thisCLst.crdCnt;
+                    end;
+                end;
+                if not nearPt and (thisCLst.cClose<>iCLstNil) then begin
+                    lastPt := crdPt;
+                    crdPt := begPt;
+                    nearPt := PtNearSeg;
+                end;
+            end;
+            PtOnCLst := nearPt;
+        end; (* PtOnCLst *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    PtNearCLst');
+
+        (* see if we are on one of the segments *)
+        nearCLst := PtOnCLst(pt,obj);
+
+        (* see if we are inside the shaded cLst *)
+        if not nearCLst then
+            if (obj^.oDat.inf.flPat<>iFillClear) and not nearCLst then begin
+                GetCLstRgn(obj^.oDat.cLst,cLstRgn);
+                GEMapPt(pt);
+                nearCLst := PtInRgn(pt,cLstRgn);
+                DisposeRgn(cLstRgn);
+
+                if traceCmd and nearCLst then
+                    writeln('        hit in region');
+
+            end;
+        PtNearCLst := nearCLst;
+    end; (* PtNearCLst *)
+
+(* ********************************************************************* *)
+
+    procedure GetSPolyRgn(thisPoly: PolyHandle; var rgn: RgnHandle);
+    (* returns a region described by the cLst *)
+    var savePen: PenState;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('GetSPolyRgn');
+
+        (* save pen *)
+        GetPenState(savePen);
+        (* turn off pen *)
+        PenNormal;
+        PenMode(srcCopy);
+
+
+        {XXX when implemented, use PtInPoly; for now, construct rgn and
+         use PtInRgn }
+
+        OpenRgn;
+        If OkFillPoly(thisPoly) then begin
+            FramePoly(thisPoly);
+            with thisPoly^^.polyPoints[0] do   {polyStart no longer in QD}
+               LineTo(h,v);
+        end else
+            FrameRect(nilRect);
+        rgn := NewRgn;
+        CloseRgn(rgn);
+
+        (* restore pen *)
+        SetPenState(savePen);
+    end; (* GetSPolyRgn *)
+
+(* ********************************************************************* *)
+
+    function NearSeg(pt,pt1,pt2: Point): Boolean;
+    Var max,absDeltay,tolerance: Integer;
+        delta: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        delta.h := pt2.h - pt1.h;
+        delta.v := pt2.v - pt1.v;
+        absDeltay := Abs(delta.v);
+        max := Abs(delta.h);
+        If max < absDeltay then
+            max := absDeltay;
+        tolerance := hKnob;
+        NearSeg := Abs(delta.v*(pt.h - pt1.h) - delta.h*(pt.v - pt1.v))
+                     <= max*tolerance;
+
+    end;{NearSeg}
+
+
+    (* ********************************************************************* *)
+
+    function PtNearSPoly(pt: Point; sPolyObj: TObjPtr): Boolean;
+    Var thisPoly: PolyHandle;
+        tempRect: Rect;
+        nearSPoly: Boolean;
+        sPolyRgn: RgnHandle;
+        count,i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        GEMapPt(pt);
+        nearSPoly := FALSE;
+        {Allocate room for thisPoly}
+        thisPoly := Pointer(ord(HAllocate(geHHz,sPolySize)));
+        Smooth(sPolyObj,thisPoly,TRUE,TRUE);  {zoomFlag=TRUE}{needPrep}
+        With thisPoly^^ do begin
+            count := (polySize-14) DIV 4;
+            For i := 2 to count  do begin
+                {$R-}
+                Pt2Rect(polyPoints[i-1],polyPoints[i],tempRect);
+                InsetRect(tempRect,-hKnob,-vKnob);
+                If PtInRect(pt,tempRect) then begin
+                    If NearSeg(pt,polyPoints[i-1],polyPoints[i]) then begin
+                        {$IfC rangeOn} {$R+} {$EndC}
+                        nearSPoly := TRUE;
+                        i := count;
+                    end;
+                end;
+            end;
+        end;
+        If NOT nearSPoly then
+            If sPolyObj^.oDat.inf.flPat<>iFillClear then begin
+                GetSPolyRgn(thisPoly,sPolyRgn);
+
+                nearSPoly := PtInRgn(pt,sPolyRgn);
+                DisposeRgn(sPolyRgn);
+
+                if traceCmd and nearSPoly then
+                    writeln('        hit in sPoly');
+
+            end;
+        {Deallocate room for thisPoly}
+        FreeH(geHHz,Pointer(ord(thisPoly)));
+        PtNearSPoly := nearSPoly;
+    end;{PtNearSPoly}
+
+(* ********************************************************************* *)
+
+    function  PtNearGrp(pt: Point; grp:TObjPtr): boolean;
+    var nearGrp: Boolean;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        nearGrp := FALSE;
+        while (grp<>NIL) and (not nearGrp) do begin
+            nearGrp := PtNearObj(pt,grp);
+            grp := grp^.fLink;
+        end;
+        PtNearGrp := nearGrp;
+    end; (* PtNearGrp *)
+
+(* ********************************************************************* *)
+
+    function  PtNearObj(* pt: Point; obj: TObjPtr): boolean *);
+    var tstRect: Rect;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('    PtNearObj(',Ord(obj):10,')');
+
+        tstRect := obj^.bBox;
+        InsetRect(tstRect,-zoomKnobSz.h,-zoomKnobSz.v);
+        if PtInRect(pt,tstRect) then
+            case obj^.oDat.kind of
+                iObjRLin: PtNearObj := PtNearRLin(pt,obj);
+                iObjSLin: PtNearObj := PtNearLine(pt,obj);
+                iObjArc:  PtNearObj := PtNearArc(pt,obj);
+                iObjRect,
+                iObjRndR: PtNearObj := PtNearRect(pt,obj);
+                iObjOval: PtNearObj := PtNearOval(pt,obj);
+                iObjFHnd,
+                iObjPoly: PtNearObj := PtNearCLst(pt,obj);
+                iObjSPoly: PtNearObj := PtNearSPoly(pt,obj);
+                iObjText: PtNearObj := PtInRect(pt,obj^.bBox);
+                iObjGroup: PtNearObj := PtNearGrp(pt,obj^.oDat.grp.lBeg);
+            end (* case *)
+        else
+            PtNearObj := FALSE;
+    end; (* PtNearObj *)
+
+(* ********************************************************************* *)
+
+    Function  PtInSelRect(* pt: Point; selRect: Rect *);
+    var knobSize: Point;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        (* expand selRect to include warmZone *)
+        InsetRect(selRect,-zoomKnobSz.h,-zoomKnobSz.v);
+        PtInSelRect := PtInRect(pt,selRect);
+    end;
+
+(* ********************************************************************* *)
+
+    function  PtOnObjKnob(* VAR pt: Point; obj: TObjPtr;
+                       var knob: Integer): Integer *);
+    (* assume that pt has already been determined to be near obj *)
+    var onKnob: Integer;
+        knobs: TKnobs;
+        selRect: Rect;
+        i: Integer;
+        scrnPt,crdPt: Point;
+        dKnobSz: Point;
+
+    (* ***************************************************************** *)
+
+        function  PtOnKnob(thisKnob: Point): Integer;
+        var hitRect: Rect;
+        begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+            PtOnKnob := iZoneCld;
+            SetRect(hitRect,thisKnob.h-zoomKnobSz.h,thisKnob.v-zoomKnobSz.v,
+                            thisKnob.h+zoomKnobSz.h,thisKnob.v+zoomKnobSz.v);
+            if PtInRect(pt,hitRect) then begin
+                PtOnKnob := iZoneWrm;
+                InsetRect(hitRect,dKnobSz.h,dKnobSz.v);
+                if PtInRect(pt,hitRect) then
+                    PtOnKnob := iZoneHot;
+            end;
+        end; (* PtOnKnob *)
+
+    (* ***************************************************************** *)
+
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        onKnob := iZoneCld;
+        SetPt(dKnobSz,zoomKnobSz.h DIV 2, zoomKnobSz.v DIV 2);
+        if PtInSelRect(pt,obj^.bBox) then begin
+            with obj^,oDat do
+            if (cSel=iSelEdt) and (kind in [iObjFHnd,iObjPoly,iObjSPoly])
+                then begin
+                With cLst^^ do begin
+                    For i := 0 to crdCnt do begin
+                        If crdKind=iObjFHnd then begin
+                            GetNode(cLst,i,crdPt);
+                        end else begin
+                            {$R-}
+                            WldToScrn(c2DLst[i],crdPt);
+                            {$IfC rangeOn} {$R+} {$EndC}
+                        end;
+                        onKnob := PtOnKnob(crdPt);
+                        if onKnob<>iZoneCld then begin
+                            knob := i;
+                            pt := crdPt;
+                            i :=  crdCnt;
+                        end;
+                    end;
+                end;
+            end else begin
+                (* get the screen pt *)
+                GetObjKnobs(obj,knobs);
+                with knobs do
+                for i := 1 to knobCnt do begin
+                    onKnob := PtOnKnob(knobInfo[i]);
+                    if onKnob<>iZoneCld then begin
+                        knob := i;
+                        pt := knobInfo[knob];
+                        i := knobCnt;
+                    end;
+                end;
+            end;
+        end;
+        PtOnObjKnob := onKnob;
+
+        if traceCmd then
+            writeln('PtOnObjKnob = ',onKnob:1,',',knob:2,',',
+                        pt.h:2,',',pt.v:2,',',ord(obj):6);
+    end; (* PtOnObjKnob *)
+
+(* ********************************************************************* *)
+
+(* Misc *)
+
+(* ********************************************************************* *)
+(*$S Init*)
+
+    procedure InitSel;
+    Var i: Integer;
+    begin
+        {$IFC sampcalls} ALogCall; {$ENDC}
+        if traceCmd then
+            writeln('InitSel');
+
+        prPstLst := NewSLst(geHHz);
+        tObjSLst := NewSLst(geHHz);
+        minSelSize := SizeOf(TSelLst)+cSelGrow-1;
+        curVrtLst := Pointer(Ord(HAllocate(geHHz,SizeOf(TVertexLst))));
+        prvVrtLst := Pointer(Ord(HAllocate(geHHz,SizeOf(TVertexLst))));
+        newVrtLst := Pointer(Ord(HAllocate(geHHz,SizeOf(TVertexLst))));
+        For i := 0 to maxNumP1 do begin
+            curVrtLst^^.vertex[i] := -1;
+            prvVrtLst^^.vertex[i] := -1;
+            newVrtLst^^.vertex[i] := -1;
+        end;
+        curVrtLst^^.vCnt := 0;
+        prvVrtLst^^.vCnt := 0;
+        newVrtLst^^.vCnt := 0;
+
+    end; (* InitSel *)
+
+end. (* unit *)
+
+
+ÿ

@@ -1,0 +1,753 @@
+
+
+        .PROC   CONSOLEASM
+        .DEF    SCREAD,SCWRITE
+
+;       Copyright 1983, 1984, Apple Computer Inc.
+;
+;   Macro TrapToHW is used to call the hardware interface routines.
+;   Parameter %1 is the magic number associated with the routine begin called.
+;
+        .MACRO  TRAPTOHW                ; trap to hardware interface
+        MOVE.W  #%1,D7                  ; routine number
+        TRAP    #5                      ; trap
+        .ENDM
+
+;
+;   Routine numbers for the hardware interface routines.
+;
+
+ScreenAddr      equ     $18
+AltScreenAddr   equ     $1a
+KeybdEvent      EQU     58      ; $3a
+AltKeyEvent     equ     $94
+KeybdPeek       EQU     60      ; $3c
+AltKeyPeek      equ     $92
+Beep            EQU     50
+
+;
+;       Soroc emulator on Lisa screen with Lisa international font
+;
+
+CRTROW          EQU     0               ;BYTE, ROW FOR SIMULATED CRT
+CRTCOL          EQU     CRTROW+1        ;BYTE, COLUMN FOR SIMULATED CRT
+CRTSTATE        EQU     CRTCOL+1        ;BYTE, STATE OF CRT SIMULATOR
+CTLSFLAG        EQU     CRTSTATE+1      ;BYTE, -1 IFF CTRL-S TOGGLED
+AUTOLF          EQU     CTLSFLAG+1      ;boolean, 1 IFF AUTO LF AFTER CR
+EVCODE          EQU     AUTOLF+2        ;BYTE, KEYCODE FOR NON-ASCII ONLY (0=NONE)
+                                        ;       (BUTTON UP=9, PLUG OUT=10)
+EVSHIFT         EQU     EVCODE+2        ;WORD, SHIFT STATE (FOR KEYCODES 1-10 ONLY)
+EVMOUSE         EQU     EVSHIFT+2       ;LONG, MOUSE X,Y (FOR KEYCODES 1-10 ONLY)
+EVTIMER         EQU     EVMOUSE+4       ;LONG, MSEC TIMER (FOR KEYCODES 1-10 ONLY)
+
+;
+;       row equates
+;
+R0      .EQU    0                       ; row 0 offset
+R1      .EQU    R0+90                   ;  etc.
+R2      .EQU    R1+90
+R3      .EQU    R2+90
+R4      .EQU    R3+90
+R5      .EQU    R4+90
+R6      .EQU    R5+90
+R7      .EQU    R6+90
+R8      .EQU    R7+90
+R9      .EQU    R8+90
+RBYTES  .EQU    900                     ; bytes for each row
+RLONGS  .EQU    225                     ; long-words for each row
+
+
+       ;  .PROC   MONSOROC,0
+       ; MOVE.L  #MSBASE,A0              ; initialization
+       ; MOVE.L  #$01010000,(A0)         ; row=1, col=1, state=0, flag=0
+       ; MOVE.L  #ALTMSBASE,A0           ; initialization
+       ; MOVE.L  #$01010000,(A0)         ; row=1, col=1, state=0, flag=0
+       ; RTS
+
+;
+;       We use the registers as follows:
+;       A0, A1  working regs (A1 points to screen, usually)
+;       A2      buffer ptr (input)
+;       A3      ptr to MSBASE or ALTMSBASE(input),
+;       D0      data byte of interest
+;       D2      byte count (input)
+;       D4.W    which screen, 0 = alt. screen, 1 = main screen (input)
+;       D1,D3,D5 our own pleasure
+;       D6      used by scread; not used by scwrite
+;       D7      used for routine # in TrapToHW
+;       A4-A6   not used
+;
+
+
+;----------------------------------------------------------
+;
+;  SCREAD    The entry to simulate keyboard input.  We pull data from
+;  the key event queue maintained in hardware interface driver.
+;
+;  procedure SCREAD (bufferptr: longint; mainscr: integer; scrdatabase: longint);
+
+SCREAD  MOVEM.L D3-D7/A2-A3,-(SP)       ;SAVE REGS USED
+        MOVE.L  32(SP),A3               ;SCRDATABASE
+        MOVE    36(SP),D4               ;MAINSCR
+        MOVE.L  38(SP),A2               ;BUFFERPTR
+        BSR     CTRLS                   ; check for CTLS & wait if necessary
+        TST.B   EVCODE(A3)
+        BNE.S   @15                     ; return with mouse/disk event if necessary
+        MOVEQ   #0,D1                   ;NO wait
+        MOVEQ   #1,D0                   ;repeats ok
+        TST     D4                      ;       { see which screen }
+        BEQ     @8                      ;       { alt screen }
+        traptohw KeybdEvent
+        BRA.S   @7
+@8      traptohw AltKeyEvent            ;   get event(repeats ok, NO wait)
+@7      TST.B   D0
+        BEQ.S   @15                     ;RETURN IF NO EVENT
+        BSR     EVENTTEST               ;SEE IF IT'S A DISK/MOUSE EVENT
+        TST.B   EVCODE(A3)
+        BEQ.S   @9                      ;NOT A DISK/MOUSE EVENT
+@15     MOVEQ   #0,D2
+        BRA.S   @6
+
+@9      CMP.B   #$1C,D2                 ; is it a LEFT arrow ?
+        BNE.S   @2
+        MOVE.B  #$08,D2
+@2      CMP.B   #$1D,D2                 ; is it a RIGHT arrow ?
+        BNE.S   @3
+        MOVE.B  #$0C,D2
+@3      CMP.B   #$1E,D2                 ; is it a UP arrow ?
+        BNE.S   @4
+        MOVE.B  #$0B,D2
+@4      CMP.B   #$1F,D2                 ; is it a DOWN arrow ?
+        BNE.S   @5
+        MOVE.B  #$0A,D2
+@5      BTST    #3,D3                   ; is command key down ?
+        BEQ.S   @6
+        AND.B   #$1F,D2                 ; make it a control character
+@6      MOVE.B  D2,(A2)                 ; copy char to buffer
+        MOVEM.L (SP)+,D3-D7/A2-A3       ;RESTORE REGS
+        MOVE.L  (SP)+,A0                ;RETURN ADDR
+        LEA     10(SP),SP               ;POP PARAMS
+        JMP     (A0)                    ;RETURN TO PASCAL
+
+
+;-------------------------------------------------------------
+;
+;       SCWRITE   The entry for performing an output function.
+;
+;       Non-ASCII events received while a ctrl-s is toggled cause this
+; routine to return with a non-zero EVCODE, and this routine should be called
+; again with length of 0 until ctrl-s processing is completed.
+;       To simulate the SOROC, a state machine is used (CRTSTATE always
+; containing the current state value).  State 0 is the normal state, while
+; the others have to do with ESC and cursor addressing functions.  The
+; current cursor location is in CRTROW & CRTCOL;  we always leave it
+; appropriately updated.
+;
+;  procedure SCWRITE (bufferptr: longint; count: integer; mainscr: integer;
+;                     scrdatabase: longint);
+;
+;
+SCWRITE MOVEM.L D3-D5/D7/A2-A3,-(SP)    ;SAVE REGS USED
+        MOVE.L  28(SP),A3               ;SCRDATABASE
+        MOVE    32(SP),D4               ;MAINSCR
+        MOVE    34(SP),D2               ;BYTE COUNT
+        MOVE.L  36(SP),A2               ;BUFFERPTR
+        CLR.B   EVCODE(A3)              ;INITIALLY CLEAR RETURNED EVENT CODE
+        TST     D2                      ; any at all?
+        BLE.S   CKCTRLS                 ;  no, check ctrl-s
+        ;traptohw CursorHide             ; remove cursor from screen
+        BSR     CLRCUR                  ; remove cursor once per call
+        MOVEQ   #0,D5                   ; HOLD CR-SENT FLAG IN D5
+WRITE1  MOVE.B  (A2)+,D0                ;  and loop thru buffer
+        CMP.B   #$10,D0                 ; how about a DLE?
+        BEQ.S   WRDLE                   ;  yes, it's special too
+        CMP.B   #$0D,D0                 ; is this a CR ?
+        BEQ.S   CRLF                    ;  yes, simulate extra stuff
+        BSR     PUTC
+WRNEXT  SUBQ    #1,D2
+        BGT.S   WRITE1
+WREXIT  BSR     SETCUR                  ; then, set it on again
+        ;traptohw CursorDisplay          ; put cursor back on screen
+        TST     D5
+        BEQ.S   EXIT                    ;SKIP TO EXIT OF NO CR SENT
+CKCTRLS BSR     CTRLS                   ; check for CTLS & wait, when CR was sent
+        BRA.S   EXIT
+
+CRLF    MOVEQ   #1,D5                   ;SET CR-SENT FLAG
+        BSR     PUTC                    ; put out the explicit CR
+        TST.B   AUTOLF(A3)
+        BEQ.S   WRNEXT                  ;auto linefeed enabled?
+        MOVE.B  #$0A,D0                 ; then, the implicit LF
+        BSR     PUTC
+        BRA.S   WRNEXT
+WRDLE   MOVE.B  #4,CRTSTATE(A3)
+        BRA.S   WRNEXT
+
+EXIT    MOVEM.L (SP)+,D3-D5/D7/A2-A3    ;RESTORE REGS
+        MOVE.L  (SP)+,A0                ;RETURN ADDR
+        LEA     12(SP),SP               ;POP PARAMS
+        JMP     (A0)                    ;RETURN TO PASCAL
+
+
+;
+;       Cursor routines.
+
+CLRCUR                                  ; code is the same folks
+SETCUR
+        BSR.S   SETA1                   ; set A1 with proper byte address
+        NOT.B   (A1)                    ;  then complement it
+        NOT.B   R1(A1)
+        NOT.B   R2(A1)
+        NOT.B   R3(A1)
+        NOT.B   R4(A1)
+        NOT.B   R5(A1)
+        NOT.B   R6(A1)
+        NOT.B   R7(A1)
+        RTS                             ; and thats all there is...
+
+
+;       SETA1           Sets A1 to proper address based upon
+; current values of CRTROW and CRTCOL.
+
+SETA1
+        move.l  a0,-(SP)                ;dont clobber a0
+        CLR     D3                      ; note: we assume D3 is free
+        MOVE.B  CRTROW(A3),D3
+        MULU    #RBYTES,D3              ; D3 = byte offset of "CRT"
+        ADD     #RBYTES,D3              ;  plus an extra one
+        TST.W   D4                      ; see which screen
+        BEQ     @6                      ; alt screen
+        traptohw ScreenAddr             ; get screen address
+        BRA.S   @7
+@6      traptohw AltScreenAddr          ; get alt screen address
+@7      ADD.L   A0,D3                   ; addin real screen address
+        MOVE.L  D3,A1                   ;  and set it up
+        CLR     D3
+        MOVE.B  CRTCOL(A3),D3
+        ADDA    D3,A1                   ; and add in column offset
+        move.l  (SP)+,a0                ;restore a0
+        RTS
+
+
+;       SCROLL  - move contents of screen up one whole line
+; We assume that we are at bottom line when called. CRTCOL will be
+; left alone, but CRTROW will be set at 32
+
+SCROLL                                  ; entry from anywhere
+        MOVE    CRTROW(A3),-(SP)        ; save current COLumn
+        MOVE    #$0100,CRTROW(A3)       ;  and set to beginning of first row
+        BSR.S   SETA1                   ;  and get address of screen
+        MOVE.L  A1,A0                   ; set from ptr also
+        ADDA    #RBYTES,A0
+        MOVE    #32*RLONGS-1,D1         ; set loop for long copies
+@1      MOVE.L  (A0)+,(A1)+
+        DBF     D1,@1
+        MOVE    (SP)+,CRTROW(A3)        ; restore old info
+        MOVE.B  #32,CRTROW(A3)          ;  but peg at bottom
+        RTS
+
+
+;       PUTLF   advance CRTROW; this may cause a scroll if at bottom
+PUTLF   ADDQ.B  #1,CRTROW(A3)
+        CMPI.B  #32,CRTROW(A3)
+        BLS.S   @9                      ; skip if its ok
+        BSR     SCROLL                  ;  else, do a scroll operation
+@9      RTS
+
+;       PUTVT   move cursor up one row;  peg at top
+PUTVT   SUBQ.B  #1,CRTROW(A3)
+        BGT.S   @9
+        MOVE.B  #1,CRTROW(A3)
+@9      RTS
+
+;       PUTBS   move cursor left one position;
+PUTBS   SUBQ.B  #1,CRTCOL(A3)
+        BGT.S   @9
+        MOVE.B  #1,CRTCOL(A3)
+@9      RTS
+
+;       PUTFF   move cursor right one position;
+PUTFF   ADDQ.B  #1,CRTCOL(A3)
+        CMPI.B  #88,CRTCOL(A3)
+        BLS.S   @9
+        MOVE.B  #$1,CRTCOL(A3)
+        BRA.S   PUTLF                   ;NEW LINE
+@9      RTS
+
+;       PUTBEL
+PUTBEL  MOVE.L  #2273,D0                ; WAVELENGTH
+        MOVE.L  #200,D1                 ; DURATION = .2 SEC
+        TrapToHW     Beep               ; make noise
+        RTS
+
+
+;
+;       PUTSPCL         Handle special characters here; such things
+; as cursor controls and ESC non-sense.
+
+PUTSPCL                                 ; character is now in D0 (-32)
+        ADD     #$20,D0                 ; just for niceness.
+
+        CMP.B   #$1B,D0                 ; ESC ?
+        BNE.S   @1                      ;  no, skip
+        MOVE.B  #1,CRTSTATE(A3)         ; else, set state for next time
+        RTS                             ;  and exit
+
+@1      CMP.B   #$1E,D0                 ; RS
+        BNE.S   @2
+        MOVE    #$0101,CRTROW(A3)       ; set to home (1,1)
+        RTS
+
+@2      CMP.B   #$08,D0                 ; BS (left arrow)
+        BEQ.S   PUTBS
+
+        CMP.B   #$0C,D0                 ; FF (right arrow)
+        BEQ.S   PUTFF
+
+        CMP.B   #$0B,D0                 ; VT (up arrow)
+        BEQ.S   PUTVT
+
+        CMP.B   #$0A,D0                 ; LF (down arrow)
+        BEQ     PUTLF
+
+        CMP.B   #$07,D0                 ; BEL
+        BEQ.S   PUTBEL
+
+        CMP.B   #$0D,D0                 ; CR
+        BNE.S   @9
+        MOVE.B  #1,CRTCOL(A3)
+
+@9      RTS                             ; none of the above
+
+;       special ESC characters here
+
+ESCT                                    ; erase to end of line
+        MOVE    #89,D1                  ; compute number at end
+        SUB.B   CRTCOL(A3),D1
+        BLT.S   @9
+        BSR     SETA1                   ; set screen pointer
+        MOVEQ   #0,D3
+@1      MOVE.B  D3,R1(A1)               ; kludgy clear
+        MOVE.B  D3,R2(A1)
+        MOVE.B  D3,R3(A1)
+        MOVE.B  D3,R4(A1)
+        MOVE.B  D3,R5(A1)
+        MOVE.B  D3,R6(A1)
+        MOVE.B  D3,R7(A1)
+        MOVE.B  D3,R8(A1)
+        MOVE.B  D3,R9(A1)
+        MOVE.B  D3,(A1)+
+        DBF     D1,@1
+@9      RTS
+
+ESCSTAR                                 ; clear the whole screen here folks
+        move.l  a0,-(sp)
+        MOVE    #8189,D1                ; clear 8190 longs
+        TST.W   D4                      ; see which screen
+        BEQ     @6                      ; alt screen
+        TrapToHW     ScreenAddr              ; get screen address
+        BRA.S   @7
+@6      TrapToHW     AltScreenAddr           ; get alt screen address
+@7      MOVE.L  a0,A1
+        MOVEQ   #0,D3
+@1      MOVE.L  D3,(A1)+
+        DBF     D1,@1
+        MOVE    #$0101,CRTROW(A3)       ; set starting cursor location
+        move.l  (sp)+,a0
+        RTS
+
+ESCY                                    ; clear from cursor loc to end of screen
+        CMPI    #$0101,CRTROW(A3)       ; is this at top of screen?
+        BEQ.S   ESCSTAR                 ;  yes, do full screen then
+        MOVE    CRTROW(A3),-(SP)        ; save current location
+        CMPI.B  #1,CRTCOL(A3)           ;  is it at left?
+        BEQ.S   @1                      ;  yes, save some time
+        BSR.S   ESCT                    ; no, clear end of this line
+        ADDQ.B  #1,CRTROW(A3)
+
+@1      CLR.B   CRTCOL(A3)              ;  and pretend at start of next line
+        MOVE    #33,D1                  ; compute rows to clear
+        SUB.B   CRTROW(A3),D1
+        BLE.S   @9                      ; skip out if none
+        MULU    #RLONGS,D1              ; else, compute loop values
+        ADD     #539,D1                 ; ADD IN 2 1/2 LINES AT SCREEN BOTTOM
+        BSR     SETA1                   ;  setup A1 with address
+        MOVEQ   #0,D3
+@2      MOVE.L  D3,(A1)+
+        DBF     D1,@2
+
+@9      MOVE    (SP)+,CRTROW(A3)        ; restore correct cursor location
+        RTS
+
+
+
+;--------------------------------------------------------
+;
+;       PUTC    The real worker of this whole mess.  On entry, D0 has
+; the byte to be output.  We are responsible for putting it out (if
+; a valid byte), updating CRT pointers, etc.  We also use CTLSKNT
+; as a ctrl-S emulation function. So, we don't hang up the debugger
+; we ignore the CTLSKNT if interrupts are shut off
+;
+PUTC    AND.W   #$00FF,D0               ; make sure of upper stuff
+        BEQ.S   XT                      ; NUL doesn't do anything
+        CLR.W   D1                      ; handle state simulation
+        MOVE.B  CRTSTATE(A3),D1
+        LSL     #2,D1                   ; QUAD FOR JUMP INDEX
+        JMP     PUTCTBL(D1)
+XT      RTS                             ; NULs are totally ignored
+
+PUTCTBL JMP     PUTC0
+        JMP     PUTC1
+        JMP     PUTC2
+        JMP     PUTC3
+        JMP     PUTC4
+
+
+PUTC0                                   ; state 0, normal stuff
+        CMPI    #216,D0                 ; test for end of font table
+        BGT     XT                      ; exit if off the end
+        SUB     #$20,D0                 ;  check it for graphic symbol
+        BLT     PUTSPCL                 ; and skip out if it isn't
+        LSL     #3,D0                   ;  else, set up as offset into FONTTBL
+        LEA     FONTTBL,A0              ; point to start of font
+        ADD     D0,A0
+        BSR.S   SETA1                   ; get screen ptr to A1
+        MOVE.B  (A0)+,(A1)              ;  and copy them bits
+        MOVE.B  (A0)+,R1(A1)
+        MOVE.B  (A0)+,R2(A1)
+        MOVE.B  (A0)+,R3(A1)
+        MOVE.B  (A0)+,R4(A1)
+        MOVE.B  (A0)+,R5(A1)
+        MOVE.B  (A0)+,R6(A1)
+        MOVE.B  (A0),R7(A1)
+        BRA     PUTFF                   ; share code to advance cursor
+
+PUTC1                                   ; ESC was just seen
+        CMP.B   #$3D,D0                 ;  ESC-=  (cursor addressing)
+        BNE.S   @1
+        MOVE.B  #2,CRTSTATE(A3)         ;  and wait for Y value
+        RTS
+
+@1      CLR.B   CRTSTATE(A3)            ; reset state for the rest
+        CMP.B   #$54,D0                 ; ESC-T, erase to end of line
+        BEQ.S   ESCT
+        CMP.B   #$59,D0                 ; ESC-Y, erase to end of screen
+        BEQ.S   ESCY
+        CMP.B   #$2A,D0                 ; ESC-*, erase screen
+        BEQ.S   ESCSTAR
+        RTS                             ; none of the above
+
+
+PUTC2                                   ; ESC-= seen, expect row value
+        SUB.B   #$1F,D0
+        MOVE.B  D0,CRTROW(A3)
+        MOVE.B  #3,CRTSTATE(A3)
+        RTS
+
+PUTC3                                   ; ESC-=, Y, expect column value
+        SUB.B   #$1F,D0
+        MOVE.B  D0,CRTCOL(A3)
+        CLR.B   CRTSTATE(A3)
+        CMP.B   #32,CRTROW(A3)          ; make limit checks now
+        BLS.S   @1
+        MOVE.B  #32,CRTROW(A3)
+@1      CMP.B   #88,CRTCOL(A3)
+        BLS.S   @2
+        MOVE.B  #88,CRTCOL(A3)
+@2      RTS
+
+
+PUTC4   CLR.B   CRTSTATE(A3)            ; handles dle expansion
+        SUB     #$20,D0
+        BLE.S   @2
+        MOVE    D0,-(SP)
+@1      MOVE.B  #$20,D0
+        BSR     PUTC
+        SUBQ    #1,(SP)
+        BGT.S   @1
+        ADDQ    #2,SP
+@2      RTS
+;
+;       PROCEDURE CTRLS
+;           Check for CTLS key in the event queue and flush all keys up to
+;           CTLS key, also set the CTLSFLAG. Exit when no CTLS key in the queue.
+;           Also, returns pre-maturely with disk/mouse event.
+
+CTRLS   MOVEM.L D0-D6,-(A7)
+        CLR.B   EVCODE(A3)              ;INITIALLY CLEAR RETURNED EVENT CODE
+CTR1    TST.B   CTLSFLAG(A3)
+        BNE.S   GRAB                    ;READ INPUT IF CLRL-S TOGGLED
+        MOVE.W  #1,-(A7)                ; index:=1
+@1      MOVEQ   #1,D0                   ; while TRUE do
+        MOVE.W  (A7),D1                 ; begin           { D1 is index }
+
+        TST.W   20(SP)                  ; *** WARNING,DEPENDS ON STACK DEPTH! ***
+                                        ;                 { see which screen }
+        BEQ     @8                      ;                 { alt screen }
+        traptohw KeybdPeek
+        BRA.S   @9
+@8      traptohw AltKeyPeek              ;   peek(repeat,index) next event
+@9      TST.B   D0                      ;   if no event then exit
+        BEQ.S   CTRLSX
+        BTST    #3,D3                   ;   if command key is down then
+        BEQ.S   @4
+        CMP.B   #'s',D2                 ;     if char = 's' or 'S' then
+        BEQ.S   GRAB0
+        CMP.B   #'S',D2                 ;       empty buffer before it
+        BEQ.S   GRAB0
+@4      ADD.W   #1,(A7)                 ;   index:=index+1
+        BRA.S   @1                      ; end;
+CTRLSX  TST.W   (A7)+                   ;  discard index
+CTRLSXIT MOVEM.L (A7)+,D0-D6
+        RTS
+
+        ;output is stopped until the right ctrl-s comes along
+        ;exit prematurely if read disk/mouse event while looking for ctrl-s
+
+GRAB0   ADDQ    #2,A7                   ;DISCARD INDEX
+GRAB    MOVEQ   #1,D0
+        MOVE.L  D0,D1                   ;        { discard all keys up to CTLS }
+
+        TST.W   18(SP)                  ; *** WARNING,DEPENDS ON STACK DEPTH! ***
+                                        ;        { see which screen }
+        BEQ     @6                      ;        { alt screen }
+        traptohw KeybdEvent
+        BRA.S   @7
+@6      traptohw AltKeyEvent             ;           KeybdEvent(repeat,wait)
+@7      BTST    #3,D3                   ;   if command key is down then
+        BEQ.S   @4
+        CMP.B   #'s',D2                 ;     if char = 's' or 'S' then
+        BEQ.S   @3
+        CMP.B   #'S',D2
+        BNE.S   @4
+@3      NOT.B   CTLSFLAG(A3)            ;         CTLSflag:=not ctlsflag
+        BRA.S   CTR1                    ;         BACK TO TOP
+
+@4      BSR.S   EVENTTEST
+        TST.B   EVCODE(A3)
+        BEQ.S   GRAB                    ;NOT A DISK/MOUSE EVENT
+        BRA.S   CTRLSXIT                ;EXIT WITH A DISK/MOUSE EVENT
+
+
+;
+;    PROCEDURE EVENTTEST
+;      Look at event just read to see if it's a disk/mouse event.
+;      If it is, then set evcode to the non-zero event
+
+EVENTTEST
+        CLR.B   EVCODE(A3)
+        TST.B   D2                      ; TEST FOR DISK/MOUNT EVENT
+        BEQ.S   @10
+        CMP.B   #1,D2
+        BEQ.S   @10
+        CMPI.B  #$74,D1                 ;LOOK FOR CMD-SHIFT-1 AS SONY EJECT
+        BNE.S   EVEX                    ;NOT 1
+        CMPI.B  #$0A,D3
+        BEQ.S   @5                      ;IS CMD-SHIFT-1
+        CMPI.B  #$0B,D3
+        BNE.S   EVEX                    ;REGULAR ASCII "1"
+@5      MOVE.B  #$0F,D1                 ;IS CMD-SHIFT-ALPHA-1
+        CLR.B   D2
+@10     ADD.B   D2,D1                   ;RETURN WITH DISK/MOUSE EVENT ONLY
+        ADD.B   D2,D1
+        ADD.B   D2,D1                   ;REMAP MOUSE UP TO 9, MOUSE UNPLUG TO 10
+        MOVE.B  D1,EVCODE(A3)
+        MOVE    D3,EVSHIFT(A3)
+        MOVE    D4,EVMOUSE(A3)
+        MOVE    D5,EVMOUSE+2(A3)
+        MOVE.L  D6,EVTIMER(A3)
+EVEX    RTS
+
+;
+FONTTBL                                   ; font table origin here folks
+    .BYTE    $00,$00,$00,$00,$00,$00,$00,$00   ; code =  32 ' '
+    .BYTE    $00,$10,$10,$10,$10,$00,$10,$00   ; code =  33 '!'
+    .BYTE    $00,$24,$24,$00,$00,$00,$00,$00   ; code =  34 '"'
+    .BYTE    $00,$48,$FC,$48,$48,$FC,$48,$00   ; code =  35 '#'
+    .BYTE    $10,$78,$84,$60,$18,$84,$78,$20   ; code =  36 '$'
+    .BYTE    $00,$60,$A8,$D0,$2C,$54,$18,$00   ; code =  37 '%'
+    .BYTE    $00,$60,$90,$60,$94,$88,$74,$00   ; code =  38 '&'
+    .BYTE    $00,$10,$10,$00,$00,$00,$00,$00   ; code =  39 '''
+    .BYTE    $08,$10,$20,$20,$20,$20,$10,$08   ; code =  40 '('
+    .BYTE    $20,$10,$08,$08,$08,$08,$10,$20   ; code =  41 ')'
+    .BYTE    $00,$10,$54,$38,$54,$10,$00,$00   ; code =  42 '*'
+    .BYTE    $00,$00,$10,$10,$7C,$10,$10,$00   ; code =  43 '+'
+    .BYTE    $00,$00,$00,$00,$00,$00,$20,$40   ; code =  44 ','
+    .BYTE    $00,$00,$00,$00,$7C,$00,$00,$00   ; code =  45 '-'
+    .BYTE    $00,$00,$00,$00,$00,$00,$30,$00   ; code =  46 '.'
+    .BYTE    $00,$04,$08,$10,$20,$40,$80,$00   ; code =  47 '/'
+    .BYTE    $00,$38,$44,$44,$44,$44,$38,$00   ; code =  48 '0'
+    .BYTE    $00,$08,$38,$08,$08,$08,$08,$00   ; code =  49 '1'
+    .BYTE    $00,$38,$44,$08,$10,$20,$7C,$00   ; code =  50 '2'
+    .BYTE    $00,$38,$44,$18,$04,$44,$38,$00   ; code =  51 '3'
+    .BYTE    $00,$08,$18,$28,$48,$7C,$08,$00   ; code =  52 '4'
+    .BYTE    $00,$7C,$40,$78,$04,$44,$38,$00   ; code =  53 '5'
+    .BYTE    $00,$38,$40,$78,$44,$44,$38,$00   ; code =  54 '6'
+    .BYTE    $00,$7C,$08,$10,$10,$20,$20,$00   ; code =  55 '7'
+    .BYTE    $00,$38,$44,$38,$44,$44,$38,$00   ; code =  56 '8'
+    .BYTE    $00,$38,$44,$44,$3C,$04,$38,$00   ; code =  57 '9'
+    .BYTE    $00,$00,$00,$30,$00,$00,$30,$00   ; code =  58 ':'
+    .BYTE    $00,$00,$00,$30,$00,$00,$10,$20   ; code =  59 ';'
+    .BYTE    $00,$00,$08,$10,$20,$10,$08,$00   ; code =  60 '<'
+    .BYTE    $00,$00,$00,$7C,$00,$7C,$00,$00   ; code =  61 '='
+    .BYTE    $00,$00,$20,$10,$08,$10,$20,$00   ; code =  62 '>'
+    .BYTE    $00,$38,$44,$08,$10,$00,$10,$00   ; code =  63 '?'
+    .BYTE    $00,$78,$84,$9C,$A4,$9C,$80,$70   ; code =  64 '@'
+    .BYTE    $00,$30,$48,$84,$FC,$84,$84,$00   ; code =  65 'A'
+    .BYTE    $00,$F8,$84,$F8,$84,$84,$F8,$00   ; code =  66 'B'
+    .BYTE    $00,$78,$84,$80,$80,$84,$78,$00   ; code =  67 'C'
+    .BYTE    $00,$F8,$84,$84,$84,$84,$F8,$00   ; code =  68 'D'
+    .BYTE    $00,$FC,$80,$F8,$80,$80,$FC,$00   ; code =  69 'E'
+    .BYTE    $00,$FC,$80,$F8,$80,$80,$80,$00   ; code =  70 'F'
+    .BYTE    $00,$78,$84,$80,$9C,$84,$7C,$00   ; code =  71 'G'
+    .BYTE    $00,$84,$84,$FC,$84,$84,$84,$00   ; code =  72 'H'
+    .BYTE    $00,$38,$10,$10,$10,$10,$38,$00   ; code =  73 'I'
+    .BYTE    $00,$1C,$08,$08,$08,$88,$70,$00   ; code =  74 'J'
+    .BYTE    $00,$88,$90,$A0,$D0,$88,$84,$00   ; code =  75 'K'
+    .BYTE    $00,$80,$80,$80,$80,$80,$FC,$00   ; code =  76 'L'
+    .BYTE    $00,$84,$CC,$B4,$84,$84,$84,$00   ; code =  77 'M'
+    .BYTE    $00,$84,$C4,$A4,$94,$8C,$84,$00   ; code =  78 'N'
+    .BYTE    $00,$78,$84,$84,$84,$84,$78,$00   ; code =  79 'O'
+    .BYTE    $00,$F8,$84,$84,$F8,$80,$80,$00   ; code =  80 'P'
+    .BYTE    $00,$78,$84,$84,$84,$94,$78,$04   ; code =  81 'Q'
+    .BYTE    $00,$F8,$84,$84,$F8,$88,$84,$00   ; code =  82 'R'
+    .BYTE    $00,$78,$84,$60,$18,$84,$78,$00   ; code =  83 'S'
+    .BYTE    $00,$FE,$10,$10,$10,$10,$10,$00   ; code =  84 'T'
+    .BYTE    $00,$84,$84,$84,$84,$84,$78,$00   ; code =  85 'U'
+    .BYTE    $00,$44,$44,$28,$28,$10,$10,$00   ; code =  86 'V'
+    .BYTE    $00,$82,$82,$92,$AA,$44,$44,$00   ; code =  87 'W'
+    .BYTE    $00,$44,$28,$10,$28,$44,$82,$00   ; code =  88 'X'
+    .BYTE    $00,$82,$44,$28,$10,$10,$10,$00   ; code =  89 'Y'
+    .BYTE    $00,$FC,$08,$10,$20,$40,$FC,$00   ; code =  90 'Z'
+    .BYTE    $38,$20,$20,$20,$20,$20,$20,$38   ; code =  91 '['
+    .BYTE    $00,$80,$40,$20,$10,$08,$04,$00   ; code =  92 '\'
+    .BYTE    $38,$08,$08,$08,$08,$08,$08,$38   ; code =  93 ']'
+    .BYTE    $10,$28,$00,$00,$00,$00,$00,$00   ; code =  94 '^'
+    .BYTE    $00,$00,$00,$00,$00,$00,$00,$FE   ; code =  95 '_'
+    .BYTE    $10,$08,$00,$00,$00,$00,$00,$00   ; code =  96 '`'
+    .BYTE    $00,$00,$3C,$44,$44,$4C,$34,$00   ; code =  97 'a'
+    .BYTE    $00,$40,$58,$64,$44,$44,$78,$00   ; code =  98 'b'
+    .BYTE    $00,$00,$38,$44,$40,$44,$38,$00   ; code =  99 'c'
+    .BYTE    $00,$04,$3C,$44,$44,$4C,$34,$00   ; code = 100 'd'
+    .BYTE    $00,$00,$38,$44,$7C,$40,$3C,$00   ; code = 101 'e'
+    .BYTE    $00,$0C,$10,$7C,$10,$10,$10,$00   ; code = 102 'f'
+    .BYTE    $00,$00,$3C,$44,$4C,$34,$44,$38   ; code = 103 'g'
+    .BYTE    $00,$40,$58,$64,$44,$44,$44,$00   ; code = 104 'h'
+    .BYTE    $10,$00,$70,$10,$10,$10,$7C,$00   ; code = 105 'i'
+    .BYTE    $04,$00,$04,$04,$04,$24,$44,$38   ; code = 106 'j'
+    .BYTE    $00,$40,$44,$48,$70,$48,$44,$00   ; code = 107 'k'
+    .BYTE    $00,$70,$10,$10,$10,$10,$7C,$00   ; code = 108 'l'
+    .BYTE    $00,$00,$EC,$92,$92,$92,$92,$00   ; code = 109 'm'
+    .BYTE    $00,$00,$58,$64,$44,$44,$44,$00   ; code = 110 'n'
+    .BYTE    $00,$00,$38,$44,$44,$44,$38,$00   ; code = 111 'o'
+    .BYTE    $00,$00,$58,$64,$44,$44,$78,$40   ; code = 112 'p'
+    .BYTE    $00,$00,$3C,$44,$44,$4C,$34,$04   ; code = 113 'q'
+    .BYTE    $00,$00,$2E,$30,$20,$20,$20,$00   ; code = 114 'r'
+    .BYTE    $00,$00,$38,$40,$38,$04,$78,$00   ; code = 115 's'
+    .BYTE    $00,$10,$7C,$10,$10,$10,$0C,$00   ; code = 116 't'
+    .BYTE    $00,$00,$44,$44,$44,$4C,$34,$00   ; code = 117 'u'
+    .BYTE    $00,$00,$44,$44,$28,$28,$10,$00   ; code = 118 'v'
+    .BYTE    $00,$00,$82,$92,$AA,$44,$44,$00   ; code = 119 'w'
+    .BYTE    $00,$00,$44,$28,$10,$28,$44,$00   ; code = 120 'x'
+    .BYTE    $00,$00,$44,$44,$4C,$34,$44,$38   ; code = 121 'y'
+    .BYTE    $00,$00,$7C,$08,$10,$20,$7C,$00   ; code = 122 'z'
+    .BYTE    $0C,$10,$10,$60,$10,$10,$10,$0C   ; code = 123 '{'
+    .BYTE    $10,$10,$10,$10,$10,$10,$10,$10   ; code = 124 '|'
+    .BYTE    $60,$10,$10,$10,$0C,$10,$10,$60   ; code = 125 '}'
+    .BYTE    $34,$58,$00,$00,$00,$00,$00,$00   ; code = 126 '~'
+    .BYTE    $FE,$FE,$FE,$FE,$FE,$FE,$FE,$FE   ; code = 127
+    .BYTE    $48,$00,$30,$48,$78,$84,$84,$00   ; code = 128 'Ä'
+    .BYTE    $30,$48,$30,$48,$78,$84,$84,$00   ; code = 129 'Å'
+    .BYTE    $00,$78,$84,$80,$80,$84,$78,$10   ; code = 130 'Ç'
+    .BYTE    $10,$20,$FC,$80,$F8,$80,$FC,$00   ; code = 131 'É'
+    .BYTE    $68,$B0,$00,$C4,$A4,$94,$8C,$00   ; code = 132 'Ñ'
+    .BYTE    $48,$00,$78,$84,$84,$84,$78,$00   ; code = 133 'Ö'
+    .BYTE    $48,$00,$84,$84,$84,$84,$78,$00   ; code = 134 'Ü'
+    .BYTE    $08,$10,$00,$3C,$44,$4C,$34,$00   ; code = 135 'á'
+    .BYTE    $10,$08,$00,$3C,$44,$4C,$34,$00   ; code = 136 'à'
+    .BYTE    $18,$24,$00,$3C,$44,$4C,$34,$00   ; code = 137 'â'
+    .BYTE    $24,$00,$3C,$44,$44,$4C,$34,$00   ; code = 138 'ä'
+    .BYTE    $34,$58,$00,$3C,$44,$4C,$34,$00   ; code = 139 'ã'
+    .BYTE    $10,$28,$3C,$44,$44,$4C,$34,$00   ; code = 140 'å'
+    .BYTE    $00,$00,$38,$44,$40,$44,$38,$10   ; code = 141 'ç'
+    .BYTE    $08,$10,$00,$3C,$48,$50,$3C,$00   ; code = 142 'é'
+    .BYTE    $20,$10,$00,$3C,$48,$50,$3C,$00   ; code = 143 'è'
+    .BYTE    $10,$28,$00,$3C,$48,$50,$3C,$00   ; code = 144 'ê'
+    .BYTE    $24,$00,$38,$44,$7C,$40,$3C,$00   ; code = 145 'ë'
+    .BYTE    $08,$10,$00,$70,$10,$10,$7C,$00   ; code = 146 'í'
+    .BYTE    $20,$10,$00,$70,$10,$10,$7C,$00   ; code = 147 'ì'
+    .BYTE    $10,$28,$00,$70,$10,$10,$7C,$00   ; code = 148 'î'
+    .BYTE    $48,$00,$70,$10,$10,$10,$7C,$00   ; code = 149 'ï'
+    .BYTE    $34,$58,$00,$58,$64,$44,$44,$00   ; code = 150 'ñ'
+    .BYTE    $08,$10,$00,$38,$44,$44,$38,$00   ; code = 151 'ó'
+    .BYTE    $20,$10,$00,$38,$44,$44,$38,$00   ; code = 152 'ò'
+    .BYTE    $10,$28,$00,$38,$44,$44,$38,$00   ; code = 153 'ô'
+    .BYTE    $28,$00,$38,$44,$44,$44,$38,$00   ; code = 154 'ö'
+    .BYTE    $34,$58,$00,$38,$44,$44,$38,$00   ; code = 155 'õ'
+    .BYTE    $08,$10,$00,$44,$44,$4C,$34,$00   ; code = 156 'ú'
+    .BYTE    $20,$10,$00,$44,$44,$4C,$34,$00   ; code = 157 'ù'
+    .BYTE    $10,$28,$00,$44,$44,$4C,$34,$00   ; code = 158 'û'
+    .BYTE    $28,$00,$44,$44,$44,$4C,$34,$00   ; code = 159 'ü'
+    .BYTE    $00,$10,$7C,$10,$7C,$10,$10,$10   ; code = 160 '†'
+    .BYTE    $00,$18,$24,$18,$00,$00,$00,$00   ; code = 161 '°'
+    .BYTE    $00,$08,$1C,$20,$20,$1C,$08,$00   ; code = 162 '¢'
+    .BYTE    $00,$30,$40,$F0,$40,$44,$78,$00   ; code = 163 '£'
+    .BYTE    $00,$30,$40,$30,$48,$30,$08,$30   ; code = 164 '§'
+    .BYTE    $00,$00,$00,$38,$38,$00,$00,$00   ; code = 165 '•'
+    .BYTE    $00,$6C,$E8,$68,$28,$28,$28,$28   ; code = 166 '¶'
+    .BYTE    $00,$38,$44,$58,$44,$44,$58,$00   ; code = 167 'ß'
+    .BYTE    $00,$78,$84,$B4,$A4,$A4,$84,$78   ; code = 168 '®'
+    .BYTE    $00,$78,$84,$B4,$A4,$B4,$84,$78   ; code = 169 '©'
+    .BYTE    $00,$F4,$5C,$54,$00,$00,$00,$00   ; code = 170 '™'
+    .BYTE    $08,$10,$00,$00,$00,$00,$00,$00   ; code = 171 '´'
+    .BYTE    $24,$00,$00,$00,$00,$00,$00,$00   ; code = 172 '¨'
+    .BYTE    $00,$00,$10,$7C,$10,$7C,$10,$00   ; code = 173 '≠'
+    .BYTE    $00,$7C,$90,$9C,$F0,$90,$9C,$00   ; code = 174 'Æ'
+    .BYTE    $00,$78,$8C,$94,$A4,$C4,$78,$00   ; code = 175 'Ø'
+    .BYTE    $00,$00,$00,$58,$B4,$68,$00,$00   ; code = 176 '∞'
+    .BYTE    $00,$00,$10,$7C,$10,$00,$7C,$00   ; code = 177 '±'
+    .BYTE    $00,$00,$10,$20,$10,$00,$78,$00   ; code = 178 '≤'
+    .BYTE    $00,$00,$20,$10,$20,$00,$78,$00   ; code = 179 '≥'
+    .BYTE    $00,$44,$28,$10,$7C,$10,$10,$00   ; code = 180 '¥'
+    .BYTE    $00,$00,$88,$88,$88,$88,$F4,$80   ; code = 181 'µ'
+    .BYTE    $00,$38,$04,$3C,$44,$44,$38,$00   ; code = 182 '∂'
+    .BYTE    $00,$F8,$44,$20,$10,$20,$44,$F8   ; code = 183 '∑'
+    .BYTE    $00,$FC,$48,$48,$48,$48,$48,$00   ; code = 184 '∏'
+    .BYTE    $00,$00,$FC,$48,$48,$48,$48,$00   ; code = 185 'π'
+    .BYTE    $00,$0C,$10,$10,$10,$10,$10,$60   ; code = 186 '∫'
+    .BYTE    $00,$3C,$44,$4C,$34,$00,$7C,$00   ; code = 187 'ª'
+    .BYTE    $00,$38,$44,$44,$38,$00,$7C,$00   ; code = 188 'º'
+    .BYTE    $00,$78,$84,$84,$CC,$48,$CC,$00   ; code = 189 'Ω'
+    .BYTE    $00,$00,$6C,$12,$7E,$90,$6E,$00   ; code = 190 'æ'
+    .BYTE    $00,$00,$38,$4C,$54,$64,$38,$00   ; code = 191 'ø'
+    .BYTE    $00,$10,$00,$10,$20,$44,$38,$00   ; code = 192 '¿'
+    .BYTE    $00,$10,$00,$10,$10,$10,$10,$00   ; code = 193 '¡'
+    .BYTE    $00,$00,$00,$00,$7C,$04,$00,$00   ; code = 194 '¬'
+    .BYTE    $00,$1C,$10,$10,$10,$D0,$30,$10   ; code = 195 '√'
+    .BYTE    $00,$0C,$10,$7C,$10,$10,$10,$60   ; code = 196 'ƒ'
+    .BYTE    $00,$00,$34,$58,$00,$34,$58,$00   ; code = 197 '≈'
+    .BYTE    $00,$00,$10,$28,$28,$44,$7C,$00   ; code = 198 '∆'
+    .BYTE    $00,$00,$00,$24,$48,$24,$00,$00   ; code = 199 '«'
+    .BYTE    $00,$00,$00,$48,$24,$48,$00,$00   ; code = 200 '»'
+    .BYTE    $00,$00,$00,$00,$00,$00,$92,$00   ; code = 201 '…'
+    .BYTE    $00,$00,$00,$00,$00,$00,$00,$00   ; code = 202 ' '
+    .BYTE    $20,$10,$00,$38,$44,$7C,$44,$00   ; code = 203 'À'
+    .BYTE    $34,$58,$00,$38,$44,$7C,$44,$00   ; code = 204 'Ã'
+    .BYTE    $34,$58,$00,$3C,$42,$42,$3C,$00   ; code = 205 'Õ'
+    .BYTE    $00,$3E,$48,$4E,$48,$48,$3E,$00   ; code = 206 '°'
+    .BYTE    $00,$00,$34,$4A,$4E,$48,$36,$00   ; code = 207 '°'
+    .BYTE    $00,$00,$00,$00,$38,$00,$00,$00   ; code = 208 '±'
+    .BYTE    $00,$00,$00,$00,$FF,$00,$00,$00   ; code = 209 '±'
+    .BYTE    $00,$36,$24,$00,$00,$00,$00,$00   ; code = 210 'µ'
+    .BYTE    $00,$12,$36,$00,$00,$00,$00,$00   ; code = 211 'µ'
+    .BYTE    $00,$18,$10,$00,$00,$00,$00,$00   ; code = 212 '«'
+    .BYTE    $00,$08,$18,$00,$00,$00,$00,$00   ; code = 213 '»'
+    .BYTE    $00,$00,$10,$00,$7C,$00,$10,$00   ; code = 214 '¿'
+    .BYTE    $00,$00,$10,$28,$44,$28,$10,$00   ; code = 215 '√'
+    .BYTE    $28,$00,$44,$44,$4C,$34,$44,$38   ; code = 216 'ÿ'
+;
+;
+        .END
+
+ˇ

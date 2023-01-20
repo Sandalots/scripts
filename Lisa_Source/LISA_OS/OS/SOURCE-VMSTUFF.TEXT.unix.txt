@@ -1,0 +1,1656 @@
+(*********************************************************************************)
+(*                                                                               *)
+(*  (c) copyright 1983, 1984  Apple Computer Inc.                                *)
+(*                                                                               *)
+(*********************************************************************************)
+
+UNIT vmstuff;
+
+INTERFACE
+
+  USES
+      {$U object/driverdefs.obj }       driverdefs,
+      {$U object/hwint.obj      }       hwint,
+      {$U object/sysglobal.obj  }       globalda,
+      {$U object/procprims.obj  }       proc_prims,
+      {$U object/mmprim.obj     }       mmprimitives,
+      {$U object/asynctr.obj    }       asynctr,
+      {$U object/genio.obj      }       genio,
+      {$U object/twiggy.obj     }       twiggy;
+
+  {$SETC BLK512 := TRUE}
+  {$SETC VMBUG  := FALSE}  (* switch controls tracing output for this Unit *)
+
+  const
+       maxint = 32766;    (* maximum value of pseudo-clock                   *)
+       badptr1 = 4276785; (* $414231 = "AB1", will gen recognizable addr err *)
+       badptr2 = $574831; (* $574831 = "WH1", will gen recognizable addr err *)
+       defpgdatasize = 512;(* number of data bytes on a page (blocksize - 24) *)
+       firstdev = 0;      (* first usable device number *)
+       redlight = -1;     (* indicates empty link or end of chain *)
+       {max_ename = 32; (* maximum length of an entry name *) moved to driverdefs}
+       REL1_VERSION  = 14;  (* FS version number of Release 1.0 *)
+       PEPSI_VERSION = 15;  (* FS version number of Pepsi Release 2.0 *)
+       SPRING_VERSION = 17;
+       NODE_SIZE  = 2048;  (* Size of tree node in bytes (4 disk pages) *)
+       NODE_INDEX = 2047;  (* NODE_SIZE - 1                             *)
+       NODE_BLKS  = 4;     (* number of disk blocks occupied by a node  *)
+       (* Exported error codes *)
+       W_DATAMAYBE       = -626;  (* Scavenger has set data maybe bit on page   *)
+       E_DATABAD         =  625;  (* Scavenger has set data bad bit on page     *)
+       E_CHECKSUM        =  663;  (* Checksum/parity/CRC from ProFile hard disk *)
+       E_NOT_IMPLEMENTED = 1199;  (* Feature/function is not implemented        *)
+
+
+  type
+     byte = -128..127;
+     error = integer;
+     ioop = (readop, writeop);
+     mountstate = ( unmounted,
+                    temp_unmounted,
+                    defmounted,
+                    realmounted,
+                    fsmounted );
+
+     MDDFdb = record
+                   fsversion    : integer;
+                   volid        : UID;
+                   volnum       : integer;
+                   volname      : string [max_ename];
+                   password     : string [max_ename];
+                   init_machine_id : longint;     (* machine initialized on *)
+                   master_machine_id : longint;   (* for theft protection *)
+                   DT_created   : longint;        (* original creation date *)
+                   DT_copy_created : longint;     (* date THIS copy made *)
+                   DT_copied    : longint;        (* date this vol was backed up *)
+                   DT_scavenged : longint;
+                   copy_thread : longint; (* incremented each time on a new copy *)
+                   geography : record
+                     firstblock : longint;    (* abs block number of first block *)
+                     lastblock  : longint;    (* abs block number of last  block *)
+                     lastfspage : longint;    (* abs page number of last fs page *)
+                   end;
+                   blockcount: longint;     (* number of blocks on disk   *)
+                   blocksize : integer;     (* bytes per block, often 512 *)
+                   datasize  : integer; (* data bytes per block *)
+                   cluster_size:integer;(* # of blocks per cluster on disk *)
+                   MDDFaddr  : longint; (* page where MDDF starts *)
+                   MDDFsize  : integer; (* size in bytes of MDDF *)
+                   bitmap_addr:longint; (* page where bit map starts *)
+                   bitmap_size:longint;(* size in bits of allocation bit map *)
+                   bitmap_bytes:integer; (* size in bytes of alloc. bit map *)
+                   bitmap_pages:integer; (* number of data pages for bitmap bytes *)
+                   slist_addr : longint; (* page where s-file list begins *)
+                   slist_packing:integer;(* number of s_entries per block in slist *)
+                   slist_block_count:integer; (* number of data blocks in slist file *)
+                   first_file: integer;  (* fid of minimum non-initial s-file *)
+                   empty_file: integer;  (* minimum fid of all unused s-file ids *)
+                   maxfiles  : integer;(* max s-file index on this device *)
+                   hintsize  : integer;      (* number of pages in s-file hints *)
+                   leader_offset : integer;  (* page offset of leader in file hints *)
+                   leader_pages  : integer;  (* number of pages in file leader *)
+                   flabel_offset  : integer;  (* byte offset of file label in first hint page *)
+                   unusedi1  : integer;  (* spare field *)
+                   map_offset    : integer;  (* page offset of first file map page *)
+                   map_size      : integer;  (* number of file map entries per page *)
+                   filecount : integer;  (* current number of s-files allocated *)
+                   freestart : longint; (* start of free page search in bit map *)
+                   unusedl1 : longint;   (* spare field *)
+                   freecount : longint; (* number of free pages in list *)
+                   rootsnum  : integer; (* s-file number of root catalog file *)
+                   rootmaxentries : integer; (* maximum number of centry in root cat *)
+                   mountinfo : mountstate;   (* info about mount state of volume *)
+                   overmount_stamp : UID; (* UID of temp overmount op *)
+                   pmem_id : longint;     (* machine ID for this copy of param mem *)
+                   pmem : rec_param_mem; (* temp parameter memory *)
+                   vol_scavenged : boolean;  (* volume modified by scavenger *)
+                   tbt_copied : boolean;     (* set on newly tbt copied disk vol *)
+
+                   smallmap_offset : integer;  (* byte offset of fmap in hint page *)
+                   hentry_offset : integer;  (* byte offset of hentry in hint page *)
+                   backup_volid : UID;   (* volume that this volume backs-up *)
+                   flabel_size : integer;  (* byte size of file label *)
+                   fs_overhead : integer;  (* per-volume file system space overhead *)
+                   result_scavenge : integer;  (* result of last scavenge *)
+                   boot_code : integer;  (* reserved for future use *)
+                   boot_environ : integer;  (* reserved for future use *)
+                   oem_id : longint;     (* third party developer's ID number *)
+                   root_page : longint;  (* root node of B-tree directory *)
+                   tree_depth : integer; (* depth of directory tree *)
+                   node_id : integer;    (* greatest node ID in the tree *)
+                   vol_seq_no : integer;     (* volume sequence number *)
+                   vol_mounted : boolean;    (* volume left mounted flag *)
+                 end;
+
+     MDDFptr = ^MDDFdb;
+
+     (* Node buffer *)
+     buffer_ptr = ^Buffer;
+     LinkSet = record
+                 f : buffer_ptr;
+                 b : buffer_ptr;
+               end;
+
+     Buffer = record
+                link   : LinkSet;
+                dirty  : boolean;
+                lock   : boolean;
+                device : integer;
+                page   : longint;
+                sem    : semaphore;
+                Data   : array[0..0] of byte;
+              end;
+
+     DCB = record
+             sfcbchain    : linkage;
+             name         : string [max_ename];
+             dnum         : integer;       (* device number *)
+             dtype        : devtype;
+             opencount    : longint;
+             slSem        : semaphore;  (* protecting the S-list during scans *)
+             MDDFdata     : MDDFptr;
+             allocmap     : bitmapptr;
+             status       : mountstate;
+             access       : integer;
+             private      : boolean;
+             remotedev    : boolean;
+             locked       : boolean;
+             mount_pending: boolean;
+             unmount_pending : boolean;
+             MDDFdirty    : boolean;
+             mapdirty     : boolean;
+             semmap : semaphore;        (* semaphore for protecting allocmap *)
+             semMDDF : semaphore;       (* semaphore for protecting MDDF *)
+             openchain : linkage;       (* open list chain *)
+             volSem : semaphore;
+             semio : semaphore;
+             topol   : longint;         (* tree topology counter *)
+             left_mounted : boolean     (* volume left mounted state *)
+           end;
+
+     DCBptr = ^DCB;
+
+     plrect = record
+                plabel : pagelabel;
+                lflink : longint;
+                ldataused : integer
+              end;
+
+     plrecpt = ^plrect;
+
+
+  var
+       mounttable : array [0 : maxdev] of dcbptr;
+       freeslot:integer;
+       semvm : array [1..bufferpages] of semaphore;(* semaphore to protect each slot *)
+       semfreeslot : semaphore;      (* semaphore to protect the freeslot variable *)
+       vmbusy : boolean;             (* indicates vm is busy - used for ubd only *)
+
+       (* pointers into directory buffer pool *)
+       ptrHot  : buffer_ptr;
+       ptrCold : buffer_ptr;
+
+       (* temporary global semaphore protecting buffer pool *)
+       g_semBufPool : semaphore;
+
+
+
+  function VmVersion : integer;
+
+  function  SuperGetspace (     nbytes : longint;
+                            var addr   : absptr ) : boolean;
+
+  procedure  SetIOMode ( mode : PrimIOMode );
+
+  procedure  SetFlushLevel (     newLevel : FlushLevel;
+                             var oldLevel : FlushLevel );
+
+  procedure VM ( var ecode   : error;
+                     device  : integer;
+                     page    : longint;
+                     offset  : integer;
+                     address : absptr;
+                     length  : integer;
+                     op      : ioop );
+
+  function InVm ( device     : integer;
+                  page       : longint;
+                  invalidate : boolean ) : boolean;
+
+  procedure LisaIO ( var ecode   : error;
+                         device  : integer;
+                         addrBuf : absptr;
+                         block   : longint;
+                         count   : longint;
+                     var actual  : longint;
+                         mode    : disk_io_type;
+                         ptrPl   : plrecpt;
+                         op      : ioop );
+
+  procedure  FlushQVM ( var ecode : error );
+
+  procedure  FlushNodes (     device : integer;
+                              clear : boolean;
+                          var ecode : integer );
+
+  procedure IO_Init ( var ecode  : error;
+                          device : integer );
+
+  procedure IO_Disinit ( var ecode  : error;
+                             device : integer );
+
+  procedure InitQVM ( var ecode : error );
+
+  procedure DisinitQVM ( var ecode : error );
+
+  procedure  InitBufPool ( var ecode : integer );
+
+  procedure Reset_VMBusy;
+
+  procedure  InitVMSems;
+
+{$IFC VMBUG}
+  procedure  PrHex ( n : longint );
+  procedure  PrHexLn ( n : longint );
+  procedure  PrOp ( o : ioop );
+{$ENDC}
+
+  (*
+   *  The following definitions of assembly language procedures are
+   *  exported to all Units using this Unit.
+   *)
+
+  procedure  PgOffset (     absOffset : longint;
+                        var page      : longint;
+                        var offset    : integer );
+
+  procedure  Pg (     absOffset : longint;
+                  var page      : longint );
+
+  procedure  ClearMem ( address : longint;
+                        nbytes  : longint );
+
+
+IMPLEMENTATION
+
+{$S kr_fs }
+
+{$IFC NOT DEBUG2}  (* turn off range checking (just in case) *)
+{$R-}
+{$ENDC}
+
+  const
+        VERCODE     = 11;      (* version of VMSTUFF unit *)
+        ALL_DEVICES = -1;
+        ALL_SFILES  = -1;
+
+        (* Unit local error codes *)
+
+        W_DATABAD         = -625;  (* Scavenger has set data bad bit on page   *)
+        W_CHECKSUM        = -663;  (* Checksum/Parity/CRC for Profile          *)
+        E_REQ_NOSPACE     =  610;
+       {E_CORVUS_ERROR    =  801; retired }
+        E_IO_FAILED       =  802;
+        E_IO_MODE_BAD     =  803;
+       {E_BLOCK_RANGE     =  806; retired }
+        E_VM_ARG_BAD      =  809;
+        E_PAGE_FETCH      =  810;
+        E_BUFFERS_NOSPACE =  816;
+        E1_DEVICE_RANGE   =  819;
+        E_IOREQ_NOSPACE   =  820;
+       {                     821   retired }
+        E2_DEVICE_RANGE   =  822;
+
+
+
+  type
+       bptr = ^byte;
+       VmBufDesc = record
+                     dev_no  : integer;  (* device from whence page came *)
+                     page_no : longint;  (* page occupying this buffer   *)
+                     counter : longint;  (* LRU clock value              *)
+                     dirty   : boolean;  (* dirty flag                   *)
+                   end;
+
+
+  var
+      vmstate:array [1..bufferpages] of VmBufDesc;
+      clock : longint;
+      vmbusycount : integer;        (* number of waiters when vmbusy is true  *)
+      semvmbusy : semaphore;        (* semaphore to wait on while vmbusy is true *)
+
+
+
+  procedure  PgOffset (*     absOffset : longint;
+                         var page      : longint;
+                         var offset    : integer *);  external;
+
+  procedure  Pg (*     absOffset : longint;
+                   var page      : longint *);  external;
+
+  procedure  ClearMem (* address : longint;
+                         nbytes  : integer *);  external;
+
+  {  *** Monitor devices are not supported ***
+  procedure CORVUS ( readflag: boolean; baseaddr: absptr; var err: integer;
+                     drive: integer; blkcount: longint; blknumber: longint;
+                     buffer: absptr );  external;
+  }
+
+
+(*
+ * NAME :
+ *
+ *  ARGUMENTS PASSED
+ *
+ *  ARGUMENTS RETURNED
+ *
+ *  SIDE EFFECTS
+ *
+ *  SUBPROCEDURES CALLED
+ *
+ *  ERROR CONDITIONS
+ *
+ *  - - - NOTES - - -
+ *)
+
+(*
+ * VmVersion :  Return the version number of the VMSTUFF code module.
+ *)
+  {$S kr_fs }
+  function VmVersion;
+  begin
+      VmVersion := VERCODE;
+  end{func VmVersion};
+
+
+{$IFC VMBUG}
+  {$S kr_fs}
+  procedure  PrHex (* n : longint *);
+
+  var
+       HexRep : string[8];
+       digit  : integer;
+       i      : integer;
+
+  begin
+      HexRep := '01234567';  (* set string length *)
+      if n < 0 then
+        HexRep := '????????'
+      else
+        for i := 8 downto 1 do
+        begin
+          digit := n mod 16;
+          if digit > 9 then
+            HexRep[i] := chr(ord('A') + (digit - 10))
+          else
+            HexRep[i] := chr(ord('0') + digit);
+          n := n div 16;
+        end;
+
+      write(HexRep);
+  end{proc PrHex};
+
+
+  procedure  PrHexLn (* n : longint *);
+  begin
+      PrHex(n);  writeln;
+  end{proc PrHexLn};
+
+
+  procedure  PrOp (* o : ioop *);
+  begin
+      if o = readop then write('read ')
+                    else write('write ');
+  end{procedure PrOp};
+
+
+  procedure  PrSyn ( s : boolean );
+  begin
+      if s then write('asynch ')
+           else write('synch  ');
+  end{proc PrSyn};
+{$ENDC}
+
+
+(*
+ * SuperGetspace :  Allocates a chunk of storage from the SysGlobal heap.
+ *
+ *  ARGUMENTS PASSED
+ *     nbytes :  number of bytes to allocate.
+ *
+ *  ARGUMENTS RETURNED
+ *     addr   :  address of the allocated chunk.  Address is nil
+ *               if no allocation was done.
+ *     (ret)  :  boolean indicating if allocation was done.
+ *
+ *  SIDE EFFECTS
+ *     May expand the SysGlobal segment.
+ *
+ *  SUBPROCEDURES CALLED
+ *     getspace, MakeSGSpace
+ *
+ *  ERROR CONDITIONS
+ *     Returns FALSE if the request cannot be satisfied.
+ *
+ *  - - - NOTES - - -
+ *  While getspace will fail if space is not
+ *  immediately available in the SysGlobal segment,
+ *  SuperGetspace will attempt to expand the SysGlobal
+ *  segment in order to satisfy the request.  Since a
+ *  process block may occur in order to expand the
+ *  SysGlobal segment, code that cannot tolerate a
+ *  process switch should not call this procedure.
+ *
+ *)
+  {$S kr_fs }
+  function  SuperGetspace (*     nbytes : longint;
+                             var addr   : absptr ) : boolean *);
+
+  var
+       no_space  : boolean;
+
+  begin
+      addr := ord(NIL);
+      no_space := FALSE;
+      repeat
+        (* Try to allocate SysGlobal space *)
+        if not getspace(nbytes, b_sysglobal_ptr, addr) then
+          MakeSGSpace(no_space);  (* expand SysGlobal *)
+      until (addr <> ord(NIL)) or no_space;
+
+      SuperGetspace := not no_space;
+  end{func SuperGetspace};
+
+
+
+
+(*
+ * InsertReq :  Add a request block to a list of request blocks.
+ *
+ *  ARGUMENTS PASSED
+ *     ptrReqList :  pointer to the list of request blocks.
+ *     ptrReq     :  pointer to the request block to insert.
+ *
+ *  ARGUMENTS RETURNED
+ *     ptrReqList :  the pointer to the request list may be altered by the
+ *                   insertion.
+ *
+ *  SUBPROCEDURES CALLED
+ *     enqueue
+ *
+ *  - - - NOTES - - -
+ *  Assumes the request list and new request block are both allocated in the
+ *  SysGlobal heap.  Assumes if the list is empty, ptrReqList is NIL.
+ *)
+  {$S kr_fs }
+  procedure  InsertReq ( var ptrReqList : reqptr_type;
+                             ptrReq     : reqptr_type );
+
+  begin
+      if ptrReqList = NIL then
+      begin
+        (* The list is empty; so make ptrReq^ the first cell in the list *)
+        ptrReqList := ptrReq;
+        (* Linkage points to itself (narcissistic) *)
+        ptrReq^.list_chain.fwd_link := ord(@ptrReq^.list_chain) - b_sysglobal_ptr;
+        ptrReq^.list_chain.bkwd_link := ptrReq^.list_chain.fwd_link;
+      end
+      else
+        (* Insert ptrReq^ after first cell in list *)
+        enqueue(ptrReq^.list_chain, ptrReqList^.list_chain, b_sysglobal_ptr);
+  end{proc InsertReq};
+
+
+
+
+(*
+ * Wait_IO :  Wait for an IO request to complete.
+ *
+ *  Block the process on the request list until one of the requests in the list
+ *  completes.  Dequeue the completed request from the list and cancel it.
+ *
+ *  ARGUMENTS PASSED
+ *     ptrReqList :  pointer to a list of request blocks.
+ *
+ *  ARGUMENTS RETURNED
+ *     ptrReqList :  pointer to the request list is altered if the request to
+ *                   complete is the first in the list.
+ *     ptrReq     :  pointer to the request that completed.
+ *     xferCount  :  number of bytes transferred.
+ *     ecode      :  error code return.
+ *
+ *  SUBPROCEDURES CALLED
+ *     blk_req, dequeue, cancel_req
+ *
+ *  ERROR CONDITIONS
+ *     ecode returned is the error status of the completed request.
+ *
+ *  - - - NOTES - - -
+ *  The completed request block is dequeued and released,and therefore the pointer
+ *  returned, ptrReq, cannot be dereferenced by the caller!  The pointer is intended
+ *  to be used only as an ID for the request.  The only information from the request
+ *  extent block that is made available to the caller is the byte transfer count.
+ *)
+  {$S kr_fs }
+  procedure  Wait_IO ( var ptrReqList : reqptr_type;
+                       var ptrReq     : reqptr_type;
+                       var xferCount  : longint;
+                       var ecode      : integer );
+
+  var
+       ptrExt   : extdptr_type;
+
+  begin
+{$IFC VMBUG}
+if trace(FS, 90) then
+begin
+  write('block on ReqList '); PrHexLn(ord(ptrReqList));
+end;
+{$ENDC}
+    (* Block until the request completes *)
+    blk_req(ptrReqList, ptrReq);
+    ptrExt := pointer(ptrReq^.req_extent);
+    ecode := ptrReq^.hard_error;
+    xferCount := ptrExt^.xfer_count;
+    if (ecode = W_CHECKSUM) or (ecode = W_DATABAD) then
+      ecode := abs(ecode);
+{$IFC VMBUG}
+if trace(FS, 90) then
+begin
+  write('complete request '); PrHex(ord(ptrReq)); writeln('  err = ',ecode,
+  '  xfer = ',xferCount);
+end;
+{$ENDC}
+    if ptrReq = ptrReqList then
+      (* Delete first cell in chain; update pointer to head *)
+      ptrReqList := pointer(ord(ptrReq^.list_chain.fwd_link) + b_sysglobal_ptr
+                            - sizeof(linkage) - sizeof(rb_headt));
+    dequeue(ptrReq^.list_chain, b_sysglobal_ptr);
+    (* This call will relspace the request block and request extent block *)
+    cancel_req(ptrReq);
+  end{proc Wait_IO};
+
+
+
+
+  {$S kr_fs }
+  procedure  SetIOMode (* mode : PrimIOMode *);
+
+  begin
+      (* Set SysGlobal cell controlling synch/asynch I/O *)
+      fs_mode := mode;
+  end{proc SetIOMode};
+
+
+
+  {$S kr_fs }
+  procedure  SetFlushLevel (*     newLevel : FlushLevel;
+                              var oldLevel : FlushLevel *);
+
+  begin
+      (* Set SysGlobal cell controlling FS buffer flushing *)
+      oldLevel := flush_level;
+      flush_level := newLevel;
+  end{proc SetFlushLevel};
+
+
+
+  {$S kr_fs }
+  procedure UltraIO ( var ecode    : error;
+                          device   : integer;
+                          addrBuf  : absptr;
+                          block_no : longint;
+                          count    : longint;
+                      var actual   : longint;
+                          mode     : disk_io_type;
+                          ptrPl    : plrecpt;
+                          op       : ioop;
+                      var ptrReq   : reqptr_type;
+                          asynch   : boolean );
+
+  var
+       ptrPCB     : ptr_pcb;     (* pointer to Process Control Block *)
+       dataSize   : integer;     (* number of data bytes on a page *)
+       hdrMode    : boolean;     (* is this a mode that transfers headers? *)
+       read_f     : boolean;     (* is this a read operation? *)
+       DummyPL    : plrect;      (* dummy page label descriptor record *)
+       Status     : reqsts_type; (* request status info record *)
+       locl_ecode : integer;     (* local error code *)
+       p_extconfig : ^ext_diskconfig;
+       no_space   : boolean;
+       {hwaddr     : longint;     (* hardware address in IO space *)}
+
+  begin
+    ecode := 0;
+    ptrPCB := pointer(c_pcb_ptr);
+    hdrMode := ((mode = CHAINED_HDRS) or (mode = WITH_HEADER));
+    read_f := (op = READOP);
+
+    with configinfo[device]^ do
+    begin
+
+      (* Determine number of data bytes per disk page *)
+{$IFC not BLK512}
+      if blockstructured then
+      begin
+        if mounttable[device] <> pointer(badptr1) then
+          dataSize := mounttable[device]^.MDDFdata^.datasize
+        else
+          dataSize := DEFPGDATASIZE;
+      end{if};
+{$ENDC}
+
+      case devt of
+
+        (**********************************************************)
+        (*  High-tech third-wave Lisa OS block-structured device  *)
+        (**********************************************************)
+        DISKDEV:
+        begin
+          if (not blockstructured) or (hdrMode and (ptrPl = NIL)) then
+          begin
+            (* Not a disk, or passing header and pointer to header is nil *)
+            ecode := E_IO_MODE_BAD;
+            exit(UltraIO);
+          end{if};
+          (* Always give the driver a valid pointer *)
+          if ptrPl = NIL then ptrPl := @DummyPL;
+          with ptrPl^ do
+          begin
+            (*
+             *  The datastat label bit is cleared on all writes that are not
+             *  performed in the RAW_IO mode.
+             *)
+            {
+            if (not read_f) and (mode <> RAW_IO) then
+              plabel.datastat := DATAOK;
+            }
+            repeat
+              DiskIO(ecode, device, plabel, lflink, ldataused, addrBuf, count,
+                     block_no, read_f, mode, ptrReq);
+              if ecode = E_REQ_NOSPACE then MakeSgSpace(no_space);
+            until (ecode <> E_REQ_NOSPACE) or no_space;
+            if ecode <= 0 then
+            begin
+              if fs_mode = synch then
+              begin
+                (* Wait for the request to complete before continuing *)
+                (* blk_req will not block process if request is completed! *)
+                repeat
+                  status_req(ptrReq, status);
+                until status.reqsrv_f = complete;
+              end{if};
+
+              if not asynch then
+              begin
+                with ptrReq^ do
+                begin
+                  list_chain.fwd_link := ord(@list_chain) - b_sysglobal_ptr;
+                  list_chain.bkwd_link := list_chain.fwd_link;
+                end{with};
+                Wait_IO(ptrReq, ptrReq, actual, ecode);
+                if ecode <= 0 then
+                  actual := count
+                  {if hdrMode then
+                    plabel := ptrDskExt^.soft_hdr;}
+                else
+{$IFC BLK512}
+                  Pg(actual, actual);
+{$ELSEC}
+                  actual := actual div dataSize;
+{$ENDC}
+              end{if};
+            end{if};
+          end{with};
+        end;
+
+        (***********************)
+        (*  Sequential device  *)
+        (***********************)
+        SEQDEV:
+        begin
+          SeqentIO(ecode, device, addrBuf, count, read_f, ptrReq); (* sic *)
+          if ecode <= 0 then
+          begin
+            with ptrReq^ do
+            begin
+              list_chain.fwd_link := ord(@list_chain) - b_sysglobal_ptr;
+              list_chain.bkwd_link := list_chain.fwd_link;
+            end{with};
+            Wait_IO(ptrReq, ptrReq, actual, ecode);
+          end{if};
+        end;
+
+        (*****************************)
+        (*  Bit bucket; null device  *)
+        (*****************************)
+        BITBKT:
+        begin
+          actual := count;
+        end;
+
+        (*************)
+        (*  Default  *)
+        (*************)
+        OTHERWISE
+          ecode := E_IO_MODE_BAD;
+
+      end{case};
+    end{with};
+  end{proc UltraIO};
+
+
+
+
+  {$S kr_fs }
+  procedure LisaIO (* var ecode   : error;
+                          device  : integer;
+                          addrBuf : absptr;
+                          block   : longint;
+                          count   : longint;
+                      var actual  : longint;
+                          mode    : disk_io_type;
+                          ptrPl   : plrecpt;
+                          op      : ioop *);
+
+  var
+       dummy : reqptr_type;
+
+  begin
+      UltraIO(ecode, device, addrBuf, block, count, actual, mode, ptrPl, op,
+              dummy, FALSE {not asynchronous});
+  end{proc LisaIO};
+
+
+
+
+
+(*
+ * TFDM :  Transfer pages between disk memory and main memory.
+ *
+ *  ARGUMENTS PASSED
+ *     addrBuf :  address of page buffer in main memory.
+ *     device  :  device on which page resides.
+ *     page    :  page number.
+ *     op      :  read or write.
+ *     asynch  :  true = asynchronous, false = synchronous
+ *
+ *  ARGUMENTS RETURNED
+ *     ecode   :  error code return.
+ *     ptrReq  :  pointer to request block for asynchronous request.
+ *
+ *  SUBPROCEDURES CALLED
+ *     UltraIO
+ *
+ *  ERROR CONDITIONS
+ *     UltraIO fails.
+ *
+ *  - - - NOTES - - -
+ *  Assumes that the device is mounted (mount table entry is valid).
+ *  The procedure name is an acronym: To/From Disk/Memory.
+ *  Art Benjamin is responsible.
+ *)
+  {$S kr_fs }
+  procedure  TFDM ( var ecode   : integer;
+                        addrBuf : absptr;
+                        device  : integer;
+                        page    : longint;
+                        op      : ioop;
+                        asynch  : boolean;
+                    var ptrReq  : reqptr_type );
+
+  var
+      block       : longint;
+      actual      : longint;
+
+  begin
+{$IFC VMBUG}
+      if trace(FS, 91) then
+      begin
+        write('TFDM  '); PrSyn(asynch); PrOp(op); PrHex(addrBuf);
+        writeln('dev = ',device,'  pg = ',page);
+      end;
+{$ENDC}
+
+      (* Map page number into block number expected by UltraIO *)
+      block := mounttable[device]^.MDDFdata^.geography.firstblock + page;
+
+      UltraIO(ecode, device, addrBuf, block, 1, actual, raw_io, NIL, op,
+              ptrReq, asynch);
+
+{$IFC VMBUG}
+      if trace(FS, 91) then
+      begin
+        write('TFDM  exit ecode = ',ecode,'  ptrReq = '); PrHexLn(ord(ptrReq));
+      end;
+{$ENDC}
+  end{proc TFDM};
+
+
+
+
+  {$S kr_fs }
+  function slotaddr (slot:integer) : absptr;
+
+  var index, blocksize : integer;
+
+  begin
+      blocksize := defblocksize;
+      index := (slot-1)*blocksize;  (* index in main mem where a slot lives *)
+      slotaddr := (mainmem+index);  (* calculate address of data *)
+  end;
+
+
+
+{$IFC DEBUG1}
+  {$S kr_fs }
+  procedure FlushError ( ecode  : integer;
+                         sfile  : integer;
+                         device : integer;
+                         page   : longint );
+
+  begin
+       Beep(3822, 1000);
+       writeln('file sys buffer flush error: ',ecode:5,'  sfile ',
+               sfile:4,'  device ',device:3,'  page ',page:5);
+  end{proc FlushError};
+{$ENDC}
+
+
+
+
+
+
+  {$S kr_fs }
+  procedure  VmError ( dev_no   : integer;
+                       page_no  : longint;
+                       sfile_no : integer;
+                       ecode    : integer );
+
+  begin
+       with VmErrList[pVmErr] do
+       begin
+         device := dev_no;
+         page := page_no;
+         sfile := sfile_no;
+         error := ecode;
+       end{with};
+       pVmErr := (pVmErr + 1) mod (MAX_VMERR + 1);
+  end{proc VmError};
+
+
+
+  {$S kr_fs }
+  procedure FlushBufs (     device : integer;
+                            sfile  : integer;
+                            reset  : boolean;
+                        var ecode  : error );
+
+{$IFC VMBUG}
+  type
+      ReqStuff = record
+                   p : longint; d : longint; b : longint;
+                 end;
+{$ENDC}
+
+  var i, j       : integer;
+      ptrLabl    : ^PageLabel;
+      ptrReq     : reqptr_type;
+      ptrReqList : reqptr_type;
+      count      : integer;
+      actual     : longint;
+      ReqTable   : array[1..BUFFERPAGES] of reqptr_type;
+
+{$IFC VMBUG}
+        t_Queue : array[1..BUFFERPAGES] of ReqStuff;
+        t_Complete : array[1..BUFFERPAGES] of ReqStuff;
+        t_i, t_j : integer;
+{$ENDC}
+
+  begin
+      LOCKDATA; (* lock the process's data into memory *)
+
+      ecode := 0;     (* initially no error *)
+      count := 0;
+
+{$IFC VMBUG}
+      if trace(FS,98) then
+      begin
+        writeln;
+        write('Flush Buffer Pool   dev = ');
+        if device = ALL_DEVICES then write('ALL') else write(device:2);
+        write('  sfile = ');
+        if sfile = ALL_SFILES then writeln('ALL') else writeln(sfile:3);
+      end;
+      t_i := 0;
+{$ENDC}
+
+      ptrReqList := NIL;
+      for i := 1 to BUFFERPAGES do with vmstate[i] do
+      begin
+        ptrReq := NIL;
+        ptrLabl := pointer(slotaddr(i));
+        if ((device = ALL_DEVICES) or (device = dev_no)) and
+           ((sfile  = ALL_SFILES ) or (sfile  = ptrLabl^.fileid)) then
+        begin
+          wait_sem(semvm[i], []);
+          if dirty then
+          begin
+            ptrLabl^.datastat := DATAOK;
+
+{$IFC VMBUG}
+            t_i := t_i + 1;
+            with t_Queue[t_i] do
+            begin
+              p := page_no; d := dev_no; b := i;
+            end;
+{$ENDC}
+            TFDM(ecode, ord(ptrLabl), dev_no, page_no, writeop, TRUE, ptrReq);
+            if ecode > 0 then
+            begin
+              (* Record an error flushing the buffer, and release the buffer *)
+              VmError(dev_no, page_no, ptrLabl^.fileid, ecode);
+{$IFC DEBUG1}
+              FlushError(ecode, ptrLabl^.fileid, dev_no, page_no);
+{$ENDC}
+              signal_sem(semvm[i]);
+            end
+            else
+            begin
+              count := count + 1;
+              InsertReq(ptrReqList, ptrReq);
+            end{if};
+          end
+          else
+          begin
+            if reset then
+            begin
+              (* Buffer is clean, but contents info should be erased *)
+              page_no := REDLIGHT;
+              dev_no := REDLIGHT;
+              counter := 0;
+              dirty := FALSE;
+            end;
+            signal_sem(semvm[i]);
+          end{if};
+        end{if};
+        ReqTable[i] := ptrReq;
+      end{for};
+
+{$IFC VMBUG}
+      t_i := 0;
+{$ENDC}
+      for i := 1 to count do
+      begin
+        Wait_IO(ptrReqList, ptrReq, actual, ecode);
+        j := 1;
+        while ReqTable[j] <> ptrReq do j := j + 1;
+        {ReqTable[j] := NIL;}
+        with vmstate[j] do
+        begin
+          if ecode > 0 then
+          begin
+            ptrLabl := pointer(slotaddr(j));
+            VmError(dev_no, page_no, ptrLabl^.fileid, ecode);
+{$IFC DEBUG1}
+            FlushError(ecode, ptrLabl^.fileid, dev_no, page_no);
+{$ENDC}
+          end;
+          dirty := FALSE;
+          if reset then
+          begin
+            page_no := REDLIGHT;
+            dev_no := REDLIGHT;
+            counter := 0;
+          end;
+          signal_sem(semvm[j]);
+
+{$IFC VMBUG}
+          t_i := t_i + 1;
+          with t_Complete[t_i] do
+          begin
+            p := page_no; d := dev_no; b := j;
+          end;
+{$ENDC}
+        end{with};
+      end{for};
+
+    UNLOCKDATA; (* FREE MEMORY FOR SWAPPING *)
+
+{$IFC VMBUG}
+    if trace(FS,98) then
+    begin
+      writeln('Queue:');
+      for t_j := 1 to t_i do with t_Queue[t_j] do
+        writeln('buffer ',b:2,'   dev = ',d:2,'  page = ',p:5);
+      writeln('Complete:');
+      for t_j := 1 to t_i do with t_Complete[t_j] do
+        writeln('buffer ',b:2,'   dev = ',d:2,'  page = ',p:5);
+    end;
+{$ENDC}
+  end{proc FlushBufs};
+
+
+
+  {$S kr_fs }
+  procedure VM (* var ecode   : error;
+                     device  : integer;
+                     page    : longint;
+                     offset  : integer;
+                     address : absptr;
+                     length  : integer;
+                     op      : ioop *);
+
+  label 1, 9;
+
+  var slot, oldslot, i, j, index, blksize : integer;
+      min, lastpage : longint;
+      baddr, uaddr:bptr;
+      pageptr, oldpageptr, labptr : ^pagelabel;
+      ptrFetchReq, ptrReq : reqptr_type;
+      done : boolean;
+      ptrDCB : DCBptr;
+      actual : longint;
+      (*$IFC OS15*)
+      p_extconfig: ^ext_diskconfig;
+      (*$ENDC*)
+
+  begin
+{$IFC VMBUG}
+    if trace (FS, 92) then
+    begin
+      write ('VM '); PrOp(op);
+      writeln(' dev = ',device,'  pg = ',page,'  ofst = ',offset,
+              '  len = ',length);
+    end;
+{$ENDC}
+
+    ptrDCB := mounttable[device];
+    if ptrDCB <> pointer (badptr1) then
+    begin
+      with ptrDCB^.MDDFdata^ do
+      begin
+        blksize := blocksize;
+        lastpage := geography.lastfspage;
+      end;
+    end
+    else
+    begin
+      blksize := defblocksize;
+      p_extconfig:=pointer(configinfo [device]^.ext_addr);
+      with p_extconfig^ do
+      begin
+        lastpage := num_bloks - fs_strt_blok - 1;
+      end;
+    end;
+
+    (* check supplied parameter values to see if valid *)
+    if (page >= 0) and (page<=(lastpage)) and (offset>=0)
+       and (offset < blksize) and (length>=0) and (offset+length<=blksize)
+       and (address>=0) and (address+length<=16777216)  (* 16777216 = maxaddr+1 *)
+    then
+    begin
+      if vmbusy then    (* during unmounting boot volume, vm must be made busy to
+                           all other processes, so that they do not own semfreeslot
+                           and semvm's. They must wait on semvmbusy. *)
+      begin
+        LOCKDATA;  (* just to be safe *)
+        vmbusycount := vmbusycount + 1;      (* keep track of number of waiters *)
+        wait_sem (semvmbusy, []);
+        UNLOCKDATA;
+      end;
+
+      ecode := 0;           (* initialize *)
+
+      (* see if referenced page is in memory *)
+      {$R-}
+      slot := bufferpages;
+      repeat
+        with vmstate[slot] do
+        begin
+          if page_no = page then if dev_no = device then goto 9;
+        end;
+        slot := slot - 1;
+      until slot = 0;
+{$IFC DEBUG2}
+      {$R+}
+{$ENDC}
+
+9:
+
+      if slot = 0 then  (* need to buffer it in memory *)
+      begin
+
+        (* referenced page is not in memory, so get it *)
+
+        (*
+         *  Lock the process' segments down to ensure that the Mem Mgr won't
+         *  be needed at any point where the process unblocks.  The Mem Mgr
+         *  cannot be allowed to enter this section in order to service a
+         *  process owning a semaphore that will block the Mem Mgr (deadlock).
+         *)
+        LOCKDATA;
+
+        wait_sem (semfreeslot, []);     (* lock the freeslot variable *)
+                                (* if the freeslot has been used, and the oldest
+                                   slot (the new free) has not been written out,
+                                   wait for the freeslot *)
+        wait_sem (semvm[freeslot], []); (* lock the slot so other reference to the
+                                           same page will wait *)
+
+{$IFC VMBUG}
+        if trace (FS, 92) then
+        writeln('VM  fetch page into buffer #',freeslot);
+{$ENDC}
+
+        TFDM(ecode, slotaddr(freeslot), device, page, readop, TRUE, ptrReq);
+                   (* set up the slot, so that other process looking for
+                      the same page will find it in memory. *)
+        if ecode > 0 then
+        begin
+          UNLOCKDATA;
+          signal_sem(semvm[freeslot]);
+          signal_sem(semfreeslot);
+          goto 1;
+        end;
+
+        with vmstate[freeslot] do
+        begin
+          page_no := page;  (* set up new map *)
+          dev_no := device; (* set up device referenced *)
+          dirty := FALSE;   (* clean new copy of page in the slot *)
+        end;
+        slot := freeslot; (* this is the slot where our data now resides *)
+
+
+        ptrFetchReq := NIL;
+        InsertReq(ptrFetchReq, ptrReq);
+                               (* read referenced page into free slot *)
+
+        (* record a miss *)
+        {labptr := pointer(slotaddr(freeslot));
+        RecordIt(30, device, labptr^.fileid, length, page);}
+
+        (* one of them has to go, so select one using pg replacement algorithm *)
+        min := MAXINT;
+        i := bufferpages;
+        oldslot := 1;  (* just in case *)
+        repeat
+          with vmstate[i] do
+          begin
+            if counter < min then
+            begin
+              min := counter;
+              oldslot := i;
+            end;
+          end;
+          i := i - 1;
+        until i = 0;
+
+        Wait_IO(ptrFetchReq, ptrReq, actual, ecode);
+{$IFC VMBUG}
+        if trace(FS,92) then
+        begin
+          labptr := pointer(slotaddr(freeslot));
+          with labptr^ do
+            writeln('VM  fetch complete  page = ',abspage,'  sfile = ',fileid,
+                    '  ecode = ',ecode,'  xfer = ',actual);
+        end;
+{$ENDC}
+        if (ecode > 0) and (ecode <> 625) then
+        begin
+          with vmstate[freeslot] do
+          begin
+            page_no := REDLIGHT;        (* put it back to free slot *)
+            dev_no := REDLIGHT;
+          end;
+        end;
+
+        signal_sem(semvm[freeslot]);  (* unlock the slot to let other process
+                                           waiting for the same page continue *)
+
+      (* oldslot is the one to go, so update state info and write out if dirty *)
+        with vmstate[oldslot] do
+        begin
+{$IFC VMBUG}
+          if trace (FS, 92) then
+            writeln ('VM  replace dev = ',dev_no,
+                     ' pg = ',page_no,' buf = ',oldslot);
+{$ENDC}
+
+          if dirty then
+          begin
+            labptr := pointer(slotaddr(oldslot));
+            FlushBufs(dev_no, labptr^.fileid, FALSE, ecode);
+          end;
+
+          page_no := REDLIGHT;   (* clear map entry for new free slot *)
+          dev_no := REDLIGHT;(* clear devnum entry for new free slot *)
+          dirty := FALSE; (* clear dirty bit for free page *)
+          counter := maxint;
+        end;
+
+        (* record an LRU swap-out *)
+        {labptr := pointer(slotaddr(freeslot));
+        RecordIt(31, olddev, labptr^.fileid, 0, oldpage);}
+
+
+        freeslot := oldslot; (* this is the new free slot we just made *)
+
+        UNLOCKDATA;
+
+        signal_sem(semfreeslot);         (* now the freeslot is really free *)
+
+        if (ecode > 0) and (ecode <> 625) then goto 1;
+      end
+      else
+      begin
+        (* record a hit *)
+        {labptr := pointer(slotaddr(slot));
+        RecordIt(30, device, labptr^.fileid, length+65536, page);}
+      end;
+
+      (* referenced page is now in memory, so effect the transfer *)
+
+      wait_sem (semvm [slot], []);    (* wait for read or write from this slot
+                                         to complete if any *)
+      with vmstate[slot] do
+        if page_no = REDLIGHT then
+          if dev_no = REDLIGHT then
+      begin                           (* previous io did not succeed *)
+        signal_sem (semvm [slot]);
+        ecode := E_PAGE_FETCH;
+        goto 1;
+      end;
+
+      clock := clock + 1;  (* increment pseudo-timer for page replacement *)
+      if clock = maxint then
+      begin
+        clock := 0;   (* prevent clock 'overflows'   *)
+        for i := 1 to bufferpages do
+        begin
+          vmstate[i].counter := 0;    (* clear all last reference info *)
+        end;
+        vmstate[freeslot].counter := maxint;  (* for proper free slot allocation *)
+      end;
+
+      vmstate[slot].counter := clock;  (* record time of this reference *)
+      index := (slot-1)*blksize + offset;
+      baddr := pointer (mainmem+index); (* calculate address of data *)
+      uaddr := pointer (address);       (* address of user buffer *)
+
+      (* perform the actual data transfer now *)
+      case op of
+        readop:
+          begin
+            moveleft (baddr^, uaddr^, length)
+          end;
+        writeop:
+          begin
+            moveleft (uaddr^, baddr^, length);
+            vmstate[slot].dirty := TRUE;  (* writing into page, mark as dirty *)
+          end;
+      end;   (* of case op of *)
+
+      signal_sem (semvm [slot]);      (* done with the slot, unlock it *)
+    end
+    else
+    begin
+      ecode := E_VM_ARG_BAD;
+    end;
+
+  1:    (* error exit or normal fall-through *)
+
+{$IFC VMBUG}
+  if trace(FS, 92) then writeln('VM  exit ecode = ',ecode);
+{$ENDC}
+
+  end{proc VM};
+
+
+
+
+
+
+
+  {$S kr_fs }
+  function InVm (* device     : integer;
+                   page       : longint;
+                   invalidate : boolean ) : boolean *);
+
+  var
+       i : integer;
+
+  begin
+    (* warning: page may be expected, but may not have been completely read in *)
+
+    {$R-}
+    i := bufferpages;
+    repeat
+      with vmstate[i] do
+      begin
+        if page_no = page then if dev_no = device then
+        begin
+          invm := TRUE;
+          if invalidate then
+          begin
+            (* Remove the page from the cache *)
+            page_no := REDLIGHT;
+            dev_no := REDLIGHT;
+            counter := 0;
+            dirty := FALSE;
+          end{if};
+          exit(invm);
+        end;
+        i := i - 1;
+      end;
+    until i = 0;
+{$IFC DEBUG2}
+    {$R+}
+{$ENDC}
+    invm := FALSE;
+  end{proc InVm};
+
+
+
+
+  {$S kr_fs }
+  procedure  FlushQVM (* var ecode : error *);
+
+  begin
+      FlushBufs(ALL_DEVICES, ALL_SFILES, FALSE, ecode);
+  end{proc FlushQVM};
+
+
+
+
+  {$S kr_fs }
+  procedure  FlushNodes (*     device : integer;
+                               clear : boolean;
+                           var ecode : integer *);
+
+  var
+       ptrS   : buffer_ptr;
+       actual : longint;
+       block  : longint;
+       save_ecode : integer;
+       PlRec  : plrect;
+
+  begin
+      with PlRec do with plabel do
+      begin
+        volume := 0;
+        datastat := dataok;
+        version := 0;
+        fileid := 4;
+        dataused := DEFPGDATASIZE;
+        relpage := 0;
+        bkwdlink := REDLIGHT;
+        lflink := REDLIGHT;
+        ldataused := DEFPGDATASIZE;
+      end{with};
+      save_ecode := 0;
+      wait_sem(g_semBufPool, []);  (* acquire the buffer pool *)
+      ptrS := ptrHot;
+      repeat
+        if ((device = -1) and (ptrS^.device > REDLIGHT))
+             or (ptrS^.device = device) then
+        begin
+          if ptrS^.dirty then
+          begin
+            PlRec.plabel.abspage := ptrS^.page;
+            PlRec.plabel.fwdlink := ptrS^.page + 1;
+            block := ptrS^.page +
+                            mounttable[ptrS^.device]^.MDDFdata^.geography.firstblock;
+            LisaIO(ecode, ptrS^.device, ord(@ptrS^.Data), block, NODE_BLKS,
+                   actual, WITH_HEADER, @PlRec, WRITEOP);
+            if ecode > 0 then save_ecode := ecode;
+            ptrS^.dirty := FALSE;
+          end{if};
+
+          if clear then with ptrS^ do
+          begin
+            page := REDLIGHT;
+            lock := FALSE;
+          end{if};
+        end{if};
+
+        ptrS := ptrS^.link.b;
+      until ptrS = ptrHot;
+
+      signal_sem(g_semBufPool);
+      ecode := save_ecode;  (* most recent error *)
+  end{proc FlushNodes};
+
+
+
+
+
+
+
+  {$S kr_fs }
+  procedure IO_Init (* var ecode  : error;
+                           device : integer *);
+
+  begin
+
+{$IFC VMBUG}
+    if trace(FS,1) then writeln ('IO_INIT: dev = ', device);
+{$ENDC}
+
+    if (device < firstdev) or (device > maxdev) then
+      ecode := E1_DEVICE_RANGE
+    else
+    begin
+      ecode := 0;
+      if configinfo[device]^.devt <> non_io then
+        UP (ecode, configinfo[device], nil);
+    end{if};
+
+{$IFC VMBUG}
+    if trace(FS, 1) then writeln('IO_INIT exit ecode = ', ecode);
+{$ENDC}
+
+  end{proc IO_Init};
+
+
+
+
+
+
+  {$S kr_fs }
+  procedure IO_Disinit (* var ecode  : error;
+                              device : integer *);
+
+  begin
+
+{$IFC VMBUG}
+    if trace (FS,1) then writeln ('IO_DISINIT  dev = ', device);
+{$ENDC}
+
+    ecode := 0;
+
+    if (device < firstdev) or (device > maxdev) then
+      ecode := E2_DEVICE_RANGE
+    else
+    begin
+      FlushBufs(device, ALL_SFILES, TRUE, ecode);
+      FlushNodes(device, TRUE, ecode);
+
+      (*  Down the device driver, and full speed ahead  *)
+      if configinfo[device]^.devt <> non_io then
+        DOWN (ecode, configinfo[device], nil, 0);
+    end{if};
+
+{$IFC VMBUG}
+    if trace (FS, 1) then writeln ('IO_DISINIT  exit ecode = ', ecode);
+{$ENDC}
+
+  end{proc IO_Disinit};
+
+
+
+
+
+
+  {$S kr_fs }
+  procedure InitQVM (* var ecode : error *);
+
+  var
+      i : integer;
+
+  begin
+    ecode := 0;
+
+    io_retries := 0;  (* Sysglobal cell controls retries in Lisaio *)
+    pVmErr := 0;      (* Sysglobal cell is index into buffer-write-error list *)
+
+    for i := 1 to bufferpages do with vmstate[i] do
+    begin
+      page_no := REDLIGHT;   (* virtual memory is empty *)
+      dev_no := REDLIGHT;(* no device references yet, either *)
+      counter := 0;  (* initial clock for all slots *)
+      dirty := FALSE; (* initial clean slots *)
+      init_sem (semvm [i], 1);  (* initial semaphore for all slots *)
+    end;
+
+    clock := 0;   (* virtual memory pseudo-timer *)
+    freeslot := 1;
+    vmstate[freeslot].counter := maxint;
+    init_sem(semfreeslot, 1);
+
+    vmbusy := false;
+    vmbusycount := 0;
+    init_sem (semvmbusy, 0);    (* other process must wait when vmbusy *)
+
+{$IFC VMBUG}
+    if trace (FS, 1) then writeln ('INITQVM exit ecode = ', ecode);
+{$ENDC}
+
+  end{proc InitQVM};
+
+
+
+
+
+
+  {$S kr_fs }
+  procedure DisinitQVM (* var ecode : error *);
+
+  begin
+    flushqvm (ecode);    (* force dirty data to the disk *)
+
+{$IFC VMBUG}
+    if trace (FS, 1) then writeln ('DISINITQVM  exit ecode = ',ecode);
+{$ENDC}
+
+  end{proc DisinitQVM};
+
+
+
+
+  {$S fs7 }
+  procedure  InitBufPool (* var ecode : integer *);
+
+  const
+      NBUFS = 4;  (* 16K of directory buffers *)
+
+  var
+      segName    : Pathname;
+      segRef     : integer;
+      addrSpace  : longint;
+      ptrBuf     : buffer_ptr;
+      ptrNextBuf : buffer_ptr;
+      ptrLastBuf : buffer_ptr;
+      i          : integer;
+
+      (* Initialize the contents of a buffer header *)
+      procedure  InitBuf ( ptrB, ptrPredB, ptrSuccB : buffer_ptr );
+      begin
+          with ptrB^ do
+          begin
+            link.b := ptrPredB;
+            link.f := ptrSuccB;
+            lock := FALSE;
+            dirty := FALSE;
+            init_sem(sem, 1);
+            page := REDLIGHT;
+            device := REDLIGHT;
+          end{with};
+      end{proc InitBuf};
+
+
+  begin
+      (* Create the buffer data space *)
+      Make_MRData(ecode, (NBUFS * (sizeof(Buffer) + NODE_SIZE)), addrSpace);
+      if ecode > 0 then exit(InitBufPool);
+
+      (* Doubly-link the buffers together *)
+      ptrLastBuf := pointer(addrSpace + (NBUFS-1) * (sizeof(Buffer) + NODE_SIZE));
+      ptrBuf := pointer(addrSpace);
+      ptrNextBuf := pointer(ord(ptrBuf) + (sizeof(Buffer) + NODE_SIZE));
+      ptrCold := ptrBuf;
+      i := 1;
+      while i < NBUFS do
+      begin
+        InitBuf(ptrBuf, ptrLastBuf, ptrNextBuf);
+        ptrLastBuf := ptrBuf;
+        ptrBuf := ptrNextBuf;
+        ptrNextBuf := pointer(ord(ptrBuf) + (sizeof(Buffer) + NODE_SIZE));
+        i := i + 1;
+      end{while};
+      InitBuf(ptrBuf, ptrLastBuf, pointer(addrSpace));
+      ptrHot := ptrBuf;
+
+      init_sem(g_semBufPool, 1);
+  end{proc InitBufPool};
+
+
+
+
+  {$S kr_fs }
+  procedure  InitVMSems;
+
+  var
+       i : integer;
+
+  begin
+      for i := 1 to bufferpages do with vmstate[i] do
+        init_sem(semvm[i], 1);
+      init_sem(semfreeslot, 1);
+      init_sem(semvmbusy, 1);
+      init_sem(g_semBufPool, 1);
+  end{proc InitVMSems};
+
+
+
+
+
+(*
+ * Reset_VMBusy :  Clear the VM busy state.
+ *
+ *  Wake-up all processes waiting on the semvmbusy semaphore (acquired by the
+ *  process that temporarily unmounts the boot volume).
+ *
+ *  SIDE EFFECTS
+ *     vmbusycount
+ *     semvmbusy
+ *
+ *  SUBPROCEDURES CALLED
+ *     signal_sem
+ *)
+  {$S kr_fs }
+  procedure Reset_VMBusy;
+
+  begin
+    while vmbusycount > 0 do
+    begin
+      signal_sem(semvmbusy);
+      vmbusycount := vmbusycount - 1;
+    end;
+  end{proc Reset_VMBusy};
+
+END.
+
+ÿ

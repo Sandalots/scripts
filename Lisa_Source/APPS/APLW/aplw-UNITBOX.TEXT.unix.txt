@@ -1,0 +1,821 @@
+{$I APLW/COMPFLAGS }                                            {gdf 1/16/84}
+{$R-}
+
+UNIT UnitBox;
+
+(* Copyright 1983, 1984, Apple Computer Inc. *)
+
+{ gdf  2/24/84 -- insert trace calls for segmentation  }
+{ crc  3/09/83 -- VisObox: WRITELN made conditional on fTstBox }
+{ bas  10/5/82 -- arrow painting }
+{ jrm  9/30/82 -- TAport, TPort, TBmp decls. to WmlStd; PxSIcon deleted }
+{ bas  8/24/82 -- scroll box, grow box icons from wmFont }
+{ jrm  8/10/82 -- removed TPSp1, THSp1; TWindow to Queue }
+{ bas  7/28/82 -- Tybox function }
+{ bas  7/27/82 -- VisObox adventures }
+{ bas  7/26/82 -- conditional compilation of Px routines }
+{ bas  7/22/82 -- page flip icons; got rid of getsymbols, drawsymbol }
+{ bas  7/19/82 -- new box structure; strip out unused vestiges of old wm }
+{ jrm  6/29/82 -- USES changes: LisaGraf => QuickDraw; moved USES UnitFile }
+{ crc  6/02/82 -- Conditional compilation }
+{ jrm  5/26/82 -- removed .prcs field of boxes }
+{ bas  4/20/82 -- Thumb stuff uses longints instead of reals }
+{ crc  4/02/82 -- USES changes for new font manager }
+{ crc  3/26/82 -- FidOfWindow now returns oboxNil rather than break 1505. }
+{ bas 02/05/82 -- comment out old wm routines }
+{ edited by bas 01/21/82 -- modify in style of scroll box library }
+
+
+INTERFACE
+
+USES
+    {$IFC sampcalls}                                               {gdf 2/24/84}
+       {$U aplw/tracecalls.obj} tracecalls,
+    {$ENDC}
+    {$U Obj:UnitStd    } UnitStd,
+    {$U Obj:UnitHz     } UnitHz,
+    {$U LibOS/Syscall }    Syscall,
+    {$U Obj:UnitFile   } UnitFile,
+    {$U Obj:Storage    } Storage,
+    {$U Obj:QuickDraw  } QuickDraw,
+    {$U Obj:FontMgr    } FontMgr,
+    {$U Obj:WM.Events  } Events,
+    {$U Obj:WM.Folders } Folders,
+    {$U Obj:WmlStd     } WmlStd,
+    {$U Obj:WM.Menus   } Menus,
+    {$U Obj:AlertMgr   } AlertMgr,
+    {$U ApLW/Queue     } Queue;
+
+CONST
+    {$IFC NOT fDbgOk} fTstBox = FALSE; {$ENDC}
+    oboxNil = MAXINT;
+    cbRgnRect = 10;                   { count of bytes in a rectangular rgn }
+    dhScroll  = 24;  dvScroll  = 16;  { width/height of a scroll box }
+    dhSkewer  =  6;  dvSkewer  =  4;  { width/height of a skewer }
+    dhPaneMin = 12;  dvPaneMin =  8;  { min width/height of a pane }
+
+TYPE
+   TArgn = Region;
+   TRgn = RgnPtr;
+   THrgn = RgnHandle;  { can't say "THrgn = ^RgnPtr". }
+
+    { box type }
+   TTybox = (tyboxNil, tyboxTab, tyboxPane, tyboxScroll, tyboxGrow,
+             tyboxMenu);
+
+   TIcon  = (iconNil, iconSkewer, iconArwA, iconPagA, iconGryA, iconThumb,
+             iconGryB, iconPagB, iconArwB);
+   TSicon = SET OF TIcon;
+
+    { scroll box icon fence posts -- posts[icon] is coordinate of end of icon }
+   TPosts = ARRAY[iconSkewer..iconArwB] OF TCd;
+
+    { box: kept in linked front-to-back order for lisagraf. }
+
+   TBox = RECORD
+       oboxNxt: TC;             { singly-linked list of boxes }
+       r: TR;                   { TR for whole box }
+       refCon: LONGINT;         { for communication with application }
+       fUpdate: TF;             { whether client should update }
+       window: TWindow;         { which screen window contains the box }
+       CASE tybox: TTybox OF    { box type, start of variant part }
+        tyboxTab:   ( hspTitle: THSp;      { h of title of folder }
+                      fSbox: TF);          { Note 1 }
+        tyboxScroll:( tyvh: TTyvh;         { Note 2 }
+                      oboxPaneFst: TC;     { first of panes in a scroll chain }
+                      sicon:      TSicon;  { set of icons sb may display }
+                      siconVis:   TSicon;  { set of icons currently visible }
+                      cPercent:   0..100); { where thumb is }
+
+        tyboxPane:  ( rgoboxLink: ARRAY[TTyvh] OF TC;   { note 3 }
+                      rgfScHead:  ARRAY[TTyvh] OF TF);  { note 4 }
+       END;
+
+  { Notes for TBox:
+      1. whether scroll/grow boxes should be ignored when painting.
+         Scroll/grow boxes stay linked in all the time, even when they are
+         not to be displayed, i.e., when the folder is inactive.
+         This flag tells whether they should be displayed.
+
+      2. horizontal scroll boxes (tyvh = tyvhH) stretch horizontally
+         across the screen and control horizontal scrolling.
+         Analogously for vertical scroll boxes (tyvh = tyvhV).
+
+      3. links for next entries on horizontal (vertical) scroll chains
+
+      4. head of horizontal (vertical) scroll chain?
+  }
+
+   TPbox = ^TBox;
+
+   TPQ = ^TQ;
+
+    { This includes the linked list of boxes and some other box-related values }
+   TAbdsp = RECORD
+              hz: THz;
+              port: TPort;
+              pq: TPQ;
+              bmpDsp: TBmp;
+              oboxLim: TC;
+              oboxFreeFst: TC;
+              oboxRoot: TC;
+              END;
+
+   TBdsp = ^TAbdsp;
+
+
+VAR
+  {$IFC fDbgOk} fTstBox: TF; {$ENDC}
+  cbBoxMore: TC;  { kludge because can't declare as manifest }
+  bdsp: TBdsp;
+  oboxMenu: TC;
+  oboxScrap: TC;
+  aportWm: TAport;
+  dptPaneMin: TPt;  { kludge cause can't have constant records }
+  dptScroll: TPt;
+  dptThumb: TPt;
+  dptSkewer: TPt;
+  oboxActive: TC;   { the tab of the active folder }
+
+    { rgSymArw maps [(icon=iconArwA), tyvh] to the char for the icon,
+      rgSymPag similarly for page flip icons. }
+   rgSymArw: ARRAY [TF, TTyvh] OF Char;
+   rgSymPag: ARRAY [TF, TTyvh] OF Char;
+
+
+ {  bdsp structure utilities }
+PROCEDURE  InitBdsp         (hz: THz; coboxMore: TC; pq: TPQ);
+FUNCTION   PboxFromObox     (obox: TC): TPbox;
+FUNCTION   OboxPrvFromObox  (obox: TC): TC;
+PROCEDURE  UnlinkObox       (oboxOut: TC);
+PROCEDURE  FreeObox         (oboxFree: TC);
+FUNCTION   OboxAlloc        (rT: TR; tybox: TTybox; refCon: LONGINT;
+                             oboxPrv: TC; window: TWindow):TC;
+FUNCTION   OboxFstFldr:     TC;
+FUNCTION   OboxFldr         (obox: TC): TC;
+FUNCTION   OboxNxtFldr      (obox: TC): TC;
+PROCEDURE  LinkFolder       (oboxLftTab: TC; oboxPrv: TC);
+FUNCTION   OboxNxtSc        (obox: TC; tyvh: TTyvh): TC;
+FUNCTION   OboxPrvSc        (obox: TC; tyvh: TTyvh): TC;
+FUNCTION   OboxScrollFromObox  (obox: TC; tyvh: TTyvh): TC;
+FUNCTION   FidOfWindow      (window: TWindow): TC;
+
+
+ { screen update utilities }
+PROCEDURE  VisObox          (obox: TC);
+FUNCTION   OboxFromPt       (pt: TPt; window:TWindow): TC;
+PROCEDURE  DiffRgnVis       (r: TR);
+PROCEDURE  SectRgnVis       (r: TR);
+
+ { scroll box routines }
+FUNCTION   CdThumbFromC     (cThumb: TC; cdStart, cdEnd: TCd): TCd;
+FUNCTION   CThumbFromCd     (cdThumb: TCd; cdStart, cdEnd: TCd): TC;
+{$ifc fThumbNumber}
+PROCEDURE  PaintThumb       (rT: TR; thePercent: Integer);
+{$endc}
+PROCEDURE  RThumb           (pbox: TPbox; cdBegThm: TCd; VAR rT: TR);
+PROCEDURE  FixVisIcons      (pbox: TPbox; VAR siconV: TSicon);
+PROCEDURE  LMkPosts         (pbox: TPbox; VAR posts: TPosts);
+PROCEDURE  PaintBox         (obox: TC);
+PROCEDURE  SetWmFont        ;
+PROCEDURE  RestoreLFont     ;
+
+
+ { debugging procedures }
+{$ifc fDbgOk}
+PROCEDURE  PxBdsp;
+PROCEDURE  PxObox           (obox: TC);
+PROCEDURE  PxClip;
+PROCEDURE  PxScrollChain    (obox: TC);
+{$endc}
+
+IMPLEMENTATION
+
+{$IFC fSymOK }
+{$D+ }
+{$ELSEC }
+{$D- }
+{$ENDC }
+
+CONST
+     { characters in wmFont for different symbols }
+    chGrow      = 'L';
+
+    symDownArw  = 'F'; { arrow pointing down }
+    symRtArw    = 'J'; { ... right }
+    symUpArw    = 'D'; { ... up }
+    symLeftArw  = 'H'; { ... left }
+
+    symDownPag  = '0'; { lower page symbol }
+    symRtPag    = 'j'; { ... right }
+    symUpPag    = '2'; { ... upper }
+    symLeftPag  = 'l'; { ... left }
+
+    { the successor character of all the above is the filled-in "interior" symbol }
+
+
+VAR
+    txState:
+      RECORD
+         txFont:  TC;
+         txFace:  Style;
+         txMode:  TC;
+         pnState: PenState;
+      END;
+
+    rScreen: TR;
+
+
+{ Relations on boxes in a folder:  Invariants that are respected by all routines
+ that create boxes or walk the links.
+
+ All boxes possess an oboxNxt link.  This ties boxes together on the
+ display list.  A scroll chain is a list linking a scroll box with the
+ panes it governs.  Each pane possess two scroll chain links, for the
+ horizontal and vertical scroll chains it is on.
+
+ The first relation is easy to describe:
+
+   1. Following the oboxNxt link for boxes in a folder:
+
+      Tab, Panes, Horizontal Scroll Boxes, Vertical Scroll Boxes, Grow Box.
+
+      This stuff is present even when the folder is closed or inactive.
+
+
+ For the other relations it helps to be precise, so I'll introduce some notation.
+
+  "b2 isNxt b1" if box b2 is directly after box b1 on the oboxNxt link;
+  "p2 isVNxt p1" if pane p2 is directly after pane p1 on p1's vertical
+      scroll chain link;
+  "p2 isHNxt p1" is similarly defined for horizontal scroll chains;
+
+  Transitive closures for the above are also defined (e.g., isNxt+).
+
+ Now the invariants:
+
+   2a. if p2 isVNxt p1, then graphically, p2 is directly to the right of p1.
+   2b. if p2 isHNxt p1, then graphically, p2 is directly below p1.
+
+       That is, the scroll chain link imposes a left to right or top to
+       bottom ordering.
+
+   3a. for vertical scroll boxes vs1, vs2: vs2 isNxt vs1 iff vs2 is
+       graphically directly below vs1.
+   3b. for horiz scroll boxes hs1, hs2: hs2 isNxt hs1 iff hs2 is
+       graphically directly to the right of hs1.
+
+       That is, scroll boxes are similarly ordered from top to bottom, or
+       left to right, but the ordering comes through the oboxNxt link.
+
+   4a. if p2 isVNxt p1, then p2 isNxt+ p1.
+   4b. if p2 isHNxt p1, then p2 isNxt+ p1.
+
+       That is, if p2 is directly to the right of p1, it is somewhere after
+       p1 following the oboxNxt link, though not necessarily directly after.
+       Similarly for p2 directly below p1.
+
+}
+
+(*$I ApLW/BOXMISC.TEXT *)
+    { contains debug printing routines, most data structure routines }
+
+
+ { The global variable oboxActive keeps track of the active folder, and is
+ oboxNil when there is no active folder.  If a folder is active,
+ its tab is the first one on the display list.  However, there may be
+ folders on the display list though no folder is active.  This is true when
+ the first folder is put on the display list but before it is made active, and
+ when the active folder is deleted from the display list but before another
+ is made active.  Routines that activate and deactivate folders MUST keep
+ oboxActive up to date.
+
+ If someone wants the first tab, active or not, use OboxFstFldr.
+
+ }
+
+{$S LWCommand}
+{-------------------------------------------------------}
+FUNCTION OboxFromPt { pt: TPt; window:TWindow };
+{-------------------------------------------------------}
+VAR obox, oboxRet: TC; pbox: TPbox;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF fTstBox THEN
+        WRITELN('OboxFromPt of [', pt.h, pt.v, '], window ',  ORD(window));
+    oboxRet := oboxNil;
+    obox := bdsp^.oboxRoot;
+    WHILE (obox <> oboxNil) AND (oboxRet = oboxNil) DO BEGIN
+        pbox := POINTER(ORD(bdsp) + obox);
+        IF PtInRect(pt, pbox^.r) AND (pbox^.window = window)
+           THEN oboxRet := obox
+           ELSE obox := pbox^.oboxNxt;
+    END;
+    OboxFromPt := oboxRet;
+    IF fTstBox THEN WRITELN(' = ', oboxRet);
+END;
+
+{$S LWCreate}
+{-------------------------------------------------------}
+PROCEDURE AddFreeOboxes(oboxLimNew: TC);
+{-------------------------------------------------------}
+VAR oboxFst: TC; pbox: TPbox;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    oboxFst := bdsp^.oboxLim;
+    IF fTstBox THEN
+        WRITELN('AddFreeOboxes -- oboxLim: ', oboxFst, ', oboxLimNew: ',
+                oboxLimNew);
+     { initialize all the new boxes to be on the free list }
+    IF oboxLimNew < oboxFst THEN Break(1104);
+    WHILE oboxFst < oboxLimNew DO BEGIN
+        pbox := POINTER(ORD(bdsp) + oboxFst);
+        pbox^.oboxNxt := bdsp^.oboxFreeFst;
+        bdsp^.oboxFreeFst := oboxFst;
+        oboxFst := oboxFst + SIZEOF(TBox);
+    END;
+    bdsp^.oboxLim := oboxLimNew;
+END;
+
+{$S LWScroll}
+{----------------------------------------------------------------------------}
+FUNCTION OboxAlloc {(rT: TR; tybox: TTybox; refCon: LONGINT; oboxPrv: TC;
+                                                window: TWindow): TC} ;
+{----------------------------------------------------------------------------}
+VAR oboxLimOld, obox, oboxNxt: TC; pbox, pboxPrv: TPbox;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF bdsp^.oboxFreeFst = oboxNil THEN BEGIN
+         { no more free boxes: increase bdsp size }
+        oboxLimOld := bdsp^.oboxLim;
+        ChangeSizeH(bdsp^.hz, @bdsp, oboxLimOld + cbBoxMore);
+        AddFreeOboxes(oboxLimOld + cbBoxMore);
+    END;
+    obox := bdsp^.oboxFreeFst;     { take care of the bdsp and linking parameters }
+    OboxAlloc := obox;
+    pbox := POINTER(ORD(bdsp) + obox);
+    bdsp^.oboxFreeFst := pbox^.oboxNxt;
+    IF oboxPrv <> oboxNil THEN BEGIN     { link it in with oboxPrv just before }
+        pboxPrv := POINTER(ORD(bdsp) + oboxPrv);
+        pbox^.oboxNxt := pboxPrv^.oboxNxt;
+        pboxPrv^.oboxNxt := obox;
+    END ELSE
+        pbox^.oboxNxt := oboxNil;
+    pbox^.r := rT;                 { fill in the box with its fields }
+    pbox^.tybox := tybox;
+    pbox^.refCon := refCon;
+    pbox^.fUpdate := FALSE;
+    pbox^.window := window;
+    WITH pbox^ DO
+       CASE tybox OF
+         tyboxPane:   InsetRect(pbox^.r, 1, 1);
+         tyboxScroll: BEGIN END;
+         tyboxTab:    hspTitle := NIL;
+       END;
+    {$ifc fDbgOk}
+    IF fTstBox THEN BEGIN
+        WRITELN('OboxAlloc -- allocated is ', obox, '; prev is ', oboxPrv);
+        PxObox(obox);
+    END;
+    {$endc}
+END;
+
+
+(*** --- DrawChain, DrawTabOutline, DrawTabRgn elided --- ***)
+
+
+{$S LWMScroll}
+{--------------------------------------}
+PROCEDURE DiffRgnVis { (r: TR) };
+{--------------------------------------}
+VAR rT: TR; argnT: TArgn; rgnT: TRgn;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF SectRect(r, thePort^.clipRgn^^.rgnBBox, rT) THEN BEGIN
+        argnT.rgnBBox := r; argnT.rgnSize := cbRgnRect;
+        rgnT := @argnT;
+        DiffRgn(thePort^.clipRgn, @rgnT, thePort^.clipRgn);
+    END;
+END;
+
+{$S LWStyle}
+{--------------------------------------}
+PROCEDURE SectRgnVis{r: TR};
+{--------------------------------------}
+VAR rT: TR; argnT: TArgn; rgnT: TRgn;
+BEGIN
+        {$IFC sampcalls}  ALogCall;  {$ENDC}
+        argnT.rgnBBox := r; argnT.rgnSize := cbRgnRect;
+        rgnT := @argnT;
+        SectRgn(thePort^.clipRgn, @rgnT, thePort^.clipRgn);
+END;
+
+(*** SetOboxRgn, ObscureRgn, SetFldRgn, SetUncoveredRgn, PxHrgn elided  ***)
+
+
+{$S LWCommand}
+{------------------------------}
+PROCEDURE VisObox { (obox: TC) };
+{------------------------------}
+VAR pbox: TPbox; rT: TR;
+BEGIN
+     {$IFC sampcalls}  ALogCall;  {$ENDC}
+     { no one should call VisObox with the box mgr's port }
+    IF thePort = bdsp^.port THEN BREAK(1105);
+    pbox := POINTER(ORD(bdsp) + obox);
+    IF pbox^.tybox = tyboxTab THEN
+        BEGIN
+        IF fTstBox THEN WRITELN('VisObox called with tab ', obox);
+        BREAK(1109);
+        END;
+    SetPort(pbox^.window);
+    pbox := POINTER(ORD(bdsp) + obox);
+    rT := pbox^.r;
+     { make pbox^.r.topLeft [0,0] in local coords }
+    WITH thePort^.portBits.bounds DO OffsetRect(rT, left, top);
+    WITH thePort^.portRect DO OffsetRect(rT, -left, -top);
+    SetOrigin(-rT.left, -rT.top);
+     { clip to <[0,0], [width, height]> }
+    OffsetRect(rT, -rT.left, -rT.top); ClipRect(rT);
+    {$ifc fDbgOk}
+    IF fTstBox THEN BEGIN
+        pbox := POINTER(ORD(bdsp) + obox);
+        WRITELN('Visobox of obox ', obox, ' and window ', ORD(pbox^.window));
+        PxObox(obox);
+        PxClip;
+    END;
+    {$endc}
+END;  { VisObox }
+
+(*** --- SetBoxMgrClip elided --- ***)
+
+
+{$S LWSelect}
+FUNCTION CdThumbFromC { (cThumb: TC; cdStart, cdEnd: TCd): TCd };
+ { Determine thumb coordinate in interval cdStart..cdEnd based on
+   cThumb, which is in hundredths (0..100).  Width (height) of thumb
+   is already figured in cdEnd }
+VAR lT: LONGINT; cT: TC;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    lT := cThumb;  lT := ((cdEnd-cdStart) * lT) DIV 100; cT := lT;
+    CdThumbFromC := cdStart + cT;
+END; { CdThumbFromC }
+
+
+{$S LWPreview}
+FUNCTION CThumbFromCd { (cdThumb: TCd; cdStart, cdEnd: TCd): TC };
+ { Determine thumb 100th in interval cdStart..cdEnd based on cdThumb, which
+   is the coordinate of the beginning of the thumb. }
+VAR lT: LONGINT;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    lT := cdThumb - cdStart;
+    CThumbFromCd := (100 * lT) DIV (cdEnd - cdStart);
+END;
+
+{$S LWSelect}
+PROCEDURE RThumb {(pbox: TPbox; cdBegThm: TCd; VAR rT: TR)};
+ { positions thumb box within gray area; cdBegThm is start of thumb;
+ if not visible, rT is rectangle with 0 area. }
+VAR cdThumb, dcdThumb: TCd; tyvh: TTyvh;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    { ASSERT pbox^.tybox = tyboxScroll }
+    WITH pbox^ DO BEGIN
+        rT := r; InsetRect(rT, 1, 1);
+        rT.topLeft.vh[tyvh]  := cdBegThm;
+        IF iconThumb IN siconVis
+            THEN rT.botRight.vh[tyvh] := cdBegThm + dptThumb.vh[tyvh]
+            ELSE rT.botRight.vh[tyvh] := cdBegThm;
+    END;
+END; { RThumb }
+
+{$S LWActive}
+PROCEDURE FixVisIcons  { (pbox: TPbox; VAR siconV: TSicon) };
+ { Determine the visible icons based on pbox^.sicon }
+VAR dcdWH, dcdSbox: TCd; rgdcd: ARRAY[0..3] OF TCd; icon: TIcon; i: TC;
+BEGIN
+ {$IFC sampcalls}  ALogCall;  {$ENDC}
+ { ASSERT pbox^.tybox = tyboxScroll }
+ { First skewer, then both arrows, then thumb, finally both page flips }
+    WITH pbox^ DO BEGIN
+        dcdSbox := dptScroll.vh[tyvh];
+        FOR i := 0 TO 3 DO rgdcd[i] := 0;
+        siconV := sicon;              { assume all ok }
+        FOR icon := iconSkewer TO iconArwB DO IF icon IN siconV THEN
+            CASE icon OF
+              iconPagA,
+              iconPagB:   rgdcd[0] := rgdcd[0] + dcdSbox;
+              iconThumb:  rgdcd[1] := rgdcd[1] + dptThumb.vh[tyvh];
+              iconArwA,
+              iconArwB:   rgdcd[2] := rgdcd[2] + dcdSbox;
+              iconSkewer: rgdcd[3] := rgdcd[3] + dptSkewer.vh[tyvh];
+            END;
+        dcdWH := r.botRight.vh[tyvh]-r.topLeft.vh[tyvh] -
+                    (rgdcd[0]+rgdcd[1]+rgdcd[2]+rgdcd[3]);
+
+        i := 0;
+        WHILE (dcdWH < 0) AND (i <= 3) DO BEGIN
+            dcdWH := dcdWH + rgdcd[i];
+            CASE i OF
+              0:  siconV := siconV - [iconPagA, iconPagB];
+              1:  siconV := siconV - [iconThumb];
+              2:  siconV := siconV - [iconArwA, iconArwB];
+              3:  siconV := siconV - [iconSkewer];
+            END;
+            i := i+1;
+        END;
+    END;
+END; { FixVisIcons }
+
+{$S LWSelect}
+PROCEDURE LMkPosts { (pbox: TPbox; VAR posts: TPosts) } ;
+VAR cdLeft, cdRight, dcdSbox, dcdThumb: TCd;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+WITH pbox^ DO BEGIN
+    dcdSbox := dptScroll.vh[tyvh];
+
+    cdLeft := r.topLeft.vh[tyvh];
+    IF iconSkewer IN siconVis THEN cdLeft := cdLeft + dptSkewer.vh[tyvh];
+    posts[iconSkewer] := cdLeft;
+    IF iconArwA IN siconVis THEN cdLeft := cdLeft + dcdSbox;
+    posts[iconArwA] := cdLeft;
+    IF iconPagA IN siconVis THEN cdLeft := cdLeft + dcdSbox;
+    posts[iconPagA] := cdLeft;
+
+    cdRight := r.botRight.vh[tyvh];
+    posts[iconArwB] := cdRight;
+    IF iconArwB IN siconVis THEN cdRight := cdRight - dcdSbox;
+    posts[iconPagB] := cdRight;
+    IF iconPagB IN siconVis THEN cdRight := cdRight - dcdSbox;
+
+    posts[iconGryB] := cdRight;
+    IF iconThumb IN siconVis THEN BEGIN
+        dcdThumb := dptThumb.vh[tyvh];
+        cdLeft := CdThumbFromC(cPercent, cdLeft, cdRight - dcdThumb);
+        cdRight := cdLeft + dcdThumb;
+        END
+    ELSE cdRight := cdLeft;
+    posts[iconThumb] := cdRight;
+    posts[iconGryA] := cdLeft;
+    END;
+END; { LMkPosts }
+
+
+
+PROCEDURE SetWmFont;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    WITH thePort^ DO BEGIN
+        txState.txFont := txFont;
+        txState.txFace := txFace;
+        txState.txMode := txMode;
+    END;
+    GetPenState(txState.pnState);
+    TextFont (wmFont);
+    TextFace ([]);
+    TextMode (srcOr);
+END;
+
+
+PROCEDURE RestoreLFont;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    TextFont(txState.txFont);
+    TextFace(txState.txFace);
+    TextMode(txState.txMode);
+    SetPenState(txState.pnState);
+END;
+
+
+{$S LWActive}
+PROCEDURE DrawArrow (symArrow: Char; ptTL: TPt);
+VAR rT: TR;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    SetRect(rT, ptTL.h, ptTL.v, ptTL.h + dhScroll, ptTL.v + dvScroll);
+    EraseRect(rT);
+    MoveTo (rT.left, rT.top);
+    DrawChar (symArrow);
+END;
+
+
+{$ifc fThumbNumber}
+PROCEDURE PaintThumb {(rT: TR; thePercent: Integer)};
+  VAR   percentString:  String [2];
+        stringIndex:    Integer;
+  BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    (* EraseRect(rT); *)
+    FrameRect(rT);
+    IF thePercent >= 100 THEN percentString := '99'
+    ELSE BEGIN
+      percentString := ' 0';
+      stringIndex := 2;
+      WHILE (thePercent > 0) AND (stringIndex > 0) DO BEGIN
+        percentString [stringIndex] := chr (ord ('0') + (thePercent mod 10));
+        thePercent := thePercent div 10;
+        stringIndex := stringIndex - 1;
+      END;
+    END;
+    MoveTo (rT.left + 2, rT.top + dptThumb.v - 4); {looks right}
+    TextFont (0);
+    TextFace ([]);
+    TextSize (0);
+    DrawString (percentString);
+  END;
+{$endc}
+
+PROCEDURE PaintSb (obox: TC);
+CONST   Tile7R15 = 7;
+VAR     rT: TR; ptTL: TPt; tyvhOther: TTyvh;
+        posts: TPosts; pbox: TPbox; icon: TIcon;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+pbox := POINTER(ORD(bdsp) + obox);
+WITH pbox^ DO BEGIN
+    FillRect(r, ltgray); FrameRect(r);
+    FixVisIcons(pbox, pbox^.siconVis);
+
+    tyvhOther := TyvhNOT(tyvh);
+     { set front edge in ortho direction (e.g. top edge for horiz sbox) }
+    ptTL.vh[tyvhOther] := r.topLeft.vh[tyvhOther];
+
+    SetWmFont;
+    LMkPosts(pbox, posts);
+    FOR icon := iconSkewer TO iconArwB DO IF icon IN siconVis THEN
+        CASE icon OF
+            iconSkewer:
+                BEGIN
+                rT := r;  rT.botRight.vh[tyvh] := posts[iconSkewer];
+                FillRect(rT, black);
+                END;
+            iconArwA,iconArwB:
+                BEGIN
+                ptTL.vh[tyvh] := posts[PRED(icon)];
+                DrawArrow(rgSymArw[icon=iconArwA, tyvh], ptTL);
+                END;
+            iconPagA, iconPagB:
+                BEGIN
+                ptTL.vh[tyvh] := posts[PRED(icon)];
+                DrawArrow(rgSymPag[icon=iconPagA, tyvh], ptTL);
+                END;
+            iconThumb:
+                BEGIN
+                RThumb(pbox, posts[iconGryA], rT);
+                EraseRect(rT);
+                {$ifc fThumbNumber}
+                PaintThumb (rT, cPercent);
+                {$elsec}
+                FrameRect(rT);
+                {$endc}
+                TextFont (wmFont);
+                END;
+            END;
+    RestoreLFont;
+    END; { with }
+END; { PaintSb }
+
+
+{-------------------------------}
+PROCEDURE PaintBox { (obox: TC) };
+{-------------------------------}
+VAR pbox, pboxTab: TPbox;  rB: TR;
+BEGIN
+{$IFC sampcalls}  ALogCall;  {$ENDC}
+{$ifc fDbgOk}
+IF fTstBox THEN
+   BEGIN WRITELN('PaintBox -- ', obox); PxObox(obox); END;
+{$endc}
+PenNormal;
+pbox := POINTER(ORD(bdsp) + obox);
+pboxTab := POINTER(ORD(bdsp) + OboxFldr(obox));
+IF pbox^.tybox <> tyboxNil THEN
+   BEGIN
+   rB := pbox^.r;
+   CASE pbox^.tybox OF
+    tyboxPane:
+         BEGIN
+         pbox^.fUpdate := TRUE;
+         FillRect(rB, white);
+         IF pboxTab^.fSbox THEN
+             BEGIN InsetRect(rB, -1, -1);  FrameRect(rB); END;
+         END;
+    tyboxMenu:
+         BEGIN
+         FillRect(rB, white); {(** FrameRect(pbox^.r); **)}
+         pbox^.fUpdate := TRUE;
+         END;
+    tyboxGrow:
+         IF pboxTab^.fSbox THEN BEGIN
+             SetWmFont;
+             EraseRect(rB);
+             MoveTo(rB.left, rB.top);
+             DrawChar(chGrow);
+             RestoreLFont;
+         END;
+    tyboxScroll: IF pboxTab^.fSbox THEN PaintSb(obox);
+    tyboxTab:
+         BEGIN
+         Break(1507);
+         END;
+    OTHERWISE BEGIN
+         FillRect(rB, gray);
+         pbox^.fUpdate := TRUE;
+         END;
+    END;
+   END;
+END;
+
+
+(*** --- InvRgnBox elided --- *)
+
+
+{$S LWScroll}
+{------------------------------------------------}
+PROCEDURE FreeObox { (oboxFree: TC) };
+{------------------------------------------------}
+VAR pboxFree: TPbox; hrgnGone: THrgn;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF fTstBox THEN WRITELN('FreeObox --', oboxFree:4);
+    UnlinkObox(oboxFree);
+    pboxFree := POINTER(ORD(bdsp) + oboxFree);
+    pboxFree^.tybox := tyboxNil;
+    pboxFree^.oboxNxt := bdsp^.oboxFreeFst;
+    bdsp^.oboxFreeFst := oboxFree;
+END;
+
+
+
+{$S LWCommand}
+{------------------------------------------}
+FUNCTION FidOfWindow { (window: TWindow): TC } ;
+{------------------------------------------}
+LABEL 99;
+VAR pbox: TPbox; obox: TC;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    obox := bdsp^.oboxRoot;
+    WHILE obox <> oboxNil DO BEGIN
+        pbox := POINTER(ORD(bdsp) + obox);
+        IF pbox^.window = window THEN GOTO 99;
+        obox := pbox^.oboxNxt;
+    END;
+99: IF obox <> oboxNil THEN IF pbox^.tybox <> tyboxTab THEN Break(1504);
+    FidOfWindow := obox;
+END;
+
+
+{$S LWCreate}
+{------------------------------------------------------}
+PROCEDURE InitBdsp { (hz: THz; coboxMore: TC; pq: TPQ) };
+{------------------------------------------------------}
+ { initialize the bdsp structure and some other globals }
+VAR oboxLim: TC; pbox: TBox; rT: TR;
+BEGIN
+    {$IFC sampcalls}  ALogCall;  {$ENDC}
+    IF fTstBox THEN WRITELN('InitBdsp called...');
+    cbBoxMore := coboxMore * SIZEOF(TBox);
+    oboxLim := SIZEOF(TAbdsp) + cbBoxMore;
+    AllocBk(hz, @bdsp, oboxLim, tybkStd);
+    bdsp^.oboxLim := SIZEOF(TAbdsp);
+    bdsp^.oboxFreeFst := oboxNil;
+    bdsp^.pq := pq;
+    bdsp^.hz := hz;
+    bdsp^.port := @aportWm;
+    bdsp^.bmpDsp := bdsp^.port^.portBits;
+    AddFreeOboxes(oboxLim);
+     { special case }
+    SetRect(rT, 0, 0, 0, 0);
+    bdsp^.oboxRoot := OboxAlloc(rT, tyboxNil, 0, oboxNil, POINTER(ORD(0)));
+    oboxActive := oboxNil;
+    SetRect(rScreen, 0, 0, 720, 364);
+    dptPaneMin.h := dhPaneMin;  dptPaneMin.v := dvPaneMin;
+    dptScroll.h  := dhScroll;   dptScroll.v  := dvScroll;
+    dptSkewer.h  := dhSkewer;   dptSkewer.v  := dvSkewer;
+    dptThumb := dptScroll;
+
+    rgSymArw[TRUE,  tyvhV] := symUpArw;       { TRUE  => iconArwA }
+    rgSymArw[TRUE,  tyvhH] := symLeftArw;
+    rgSymArw[FALSE, tyvhV] := symDownArw;     { FALSE => iconArwB }
+    rgSymArw[FALSE, tyvhH] := symRtArw;
+
+    rgSymPag[TRUE,  tyvhV] := symUpPag;       { TRUE  => iconPagA }
+    rgSymPag[TRUE,  tyvhH] := symLeftPag;
+    rgSymPag[FALSE, tyvhV] := symDownPag;     { FALSE => iconPagB }
+    rgSymPag[FALSE, tyvhH] := symRtPag;
+
+    {$ifc fDbgOk}
+    IF fTstBox THEN PxBdsp;
+    {$endc}
+END;  { InitBdsp }
+
+
+END.
+
+
+
+ÿ

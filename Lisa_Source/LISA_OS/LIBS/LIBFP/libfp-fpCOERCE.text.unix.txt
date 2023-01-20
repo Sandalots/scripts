@@ -1,0 +1,369 @@
+;-----------------------------------------------------------
+; 03JUL82: WRITTEN BY JEROME COONEN
+; 11AUG82: CLEANUP
+; 01SEP82: RND MODE ENCODING CHANGED (JTC)
+; 12DEC82: UFLOW DEFINITION CHANGED TO SUPPRESS SIGNAL WHEN
+;       RESULT IS EXACT, EVEN IF TINY (JTC)
+; 13APR83: COMMENT OUT THE TRAP BYPASS CODES FOR OVERFLOW
+;       AND UNDERFLOW, SO DEFAULT RESULT IS ALWAYS DELIVERED.
+;                                                       (JTC)
+; 4APR84: FIXED BUG IN DCOERCE (JTC)
+;
+; FOR LACK OF A BETTER PLACE, THESE FIRST UTILITIES ARE
+; STUCK WITH THE COERCION ROUTINES.
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; THESE ROUTINES HANDLE THE SPECIAL CASES IN OPERATIONS
+; WHEN ONE OR THE OTHER OF THE OPERANDS IS THE RESULT.
+; SUBCASES DEPEND ON WHETHER THE SIGN SHOULD BE
+; STUFFED TOO.  THE SRC-IS-RES IS ALWAYS TRIVIAL.
+;-----------------------------------------------------------
+RDSTSGN:
+        ADD.B   D6,D6           ; SHIFT DST SIGN TO BIT #7
+RDST:
+        MOVE.L  A1,D4
+        MOVE.L  A2,D5
+        MOVEA.L A3,A4           ; EXP TOO
+RSRCSGN:
+RSRC:
+        RTS
+
+
+;-----------------------------------------------------------
+; RTSHIFT MILESTONE ++++++++++++++++++++++++++++++++++++++ .
+;
+; THIS IS THE RIGHT SHIFTER USED IN ADD/SUB, DENORM,...
+; VARIANT SKIPS CHECK FOR SUPERFLUOUS SHIFTS OVER 66.
+;-----------------------------------------------------------
+
+RTSHIFT:
+        CMPI.W  #66,D0
+        BLS.S   QRTSHIFT
+        MOVE.W  #66,D0
+QRTSHIFT:
+        LSR.L   #1,D4           ; SHIFT 0 IN
+        ROXR.L  #1,D5
+        ROXR.W  #1,D7
+        SCS     D1              ; SAVE C-OUT
+        OR.B    D1,D7
+        SUBQ.W  #1,D0
+        BNE.S   QRTSHIFT
+        RTS
+
+
+;-----------------------------------------------------------
+; ASSUME POST-OPERATION REGISTER MASK, WITH RESULT IN
+; D7.B, A4, D4,5.  COERCE ACCORDING TO BITS IN D6.W.
+;
+; USUALLY ASSUME OPERAND IS A NONZERO, FINITE NUMBER.
+; VARIANTS WILL NORMALIZE THE NUMBER, EVEN CHECKING
+; IT FOR ZERO FIRST.
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; CHECK VALUE FIRST, EXIT IF ZER0, WITH EXP FIX.
+;-----------------------------------------------------------
+ZNORMCOERCE:
+        TST.L   D4
+        BNE.S   NORMCOERCE
+        TST.L   D5
+        BNE.S   NORMCOERCE
+        TST.W   D7              ; MAY BE JUST ROUND BITS
+        BNE.S   NORMCOERCE
+
+        SUBA.L  A4,A4           ; SET EXP TO 0
+        RTS                     ; NEVER COERCE 0
+
+;-----------------------------------------------------------
+; ASSUME, AS AFTER SUBTRACT THAT VALUE IS NONZERO.  USE 1ST
+; BRANCH TO SHORTEN ACTUAL LOOP BY A BRANCH.
+;-----------------------------------------------------------
+NORMCOERCE:
+        TST.L   D4              ; CHECK FOR LEAD 1
+        BRA.S   @2
+@1:
+        SUBQ.L  #1,A4           ; DECREMENT EXP
+        ADD.W   D7,D7           ; SHIFT RND
+        ADDX.L  D5,D5           ; LO BITS
+        ADDX.L  D4,D4
+@2:
+        BPL.S   @1              ; WHEN NORM, FALL THROUGH
+
+;-----------------------------------------------------------
+; COERCE MILESTONE +++++++++++++++++++++++++++++++++++++++ .
+;
+; RUN SEPARATE SEQUENCES FOR EXT, SGL, DBL TO SAVE TESTS.
+; NOTE THAT FOR CONVENIENCE IN BRANCHING, THE SGL AND DBL
+; COERCE SEQUENCES FOLLOW THE COERCE ROUTINES.
+; SINCE OVERFLOW RESULTS IN A VALUE DEPENDING ON THE
+; PRECISION CONTROL BITS, RETURN CCR KEY FROM OFLOW:
+; EQ: OK  NE: HUGE
+;-----------------------------------------------------------
+COERCE:
+        TST.L   D6              ; CHEAP SUBST FOR #SPREC+16
+        BMI     SCOERCE
+        BTST    #DPREC+16,D6    ; IS IT DOUBLE
+        BNE     DCOERCE
+
+        SUBA.L  A3,A3           ; EXT UFLOW THRESH
+        BSR.S   UFLOW
+
+        CLR.L   D1              ; SET INCREMENT FOR RND
+        MOVEQ   #1,D2
+        BTST    #0,D5           ; LSB = 1?
+        BSR.S   ROUND
+
+        MOVEA.W #$7FFE,A3       ; OFLOW THRESH
+        BSR.S   OFLOW
+        BEQ.S   @1
+
+;-----------------------------------------------------------
+; STORE EXTENDED HUGE -- JUST A STRING OF 1'S.
+;-----------------------------------------------------------
+        MOVEA.L A3,A4           ; MAX FINITE EXP
+        MOVEQ   #-1,D4
+        MOVE.L  D4,D5
+@1:
+        RTS
+
+
+
+;-----------------------------------------------------------
+; UFLOW MILESTONE ++++++++++++++++++++++++++++++++++++++++ .
+;
+; UNDERFLOW TEST -- DENORMALIZED REGARDLESS
+;-----------------------------------------------------------
+UFLOW:
+        MOVE.L  A3,D0           ; COPY THRESHOLD
+        SUB.L   A4,D0           ; THRESH - EXP
+        BGT.S   @1
+        RTS
+@1:
+        BSET    #ERRU+8,D6      ; SIGNAL UNDERFLOW
+
+;-----------------------------------------------------------
+;******** DELETED - NO IEEE TRAP SUPPORT
+;        BTST    #ERRU,1(A0)     ; TRAP BITS IN STATE.LO
+;        BEQ.S   @3
+;        RTS
+;@3:
+;-----------------------------------------------------------
+
+        MOVEA.L A3,A4           ; EXP <- THRESH
+        BRA.S   RTSHIFT
+
+
+
+;-----------------------------------------------------------
+; ROUND MILESTONE ++++++++++++++++++++++++++++++++++++++++ .
+;
+; ROUND BASED ON GUARD AND STICKY IN D7.W AND LSB WHOSE
+; COMPLEMENT IS IN THE Z FLAG THANKS TO A BTST.
+; SUPPRESS UFLOW FLAG IF EXACT AND NONTRAPPING.
+;-----------------------------------------------------------
+ROUND:;-----------------------------------------------------------
+
+        SNE     D0              ; RECORD LSB
+
+        TST.W   D7              ; ANY NONZERO BITS?
+        BNE.S   @1
+
+
+;-----------------------------------------------------------
+; IF NOT TRAPPING ON UFLOW, JUST SUPPRESS ANY UFLOW SIGNAL.
+; SINCE WE DON'T SUPPORT TRAPPING, ALWAYS SUPPRESS SIGNAL.
+;-----------------------------------------------------------
+;
+;        BTST    #ERRU,1(A0)     ; TRAPPING <-- 1
+;        BNE.S   @101
+;-----------------------------------------------------------
+
+        BCLR    #ERRU+8,D6      ; SUPPRESS UFLOW SIGNAL
+
+;-----------------------------------------------------------
+;@101:
+;-----------------------------------------------------------
+        RTS
+
+@1:
+        BSET    #ERRX+8,D6      ; SIGNAL INEXACT
+        BTST    #RNDLO,(A0)     ; NEAREST & TOWARD -INF: X0
+        BEQ.S   @5              ; LOOKING FOR 00 AND 10
+        BTST    #RNDHI,(A0)     ; CHOP: 11 TOWARD +INF: 01
+        BEQ.S   @3
+        RTS
+@3:
+        TST.B   D6              ; PLUS?
+        BPL.S   ROUNDUP
+        RTS
+@5:
+        BTST    #RNDHI,(A0)     ; NEAR: 00  TOWARD -INF: 10
+        BNE.S   @7
+
+        CMPI.W  #$8000,D7       ; 1/2 CASE?
+        BCC.S   @51
+        RTS                     ; < 1/2
+@51:
+        BHI.S   ROUNDUP
+        TST.B   D0              ; CHECK LSB
+        BNE.S   ROUNDUP
+        RTS
+@7:
+        TST.B   D6              ; MINUS?
+        BMI.S   ROUNDUP
+        RTS
+
+;-----------------------------------------------------------
+; RECORD INCREMENT OF SIGNIFICAND.
+;-----------------------------------------------------------
+ROUNDUP:
+        BSET    #RNDINC,1(A0)
+
+        ADD.L   D2,D5
+        ADDX.L  D1,D4
+        BCC.S   @9
+
+        ROXR.L  #1,D4
+        ADDQ.L  #1,A4
+@9:
+        RTS
+
+
+;-----------------------------------------------------------
+; OFLOW MILESTONE ++++++++++++++++++++++++++++++++++++++++ .
+;
+; CHECK FOR OVERFLOW WITH THRESH IN A3, IF SO, STUFF INF
+; AND RETURN WITH CCR AS NE IF HUGE SHOULD BE STUFFED.
+;-----------------------------------------------------------
+OFLOW:
+        CMPA.L  A4,A3
+        BLT.S   @1
+        CLR.W   D0              ; SET EQ
+        RTS
+@1:
+        BSET    #ERRO+8,D6      ; SET FLAG REGARDLESS
+
+;-----------------------------------------------------------
+; REMOVE TRAP CODE TO BYPASS DEFAULT RESULT ON TRAP
+;
+;        BTST    #ERRO,1(A0)     ; CHECK FOR TRAP
+;        BEQ.S   @10
+;
+;        CLR.W   D0              ; SET EQ
+;        RTS
+;@10:
+;-----------------------------------------------------------
+
+        BSET    #ERRX+8,D6      ; INEXACT, TOO
+
+;-----------------------------------------------------------
+; STORE INF WITH SIGN OF OVERFLOWED VALUE, THEN CHECK...
+;-----------------------------------------------------------
+        MOVEA.W #$7FFF,A4       ; MAX EXP
+        CLR.L   D4              ; MAKE INF
+        MOVE.L  D4,D5
+
+;-----------------------------------------------------------
+; SINCE NONTRAPPING, RESULT IS EITHER 'INF' OR 'HUGE'.
+; HAVE 'INF' ALREADY; RETURN WITH CCR SET TO 'NE' IF
+; 'HUGE' IS NEEDED.
+;
+; RETURN WITH EQ IFF NEAR, (+ & RNDUP), OR (- & RNDDN).
+;-----------------------------------------------------------
+        MOVE.B  (A0),D1
+        AND.B   #RNDMSK,D1
+        BNE.S   @2              ; ASSUME 00-NEAR
+        RTS                     ; RETURN WITH INF
+@2:
+;-----------------------------------------------------------
+; NOW USE TRICK TO RETURN WITH CCR SET JUST RIGHT.
+;-----------------------------------------------------------
+        CMPI.B  #RND0,D1        ; CHOPPING?
+        BNE.S   @4
+        TST.B   D1              ; TO SET NE -- ALWAYS HUGE
+        RTS
+@4:
+        TST.B   D6              ; CHECK SIGN
+        BMI.S   @5
+
+        CMPI.B  #RNDUP,D1       ; MUST BE EQ TO KEEP INF
+        RTS
+@5:
+        CMPI.B  #RNDDN,D1       ; MUST BE EQ TO KEEP INF
+        RTS
+
+
+
+;-----------------------------------------------------------
+; THE SINGLE AND DOUBLE COERCE ROUTINES WERE PLACE DOWN
+; HERE SO THEY COULD ACCESS THE UTILITIES WITH SHORT BR'S.
+;-----------------------------------------------------------
+SCOERCE:
+        MOVEA.W #$3F81,A3       ; SGL UFLOW THRESH
+        BSR.S   UFLOW
+
+        TST.L   D5              ; ANY LO BITS?
+        SNE     D0
+        OR.B    D0,D7           ; SAVE AS STICKIES
+        ADD.B   D4,D4           ; GUARD TO X
+        ROXR.W  #1,D7           ; X TO GUARD
+        OR.B    D4,D7           ; LAST STICKIES
+
+        CLR.L   D5              ; CLEAR LO BITS
+        CLR.B   D4
+
+        MOVE.L  #$0100,D1       ; SET INCREMENT FOR RND
+        CLR.L   D2
+
+        BTST    #8,D4           ; LSB -> Z
+        BSR.S   ROUND
+
+        MOVEA.W #$407E,A3       ; OFLOW THRESH
+        BSR.S   OFLOW
+        BEQ.S   @3
+
+;-----------------------------------------------------------
+; STORE SINGLE HUGE -- 24 ONES WITH BIASED 7F EXP.
+;-----------------------------------------------------------
+        MOVEA.L A3,A4           ; MAX SGL EXP
+        MOVEQ   #-1,D4
+        CLR.B   D4
+@3:
+        RTS
+
+
+DCOERCE:
+        MOVEA.W #$3C01,A3       ; DBL UFLOW THRESH
+        BSR.S   UFLOW
+
+        MOVE.W  #$07FF,D0       ; MASK FOR LOW BITS
+        AND.W   D5,D0
+        ANDI.W  #$0F800,D5      ; CLEAR LO BITS
+        LSL.W   #5,D0           ; LEFT ALIGN
+        LSR.W   #1,D7           ; MAKE WAY FOR GUARD
+        BCC.S   @1              ; RECORD POSSIBLE STRAY STICKY BIT
+        BSET    #0,D7
+@1:
+        OR.W    D0,D7
+
+        CLR.L   D1              ; SET INCREMENT FOR RND
+        MOVE.L  #$00000800,D2
+
+        BTST    #11,D5          ; LSB -> Z
+        BSR.S   ROUND
+
+        MOVEA.W #$43FE,A3       ; OFLOW THRESH
+        BSR.S   OFLOW
+        BEQ.S   @5
+
+;-----------------------------------------------------------
+; STORE DOUBLE HUGE -- 53 ONES WITH BIASED 3FF EXP.
+;-----------------------------------------------------------
+        MOVEA.L A3,A4
+        MOVEQ   #-1,D4          ; LEAD 32 BITS
+        MOVE.L  #$0FFFFF800,D5  ; FINAL 21 BITS
+@5:
+        RTS
+
+ÿ

@@ -1,0 +1,3053 @@
+{INCLUDE FILE UOBJECT4 -- KITBUG}
+{Copyright 1983, 1984, Apple Computer, Inc.}
+
+{changed 04/30 1412 In GetDollarD make sure the constants we are searching for don't appear in the
+                        body of the procedure}
+
+{ ====================================== VALIDITY CHECKS ====================================== }
+
+
+{$S SgCLAcld}
+
+
+FUNCTION  ValidGlobalAddress(addr: LONGINT): BOOLEAN;
+BEGIN
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+    ValidGlobalAddress := (%_GetA5 > addr) AND (addr > ORD(@addr));
+END;
+
+
+FUNCTION  ValidSTP(stAddr: LONGINT): BOOLEAN;
+    VAR count:  INTEGER;
+        hiWord: INTEGER;
+BEGIN
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+    IF ValidGlobalAddress(stAddr) AND ValidGlobalAddress(stAddr+3) AND NOT ODD(stAddr) THEN
+        BEGIN
+        count := 100;     {Prevent infinite loops}
+        hiWord := 0;
+        WHILE ValidGlobalAddress(stAddr-4) AND ValidGlobalAddress(stAddr-1) AND NOT ODD(stAddr) AND (count > 0) DO
+            BEGIN
+      {$R-} hiWord := TpINTEGER(stAddr-4)^;
+            stAddr := TpLONGINT(stAddr-4)^; {$IFC fRngObject}{$R+}{$ENDC}
+            count := count - 1;
+            END;
+        ValidSTP := hiWord = -1;
+        END
+    ELSE
+        ValidSTP := FALSE;
+END;
+
+
+FUNCTION  ValidObject(hndl: Handle): BOOLEAN;
+BEGIN
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+    ValidObject := FALSE;
+    IF (hndl <> NIL) AND (cObject <> NIL) THEN                          {Not NIL; and we have made a heap}
+        IF ValidDataAddress(ORD(hndl)) THEN                             {Handle reasonable}
+            IF ValidDataAddress(ORD(hndl^)) THEN                        {Master ptr reasonable}
+                IF ValidSTP(ORD(ClassPtr(hndl))) THEN                   {Reasonable stp}
+                    ValidObject := TRUE;                                {Go for it}
+END;
+
+
+{ ====================================== GARBAGE COLLECTOR ====================================== }
+
+
+{$S SgCLAcld}
+
+
+PROCEDURE MarkHeap{(heap: THeap; mpAddress: LONGINT)};
+
+{ MarkHeap accepts two parameters: (1) a pointer (heap) to the document heap and (2) the address, }
+{ (mpAddress) of a "root" master pointer from which all other accessible objects on heap can be reached. }
+
+{ MarkHeap marks all objects that are "in-use" by marking the root object, all objects that the root object }
+{ has a handle on, all objects that those objects have handles on, etc.  Marking is accomplished by setting }
+{ the high order bit (bit 31) of the master pointer that points to the object which is to be marked. }
+
+{ Although MarkHeap operates depth-first, it is NOT recursive.  Thus, it can mark long chains of objects }
+{ without causing stack expansion.  If w.e => x, x.f => y and y.g => z, then while y is being scanned, }
+{ x.f => w.e.  Thus, when y returns to x for further marking starting after f, x can know where it will }
+{ have to return to when its scan is complete.  The comments below assume that the scan has reached y.g }
+
+    TYPE TOffsets = RECORD
+            objectOffset:   INTEGER;    { x - mpFirst: where the object's master ptr is in the heap }
+            fieldOffset:    INTEGER;    { @x.f - @x^^: where the field is in the object }
+        END;
+
+    VAR hz: THz;                    { heap as a UnitHz type }
+        mpFirst: LONGINT;           { The address of the first master pointer in the heap }
+        mpLast: LONGINT;            { The address of the last master pointer in the heap }
+
+        blockPtr: TBk;              { A pointer to the first (size) word of the storage block of y}
+        sizeInWords: INTEGER;       { The size found there }
+
+        firstFieldAddress: LONGINT; { @y^^, the address of y's first data field (usually a method-table ptr)}
+        lastFieldAddress: LONGINT;  { The upper limit of the fieldAddress loop--the last 4-byte field of y }
+
+        mpPtr: TpLONGINT;           { A handle as a pointer to a LONGINT (the master pointer) }
+        mp: LONGINT;                { The master pointer value, z^, i.e., the object data address }
+
+        fieldOffset: INTEGER;       { @y.g - @y^^ }
+        fieldAddress: LONGINT;      { The address of the field y.g, which may or may not be a handle.
+                                        It increases by twos because a handle can start on any even address}
+        previous: TOffsets;         { Two offsets representing @x.f: x - mpFirst & @x.f - @x^^.
+                                      A pointer to x.f will be stashed there while z is scanned,
+                                      in the form of two offsets (see "previous") }
+
+        hndlAddress: LONGINT;       { The handle z found in or to be replaced in y.g }
+
+        goodHandleFound: BOOLEAN;   { TRUE if a handle to an unmarked object was found in the fields of
+                                      the present object; otherwise, FALSE. }
+
+BEGIN   { MarkHeap }
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+
+    hz := THz(heap);           { A pointer to the heap }
+    mpFirst := ORD(@hz^.argpPool);                    { The address of the first master pointer }
+    mpLast := mpFirst + (4 * (hz^.ipPoolMac - 1));    { The address of the last master pointer }
+
+    fieldOffset := 0;                      { The offset from firstFieldAddress of the first field to consider }
+    goodHandleFound := TRUE;
+    previous.objectOffset := 1;         { An illegal value to flag the end of the entire marking operation }
+
+{$IFC LibraryVersion > 20}
+    {Mark the hrgpnob field of the Hz}
+    mpPtr := TpLONGINT(hz^.hrgpnob);
+    mpPtr^ := mpPtr^ + $80000000;
+
+    {Mark the hScramble field of the Hz}
+    mpPtr := TpLONGINT(hz^.hScramble);
+    mpPtr^ := mpPtr^ + $80000000;
+{$ENDC}
+
+    mpPtr := TpLONGINT(mpAddress);        { The handle of y }
+    mpPtr^ := mpPtr^ + $80000000;       { Mark the master pointer which points to the present object }
+
+    REPEAT                              { Loop through all accessible objects}
+
+        firstFieldAddress := mpPtr^;                    { The address of the first field of y }
+        blockPtr := TBk(firstFieldAddress - 4);         { The size word of the header of the object }
+        sizeInWords := blockPtr^.hdr.cw;                { The size of the object, in words }
+        lastFieldAddress := firstFieldAddress + sizeInWords + sizeInWords - 6; { The last 4-byte field }
+
+        fieldAddress := firstFieldAddress + fieldOffset;    { Where to start or resume the scan of y  }
+
+        IF (NOT goodHandleFound) THEN
+            BEGIN    { We have just returned to y after scanning z }
+            previous := TOffsets(TpLONGINT(fieldAddress)^);{ Restore previous offsets from field y.g }
+            TpLONGINT(fieldAddress)^ := hndlAddress;       { Restore the original contents of y.g, which was z }
+
+            fieldAddress := fieldAddress + 2;           { Advance to the next potential handle }
+            fieldOffset := fieldOffset + 2;
+            END;
+
+        goodHandleFound := FALSE;    { No handle to an unmarked object has been found yet }
+
+           { Scan the fields of the present object in search of a handle to an unmarked object }
+        WHILE ((fieldAddress <= lastFieldAddress) AND (NOT goodHandleFound)) DO
+            BEGIN
+            hndlAddress := TpLONGINT(fieldAddress)^;       { Get what may be the address of a master pointer }
+
+            IF (hndlAddress >= mpFirst) THEN
+                IF (hndlAddress <= mpLast) THEN
+                    IF (LIntAndLInt(hndlAddress - mpFirst, 3) = 0) THEN
+                        BEGIN
+                                     { if the address of the alleged master pointer lies between the }
+                                     { addresses of the first and last master pointers, inclusive, and if }
+                                     { the address of the alleged master pointer lies a multiple of 4 bytes }
+                                     { (the length of a master pointer) from the address of the first }
+                                     { master pointer, then the given address is the address of a master }
+                                     { pointer (i.e. it is a valid handle).}
+                        mpPtr := TpLONGINT(hndlAddress);  { Get a handle on the validated master pointer }
+                        mp := ORD(mpPtr^);
+                        IF (mp >= 0) THEN { unmarked }
+                            IF NOT (((mp >= mpFirst) AND (mp <= mpLast)) OR (mp = 1)) THEN
+                                BEGIN  { not on the free list; it must be in the heap proper }
+                                goodHandleFound := TRUE;    { A handle to an unmarked object has been found }
+
+                                TOffsets(TpLONGINT(fieldAddress)^) := previous; { Save offsets in the field y.g }
+
+                                previous.fieldOffset := fieldOffset;  { y's current offsets are z's previous ones }
+                                previous.objectOffset := mpAddress - mpFirst;
+
+                                mpAddress := hndlAddress;       { The handle of z }
+                                END;
+                        END;
+
+            fieldAddress := fieldAddress + 2;   { Advance to the next potential handle }
+            fieldOffset := fieldOffset + 2;     { Set offset to next potential handle }
+            END;
+
+        IF goodHandleFound THEN             { y.g contained the handle of z }
+            BEGIN
+            mpPtr^ := mpPtr^ + $80000000;   { Mark the master pointer of z }
+            fieldOffset := 0;               { Prepare to scan z }
+            END
+        ELSE
+            BEGIN    { Finished examining the fields of y.  Prepare to return to x.f }
+            hndlAddress := mpAddress;       { The handle y will be put back into x.f where it belongs }
+            fieldOffset := previous.fieldOffset;            { Restore fieldOffset to @x.f - @x^^ }
+            mpAddress := mpFirst + previous.objectOffset;   { Restore mpAddress to x }
+            mpPtr := TpLONGINT(mpAddress);                    { The handle of y }
+            END;
+
+      UNTIL previous.objectOffset = 1;    { until all the fields of the original object have been examined }
+END;   { MarkHeap }
+
+
+PROCEDURE SweepHeap{(heap: THeap; report: BOOLEAN)};
+
+{ This procedure sweeps through all existing objects on the document heap specified by the handle heap.  }
+{ If the parameter report has the value TRUE, then the classes of all unmarked objects are displayed on the }
+{ alternate screen; otherwise, if report is FALSE, the unmarked objects are quietly freed-up. }
+
+    VAR tempPtr: TpLONGINT; { a temporary pointer used either to carry out simple indirection or to mark a }
+                         { master pointer }
+
+    PROCEDURE CollectGarbage (obj: TObject);
+
+    { This procedure accepts a handle, obj, to an object and frees or reports that object (depending on the }
+    { value of SweepHeap's parameter, report) if its master pointer is not marked.  If, the }
+    { object's master pointer is marked, then this procedure unmarks the object's master pointer but }
+    { otherwise leaves the object alone. }
+
+        VAR mpAddress:  LONGINT;    { the address of the master pointer specified by the handle obj }
+            clsName:    TClassName; { the name of that class }
+            hexOrd:     S8;         { the handle of the object, as a hex string }
+
+    BEGIN    { CollectGarbage }
+
+        mpAddress := ORD(obj);
+
+        tempPtr := TpLONGINT(obj);   { get a handle of the right type on the given object OBJ }
+        IF (tempPtr^ < 0) THEN
+            BEGIN    { if the given object OBJ is marked }
+            tempPtr := TpLONGINT(mpAddress);   { Unmark the master pointer that points to the present object }
+            tempPtr^ := tempPtr^ - $80000000;  { Note: 2^31 = $80000000 }
+            END
+        ELSE IF report THEN
+            BEGIN
+            WriteLn;
+            IF ValidObject(Handle(obj)) THEN
+                CpToCn(TPSliceTable(ClassPtr(Handle(obj))), TS8(clsName))
+            ELSE
+                clsName := '????????';
+
+            LIntToHex(ORD(obj), @hexOrd);
+            Write (CHR(7), 'Found garbage object $', hexOrd, ' of class ', clsName);  { Report the garbage }
+            END
+        ELSE
+            FreeH(THz(heap), TH(obj));  { It is unmarked, i.e., garbage.  Free it. }
+
+    END;    { CollectGarbage }
+
+BEGIN    { SweepHeap }
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+    EachObject(heap, CollectGarbage);
+END;     { SweepHeap }
+
+
+{ ====================================== ABCBREAK ====================================== }
+
+
+{$IFC fDbgObject}
+PROCEDURE TallyZero; FORWARD;
+{$ENDC}
+
+
+{$S sError}
+PROCEDURE ABCBreak{(s: S255; errCode: LONGINT)};
+    VAR asHex: S8;
+BEGIN
+    {$IFC fDbgObject}
+    WriteLn;
+    Write(CHR(7), s);       {Beep}
+    IF errCode <> 0 THEN
+        BEGIN
+        LIntToHex(errCode, @asHex);
+        Write(': ', errCode:1, ' = $', asHex);
+        END;
+    WriteLn;
+    {Turn off all tracing, tallying, etc.}
+    tallyingCalls := FALSE;
+    TallyZero;
+    fTraceEnabled := FALSE;
+    defTraceCount := 0;
+    traceCount := defTraceCount;
+    returnToMain := TRUE;
+    EntDebugger(' ', 'Error caused ABCBreak call');
+    {$ELSEC}
+    HALT;
+    {$ENDC}
+END;
+{$S SgCLAcld}
+
+
+{ ====================================== $D DECODING ====================================== }
+
+
+{$IFC fTrace OR fDebugMethods}
+
+{$S SgCLAdbg}
+
+
+FUNCTION GetDollarD(pFrame: TppINTEGER;
+                    VAR nameOfClass: TClassName; VAR nameOfMethod: S8; VAR nextPC: LONGINT): BOOLEAN;
+    LABEL 1;
+
+    VAR pname:              TPByte;
+        pPC:                TppINTEGER;
+        pc:                 TpINTEGER;
+        startOfSegment:     TpLONGINT;
+        endOfSegment:       TpINTEGER;
+        pcl:                TpLONGINT;
+        fBothClassAndProc:  BOOLEAN;
+
+    PROCEDURE SwapIn(valueString: S8);
+        BEGIN
+        END;
+
+    PROCEDURE CopyName(VAR anyName: S8);
+        VAR j: INTEGER;
+    BEGIN
+        anyName := '12345678';
+        FOR j := 1 TO 8 DO
+            BEGIN
+            anyName[j] := CHR(Wand(pname^, 127));
+            pname := TPByte(ORD(pname)+1);
+            END;
+    END;
+
+    PROCEDURE AdvancePC;
+
+    BEGIN
+        IF ORD(pc) >= ORD(endOfSegment) THEN
+            GOTO 1;
+        pc := TpInteger(ORD(pc)+2);
+    END;
+
+BEGIN
+        {$IFC fMaxTrace}BP(1);{$ENDC}
+        {$IFC fMaxTrace}EP;{$ENDC}
+    pPC := TppINTEGER(ORD(pFrame) + 4);
+    pc := pPC^;
+    nameOfClass := '';
+    nameOfMethod := '';
+    nextPC := 0;
+    GetDollarD := FALSE;
+
+    IF ORD(pc) <> 0 THEN
+        BEGIN
+    {$R-} SwapIn(TPS8(pc)^); {$IFC fRngObject} {$R+} {$ENDC} {Be sure the code is swapped in}
+
+        startOfSegment := TpLONGINT(LIntAndLint(LONGINT(PC), $FFFE0000));
+        endOfSegment := TpINTEGER(LONGINT(startOfSegment) + LIntAndLint(startOfSegment^, $00FFFFFF) {length} );
+
+            {We add the -1 to the following tests so that the things we are searching for don't
+                appear in the body of the procedure.}
+        WHILE (pc^-1) <> ($4E5E-1) DO                   {search for UNLK A6}
+            IF ORD(pc) >= ORD(endOfSegment) THEN
+                GOTO 1
+            ELSE
+                pc := TpINTEGER(ORD(pc)+2);
+        WHILE ((pc^-1) <> ($4E75-1)) AND
+              ((pc^-1) <> ($4ED0-1)) DO                 {search for RTS or JMP (A0)}
+            IF ORD(pc) >= ORD(endOfSegment) THEN
+                GOTO 1
+            ELSE
+                pc := TpINTEGER(ORD(pc)+2);
+
+        nextPC := ORD(pc);
+        GetDollarD := TRUE;
+
+        pname := TPByte(ORD(pc)+3);
+        fBothClassAndProc := pname^ < 0;
+        pname := TPByte(ORD(pname)-1);
+        CopyName(nameOfMethod);
+        IF fBothClassAndProc THEN
+            CopyName(S8(nameOfClass))
+        ELSE
+            nameOfClass := '';
+        END;
+1:
+END;
+{$ENDC}
+
+
+{ ==================================== CALL TALLY ==================================== }
+
+
+{$IFC fTrace}
+
+
+{$S SgCLAini}       {  *** NB ***  Is this Sg necessary?  }
+
+
+PROCEDURE TallyStart;
+    VAR timeNow:    LONGINT;
+        i:          INTEGER;
+        arrSize:    INTEGER;
+        elapsed:    LONGINT; (*^*)
+BEGIN
+    IF tallies = NIL THEN
+        BEGIN
+        {array size must be <= maxTallies; imposed by declaration of tallies global variable.}
+        arrSize := Min(numMethods, maxTallies);
+        tallies := THTallies(TArray.CREATE(NIL, mainHeap, arrSize, SIZEOF(TTally)));
+        TArray(tallies).InsNullsAt(1, arrSize);
+        elapsed := 0;(*^*)
+        END
+    ELSE {continuing}
+        elapsed := stopTime - startTime;(*^*)
+
+    timeNow := MicroTimer;
+    startTime := timeNow - elapsed; (*^*)
+    FOR i := 0 TO tabLevel DO    {BP's already passed}
+        traceTimes[i] := timeNow; (*^*)
+    stopTime := timeNow;
+
+    tallyingCalls := TRUE;
+END;
+
+
+PROCEDURE TallyZero;
+BEGIN
+    IF tallies <> NIL THEN
+        BEGIN
+        Free(TArray(tallies));
+        tallies := NIL;
+        END;
+END;
+
+
+FUNCTION TallySlot(pc: LONGINT): INTEGER;
+
+    FUNCTION ComparePC(hashIndex: INTEGER): THashCompare;
+        VAR myPC:   LONGINT;
+    BEGIN
+        myPC := tallies^^.recs[hashIndex].epPC;
+        IF myPC = 0 THEN
+            ComparePC := cHole
+        ELSE
+        IF myPC = pc THEN
+            ComparePC := cMatch
+        ELSE
+            ComparePC := cMismatch;
+    END;
+
+BEGIN
+    TallySlot := LookupInHashArray(tallies^^.header.size, pc, FALSE, ComparePC);
+END;
+
+
+PROCEDURE Tally(pc, micSecs: LONGINT);
+    VAR slot:       INTEGER;
+        segNum:     INTEGER;
+        pPC:        TpByte;
+BEGIN
+    pPC := TPByte(@pc);
+    pPC^ := 0;  {occasionally, a return addr hibyte is nonzero! no one knows why...}
+
+    slot := TallySlot(pc);
+    WITH tallies^^.recs[ABS(slot)] DO
+        IF slot > 0 THEN
+            BEGIN
+            count := count + 1;
+            microseconds := microseconds + micsecs;
+            END
+        ELSE
+        IF slot < 0 THEN
+            BEGIN
+            segNum := TpINTEGER(pPC)^ DIV 2;
+            IF segNum = 0 THEN
+                ABCBreak('Impossible Tally PC', pc)
+            ELSE
+                BEGIN
+                epPC := pc;
+                count:= 1;
+                microseconds := micSecs;
+                END;
+            END
+        ELSE
+            BEGIN
+            ABCBreak('Tally table full--more non-method procedures had EP''s than expected',
+                    tallies^^.header.size);
+            tallyingCalls := FALSE;
+            END;
+END;
+
+
+PROCEDURE TallyReport;
+    VAR totalCalls:     LONGINT;
+        totalTime:      LONGINT;
+        callees:        INTEGER;
+        slot:           INTEGER;
+        calls:          INTEGER;
+        micSecs:        LONGINT;
+        roundoff:       LONGINT;
+        i:              INTEGER;
+        j:              INTEGER;
+        sortKeys:       THIdxArray;
+        segCount:       ARRAY [0..127] OF LONGINT;
+        segTime:        ARRAY [0..127] OF LONGINT;
+        pc:             LONGINT;
+        sortBy:         INTEGER;
+        swapem:         BOOLEAN;
+        sloti:          INTEGER;
+        slotj:          INTEGER;
+        pctg:           INTEGER;
+        elapsed:        LONGINT;
+        segName:        S8;
+        segNum:         INTEGER;
+        cState:         TConvResult;
+        wantCalled:     BOOLEAN;
+        clsName:        TClassName;
+        mthName:        S8;
+        nextPC:         LONGINT;
+        inStr:          S255;
+        hexPC:          S8;
+
+        PROCEDURE ReadSegNames;
+            CONST
+                bSegTable = $9A;
+                bEOFMark = $00;
+                bModuleName = $80;
+                bCodeBlock = $85;
+
+                modNameSkip = 8; {# bytes to skip in module name block, to get segment name}
+
+                allBlanks = '        '; {8 blanks}
+                blankSeg  = 'BLANKSEG';
+
+            TYPE
+                SegTblEntry = RECORD
+                    SegName:        PACKED ARRAY[1..8] OF CHAR;
+                    SegNumber:      INTEGER;
+                    Version1:       LONGINT;
+                    Version2:       LONGINT;
+                    END;
+
+            VAR prcsInfo:       ProcInfoRec;
+                error:          INTEGER;
+                aFile:          TFile;
+                scanner:        TFileScanner;
+                blkType:        LONGINT;
+                blkSize:        LONGINT;
+                nSegments:      LONGINT;
+                segblk:         SegTblEntry;
+                addr:           LONGINT;
+                i:              INTEGER;
+
+        BEGIN
+            Info_Process(error, My_id, prcsInfo);
+            IF error <= 0 THEN
+                BEGIN
+                segName := allBlanks;
+                segNames := TArray.CREATE(NIL, mainHeap, 127, SIZEOF(S8));
+                segNames.InsNullsAt(1, 127);
+
+                aFile := TFile.CREATE(NIL, mainHeap, prcsInfo.progPathName, '');
+                scanner := TFileScanner.CREATE(NIL, aFile, [fRead]);
+                WriteLn('Reading segment numbers and names from ', prcsInfo.progPathName);
+                WriteLn;
+
+                REPEAT
+                    blkType := scanner.ReadNumber(1);
+                    blkSize := scanner.ReadNumber(3) - 4;
+
+                    CASE blkType OF
+                        bSegTable:
+                            BEGIN
+                            nSegments := scanner.ReadNumber(2);
+                            blkSize := blkSize-2;
+                            FOR i := 1 TO nSegments DO
+                                BEGIN
+                                scanner.XferSequential(xRead, @segblk, SIZEOF(SegTblEntry));
+                                blkSize := blkSize - scanner.actual;
+                                XferLeft(Ptr(@segblk.segName), Ptr(ORD(@segName)+1), 8);
+                                segNames.PutAt(segblk.SegNumber, @segName);
+                                END;
+                            END;
+
+                        bModuleName:
+                            BEGIN
+                            scanner.Skip(modNameSkip);
+                            blkSize := blkSize-modNameSkip;
+
+                            scanner.XferSequential(xRead, Ptr(ORD(@segName)+1), 8);
+                            blkSize := blkSize - scanner.actual;
+                            IF segName = allBlanks THEN
+                                segName := blankSeg;
+                            END;
+
+                        bCodeBlock:
+                            BEGIN
+                            addr := scanner.ReadNumber(4);
+                            blkSize := blkSize - 4;
+                            segNames.PutAt(addr DIV $20000, @segName);
+                            END;
+                        END;
+
+                    scanner.Skip(blkSize);
+                UNTIL scanner.atEnd  OR (blkType = bEOFMark);
+
+                scanner.Close;
+                END;
+        END;
+
+(**********
+        PROCEDURE ReadSegNames;
+            LABEL
+                1;
+
+            VAR prcsInfo:       ProcInfoRec;
+                error:          INTEGER;
+                progVolume:     TFilePath;
+                fileName:       TFilePath;
+                progExt:        TFilePath;
+                segNameFile:    TEXT;
+                i:              INTEGER;
+                segName:        S8;
+                segNum:         INTEGER;
+        BEGIN
+            Info_Process(error, My_id, prcsInfo);
+            IF error <= 0 THEN
+                BEGIN
+                i := Length(prcsInfo.progPathName);
+                WHILE i > 0 DO
+                    IF (prcsInfo.progPathName[i] = '}') OR (prcsInfo.progPathName[i] = '.') THEN
+                        GOTO 1
+                    ELSE
+                        i := i - 1;
+1:
+                IF i > 0 THEN
+                    filename := Concat(Copy(prcsInfo.progPathName, 1, i), 'SegNames.Text');
+                Reset(segNameFile, fileName);
+                i := IoResult;
+                IF i > 0 THEN
+                    WriteLn('Unable to open ', fileName, ' because of error number ', i:1)
+                ELSE
+                    BEGIN
+                    WriteLn('Reading segment numbers and names from ', fileName);
+                    WriteLn;
+                    segNames := TArray.CREATE(NIL, mainHeap, 127, SIZEOF(S8));
+                    segNames.InsNullsAt(1, 127);
+
+                    WHILE (i = 0) AND NOT Eof(segNameFile) DO
+                        BEGIN
+                        segNum := 0;
+                        ReadLn(segNameFile, segNum, inStr);
+                        i := IoResult;
+                        IF (i <= 0) AND (1 <= segNum) AND (segNum <= 127) THEN
+                            BEGIN
+                            TrimBlanks(@inStr);
+                            segName := Copy(Concat(inStr, '       '), 1, 8);
+                            segNames.PutAt(segNum, @segName);
+                            END
+                        ELSE
+                        IF i > 0 THEN
+                            WriteLn('*** IoError number ', i:1, ' reading ', fileName)
+                        ELSE
+                        IF NOT Eof(segNameFile) THEN
+                            WriteLn('*** Bad segment number: ', segNum:1, ' in file ', fileName);
+                        END;
+
+                    segName := '????????';
+                    FOR segNum := 1 TO 127 DO
+                        IF TPByte(segNames.At(segNum))^ = 0 THEN
+                            segNames.PutAt(segNum, @segName);
+                    END;
+
+                WriteLn;
+                WriteLn;
+                Close(segNameFile);
+                END;
+        END;
+**********)
+
+        PROCEDURE WriteName;
+        BEGIN
+            IF mthName = '' THEN
+                BEGIN
+                LIntToHex(pc, @hexPC);
+                Write('$', hexPC, '        ');
+                END
+            ELSE
+            IF clsName = '' THEN
+                Write(mthName, '         ')
+            ELSE
+                Write(clsName, '.', mthName);
+        END;
+
+        FUNCTION TallyRange(pc1, pc2: LONGINT): INTEGER;
+            VAR slot:   INTEGER;
+        BEGIN   {If this proves too slow, make the sortarray by PC and binary search it}
+            FOR slot := 1 TO tallies^^.header.size DO
+                WITH tallies^^.recs[slot] DO
+                    IF count > 0 THEN
+                        IF pc1 < epPC THEN
+                            IF epPC <= pc2 THEN
+                                BEGIN
+                                TallyRange := slot;
+                                EXIT(TallyRange);
+                                END;
+            TallyRange := 0;
+        END;
+
+    PROCEDURE SwapIn(valueString: S8);
+        BEGIN
+        END;
+
+BEGIN
+    FOR j := tabLevel - 1 DOWNTO 0 DO (*^*)
+        BEGIN
+        elapsed := stopTime - traceTimes[j];
+        FOR i := j - 1 DOWNTO 0 DO (*^*)
+            traceTimes[i] := traceTimes[i] + elapsed;
+        Tally(TpLONGINT(traceFrames[j] + 4)^, elapsed);
+        END;
+
+    totalTime := stopTime - startTime(* - debugTime*);
+    WriteLn;
+    WriteLn((totalTime + 500) DIV 1000:1, ' milliseconds have elapsed since tallying began');
+(*  WriteLn((totalTime + 500) DIV 1000:1, ' milliseconds have elapsed since tallying began, not counting ',
+            debugTime:1, ' ms. in debug code.');*)
+
+    WriteLn;
+
+    totalCalls := 0;
+    callees := 0;
+    FOR segNum := 1 TO 127 DO
+        BEGIN
+        segCount[segNum] := 0;
+        segTime[segNum] := 0;
+        END;
+
+    FOR slot := 1 TO tallies^^.header.size DO
+        WITH tallies^^.recs[slot] DO
+            IF count > 0 THEN
+                BEGIN
+                totalCalls := totalCalls + count;
+                callees := callees + 1;
+                segNum := TpINTEGER(@epPC)^ DIV 2;
+                segCount[segNum] := segCount[segNum] + count;
+                segTime[segNum] := segTime[segNum] + microseconds;
+                END;
+
+    IF totalCalls = 0 THEN
+        WriteLn('All tallies are zero.')
+    ELSE
+        BEGIN {totalCalls > 0}
+        roundOff := totalTime DIV 2;
+
+        WriteLn(callees:1, ' methods were called  a total of ', totalCalls:1, ' times.');
+        WriteLn;
+
+        IF segNames = NIL THEN
+            ReadSegNames;
+
+        WriteLn('                  SEGMENT USAGE');
+        WriteLn;
+
+        WriteLn('No. of calls  % of time    Segment   SegSize   Seg#');
+        WriteLn('------------  ---------    -------   -------   ----');
+        WriteLn;
+
+        FOR segNum := 1 TO 127 DO
+            IF segCount[segNum] > 0 THEN
+                BEGIN
+                IF segNames = NIL THEN
+                    segName := '????????'
+                ELSE
+                    segName := TPString(segNames.At(segNum))^;
+
+                    {Be sure the code is swapped in, before getting the size of the segment}
+          {$R-} SwapIn(TpS8($20000 * segNum)^); {$IFC fRngObject} {$R+} {$ENDC}
+
+                WriteLn(segCount[segNum]:8, ' ....... ',
+                        (LONGINT(segTime[segNum]) * 100 + roundOff) DIV totalTime:3, '% ...  ',
+                        segName,
+                        LIntAndLint(TpLONGINT($20000 * segNum)^, $00FFFFFF):8,
+                        segNum:7);
+                END;
+
+        REPEAT
+            WriteLn;
+            WriteLn;
+
+            Write('Report procedure executions sorted by (C = # Calls; T = % of Time; S = Segment)? ');
+            ReadLn(inStr);
+            StrUpperCased(@inStr);
+            TrimBlanks(@inStr);
+            IF inStr = '' THEN
+                sortBy := -1
+            ELSE
+            IF inStr[1] = 'C' THEN
+                sortBy := 1
+            ELSE
+            IF inStr[1] = 'T' THEN
+                sortBy := 2
+            ELSE
+            IF inStr[1] = 'S' THEN
+                sortBy := 3
+            ELSE
+                sortBy := 0;
+
+            IF sortBy > 0 THEN
+                BEGIN {sortBy > 0}
+                sortKeys := MakeIdxArray(callees, FALSE);
+
+                {$R-}
+                WITH sortKeys^^, tallies^^ DO
+                    BEGIN {with}
+                    i := 0;
+                    FOR slot := 1 TO header.size DO
+                        IF recs[slot].count > 0 THEN
+                            BEGIN
+                            i := i + 1;
+                            records[i] := slot;
+                            END;
+
+                    FOR i := 1 TO callees-1 DO
+                        BEGIN
+                        sloti := records[i];
+                        FOR j := i+1 TO callees DO
+                            BEGIN
+                            slotj := records[j];
+                            CASE sortBy OF
+                                1: swapem := recs[sloti].count > recs[slotj].count;
+                                2: swapem := recs[sloti].microseconds > recs[slotj].microseconds;
+                                3: swapem := TpINTEGER(@recs[sloti].epPC)^ DIV 2 >
+                                             TpINTEGER(@recs[slotj].epPC)^ DIV 2;
+                                END;
+                            IF swapem THEN
+                                BEGIN
+                                records[i] := slotj;
+                                records[j] := sloti;
+                                sloti := records[i];
+                                slotj := records[j];
+                                END;
+                            END;
+                        END;
+                    END; {with}
+                {$IFC fRngObject}{$R+}{$ENDC}
+
+                WriteLn('No. of calls  % of time      Routine name        PC      Segment');
+                WriteLn('------------  ---------   -----------------   --------   -------');
+                WriteLn;
+
+                FOR i := callees DOWNTO 1 DO
+                    BEGIN
+                    slot := sortKeys^^.records[i];
+                    WITH tallies^^.recs[slot] DO
+                        BEGIN
+                        calls := count;
+                        micSecs := microseconds;
+                        pc := epPC;
+                        END;
+
+                    j := TpINTEGER(@pc)^ DIV 2;
+                    IF sortBy = 3 THEN {if by segment}
+                        IF i < callees THEN {if not first line printed}
+                            IF j <> segNum THEN {if different from segment of previous line}
+                                WriteLn; {then leave a blank line}
+                    segNum := j;
+
+                    Write(calls:8, ' ....... ');
+
+                    pctg := (LONGINT(micSecs) * 100 + roundOff) DIV totalTime;
+                    IF pctg = 0 THEN
+                        Write('    ')
+                    ELSE
+                        Write(pctg:3, '%');
+
+                    Write(' ... ');
+
+                    IF GetDollarD(TppINTEGER(ORD(@pc)-4), clsName, mthName, nextPC) THEN;
+                    WriteName;
+
+                    LIntToHex(pc, @hexPC);
+                    Write('   ', hexPC);
+
+                    IF segNames = NIL THEN
+                        Write(segNum:10)
+                    ELSE
+                        BEGIN
+                        segName := TPString(segNames.At(segNum))^;
+                        IF segName = '????????' THEN
+                            Write(segNum:10)
+                        ELSE
+                            Write('   ', segName);
+                        END;
+
+                    WriteLn;
+
+                    IF CheckKeyPress('Tally and Time Listing') THEN
+                        i := 1;
+                    END; {for i}
+
+                TArray(sortKeys).Free;
+                END; {IF sortBy > 0}
+            UNTIL sortBy < 0;
+
+        IF segNames <> NIL THEN {segNames will be non-NIL except in case of an IO error}
+            REPEAT
+                Write('List procedures that were and weren''t called in segment [name or number]? ');
+                ReadLn(inStr);
+                TrimBlanks(@inStr);
+                StrUpperCased(@inStr);
+                IF inStr = '?' THEN
+                    BEGIN
+                    WriteLn('List of all segments used by application:');
+                    i := 0; {# output so far}
+                    FOR segnum := 1 TO 127 DO
+                        BEGIN
+                        segname := TPString(segNames.At(segnum))^;
+                        IF segname <> '' THEN
+                            BEGIN
+                            Write(segnum:3, ':', segname, '  ');
+                            i := i+1;
+                            IF i MOD 5 = 0 THEN
+                                WriteLn;
+                            END;
+                        END;
+                    WriteLn;
+                    END
+                ELSE
+                IF inStr <> '' THEN
+                    BEGIN
+                    StrToInt(@inStr, segNum, cState);
+                    IF cState <> cvValid THEN
+                        BEGIN
+                        segNum := 0;
+                        FOR i := 1 TO 127 DO
+                            BEGIN
+                            segName := TPString(segNames.At(i))^;
+                            StrUpperCased(@segName);
+                            IF segName = inStr THEN
+                                segNum := i;
+                            END; {For i}
+                        END  {invalid number}
+                    ELSE IF (segNum>=1) AND (segNum<=127) THEN{make sure the segment number is OK}
+                        BEGIN
+                        segName := TPString(segNames.At(segNum))^;
+                        IF segName = '' THEN
+                            segNum := 0;
+                        END
+                    ELSE
+                        segNum := 0;
+
+                    IF segNum = 0 THEN
+                        WriteLn('No such segment')
+                    ELSE
+                        FOR wantCalled := TRUE DOWNTO FALSE DO
+                            BEGIN
+                            WriteLn;
+                            Write('PROCEDURES THAT WERE ');
+                            IF wantCalled THEN
+                                Write('CALLED')
+                            ELSE
+                                Write('NOT CALLED OR HAD NO BP/EP');
+                            Write(' IN SEGMENT');
+
+                            IF segNames <> NIL THEN
+                                Write(': ', TPString(segNames.At(segNum))^);
+                            WriteLn(' #', segNum:1, '--');
+                            WriteLn;
+
+                            pc := segNum * $20000;
+                            j := 0;
+                            WHILE GetDollarD(TppINTEGER(ORD(@pc)-4), clsName, mthName, nextPC) DO
+                                BEGIN
+                                IF (TallyRange(pc, nextPC) > 0) = wantCalled THEN
+                                    BEGIN
+                                    WriteName;
+                                    Write('   ');
+                                    j := j + 1;
+                                    IF j = 4 THEN
+                                        BEGIN
+                                        j := 0;
+                                        WriteLn;
+                                        END;
+                                    END;
+                                pc := nextPC;
+                                IF CheckKeyPress('Segment Listing') THEN
+                                    pc := 0;
+                                END;
+                            WriteLn;
+                            WriteLn;
+                            END; {FOR wantCalled}
+                    END; {inStr <> ''}
+
+                UNTIL inStr = '';
+
+        END; {totalCalls > 0}
+
+    WriteLn;
+END;
+
+{$ENDC}
+
+{ ============================================================================================= }
+
+
+{$S SgCLAdbg} {for rest of file}
+
+
+{ ====================================== "FIELDS" METHODS ====================================== }
+
+
+{$IFC fDebugMethods}
+PROCEDURE ParseDecl(inStr: S255;
+                PROCEDURE FoundName(token: S8);
+                PROCEDURE FoundType(token: S8; typeCode: TTypeCode; numBytes: INTEGER;
+                 {for arrays only:} lowerBound, upperBound: INTEGER; memberTypeStr: S255);
+                PROCEDURE FoundUnexpected(token, wanted: S8));
+    VAR p:          INTEGER;
+        token:      S8;
+        eoi:        INTEGER;
+        alpha:      BOOLEAN;
+        start:      INTEGER;    {where the last token started}
+        inhibited:  BOOLEAN;
+
+    PROCEDURE NextToken;
+    BEGIN
+      {Skip leading blanks}
+        WHILE (p <= eoi) AND (inStr[p] <= ' ') DO
+            p := p + 1;
+
+        start := p;
+
+        IF p > eoi THEN
+            token := ''
+        ELSE
+            BEGIN
+            WHILE (p <= eoi) AND (inStr[p] IN ['-', '0'..'9', 'A'..'Z', 'a'..'z']) DO  {Form a word or number}
+                p := p + 1;
+            alpha := p > start;
+            IF NOT alpha THEN  {A single non-alphanumeric nonblank character}
+                p := p + 1;
+            token := Copy(inStr, start, CMin(8, p - start));
+            END;
+    END;
+
+    PROCEDURE Expect(str: S8);
+    BEGIN
+        StrUpperCased(@token);
+        IF token <> str THEN
+            FoundUnexpected(token, str);
+        NextToken;
+    END;
+
+    FUNCTION ParseNumber: LONGINT;
+        VAR k:      LONGINT;
+            cState: TConvResult;
+    BEGIN
+        StrToLint(@token, k, cState);
+        IF cState = cvValid THEN
+            ParseNumber := k
+        ELSE
+            FoundUnexpected(token, 'a number');
+        NextToken;
+    END;
+
+    PROCEDURE ParseField; FORWARD;
+
+    PROCEDURE ParseType(inhibit: BOOLEAN);
+        VAR typeName:       S8;
+            upName:         S8;
+            alphaName:      BOOLEAN;
+            word:           S8;
+            lowerBound:     INTEGER;
+            upperBound:     INTEGER;
+            pp:             INTEGER;
+            i:              INTEGER;
+            len:            INTEGER;
+            wasInhibited:   BOOLEAN;
+    BEGIN
+        wasInhibited := inhibited;
+        IF inhibit THEN
+            inhibited := TRUE;
+        typeName := token;
+        upName := token;
+        StrUpperCased(@upName);
+        alphaName := alpha;
+        NextToken;
+        IF NOT alphaName THEN
+            FoundUnexpected(typeName, 'typename')
+        ELSE
+        IF upName = 'RECORD' THEN
+            BEGIN
+            REPEAT
+                ParseField;
+                word := token;
+                StrUpperCased(@word);
+              UNTIL (word = 'END') OR (word = '');
+            Expect('END');
+            END
+        ELSE
+        IF upName = 'ARRAY' THEN
+            BEGIN
+            Expect('[');
+            lowerBound := ParseNumber;
+            Expect('.');
+            Expect('.');
+            upperBound := ParseNumber;
+            Expect(']');
+            pp := p;
+            Expect('OF');
+            ParseType(TRUE);
+            IF NOT inhibited THEN
+                FoundType('ARRAY', yArray, 0, lowerBound, upperBound, Copy(inStr, pp, start - pp));
+            END
+        ELSE
+        IF upName = 'STRING' THEN
+            BEGIN
+            Expect('[');
+            len := ParseNumber;
+            Expect(']');
+            IF NOT inhibited THEN
+                FoundType('STRING', yString, len + 1, 0, 0, '');
+            END
+        ELSE
+        IF upName = 'BOOLEAN' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yBoolean, 1, 0, 0, '');
+            END
+        ELSE
+        IF upName = 'CHAR' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yChar, 2, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'BYTE' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yByte, 1, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'HEXBYTE' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yHexByte, 1, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'INTEGER' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yInteger, 2, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'HEXINTEG' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yHexInteger, 1, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'LONGINT' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yLongInt, 4, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'REAL' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yReal, 4, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'POINT' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yPoint, 4, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'PTR' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yPtr, 4, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'LONGREAL' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yLongReal, 8, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'LPOINT' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yLPoint, 8, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'RECT' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yRect, 8, 0, 0, '')
+            END
+        ELSE
+        IF upName = 'LRECT' THEN
+            BEGIN
+            IF NOT inhibited THEN
+                FoundType(typeName, yLRect, 16, 0, 0, '')
+            END
+        ELSE
+            BEGIN
+            IF CiOfCn(upName) > 0 THEN
+                BEGIN
+                word := token;
+                StrUpperCased(@word);
+                IF word = 'OF' THEN
+                    BEGIN
+                    pp := p;
+                    NextToken;
+                    ParseType(TRUE);
+                    IF NOT inhibited THEN
+                        FoundType(typeName, yObject, SIZEOF(Handle), 0, 0, Copy(inStr, pp, start - pp));
+                    END
+                ELSE
+                IF NOT inhibited THEN
+                    FoundType(typeName, yObject, SIZEOF(Handle), 0, 0, '');
+                END
+            ELSE
+                FoundUnexpected(typeName, 'typename');
+            END;
+        inhibited := wasInhibited;
+    END;
+
+    PROCEDURE ParseField;
+    BEGIN
+        IF NOT alpha THEN
+            BEGIN
+            FoundUnexpected(token, 'var name');
+            NextToken;
+            END
+        ELSE
+            BEGIN
+            IF NOT inhibited THEN
+                FoundName(token);
+            NextToken;
+            Expect(':');
+            ParseType(FALSE);
+            IF token = ';' THEN
+                NextToken
+            ELSE
+            IF (token <> '') AND (token <> 'END') THEN
+                FoundUnexpected(token, '; or END');
+            END;
+    END;
+
+BEGIN
+    inhibited := FALSE;
+    p := 1;
+    eoi := Length(inStr);
+    Insert(' ', inStr, Length(inStr) + 1); {So that inStr[eoi+1] won't blow up}
+    NextToken;
+    WHILE token <> '' DO
+        ParseField;
+END;
+
+
+PROCEDURE WriteDRecord{(numLevels: INTEGER; hDRecord: Handle; posInDRecord: INTEGER;
+                       PROCEDURE SupplyFields(PROCEDURE Field(nameAndType: S255)))};
+
+    VAR fieldInDRecord: INTEGER;
+
+    PROCEDURE WrCkAbort;
+    BEGIN
+        IF KeyPress THEN
+            BEGIN
+            WrStr('...abort...');
+            EXIT(WriteDRecord);
+            END;
+    END;
+
+    PROCEDURE DeclName(token: S8);
+    BEGIN
+        WrCkAbort;
+        WrStr(Concat(token, ': '));
+    END;
+
+    PROCEDURE SkipName(token: S8);
+    BEGIN
+        WrCkAbort;
+    END;
+
+    PROCEDURE DeclBad(token, wanted: S8);
+    BEGIN
+        WrCkAbort;
+        WrLn;
+        WrStr('<<The Field proc expected:');
+        WrStr(Concat(' ''', wanted, ''' '));
+        WrStr('but encountered:');
+        WrStr(Concat(' ''', token, '''>>'));
+    END;
+
+    PROCEDURE DeclType(token: S8; typeCode: TTypeCode; numBytes: INTEGER;
+                       lowerBound, upperBound: INTEGER; memberTypeStr: S255); FORWARD;
+
+    PROCEDURE DeclArray(token: S8; lowerBound, upperBound: INTEGER; memberTypeStr: S255);
+        VAR str1:           S8;
+            str2:           S8;
+            i:              INTEGER;
+            origPos:        INTEGER;
+    BEGIN
+        IF Odd(posInDRecord) THEN
+            posInDRecord := posInDRecord + 1;
+        IntToStr(lowerBound, @str1);
+        IntToStr(upperBound, @str2);
+        WrStr(Concat(token, ' [', str1, '..', str2, '] = {'));
+        FOR i := lowerBound TO upperBound DO
+            BEGIN
+            IF i > lowerBound THEN
+                WrStr(', ');
+            origPos := posInDRecord;
+            IntToStr(i, @str1);
+            ParseDecl(CONCAT(str1, ': ', memberTypeStr), DeclName, DeclType, DeclBad);
+(*****
+            IF Odd(posInDRecord) THEN
+                posInDRecord := posInDRecord + 1;
+*****)
+            END;
+        WrStr('}');
+    END;
+
+    PROCEDURE DeclType(token: S8; typeCode: TTypeCode; numBytes: INTEGER;
+                       lowerBound, upperBound: INTEGER; memberTypeStr: S255);
+        TYPE
+            TAlias =
+                RECORD
+                    CASE TTypeCode OF
+                        yByte:      (asByte:    Byte);
+                        yChar:      (asChar:    CHAR);
+                        yInteger:   (asInteger: INTEGER);
+                        yLongInt:   (asLongInt: LONGINT);
+                        yLPoint:    (asLPoint:  FakeLPoint);
+                        yLRect:     (asLRect:   FakeLRect);
+                        yObject:    (asObject:  TObject);
+                        yPoint:     (asPoint:   FakePoint);
+                        yReal:      (asReal:    REAL);
+                        yRect:      (asRect:    FakeRect);
+                        yString:    (asString:  S255);
+                        END;
+        VAR alias:          ^TAlias;    {a bona fide use for aliasing instead of typecasting}
+            obj:            TObject;
+            str:            S255;
+            i:              INTEGER;
+    BEGIN
+        IF typeCode = yArray THEN
+            BEGIN
+            DeclArray(token, lowerBound, upperBound, memberTypeStr);
+            EXIT(DeclType);
+            END;
+
+        IF token <> '' THEN
+            WrStr(Concat(token, ' = '));
+
+        IF numBytes > 1 THEN
+            IF Odd(posInDRecord) THEN
+                posInDRecord := posInDRecord + 1;
+
+        alias := POINTER(ORD(hDRecord^) + posInDRecord); {Careful, this is a relocatable location!}
+        str := '';
+        CASE typeCode OF
+            yPtr:       BEGIN
+                        LIntToHex(alias^.asLongInt, @str);
+                        str := Concat('$', str);
+                        END;
+            yBoolean:   IF alias^.asByte = ORD(FALSE) THEN
+                            str := 'FALSE'
+                        ELSE
+                            str := 'TRUE';
+            yByte:      IntToStr(alias^.asByte, @str);
+            yHexByte:   BEGIN
+                        LIntToHex(alias^.asByte, @str);
+                        str := CONCAT('$', Copy(str, 7, 2));
+                        END;
+            yChar:      BEGIN
+                        str := 'A';
+                        str[1] := alias^.asChar;
+                        END;
+            yInteger:   IntToStr(alias^.asInteger, @str);
+            yHexInteger:BEGIN
+                        LIntToHex(alias^.asInteger, @str);
+                        str := CONCAT('$', Copy(str, 5, 4));
+                        END;
+            yLongInt:   LIntToStr(alias^.asLongInt, @str);
+            yLPoint:    LPointToStr(alias^.asLPoint, @str);
+            yLRect:     LRectToStr(alias^.asLRect, @str);
+            yObject:    BEGIN
+                        obj := alias^.asObject;
+                        LIntToHex(ORD(obj), @str);
+                        str := Concat('$', str, ' -- ');
+                        IF obj = NIL THEN
+                            str := 'NIL'
+                        ELSE IF NOT ValidObject(Handle(obj)) THEN
+                            str := Concat(str, 'Invalid Object')
+                        ELSE
+                            BEGIN
+                            WrStr(str);
+                            str := '';
+                            obj.Debug(numLevels - 1, memberTypeStr);
+                            END;
+                        END;
+            yPoint:     PointToStr(alias^.asPoint, @str);
+            yRect:      RectToStr(alias^.asRect, @str);
+            yString:    BEGIN
+                        str := Concat('''', alias^.asString, '''');
+                        IF Odd(numBytes) THEN
+                            numBytes := numBytes + 1;
+                        END;
+            yReal:      BEGIN
+                        LIntToStr(Round(alias^.asReal * 1000.0), @str);
+                        FOR i := LENGTH(str) TO 3 DO
+                            Insert('0', str, 1);
+                        Insert('.', str, LENGTH(str)-2);
+                        END;
+            OTHERWISE   DeclBad(token, 'typename');
+            END;
+
+        WrCkAbort;
+        IF str <> '' THEN
+            WrStr(Concat(str, ' '));
+
+        posInDRecord := posInDRecord + numBytes;
+    END;
+
+    PROCEDURE DebugField(nameAndType: S255);
+    BEGIN
+        IF nameAndType <> '' THEN
+            BEGIN
+            fieldInDRecord := fieldInDRecord + 1;
+            IF fieldInDRecord > 1 THEN
+                WrStr('; ');
+            ParseDecl(nameAndType, DeclName, DeclType, DeclBad);
+            WrCkAbort;
+            END
+        ELSE    {Empty string signifies padding to a word boundary, if necessary}
+        IF Odd(posInDRecord) THEN
+            posInDRecord := posInDRecord + 1;
+    END;
+
+BEGIN
+    IF KeyPress THEN
+        Exit(WriteDRecord);
+
+    fieldInDRecord := 0;
+    WrStr('[ ');
+    SupplyFields(DebugField);
+    WrStr('] ');
+END;
+
+
+PROCEDURE DumpVar{(pVariable: Ptr; nameAndType: S255)};
+
+    PROCEDURE SupplyVar(PROCEDURE Field(nameAndType: S255));
+    BEGIN
+        Field(nameAndType);
+    END;
+
+BEGIN
+    currXPos := 0;
+    outputIndent := 20;
+    WriteDRecord(1, @pVariable, 0, SupplyVar);
+    outputIndent := 0;
+    WrLn;
+END;
+{$ENDC}
+
+
+{ ====================================== KITBUG ====================================== }
+
+
+{$IFC fDbgObject}
+PROCEDURE WrStr{(str: S255)};   { Write a STRING with word-wrap }
+    VAR start:  INTEGER;
+        maxLen: INTEGER;
+        len:    INTEGER;
+        total:  INTEGER;
+BEGIN
+    total := Length(str);
+    start := 1;
+    WHILE start <= total DO
+        BEGIN
+        len := total - start + 1;
+        maxLen := outputRMargin - currXPos;
+        IF len > maxLen THEN
+            BEGIN
+            len := maxLen;
+            WHILE (len > 0) AND (str[len] <> ' ') DO
+                len := len - 1;
+            IF (len = 0) AND (currXPos = outputIndent) THEN
+                len := maxLen;
+            END;
+        IF len > 0 THEN
+            BEGIN
+            Write(Copy(str, start, len));
+            currXPos := currXPos + len;
+            start := start + len;
+            END;
+        IF (currXPos >= outputRMargin) OR (start <= total) THEN
+            WrLn;
+        END;
+END;
+
+
+PROCEDURE WrLn;                     { goto next line and output indentation }
+BEGIN
+    WriteLn;
+    IF outputIndent > 0 THEN
+        BEGIN
+        Write(' ':outputIndent);
+        currXPos := outputIndent;
+        END
+    ELSE
+        currXPos := 0;
+END;
+
+
+FUNCTION CheckKeyPress{(routine: S255): BOOLEAN};
+    VAR ch: CHAR;
+BEGIN
+    IF KeyPress THEN
+        BEGIN
+        IF routine <> '' THEN
+            BEGIN
+            WriteLn;
+            WriteLn('   -- ', routine, ' stopped because you typed a key --');
+            WriteLn;
+            END;
+(* commented out and should be removed if paslib bug has been fixed
+        { flush characters; because of PASLIB bug, also stop when user types a ~ }
+        ch := ' ';
+        WHILE KeyPress AND (ch<>'~') DO
+            IF EOLn THEN
+                ReadLn
+            ELSE
+                Read(ch);
+*)
+        CheckKeyPress := TRUE;
+        END
+    ELSE
+        CheckKeyPress := FALSE;
+END;
+
+
+    {$IFC fDebugMethods}
+PROCEDURE WrObj(object: TObject; numLevels: INTEGER; memberTypeStr: S255);
+BEGIN
+    WriteLn;
+    currXPos := 0;
+    outputIndent := 0;
+    IF ValidObject(Handle(object)) THEN
+        BEGIN
+        object.Debug(numLevels, memberTypeStr);
+        IF CheckKeyPress('Display of the object') THEN;
+        END
+    ELSE
+        Write('Not an object: ', ORD(object):1);
+END;
+    {$ENDC}
+
+
+{$S SgCLAini}
+PROCEDURE DumpHeap(heap: THeap; wantedSTP: LONGINT; wantedReference: LONGINT; fPrintSelf: BOOLEAN);
+    VAR hz:             THz;
+        cb:             TC;
+        hndl:           Handle;
+        obj:            TObject;
+        heapSize:       LONGINT;
+        numObjects:     LONGINT;    {Clascal objects only}
+        objOvhdSize:    LONGINT;    {includes master, header, and class pointer}
+        objDataSize:    LONGINT;
+        numOther:       LONGINT;    {Non-Clascal objects}
+        otherSize:      LONGINT;
+        numFree:        LONGINT;
+        freeSize:       LONGINT;
+        bigFreeSize:    LONGINT;
+        bk:             TBk;
+        dumpIt:         BOOLEAN;
+        valid:          BOOLEAN;
+        offset:         INTEGER;
+        base:           LONGINT;
+        hStr:           S8;
+        class:          TClass;
+        className:      TClassName;
+BEGIN
+    WriteLn;
+
+    IF heap = NIL THEN
+        BEGIN
+        WriteLn('The heap pointer is NIL');
+        WriteLn;
+        EXIT(DumpHeap);
+        END;
+
+    hz := THz(heap);
+    heapSize := cbOfHz(hz);
+
+    numObjects := 0;
+    objOvhdSize := 0;
+    objDataSize := 0;
+    numOther := 0;
+    otherSize := 0;
+    numFree := 0;
+    freeSize := 0;
+    bigFreeSize := 0;
+
+    WriteLn('Heap size in bytes: ', heapSize:6);
+    WriteLn('Bytes free:         ', hz^.cbFree:6);
+    WriteLn;
+
+    WriteLn('Heap contents (handle, size in bytes):');
+    WriteLn;
+
+        { setup indentation for writing objects }
+    outputIndent := 17; { '$', ORD(hndl):8, cb:6, ': ' }
+
+    bk := hz^.bkFst;
+    WHILE (ORD(bk) >= ORD(hz^.bkFst)) AND (ORD(bk) <= ORD(hz^.bkLst)) DO
+        BEGIN
+        IF bk^.hdr.tybk <> tybkFree THEN
+            cb := bk^.hdr.cw * 2
+        ELSE
+            cb := bk^.cwFree * 2;
+
+        IF cb <= 0 THEN
+            BEGIN
+            WriteLn('FREE BLOCK ', ORD(bk):1, ' HAS LENGTH', cb);
+            EXIT(DumpHeap);
+            END;
+
+        CASE bk^.hdr.tybk OF
+
+            tybkStd:
+                BEGIN
+{$IFC LibraryVersion <= 20}
+                hndl := Handle(ORD(hz) + bk^.oh);
+{$ELSEC}
+                hndl := Handle(ORD(@hz^.argpPool) + (LONGINT(bk^.bp.ip)*4));
+{$ENDC}
+                valid := ValidObject(hndl);
+
+                IF wantedSTP > 0 THEN
+                    IF valid THEN    {looks like a class pointer; pray that it is!}
+                        dumpIt := %_InObCp(ORD(hndl), wantedSTP)
+                    ELSE
+                        dumpIt := FALSE
+                ELSE
+                IF wantedReference <> 0 THEN
+                    BEGIN
+                    offset := 0;
+                    base := ORD(hndl^);
+                    WHILE (offset < cb) AND (TpLONGINT(base + offset)^ <> wantedReference) DO
+                        offset := offset + 2;
+                    dumpIt := offset < cb;
+                    END
+                ELSE
+                    dumpIt := TRUE;
+
+                IF dumpIt THEN
+                    BEGIN
+                    LIntToHex(ORD(hndl), @hStr);
+                    Write('$', hStr, cb:6, ': ');
+                    IF bk <> TBk(ORD(hndl^) - 4) THEN
+                        BEGIN
+                        WriteLn('INCORRECT BACK POINTER FOR bk = ', ORD(bk):1);
+                        EXIT(DumpHeap);
+                        END;
+
+                    IF valid THEN
+                        BEGIN
+                        obj := TObject(hndl);
+
+                        currXPos := outputIndent;
+
+                        {$IFC fDebugMethods}
+                        IF fPrintSelf THEN
+                            obj.Debug(1, '')
+                        ELSE
+                            obj.Debug(0, '');
+                        {$ELSEC}
+                        class := obj.Class;
+                        CpToCn(TPSliceTable(class), TS8(className));
+                        TrimBlanks(@className);
+                        Write(className);
+                        {$ENDC}
+
+                        numObjects := numObjects + 1;
+                        objOvhdSize := objOvhdSize + 12; {master=4, header=4, classPtr=4}
+                        objDataSize := objDataSize + cb-4;   {classPtr=4}
+                        END
+                    ELSE
+                        BEGIN
+                        numOther := numOther + 1;
+                        otherSize := otherSize + cb;
+                        Write('???');
+                        END;
+
+                    WriteLn;
+                    END;
+                bk := TBk(ORD(hndl^) - 4); {in case the heap compacted during obj.Debug}
+                END;
+
+            tybkFree:
+                BEGIN
+                numFree := numFree + 1;
+                freeSize := freeSize + cb;
+                IF cb > bigFreeSize THEN
+                    bigFreeSize := cb;
+                END;
+
+            OTHERWISE
+                BEGIN
+                numOther := numOther + 1;
+                otherSize := otherSize + cb;
+                END;
+            END;
+
+        bk := TBk(ORD(bk) + cb);
+
+        IF CheckKeyPress('HeapDump') THEN
+            EXIT(DumpHeap);
+        END;
+    WriteLn;
+
+    IF numObjects > 0 THEN
+        BEGIN
+        WriteLn('Number of Clascal objects:         ', numObjects:6);
+        IF wantedReference = 0 THEN
+            BEGIN
+            WriteLn('Bytes in their headers & masters:  ', objOvhdSize:12);
+            WriteLn('Bytes in their records:            ', objDataSize:12);
+            IF objDataSize+objOvhdSize > 0 THEN
+                WriteLn('Header and master overhead:        ',
+                        (100 * objOvhdSize) DIV (objDataSize+objOvhdSize):5, '%');
+            END;
+        WriteLn;
+        END;
+
+    IF (wantedSTP <= 0) AND (wantedReference = 0) THEN
+        BEGIN
+        WriteLn('Number of free blocks:             ', numFree:6);
+        WriteLn('Largest free block:                ', bigFreeSize:6);
+        WriteLn('Bytes in free blocks:              ', freeSize:12);
+        WriteLn;
+        WriteLn('Number of other blocks:            ', numOther:6);
+        WriteLn('Bytes in those blocks:             ', otherSize:12);
+        WriteLn;
+        WriteLn('Other overhead:                    ', heapSize-objOvhdSize-objDataSize-freeSize-otherSize:12);
+        WriteLn('Total heap size in bytes:          ', heapSize:12);
+        WriteLn;
+        END;
+END;
+
+
+{$S SgCLAini}
+PROCEDURE GoKitBug; {intended to be called from LisaBug}
+BEGIN
+    EntDebugger(' ', 'Called from GoKitBug');
+END;
+
+
+{$S SgCLAini}
+PROCEDURE EntDebugger{(inputStr, enterReason: S255)};
+    LABEL 99;
+    CONST   null = CHR(0);
+    VAR token:      S255;
+        cState:     TConvResult;
+        timeToGo:   BOOLEAN;
+        brClass:    S8;
+        brMethod:   S8;
+
+    PROCEDURE GetToken;
+        VAR endOfToken: INTEGER;
+    BEGIN
+        token := '';
+        WHILE Pos(' ', inputStr) = 1 DO
+            Delete(inputStr,1,1);
+        endOfToken := Pos(' ', inputStr)-1;
+        IF endOfToken <= 0 THEN
+            endOfToken := Length(inputStr);
+        token := Copy(inputStr, 1, endOfToken);
+        Delete(inputStr, 1, endOfToken);
+    END;
+
+    PROCEDURE DebugStatus;
+        VAR i: INTEGER;
+    BEGIN
+        IntToStr(curTraceLevel, @token);
+        Write('Watch Level = ',token);
+        IntToStr(defTraceCount, @token);
+        WriteLn(', Watch Count = ',token);
+        FOR i := 1 TO breakMCount DO
+            WITH breakMethods[i] DO
+                IF (brClass <> '') OR (brMethod <> '') THEN
+                    WriteLn(i:3, ': ', brClass:8,'.',brMethod:8)
+    END;
+
+    PROCEDURE ClearBreaks;
+        VAR brNumber:   INTEGER;
+            cState:     TConvResult;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Clear which breakpoint [A for all breakpoints]? ');
+            ReadLn(token);
+            END;
+
+        TrimBlanks(@token);
+        StrUpperCased(@token);
+
+        IF token <> '' THEN
+            IF token[1] = 'A' THEN
+                breakMCount := 0
+            ELSE
+                BEGIN
+                StrToInt(@token, brNumber, cState);
+                IF cState = cvValid THEN
+                    IF (brNumber >= 1) AND (brNumber <= breakMCount) THEN
+                        WITH breakMethods[brNumber] DO
+                            BEGIN
+                            brClass := '';
+                            brMethod := '';
+
+                            IF brNumber = breakMCount THEN
+                                breakMCount := breakMCount - 1;
+                            END;
+                END;
+    END;
+
+    { get input up to the first '.'; if non-null convert to 8 characters;
+        prompt user with argument if there is no pending input }
+    PROCEDURE GetOne(prompt: S255);
+        VAR i:  INTEGER;
+    BEGIN
+        GetToken;
+
+        IF token = '' THEN
+            BEGIN
+            Write(prompt);
+            ReadLn(token);
+            END;
+
+        i := Pos('.', token);
+
+        IF i > 0 THEN
+            BEGIN
+            inputStr := Concat(Copy(token, i + 1, Length(token) - i), inputStr);
+            token := Copy(token, 1, i - 1);
+            END;
+
+        TrimBlanks(@token);
+        IF token <> '' THEN
+            BEGIN
+            StrUpperCased(@token);
+            token := Copy(Concat(token, '       '), 1, 8);
+            END;
+    END;
+
+    PROCEDURE BrSetup(prompt: S255);
+        VAR brNumber:   INTEGER;
+
+        FUNCTION MoreThanAClass: Boolean;
+        BEGIN
+            MoreThanAClass := TRUE;
+            IF length(inputstr) > 0 THEN
+                IF inputstr[length(inputstr)] = '.' THEN
+                BEGIN
+                    GetOne(Concat(prompt,' what Class?'));
+                    WITH breakMethods[brNumber] DO
+                        BEGIN
+                        brClass := token;
+                        brMethod := '';
+                        END;
+                    MoreThanAClass := FALSE;
+                END;
+        END;
+
+    BEGIN
+        FOR brNumber := 1 TO maxBreaks DO
+            WITH breakMethods[brNumber] DO
+                IF (brNumber > breakMCount) OR ((brClass='') AND (brMethod='')) THEN
+                    BEGIN
+                    IF MoreThanAClass THEN
+                        BEGIN
+                        GetOne(Concat(prompt,' what Class?'));
+                        brClass := token;
+                        GetOne(Concat(prompt,' what Method?'));
+                        brMethod := token;
+                        END;
+                    IF (brClass <> '') OR (brMethod <> '') THEN
+                        breakMCount := Max(breakMCount, brNumber);
+                    lastBpPc := 0;
+                    lastEpPc := 0;
+                    EXIT(BrSetup);
+                    END;
+
+        WriteLn('Too Many Breaks Defined, you must first clear a breakpoint')
+    END;
+
+    PROCEDURE TraceOrNot;
+        VAR i: INTEGER;
+    BEGIN
+        GetToken;
+        StrToInt(@token, i, cState);
+        IF cState = cvValid THEN
+            BEGIN
+            defTraceCount := i;
+            GetToken;
+            END
+        ELSE
+            defTraceCount := 0;
+
+        returnToMain := TRUE;
+        fTraceSelf := FALSE;
+        fTraceClass := FALSE;
+        WHILE token <> '' DO
+            BEGIN
+            StrUpperCased(@token);
+            IF token[1] = 'A' THEN {Stay on Alternate Screen During Trace}
+                returnToMain := FALSE
+            ELSE
+            IF token[1] = 'C' THEN {Print Class with Trace}
+                fTraceClass := TRUE
+            ELSE
+            IF token[1] = 'F' THEN {Print Fields with Trace}
+                fTraceSelf := TRUE;
+            GetToken;
+            END;
+
+        fTraceEnabled := TRUE;
+        traceCount := defTraceCount;
+    END;
+
+    PROCEDURE Level;
+        VAR i: INTEGER;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Lowest BP level to watch (1..9999)? ');
+            ReadLn(token);
+            END;
+        StrToInt(@token, i, cState);
+        IF cState = cvValid THEN
+            IF (i >= 1) AND (i <= 32000) THEN
+                curTraceLevel := i;
+    END;
+
+    FUNCTION  YesNo(prompt: S255): BOOLEAN;
+    BEGIN
+        REPEAT
+            GetOne(Concat(prompt, '? [Y/N]: '));
+            IF token = '' THEN
+                GOTO 99;
+          UNTIL token[1] IN ['Y', 'N'];
+        YesNo := token[1] = 'Y';
+    END;
+
+    PROCEDURE PromptOnOff;
+    BEGIN
+        showPrompt := YesNo('Show Debugger Prompt');
+    END;
+
+    {$IFC fDebugMethods}
+    PROCEDURE Inspect;
+    VAR lh: LONGINT;
+        d:  INTEGER;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Handle to inspect [depth] [member decl]? ');
+            Readln(inputStr);
+            GetToken;
+            END;
+
+        HexStrToLInt(@token, lh, cState);
+        IF cState <> cvValid THEN
+            BEGIN
+            WriteLn('Not a hex number');
+            Exit(Inspect);
+            END
+        ELSE
+            GetToken;
+
+        StrToInt(@token, d, cState);
+        IF cState <> cvValid THEN
+            d := 1;
+
+        IF ValidObject(Handle(lh)) THEN
+            BEGIN
+            WrObj(TObject(lh), d, inputStr);
+            Writeln;
+            END
+        ELSE
+            Writeln('Invalid Object');
+        Writeln;
+    END;
+    {$ENDC}
+
+
+    PROCEDURE TallyAndTime;
+    BEGIN
+        tallyingCalls := FALSE;
+        IF tallies <> NIL THEN
+            BEGIN
+            IF YesNo('Do you want to see performance measurements now') THEN
+                TallyReport;
+            IF YesNo('Do you want to zero the tallies and times') THEN
+                TallyZero;
+            END;
+        IF YesNo('Do you want to continue execution and measure its performance') THEN
+            TallyStart;
+        WriteLn;
+    END;
+
+    PROCEDURE RefsToObject;
+    VAR lh: LONGINT;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Handle of the object whose every Reference from the same heap should be dumped? ');
+            Readln(inputStr);
+            GetToken;
+            END;
+
+        HexStrToLInt(@token, lh, cState);
+        IF cState <> cvValid THEN
+            BEGIN
+            WriteLn('Not a hex number');
+            Exit(RefsToObject);
+            END;
+
+        IF ValidObject(Handle(lh)) THEN
+            DumpHeap(TObject(lh).Heap, -1, lh, TRUE)
+        ELSE
+            Writeln('Invalid Object');
+        Writeln;
+    END;
+
+    FUNCTION  StackFrame(whichFrame: INTEGER): LONGINT;
+        { Returns address of stack frame 'whichFrame' (>=-1);
+            whichFrame < 0 returns -1.
+            whichFrame = 1 is the top frame not belonging to the debugger itself.
+                When called from ABCBREAK, the caller of ABCBREAK is frame 1;
+                When called from BEPSN, the caller of BP or EP is frame 1.
+            whichFrame = 2 is the caller of frame 1, and so on.
+            If whichFrame is greater than # frames, returns -1.
+            If neither ABCBREAK nor BEPSN is on the stack, returns -1.}
+        VAR dummy:          INTEGER;    { must be first local and two bytes long }
+            RA6:            LONGINT;
+            RA5:            LONGINT;
+            i:              INTEGER;
+            className:      TClassName;
+            procName:       S8;
+            startCount:     BOOLEAN;
+            frameReference: INTEGER;
+            nextPC:         LONGINT;
+    BEGIN
+        StackFrame := -1;       { default return }
+        frameReference := 0;
+        startCount := FALSE;
+
+        RA5 := %_GetA5;
+        RA6 := ORD(@dummy)+2;   { stack frame called by current one; start with my stack frame }
+        WHILE (whichFrame >= frameReference) AND (RA6 <> RA5) DO
+            BEGIN
+            IF NOT startCount THEN
+                BEGIN
+                IF GetDollarD(TppINTEGER(RA6), className, procName, nextPC) THEN { is this frame 0? }
+                    IF (className = '') AND ((procName = 'BEPSN   ') OR (procName = 'ABCBREAK'))THEN
+                        BEGIN
+                        startCount := TRUE; { yes }
+                        IF procName = 'BEPSN   ' THEN
+                            frameReference := -1;
+                        END;
+                END;
+
+            RA6 := TpLONGINT(RA6)^;    { preceding stack frame }
+
+            IF startCount THEN
+                BEGIN
+                IF whichFrame = frameReference THEN
+                    StackFrame := RA6;
+                whichFrame := whichFrame - 1;
+                END;
+            END;
+    END;
+
+    PROCEDURE WrMemory(start: LONGINT; numBytes: INTEGER; checkAddresses: BOOLEAN);
+        VAR addr:       LONGINT;
+            str:        S255;
+            asChars:    STRING[16];
+            extdWord:   LONGINT;
+            overflow:   BOOLEAN;
+            fullBytes:  INTEGER;
+
+        FUNCTION Byte2Char(n: INTEGER): CHAR;
+        BEGIN
+            IF (n < 32) OR (n > ORD('~')) THEN
+                Byte2Char := 'е'
+            ELSE
+                Byte2Char := CHR(n);
+        END;
+
+        {$R-}
+        PROCEDURE AddCh(s: TPString; ch: CHAR; maxStrLeng: INTEGER; VAR overflow: BOOLEAN);
+            BEGIN
+            overflow := TRUE;
+            IF Length(s^) < maxStrLeng THEN
+                BEGIN
+                overflow := FALSE;
+                s^[0] := CHR(ORD(s^[0]) + 1);
+                s^[ORD(s^[0])] := ch;
+              END;
+          END;
+          {$IFC fRngObject} {$R+} {$ENDC}
+
+    BEGIN
+        { start at an even address and fullBytes a multiple of 16 >= numBytes }
+
+        addr := (start DIV 2) * 2;
+
+        IF checkAddresses THEN
+            IF NOT ValidDataAddress(addr) THEN
+                IF NOT ValidGlobalAddress(addr) THEN
+                    BEGIN
+                    WriteLn;
+                    WriteLn('*** That address is neither in a data segment nor in the stack/global segment. ***');
+                    WriteLn;
+                    EXIT(WrMemory);
+                    END;
+
+        fullBytes := ((numBytes + 15) DIV 16) * 16;
+
+        WHILE fullBytes > 0 DO
+            BEGIN
+            IF fullBytes MOD 16 = 0 THEN
+                BEGIN
+                LIntToHex(addr, @str);
+                Write('  ', str, '   ');
+                asChars := '';
+                END;
+
+            IF checkAddresses THEN
+                IF NOT ValidDataAddress(addr) THEN
+                    IF NOT ValidGlobalAddress(addr) THEN
+                        WHILE numBytes > 0 DO
+                            BEGIN
+                            Write('ееее ');
+                            AddCh(@asChars, 'е', 16, overflow);
+                            AddCh(@asChars, 'е', 16, overflow);
+                            numBytes := numBytes - 2;
+                            fullBytes := fullBytes - 2;
+                            END;
+
+            IF numBytes <= 0 THEN
+                WHILE fullBytes > 0 DO
+                    BEGIN
+                    Write('     ');
+                    AddCh(@asChars, ' ', 16, overflow);
+                    AddCh(@asChars, ' ', 16, overflow);
+                    fullBytes := fullBytes - 2;
+                    END;
+
+            IF fullBytes > 0 THEN
+                BEGIN
+                extdWord := LIntAndLInt(TpINTEGER(addr)^, $0000FFFF);
+                LIntToHex(extdWord, @str);
+                Delete(str, 1, 4);  {4 leading zeros}
+                Write(str, ' ');
+
+                AddCh(@asChars, Byte2Char(extdWord DIV 256), 16, overflow);
+                AddCh(@asChars, Byte2Char(extdWord MOD 256), 16, overflow);
+
+                addr := addr + 2;
+                fullBytes := fullBytes - 2;
+                numBytes := numBytes - 2;
+                END;
+
+            IF fullBytes MOD 16 = 0 THEN
+                WriteLn('   |', asChars, '|');
+            END;
+
+        WriteLn;
+    END;
+
+    FUNCTION WrFrame(whichFrame: INTEGER; full: BOOLEAN): BOOLEAN;
+        { Write a frame given its number; return TRUE if that frame exists }
+        VAR RA5:            LONGINT;
+            calledA6:       LONGINT;
+            addr:           LONGINT;
+            laterA6:        LONGINT;
+            earlierA6:      LONGINT;
+            hexStr:         S8;
+            gotMainProg:    BOOLEAN;
+            className:      TClassName;
+            methName:       S8;
+            procName:       S255;
+            procStart:      LONGINT;
+            frameSELF:      TObject;
+            class:          TClass;
+            nextPC:         LONGINT;
+            localBytes:     INTEGER;
+            paramBytes:     INTEGER;
+            selfBytes:      INTEGER;
+
+    PROCEDURE SwapIn(valueString: S8);
+        BEGIN
+        END;
+
+    BEGIN
+        RA5 := %_GetA5;
+        calledA6 := StackFrame(whichFrame-1);       { A6 of frame called by desired frame }
+        IF (whichFrame < 1) OR (calledA6 = -1) OR (calledA6 = RA5) THEN
+            BEGIN
+            WrFrame := FALSE;
+            EXIT(WrFrame);
+            END;
+        WrFrame := TRUE;
+
+        addr := calledA6;
+        LIntToHex(TpLONGINT(addr)^, @hexStr);
+        Write('Frame # ', whichFrame:3, ' @ $', hexStr, '  ');
+        gotMainProg := TpLONGINT(addr)^ = RA5;    { stack frame for main prog starts at A5 }
+
+        { find called-from address }
+        IF GetDollarD(TppINTEGER(calledA6), className, methName, nextPC) THEN
+            IF className = '' THEN
+                procName := methName
+            ELSE
+                procName := Concat(className, '.', methName)
+        ELSE
+            procName := '';
+
+        IF procName <> '' THEN
+            BEGIN
+            Write(procName:17);
+
+            { search back in code for TST.W <n>(A7) and LINK A6,<m> instructions }
+            addr := calledA6+4;
+            addr := TpLONGINT(addr)^;
+      {$R-} SwapIn(TPS8(addr)^); {$IFC fRngObject} {$R+} {$ENDC} {Be sure the code is swapped in}
+            procStart := 0;
+            WHILE procStart = 0 DO
+                BEGIN
+                addr := addr - 2;
+
+                IF TpINTEGER(addr)^ = $4E56 { LINK A6,<n> } THEN
+                    { found LINK, so numLocal is now set correctly, and
+                      start of PROCEDURE is 4 bytes back (auto stack expansion) }
+                    procStart := addr - 4;
+                END;
+
+            IF gotMainProg THEN
+                procStart := procStart + 4;         { main prog has no stack expansion }
+
+            addr := calledA6+4;
+            LintToHex(TpLONGINT(addr)^-4 - procStart, @hexStr);
+            Delete(hexStr, 1, Length(hexStr)-4);       { only want the lower 4 digits of hex number }
+            Write('+ $', hexStr);
+
+            { advance to next stack frame now, so we can get at its variables }
+            laterA6 := calledA6;
+            calledA6 := TpLONGINT(laterA6)^;
+            IF calledA6 = RA5 THEN
+                earlierA6 := RA5
+            ELSE
+                earlierA6 := TpLONGINT(calledA6)^;
+
+            frameSELF := NIL;
+            IF (className <> '') AND (procName <> 'CREATE  ') THEN { regular method }
+                BEGIN
+                addr := calledA6+8;
+                IF ValidObject(Handle(TpLONGINT(addr)^)) THEN
+                    frameSELF := TObject(TpLONGINT(addr)^);
+                END;
+
+            IF frameSELF <> NIL THEN
+                BEGIN
+                LIntToHex(ORD(frameSELF), @hexStr);
+                class := frameSELF.Class;
+                CpToCn(TPSliceTable(class), TS8(className));
+                Write('  (', className, ': $', hexStr, ')');
+                END;
+
+            IF full THEN
+                BEGIN
+                {$IFC fDebugMethods}
+                WriteLn;
+                IF frameSELF <> NIL THEN
+                    BEGIN
+                    Write('SELF = ');
+                    currXPos := 7;
+                    outputIndent := 7;
+                    frameSELF.Debug(1, '');
+                    WriteLn;
+                    END;
+                {$ENDC}
+
+                localBytes := Max(0, Min(ORD(calledA6 - (laterA6 + 8)), $50));
+                paramBytes := Max(0, Min(ORD(earlierA6 - (calledA6 + 8)), $50));
+                selfBytes := 4 * ORD(frameSELF <> NIL);
+                WriteLn;
+                WriteLn('LOCALS (First declared local is listed last):');
+                WrMemory(calledA6 - localBytes, localBytes, FALSE);
+                WriteLn('PARAMETERS (Last declared parameter is listed first):');
+                WrMemory(calledA6 + 8 + selfBytes, paramBytes - selfBytes, FALSE);
+                END;
+            END;
+
+        WriteLn;
+    END;
+
+    PROCEDURE StackCrawl;
+        VAR frNum:          INTEGER;
+    BEGIN
+        frNum := 1;
+        WHILE WrFrame(frNum, FALSE) DO
+            frNum := frNum + 1;
+        WriteLn;
+    END;
+
+    PROCEDURE FrameDump;
+        VAR i:      INTEGER;
+            frame:  LONGINT;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Frame number to dump? ');
+            ReadLn(token);
+            END;
+        StrToInt(@token,i,cState);
+        IF cState = cvValid THEN
+            BEGIN
+            IF (i >= 1) THEN
+                IF NOT WrFrame(i, TRUE) THEN
+                    WriteLn('Frame number was too large');
+            END;
+        WriteLn;
+    END;
+
+    PROCEDURE ToPrinter;
+        VAR errnum:     INTEGER;
+            outfname:   PathName;
+
+{$IFC LibraryVersion <= 20}
+            { Paslib initialization done in the WorkShop that is not done in the DeskTop manager }
+        PROCEDURE TellPaslibPrinterLocation;
+            CONST
+                AlreadyMounted = 1052;
+
+            VAR
+                errnum:       INTEGER;                          { error return }
+                tp:           TPORTS;
+                devname:      E_Name;
+                vname:        E_Name;
+                password:     E_Name;
+                tdt:          TDeviceType;
+                tdi:          TDeviceInfo;
+                dsp:          DsProcParam;
+                DevControl:   DcType;
+                path:         PathName;
+
+        BEGIN
+            FOR tp := uppertwig TO t_extra3 DO
+                BEGIN
+                Get_config_name(errnum,tp,devname);
+                IF errnum <= 0 THEN
+                    BEGIN
+                    PMReadConfig(tp,tdt,tdi);
+                    IF tdt IN [DMPrinter,Typer] THEN
+                        BEGIN
+                        Mount(errnum, vname, password, devname);
+                        IF (errnum <= 0) or (errnum = AlreadyMounted) THEN
+                            BEGIN
+                            dsp.proccode := dsPrintDev;
+                            dsp.PrDevice := Concat('-', devname);
+                            DSPaslibCall(dsp);
+                            WITH DevControl DO
+                                BEGIN
+                                path := Concat('-',devname,'-x'); {OD}
+                                dcversion := 2;
+                                dccode := 17;   {auto LF disable}
+                                dcdata[0] := 1;
+                                Device_Control(errnum,path,DevControl);
+                                CASE tp OF
+                                  seriala,serialb:
+                                    BEGIN
+                                      dccode := 5;
+                                      dcdata[0] := 9600;
+                                      Device_control(errnum,path,devcontrol); {baud rate}
+                                      dccode := 2;
+                                      Device_control(errnum,path,devcontrol); {DTR}
+                                      dccode := 1;
+                                      dcdata[0] := 0;
+                                      Device_control(errnum,path,devcontrol); {8-bit no-parity}
+                                      dccode := 12;
+                                      dcdata[0] := 60;
+                                      Device_control(errnum,path,devcontrol); {time out}
+                                      dccode := 10;
+                                      dcdata[0] := 0;
+                                      dcdata[1] := -128;
+                                      Device_control(errnum,path,devcontrol); {disconnect detect}
+                                    END;
+                                END {CASE}
+                            END;
+                        EXIT(TellPaslibPrinterLocation);
+                        END
+                    ELSE
+                        WriteLn('Error number ',errnum,' mounting ',devname);
+                    END;
+                END
+            END;
+        END { TellPaslibPrinterLocation };
+{$ELSEC} {Spring Version}
+            { Paslib initialization done in the WorkShop that is not done in the DeskTop manager }
+        PROCEDURE TellPaslibPrinterLocation;
+            CONST
+                AlreadyMounted = 1052;
+                cdSerialCable = 32;
+
+            TYPE
+                TExtWords = PACKED RECORD
+                        isPrinter:  BOOLEAN;
+                        isDefault:  BOOLEAN;
+                        driverID:   -8192..8191;
+                        END;
+
+            VAR
+                errnum:         INTEGER;  { error return }
+                nextEntry:      LONGINT;
+                config:         ConfigDev;
+                pExtWords:      ^TExtWords;
+                vname:          E_Name;
+                password:       E_Name;
+                devControl:     DcType;
+                dsp:            DsProcParam;
+                path:           Pathname;
+        BEGIN
+            nextEntry := 0;
+            REPEAT
+                PmReadConfig(errnum, nextEntry, config);
+                IF errnum <= 0 THEN
+                    IF config.nExtWords >= 1 THEN
+                        BEGIN
+                        pExtWords := @config.extWords[1];
+                        IF pExtWords^.isPrinter THEN
+                            BEGIN
+                            Mount(errnum, vname, password, config.devname);
+                            IF (errnum <= 0) or (errnum = AlreadyMounted) THEN
+                                BEGIN
+                                dsp.proccode := dsPrintDev;
+                                dsp.PrDevice := Concat('-', config.devname);
+                                DSPaslibCall(dsp);
+                                WITH devControl DO
+                                    BEGIN
+                                    path := Concat('-', config.devname, '-x'); {OD}
+                                    dcversion := 2;
+                                    dccode := 17;   {auto LF disable}
+                                    dcdata[0] := 1;
+                                    Device_Control(errnum, path, devControl);
+
+                                    IF config.driverID = cdSerialCable THEN
+                                        BEGIN
+                                        dccode := 5;
+                                        dcdata[0] := 9600;
+                                        Device_control(errnum,path,devcontrol); {baud rate}
+                                        dccode := 2;
+                                        Device_control(errnum,path,devcontrol); {DTR}
+                                        dccode := 1;
+                                        dcdata[0] := 0;
+                                        Device_control(errnum,path,devcontrol); {8-bit no-parity}
+                                        dccode := 12;
+                                        dcdata[0] := 60;
+                                        Device_control(errnum,path,devcontrol); {time out}
+                                        dccode := 10;
+                                        dcdata[0] := 0;
+                                        dcdata[1] := -128;
+                                        Device_control(errnum,path,devcontrol); {disconnect detect}
+                                        END; {IF config.driverID = cdSerialCable}
+                                    END; {WITH devControl DO}
+                                END {IF (errnum <= 0) or (errnum = AlreadyMounted) THEN}
+                            ELSE
+                                WriteLn('Error number ', errnum, ' mounting ', config.devname);
+                            END; {IF pExtWords^.isPrinter THEN}
+                        END; {IF config.nExtWords >= 1 THEN}
+            UNTIL errnum > 0;
+        END { TellPaslibPrinterLocation };
+{$ENDC}
+
+    BEGIN
+        GetToken;
+        outfname := token;
+        IF token = '' THEN
+            BEGIN
+            Write('Name of file to send output to? [-console] ');
+            ReadLn(outfname);
+            END;
+        IF outfname = '' THEN
+          OutputRedirect(errnum,outfname,TRUE)
+        ELSE
+          BEGIN
+            StrUpperCased(@outfname);
+            IF outfname = '-PRINTER' THEN
+              TellPaslibPrinterLocation;
+            OutputRedirect(errnum,outfname,FALSE);
+          END;
+        IF errnum > 0 THEN
+            BEGIN
+            IF outfname = '' THEN
+                outfname := '-CONSOLE';
+            WriteLn('Error number ',errnum,' redirecting output to ',outfname);
+            END;
+    END;
+
+    PROCEDURE MemoryDump;
+        VAR start:      LONGINT;
+            numBytes:   LONGINT;
+    BEGIN
+        GetToken;
+        IF token = '' THEN
+            BEGIN
+            Write('Starting address [# bytes]? ');
+            Readln(inputStr);
+            GetToken;
+            END;
+
+        HexStrToLInt(@token, start, cState);
+        IF cState <> cvValid THEN
+            Exit(MemoryDump)
+        ELSE
+            GetToken;
+
+        HexStrToLInt(@token, numBytes, cState);
+        IF cState <> cvValid THEN
+            numBytes := $10;
+
+        WrMemory(start, numBytes, TRUE);
+    END;
+
+    PROCEDURE HeapDump;
+        VAR allInfo:        BOOLEAN;
+            wantedSTP:      LONGINT; {-1 for all classes}
+            allHeaps:       BOOLEAN;
+            index:          INTEGER;
+            heap:           THeap;
+            dumpDocHeap:    BOOLEAN;
+    BEGIN
+        allInfo := TRUE;
+        wantedSTP := -1;
+        allHeaps := TRUE;
+
+        GetToken;
+        IF token <> '' THEN
+            BEGIN
+            allHeaps := FALSE;
+            TrimBlanks(@token);
+            StrUpperCased(@token);
+            index := CiOfCn(Copy(Concat(token, '       '), 1, 8));
+            IF index > 0 THEN
+                wantedSTP := ORD(hMySTables^^.records[index])
+            ELSE
+                BEGIN
+                WriteLn('No such class!');
+                EXIT(HeapDump);
+                END;
+            END;
+
+        IF allHeaps THEN
+            IF NOT YesNo('All classes') THEN
+                WHILE wantedSTP <= 0 DO
+                    BEGIN
+                    GetOne('Which class?');
+                    IF token = '' THEN
+                        GOTO 99
+                    ELSE
+                        BEGIN
+                        index := CiOfCn(token);
+                        IF index > 0 THEN
+                            wantedSTP := ORD(hMySTables^^.records[index])
+                        ELSE
+                            WriteLn('No such class!');
+                        END;
+                    END;
+
+        {$IFC fDebugMethods}
+        IF wantedSTP <= 0 THEN
+            allInfo := YesNo('Dump fields as well as class of each object');
+        {$ELSEC}
+        allInfo := FALSE;
+        {$ENDC}
+
+        IF allHeaps THEN
+            IF YesNo('Dump Process Heap') THEN
+                DumpHeap(mainHeap, wantedSTP, 0, allInfo);
+
+        IF isInitialized THEN
+            BEGIN
+            IF allHeaps THEN
+                dumpDocHeap := YesNo('Dump Active Document Heap')
+            ELSE
+                dumpDocHeap := TRUE;
+
+            IF dumpDocHeap THEN
+                BEGIN
+                heap := BindHeap(TRUE, TRUE);
+                IF heap = NIL THEN
+                    BEGIN
+                    WriteLn('There is no active document heap!');
+                    WriteLn;
+                    WriteLn;
+                    END
+                ELSE
+                    DumpHeap(heap, wantedSTP, 0, allInfo);
+                END;
+
+            IF allHeaps THEN
+                IF YesNo('Dump Clipboard Heap') THEN
+                    BEGIN
+                    heap := BindHeap(FALSE, TRUE);
+                    IF heap = NIL THEN
+                        BEGIN
+                        WriteLn('There is no clipboard heap!  Maybe no cut/copy has been done since booting.');
+                        WriteLn;
+                        END
+                    ELSE
+                        DumpHeap(heap, wantedSTP, 0, allInfo);
+                    heap := BindHeap(FALSE, FALSE);
+                    END;
+            END
+        ELSE
+            BEGIN
+            WriteLn('There is no document or clipboard heap because the process is not fully initialized');
+            WriteLn;
+            END;
+    END;
+
+BEGIN {EntDebugger}
+    SetScreenKeybd(altscrn);
+    traceCount := defTraceCount;
+    timeToGo := FALSE;
+    WriteLn;
+    WriteLn('ToolKit Debugger - ',enterReason);
+
+    { flush characters; because of PASLIB bug, also stop when user types a ~ }
+(*  commented out as a test case to see if still needed here
+    IF CheckKeyPress('') THEN;
+*)
+
+    IF tallyingCalls THEN
+        BEGIN
+        TallyAndTime;
+        returnToMain := tallyingCalls;
+        END;
+
+    IF NOT tallyingCalls THEN
+        BEGIN
+        REPEAT
+            IF NOT timeToGo THEN
+                BEGIN
+                IF showPrompt THEN
+                    BEGIN
+                    WriteLn('B)reakpoint, C)learBreakpoints [breakpoint #/ALL], D)ebugStatus, E)nterLisabug,');
+                    {$IFC fDebugMethods}
+                    WriteLn('     F)rameDump, G)o, H)eapDump [class], I)nspectObject, L)evelsToWatch,');
+                    {$ELSEC}
+                    WriteLn('     F)rameDump, G)o, H)eapDump [class], L)evelsToWatch,');
+                    {$ENDC}
+                    WriteLn('     M)emoryDump <location> [# bytes], O)utputTo, P)rompt [Y/N], R)efsToObject,');
+                    WriteLn('     S)tackCrawl, T)ally & Time, W)atch [count] [A)ltScreen] [C)lass] [F)ields]');
+                    END;
+                Write('-->');
+                ReadLn(inputStr);
+                END;
+            GetToken;
+            IF token <> '' THEN
+                CASE CharUpperCased(token[1]) OF
+                    null:   GoKitBug;   {don't expect people to type this command, but this
+                                            will guarantee that the Linker does not flush
+                                            the GoKitBug procedure}
+                    'B':    BrSetup('Break on');
+                    'C':    ClearBreaks;
+                    'D':    DebugStatus;
+                    'E':    %_GoLisabug;
+                    'F':    FrameDump;
+                    'G':    BEGIN
+                            fTraceEnabled := FALSE;
+                            defTraceCount := 0;
+                            traceCount := defTraceCount;
+                            returnToMain := TRUE;
+                            timeToGo := TRUE;
+                            END;
+
+                    'H':    HeapDump;
+                    {$IFC fDebugMethods}
+                    'I':    Inspect;
+                    {$ENDC}
+                    'L':    Level;
+                    'M':    MemoryDump;
+                    'O':    ToPrinter;
+                    'P':    PromptOnOff;
+                    'R':    RefsToObject;
+                    'S':    StackCrawl;
+                    'T':    BEGIN
+                            TallyAndTime;
+                            timeToGo := tallyingCalls;
+                            END;
+
+                    'W':    BEGIN
+                            TraceOrNot;
+                            timeToGo := TRUE;
+                            END;
+
+                    'X':    timeToGo := TRUE;
+                    END;
+            99:
+          UNTIL timeToGo;
+        END;
+
+    IF tallyingCalls THEN
+        BEGIN
+        fTraceEnabled := FALSE;
+        defTraceCount := 0;
+        traceCount := defTraceCount;
+        returnToMain := TRUE;
+        END;
+
+    IF returnToMain THEN
+        SetScreenKeybd(priscrn);
+
+END; {EntDebugger}
+{$S SgCLAdbg}
+
+
+FUNCTION  AKeyPress: BOOLEAN;
+    VAR tb: BOOLEAN;
+BEGIN
+    AKeyPress := FALSE;
+    IF kpcntr >= keyPresLimit THEN
+        BEGIN
+        tb := KeyPress;
+            { force call to keyPress until press is dealt with }
+        IF NOT tb THEN
+            kpcntr := 0;
+        AKeyPress := tb;
+        END
+    ELSE
+        kpcntr := kpcntr + 1
+END;
+
+
+{ ====================================== BP -- EP ====================================== }
+
+
+{$IFC fTrace}
+PROCEDURE BEPSN(odummy: LONGINT; fBegin, displayIt: BOOLEAN);
+    VAR receiver:       TObject;
+        caller:         TpLONGINT;
+        i:              INTEGER;
+        className:      TClassName;
+        procName:       S8;
+        toDebugger:     BOOLEAN;
+        nextPC:         LONGINT;
+
+      { See if this is the method to start tracing at }
+    PROCEDURE BreakHere;
+        VAR ts:     S16;
+            i:      INTEGER;
+            found:  BOOLEAN;
+    BEGIN
+        found := FALSE;
+        FOR i := 1 TO breakMCount DO
+            BEGIN
+            WITH breakMethods[i] DO
+                { NOTE: if both brClass and brMethod are '', then the iTH breakpoint is unassigned }
+                IF brClass = '' THEN
+                    found :=  (brMethod = procName) AND (brMethod <> '')
+                ELSE
+                IF brMethod = '' THEN
+                    found := brClass = className
+                ELSE
+                    found := (brClass = className) AND (brMethod = procName);
+            IF found THEN
+                BEGIN
+                displayIt := TRUE;
+                toDebugger := TRUE;
+                returnToMain := TRUE;
+                fTraceSelf := FALSE;
+                fTraceClass := TRUE;
+                lastBpPc := 0;
+                lastEpPc := 0;
+                EXIT(BreakHere)
+                END
+            END
+    END;
+
+    PROCEDURE WriteOutDebugInfo;
+        CONST maxIndent = 70;
+        VAR i:      INTEGER;
+            hexStr: S8;
+    BEGIN
+        WriteLn;
+        indentTrace := CMin(tabLevel, maxIndent + 5);
+
+        IF tabLevel <= trLevMemory THEN
+            Write(traceLevels[tablevel]:4, ' ')
+        ELSE
+            Write('     ');
+
+        Write(' ': CMin(tabLevel, maxIndent));
+
+        IF tabLevel > maxIndent + 5 THEN
+            Write(tabLevel:4, ' ')
+        ELSE
+        IF indentTrace > maxIndent THEN
+            Write(' ': indentTrace - maxIndent);
+
+        IF fBegin THEN
+            Write('BEGIN ')
+        ELSE
+            Write('END   ');
+        {$IFC fDebugMethods}
+        currXPos := indentTrace + 11 {5 for level #; 6 for BEGIN/END};
+        {$ENDC}
+
+        IF className<>'' THEN
+            BEGIN
+            Write(className, '.');
+            {$IFC fDebugMethods}
+            currXpos := currXPos + 9;
+            {$ENDC}
+            END;
+        Write(procName);
+        {$IFC fDebugMethods}
+        currXPos := currXPos + 8;
+        {$ENDC}
+
+        IF (fTraceSelf OR fTraceClass) AND (receiver <> NIL) THEN
+            IF (procName<>'DEBUGOBJ') AND (procName<>'DEBUG   ') AND (procName<>'FIELDS  ') AND
+               (fBegin OR ((procName<>'FREEOBJE') AND (procName<>'FREE    '))) THEN
+                BEGIN
+                {$IFC fDebugMethods}
+                Write('(');
+                currXPos := currXPos + 1;
+
+                IF (procName <> 'FREEOBJE') AND fTraceSelf THEN
+                    BEGIN
+                    outputIndent := currXPos;
+                    receiver.Debug(1, '');
+                    END
+                ELSE
+                    BEGIN
+                    receiver.Debug(0, '');
+                    LIntToHex(LONGINT(receiver), @hexStr);
+                    Write(': $', hexStr);
+                    END;
+
+                Write(')');
+                {$ENDC}
+                END;
+    END;
+
+    PROCEDURE TraceStuff;
+        VAR nextPC: LONGINT;
+    BEGIN
+        IF traceCount = 1 THEN
+            EntDebugger(' ','Count methods displayed')
+        ELSE
+            traceCount := traceCount - 1
+    END;
+
+BEGIN
+    toDebugger := FALSE;
+
+    IF fDebugRecursion THEN
+        EXIT(BEPSN);
+    fDebugRecursion := TRUE;
+
+    caller := TpLONGINT(odummy + 4);
+    receiver := NIL;
+    IF GetDollarD(TppINTEGER(caller), className, procName, nextPC) THEN
+        IF (className <> '') AND (procName <> 'CREATE  ') THEN
+            IF ValidObject(Handle(TpLONGINT(caller^+8)^)) THEN
+                receiver := TObject(TpLONGINT(caller^+8)^);
+
+    IF breakMCount > 0 THEN
+        BreakHere;
+
+    IF displayIt THEN
+        WriteOutDebugInfo;
+
+    IF toDebugger THEN
+        EntDebugger(' ','Breakpoint found')
+    ELSE
+        BEGIN
+        IF displayIt THEN
+            toDebugger := KeyPress
+        ELSE
+            toDebugger := AKeyPress;
+
+        IF toDebugger THEN
+            EntDebugger(' ','Key pressed on alternate screen')
+        ELSE
+        IF (traceCount > 0) and (displayIt) THEN
+            TraceStuff;
+        END;
+
+    fDebugRecursion := FALSE;
+END;
+
+
+PROCEDURE BP{(myTraceLevel: INTEGER)};
+    VAR dummy:      LONGINT;    {Must be first VAR}
+        bpFrame:    TpLONGINT;
+        callerPC:   LONGINT;
+        departed:   LONGINT;
+BEGIN
+    IF tallyingCalls THEN
+        stopTime := MicroTimer(* - debugTime*);
+
+    tabLevel := tabLevel + 1;  {Increment first because BEPSN can be reentrant}
+    callerPC := TpLONGINT(ORD(@dummy) + 8)^;
+    IF tabLevel <= trLevMemory THEN
+        BEGIN
+        traceLevels[tabLevel] := myTraceLevel;
+        bpFrame := TpLONGINT(ORD(@dummy) + 4);
+        traceFrames[tabLevel] := LIntAndLInt(bpFrame^, $00FFFFFF);
+        END;
+
+    IF fTraceEnabled AND (myTraceLevel >= curTraceLevel) THEN
+        BEPSN(ORD(@dummy), TRUE, TRUE)
+    ELSE
+    IF (breakMCount > 0) OR AKeyPress THEN
+        IF callerPC <> lastBpPc THEN
+            BEPSN(ORD(@dummy), TRUE, FALSE);
+    lastBpPc := callerPC;
+
+    IF tallyingCalls THEN
+        BEGIN
+        departed := MicroTimer;
+(*      debugTime := debugTime + departed - stopTime + tallyOverhead; *)
+        IF tabLevel <= trLevMemory THEN
+            traceTimes[tabLevel] := departed (*- debugTime*);
+        END;
+END;
+
+
+PROCEDURE EP;
+    VAR dummy:      LONGINT;    {Must be first VAR and 4 bytes long}
+        epFrame:    LONGINT;
+        doTrace:    BOOLEAN;
+        i:          INTEGER;
+        callerPC:   LONGINT;
+        elapsed:    LONGINT;
+BEGIN
+    callerPC := TpLONGINT(ORD(@dummy) + 8)^;
+
+    IF tallyingCalls THEN
+        BEGIN
+        stopTime := MicroTimer (*- debugTime*);
+
+        IF tabLevel <= trLevMemory THEN
+            BEGIN
+            elapsed := stopTime - traceTimes[tabLevel];
+            FOR i := tabLevel - 1 DOWNTO 1 DO
+                traceTimes[i] := traceTimes[i] + elapsed;
+            Tally(callerPC, elapsed);
+            END
+        ELSE
+            BEGIN
+            WriteLn('Stack bigger than performance measurement can handle! ', tablevel:1);
+            tallyingCalls := FALSE;
+            END;
+        END;
+
+    IF tabLevel < 0 THEN
+        BEGIN
+        tabLevel := 0;
+        Writeln('--------------------------');
+        BEPSN(ORD(@dummy), FALSE, TRUE);
+        ABCBreak('The above EP had no BP at all', 0);
+        doTrace := FALSE;
+        END
+    ELSE IF tabLevel <= trLevMemory THEN
+        BEGIN
+        epFrame := LIntAndLInt(TpLONGINT(ORD(@dummy) + 4)^, $00FFFFFF);
+        IF traceFrames[tabLevel] <> epFrame THEN
+            BEGIN
+            i := tabLevel - 1;      {Try to resynchronize}
+            WHILE (tabLevel <> i) AND (i >= 0) DO
+                IF traceFrames[i] = epFrame THEN
+                    BEGIN
+                    Writeln('--------------------------');
+                    ABCBreak('There was a BP with no EP', 0);
+                    tabLevel := i;
+                    END
+                ELSE
+                    i := i - 1;
+            IF tabLevel <> i THEN
+                BEGIN
+                Writeln('--------------------------');
+                BEPSN(ORD(@dummy), FALSE, TRUE);
+                ABCBreak('The above EP had no BP', 0);
+                END;
+            END;
+        doTrace := fTraceEnabled AND (traceLevels[tablevel] >= curTraceLevel);
+        END
+    ELSE
+        doTrace := FALSE;
+
+    IF doTrace THEN
+        BEPSN(ORD(@dummy), FALSE, TRUE)
+    ELSE
+    IF (breakMCount > 0) OR AKeyPress THEN
+        IF callerPC <> lastEpPc THEN
+            BEPSN(ORD(@dummy), FALSE, FALSE);
+
+    IF tabLevel >= 0 THEN
+        tabLevel := tabLevel - 1;
+    lastEpPc := callerPC;
+
+(*  IF tallyingCalls THEN
+        debugTime := MicroTimer - stopTime + tallyOverhead;
+    *)
+END;
+{$ENDC}
+{$ENDC}
+
+
+{ ====================================== COUNTHEAP ====================================== }
+
+
+{$IFC fCheckHeap}
+FUNCTION CountHeap{(heap: THeap): INTEGER};
+    VAR hz:         THz;
+        numObjects: INTEGER;
+BEGIN
+    hz := THz(heap);
+    IF FCheckHzOK(hz, numObjects) THEN ;
+    CountHeap := numObjects;
+END;
+{$ENDC}
+
+
+{$S sInit1}
+
+
+
+ 

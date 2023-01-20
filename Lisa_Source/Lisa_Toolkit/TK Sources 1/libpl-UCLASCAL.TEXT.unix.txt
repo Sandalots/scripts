@@ -1,0 +1,1320 @@
+{UClascal -- In Spring '84 Release, part of PASLIB: only special units like UOBJECT will ever USE it}
+{Copyright 1984, Apple Computer, Inc.}
+
+{changed 04/02/84 1330  Before exiting %_PGM2, see if the compiler saved A7 away, and if so
+                            change the value to account for the method tables on the stack.}
+{changed 02/23/84 1200  %_InObCp/Cn: Make them work before classesInitialized, too}
+{changed 02/22/84 1715  CiToCn: Make it work before classesInitialized, too}
+{changed 02/19/84 1908  SizeOfCp & CiOfCp: Make them work before classesInitialized, too}
+{changed 01/18/84 2348  LookupInHashArray returns -index instead of -1 for failure, 0 for full table}
+{changed 01/18/84 0737  Renamed %_CallMethod to %_MethodCall so LisaBug traces mean more to people}
+{changed 01/15/84 1725  ObjectSize is always positive now, so QClassSize has been eliminated;
+                        TOctet & TPOctets to INTERFACE}
+{changed 01/12/84 1952  Added TOctets and used it to get around signed byte bugs}
+{changed 01/12/84 1525  Added fTrcClascal to turn off extra writeLns when not debugging this unit;
+                        %_InObCp/Cn mask off high byte of object's stp before testing quality}
+{changed 01/11/84 1714  Fixed a bunch of bugs}
+{changed 01/11/84 1312  Added DumpArrays}
+{changed 01/10/84 2117  More moved to UObject so apps don't have to USE this unit}
+{changed 01/05/84 2141  Began Construction}
+
+
+{   RESPONSIBILITIES...
+
+        The first class-init block is responsible for calling our procedure:
+            InitClascal(PROCEDURE Finished(error: INTEGER));
+        If no other class has already called it, then pleaseInitClascal will be TRUE, in case interested.
+
+        If an error occurs during initialization and InitClascal has been called, we'll call:
+            Finished(error);
+        The error code is an OS error code, except 3333 (need a new number!!!!) is our own error;
+        If an error occurs during initialization and InitClascal has not been called, we
+            do a Trap 0, which should get into LisaBug if present, else cause Technical Difficulties.
+
+        Just before returning from %_Pgm2, if FinishedProc is installed, we'll call:
+            Finished(0);
+        which may want to copy tables from pClasses, pSTables, pAuthors, pAliases (interface globals)
+
+        Typecast errors will also call Finished(3333) (need a new number!!!!)
+
+}
+
+{$SETC ForOS := TRUE }
+
+UNIT UClascal;
+
+{$SETC IsIntrinsic := TRUE }
+
+{$IFC IsIntrinsic}
+INTRINSIC;
+{$ENDC}
+
+INTERFACE
+
+USES
+    {$U -#BOOT-SysCall   } SysCall;
+
+
+{$SETC fTrcClascal   := FALSE}
+{$SETC fSymClascal   := TRUE}{FALSE}
+{$SETC fDbgClascal   := TRUE}{FALSE}
+
+
+{$%+}
+
+
+CONST
+
+    maxClasses  = 800;  {Hash table sizes}
+    maxUnits    = 100;
+
+    maxAuthors  = 127;  {Because their indices are encoded in one byte in TClassInfo}
+    maxAliases  = 127;
+
+
+TYPE
+
+    TByte = -128..127; {The T-names are so programs can USE UObject, NOT USE UClascal, and use "Byte"}
+    TOctet = 0..255;
+
+    TOctets = PACKED ARRAY [0..32700] OF TOctet;
+    TPOctets = ^TOctets;
+
+    TS8 = STRING[8];
+    TS32 = STRING[32];
+
+    TA8 = PACKED ARRAY [1..8] OF CHAR;
+    TA32 = PACKED ARRAY [1..32] OF CHAR;
+
+    THashCompare = (cHole, cMatch, cMismatch);
+
+    TMethodArray = ARRAY [1..256] OF LONGINT;
+    TPMethodArray = ^TMethodArray;
+
+    TSliceTable = ARRAY [0..255] OF TPMethodArray;
+    TPSliceTable = ^TSliceTable;
+
+    TClassInfo = RECORD             {16 bytes per class}
+        classAlpha:             TA8;          {Class name in this program: Exactly 8 upper-case characters}
+        superIndex:             INTEGER;      {Index of my superclass in ARRAY [1..xx] OF TClassInfo}
+        objectSize:             INTEGER;      {SIZEOF(an object of this class) as declared}
+        classAlias:             TByte;        {For ToolKit: Array index, or 0 if same as classAlpha}
+        companyAndAuthor:       TByte;        {For ToolKit: Array index, or 0 if unspecified}
+        version:                TByte;        {For ToolKit: Version number of the object format (default=1)}
+        oldestReadableVersion:  TByte;        {For ToolKit: Oldest version number it is capable of updating}
+        END;
+
+  {Each of the following types has only one member at run-time, and only during initialization}
+  {These arrays start out small, but can grow.  Each has a single pointer that is updated automatically}
+
+    TClassArray     = ARRAY [1..maxClasses] OF TClassInfo;
+    TPClassArray    = ^TClassArray;
+
+    TSTableArray    = ARRAY [1..maxClasses] OF TPSliceTable;
+    TPSTableArray   = ^TSTableArray;
+
+    TAuthorArray    = ARRAY [1..maxAuthors] OF TA32;
+    TPAuthorArray   = ^TAuthorArray;
+
+    TAliasArray     = ARRAY [1..maxAliases] OF TA8;
+    TPAliasArray    = ^TAliasArray;
+
+
+VAR
+
+    pleaseInitClascal:  BOOLEAN;        {does InitClascal need to be called by some SUBCLASS OF NIL?}
+    classesInitialized: BOOLEAN;        {has %_Pgm2 completed?}
+
+    pClasses:           TPClassArray;   {pointer to array of TClassInfo,   or NIL after %_Pgm2}
+    pSTables:           TPSTableArray;  {.................of TPSliceTable, ..........}
+    pAuthors:           TPAuthorArray;  {.................of TA32,         ..........}
+    pAliases:           TPAliasArray;   {.................of TA8,          ..........}
+    pMethods:           TPMethodArray;  {.................of ProcPtr,      ..........}
+
+    limClasses:         INTEGER;        {space allocated in pClasses^ & pSTables^}
+    limAuthors:         INTEGER;        {................in pAuthors^}
+    limAliases:         INTEGER;        {................in pAliases^}
+    limMethods:         INTEGER;        {................in pMethods^}
+
+    numClasses:         INTEGER;        {number of elements in pClasses^ & pSTables^}
+    numAuthors:         INTEGER;        {...................in pAuthors^}
+    numAliases:         INTEGER;        {...................in pAliases^}
+    numMethods:         INTEGER;        {...................in pMethods^   ... now or last time they existed}
+
+
+{Called from class-initialization blocks}
+
+PROCEDURE InitClascal(PROCEDURE FinishedProc(error: INTEGER));          {required from first class-init}
+
+PROCEDURE QUnitAuthor(VAR companyAndAuthor: TA32);                      {required once per unit with ToolKit}
+PROCEDURE QClassAuthor(VAR companyAndAuthor: TA32);                     {optional}
+PROCEDURE QClassAlias(VAR classAlias: TA8);                             {optional}
+PROCEDURE QClassVersion(itsVersion, oldestItCanRead: TByte);            {optional}
+
+
+{Called from version-conversion, allocation, and debugging code}
+
+PROCEDURE CiToCn(index: INTEGER; VAR className: TS8);                   {convert class index to class title S8}
+PROCEDURE CpToCn(stp: TPSliceTable; VAR className: TS8);                {convert stp to class title S8}
+
+FUNCTION  CiOfCp(stp: TPSliceTable): INTEGER;                           {convert stp to class index}
+FUNCTION  SizeOfCp(stp: TPSliceTable): INTEGER;                         {convert stp to object size}
+
+FUNCTION  LookupInHashArray(tblSize: INTEGER; hashKey: LONGINT; toInsert: BOOLEAN;
+                            FUNCTION Compare(index: INTEGER): THashCompare): INTEGER;
+FUNCTION  CallPC: LONGINT;
+
+
+{Called by code generated by the compiler}
+
+PROCEDURE %_Pgm1;                       {Called before the first unit is initialized}
+PROCEDURE %_Unit;                       {Called at the beginning of each unit-initialization block}
+PROCEDURE %_Class(itsClassName, itsSuperName: TS8; itsSTP: TPSliceTable; itsEvenMethods, itsOddMethods,
+                  itsObjSize: INTEGER); {Called at the beginning of each class-initialization block}
+PROCEDURE %_Pgm2;                       {Called after the last unit is initialized}
+
+{These both return their first argument if it is NIL or passes a class-membership check; else Finished(3333)  }
+FUNCTION  %_CkObCP(ordObject, ordSTP: LONGINT): LONGINT;            {TFoo(obj),          TFoo in same unit }
+FUNCTION  %_CkObCN(ordObject: LONGINT; VAR className: TS8): LONGINT; {TFoo(obj),          TFoo in other unit}
+
+{These both return TRUE if their first arg is NON-NIL and if it passes a class-membership check}
+FUNCTION  %_InObCP(ordObject, ordSTP: LONGINT): BOOLEAN;            {InClass(obj, TFoo), TFoo in same unit }
+FUNCTION  %_InObCN(ordObject: LONGINT; VAR className: TS8): BOOLEAN; {InClass(obj, TFoo), TFoo in other unit}
+
+
+IMPLEMENTATION
+
+
+{Segments: SgPASini(tialize and Terminate), SgPASres(ident)}
+
+{$R-}
+
+{$IFC fSymClascal}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+CONST
+
+    minClasses  = 1;                {Initial array sizes}
+    minAuthors  = 1;
+    minAliases  = 1;
+    minMethods  = 1;
+
+    growClasses = 100;              {Array growth increments (tunable)}
+    growAuthors = 8;
+    growAliases = 32;
+    growMethods = 2000;
+
+
+TYPE
+
+    TS255 = STRING[255];
+
+    TPA8 = ^TA8;
+    TPA32 = ^TA32;
+
+    TBytes = ARRAY [0..32700] OF TByte;
+    TPBytes = ^TBytes;
+
+    TWords = ARRAY [0..16350] OF INTEGER;
+    TPWords = ^TWords;
+
+    TPOctet = ^TOctet;
+    TPByte = ^TByte;
+    TPInt  = ^INTEGER;
+    TPLint = ^LONGINT;
+    Handle = ^TPLint;
+
+    ProcPtr = ^LONGINT;
+
+    TIdxArray = ARRAY [0..maxClasses] OF INTEGER;       {Element 0 is length; holes contain 0}
+    TPIdxArray = ^TIdxArray;
+
+    TUnitArray = ARRAY [0..maxUnits] OF LONGINT;        {Element 0 is length; holes contain 0}
+    TPUnitArray = ^TUnitArray;
+
+
+VAR
+
+    biggestAbstractClass:   INTEGER;        {max number of methods among all entirely abstract slices, or 1}
+    mAllocAddr:             LONGINT;        {last allocated location in the method table}
+    currCallCallPC:         LONGINT;        {the callPC of the unit whose classes are being initted}
+
+    pHashName:              TPIdxArray;     {index of a class in pClasses & pSTables, or 0 for a hole}
+    pHashUnit:              TPUnitArray;    {pc of %_Unit caller, or 0 if a hole}
+
+    p%_Class:               ProcPtr;        {@ %_Class -- a pointer to the first instruction}
+    pJmp%_Class:            ProcPtr;        {...same, but a pointer to the jump table entry}
+
+    pFinishedProc:          ProcPtr;        {@ FinishedProc passed in to InitClascal or @ DefaultFinishedProc}
+    authorOfUnit:           TByte;          {Set by UnitAuthor and cleared by EndPreviousUnit}
+    oldNumClasses:          INTEGER;        {numClasses at the beginning of this unit's initialization}
+
+    firstPackedName:        INTEGER;        {Set in %_Pgm2; see FindCn for explanation}
+    dictBase:               LONGINT;        {Ditto}
+
+  {The following are assembler routines in CLASLIB.TEXT}
+    FUNCTION  %_GetA5: LONGINT; EXTERNAL;
+    FUNCTION  %_NextMethod(VAR pc: LONGINT;                                  {input and inc'd by 4 or 8}
+                           VAR impLevelNumber, impMethNumber: INTEGER        {input and output both}
+                           ): ProcPtr; EXTERNAL;
+    PROCEDURE %_JmpTo(pc: LONGINT); EXTERNAL;
+    PROCEDURE %_ExitCaller(argBytes: INTEGER); EXTERNAL;
+    PROCEDURE %_ExitPoppingTo(newSP: LONGINT); EXTERNAL;
+    PROCEDURE %_MethodCall; EXTERNAL;
+    PROCEDURE %_GoLisaBug; EXTERNAL;
+    PROCEDURE %_InsStack(addrToInsertAt, bytesToInsert: LONGINT); EXTERNAL;
+
+
+{$S SgPASres}
+
+
+FUNCTION  FindCn(index: INTEGER; VAR charsApart: BOOLEAN): LONGINT;
+        {The class names starting with index=firstPackedName are stored packed below the method table,
+            so the 8-character names start 8 bytes apart.
+         The class names before index=firstSpreadName are stored in the unused high-order
+            bytes of the method table, one every fourth byte, so the 8-character names start
+            32 bytes apart.  This kludge saves 1-2K of resident storage in a ToolKit application.
+         The name of the first class ends just before dictBase, the second class precedes it, etc.}
+    VAR firstCharOffset: LONGINT;
+BEGIN
+    charsApart := index < firstPackedName;
+    IF charsApart THEN
+        firstCharOffset := index * 32
+    ELSE
+        firstCharOffset := (numMethods * 4) + ((index + 1 - firstPackedName) * 8);
+    FindCn := dictBase - firstCharOffset;
+END;
+
+
+FUNCTION  CiOfCp(stp: TPSliceTable): INTEGER;
+    VAR index: INTEGER;
+      {After init, the class index is recorded in the slice table, bytes 0 and 4 (high and low order bytes)}
+BEGIN
+    CiOfCp := 0;
+    IF classesInitialized THEN
+        CiOfCp := 256 * TPOctets(stp)^[0] + TPOctets(stp)^[4]
+    ELSE
+        FOR index := 1 TO numClasses DO
+            IF pSTables^[index] = stp THEN
+                CiOfCp := index;
+END;
+
+
+FUNCTION  SizeOfCp(stp: TPSliceTable): INTEGER;
+      {After init, the size is recorded in the slice table, bytes 8 and 12, unless there are only 2 slices,}
+      {..in which case the long before the slice table has a -1 in the even word and the object size
+         in the odd word, instead of a superlink}
+BEGIN
+    IF NOT classesInitialized THEN
+        SizeOfCp := pClasses^[CiOfCp(stp)].objectSize
+    ELSE
+    IF TPWords(stp)^[-2] <= 0 THEN
+        SizeOfCp := TPWords(stp)^[-1]
+    ELSE
+        SizeOfCp := 256 * TPOctets(stp)^[8] + TPOctets(stp)^[12];
+END;
+
+
+PROCEDURE CiToCn(index: INTEGER; VAR className: TS8);
+    VAR charsApart: BOOLEAN;
+        deltaAddr:  INTEGER;
+        dictAddr:   LONGINT;
+        i:          INTEGER;
+        classAlpha: TA8;
+BEGIN
+    className[0] := CHAR(8);
+    IF NOT classesInitialized THEN
+        BEGIN
+        classAlpha := pClasses^[index].classAlpha;
+        FOR i := 1 TO 8 DO
+            className[i] := classAlpha[i];
+        END
+    ELSE
+        BEGIN
+        dictAddr := FindCn(index, charsApart);
+        deltaAddr := 3*ORD(charsApart) + 1;
+        FOR i := 1 TO 8 DO
+            BEGIN
+            className[i] := CHAR(TPByte(dictAddr)^);
+            dictAddr := dictAddr + deltaAddr;
+            END;
+        END;
+END;
+
+
+PROCEDURE CpToCn(stp: TPSliceTable; VAR className: TS8);
+BEGIN
+    CiToCn(CiOfCp(stp), className);
+END;
+
+
+PROCEDURE DefaultFinishedProc(error: INTEGER);
+BEGIN
+    %_GoLisabug;
+END;
+
+
+PROCEDURE CallFinishedProc(PROCEDURE ModelFinishedProc(error: INTEGER); error: INTEGER);
+    VAR pModelFinishedProc: TPLint;
+BEGIN
+    pModelFinishedProc  := TPLint(ORD(@pModelFinishedProc) + 18);
+    pModelFinishedProc^ := ORD(pFinishedProc);
+    ModelFinishedProc(error);
+END;
+
+
+PROCEDURE CLAFail(error: INTEGER);                              {Called when fDbgClascal is FALSE}
+BEGIN
+    IF error = 0 THEN
+        error := 3333;                                          {GET A NUMBER ASSIGNED}
+    CallFinishedProc(DefaultFinishedProc, error);
+END;
+
+
+{$IFC fDbgClascal}
+PROCEDURE CLABreak(s: TS255; n: LONGINT);        {Called when fDbgClascal is TRUE}
+BEGIN
+    WriteLn('CLABreak: ', s, ' = ', n);
+    ClaFail(0);
+END;
+{$ENDC}
+
+
+{Each expression "InClass(obj, TFoo)" generates:
+    %_InObCp(val, classPtr) or %_InObCn(val, 'TFOO    ')
+    The former ("In Object Class Pointer") is generated when TFoo is defined in the same unit.
+    The latter ("In Object Class Name") is generated when TFoo is defined in another unit.
+    Both are defined below}
+
+FUNCTION %_InObCp(ordObject, ordSTP: LONGINT): BOOLEAN;
+    TYPE    PST = ^TST;
+            TST = ARRAY[0..0] OF PST;
+            PPST = ^PST;
+            PPPST = ^PPST;
+    VAR trialSTP:       PST;
+        pSTP:           PPST;
+BEGIN
+    %_InObCp := FALSE;
+    IF ordObject <> 0 THEN
+        BEGIN
+        trialSTP := PPPST(ordObject)^^;
+        pSTP := @trialSTP;
+        TPByte(pSTP)^ := 0;
+        WHILE trialSTP <> PST(ordSTP) DO
+            BEGIN
+            IF classesInitialized THEN
+                trialSTP := trialSTP^[-1]
+            ELSE
+                trialSTP := PST (TPMethodArray(pSTables^[pClasses^[CiOfCp(TPSliceTable(trialSTP))].superIndex]));
+            IF ORD(trialSTP) <= 0 THEN
+                EXIT(%_InObCp);
+            END;
+        %_InObCp := TRUE;
+        END;
+END;
+
+
+FUNCTION %_InObCn(ordObject: LONGINT; VAR className: TS8): BOOLEAN;
+    TYPE    PST = ^TST;
+            TST = ARRAY[0..0] OF PST;
+            PPST = ^PST;
+            PPPST = ^PPST;
+    VAR trialSTP:       PST;
+        tryClassName:   TS8;
+        pSTP:           PPST;
+BEGIN
+    %_InObCn := FALSE;
+    IF ordObject <> 0 THEN
+        BEGIN
+        trialSTP := PPPST(ordObject)^^;
+        pSTP := @trialSTP;
+        TPByte(pSTP)^ := 0;
+        REPEAT
+            CpToCn(TPSliceTable(trialSTP), tryClassName);
+            IF tryClassName = className THEN
+                BEGIN
+                %_InObCn := TRUE;
+                EXIT(%_InObCn);
+                END;
+            IF classesInitialized THEN
+                trialSTP := trialSTP^[-1]
+            ELSE
+                trialSTP := PST(TPMethodArray(pSTables^[pClasses^[CiOfCp(TPSliceTable(trialSTP))].superIndex]));
+          UNTIL ORD(trialSTP) <= 0;
+        END;
+END;
+
+
+{Each typecast expression TFoo(val) with range checking on generates:
+    %_CkObCp(val, classPtr) or %_CkObCn(val, 'TFOO    ')
+    The former ("Check Object Class Pointer") is generated when TFoo is defined in the same unit.
+    The latter ("Check Object Class Name") is generated when TFoo is defined in another unit.
+    Both are defined below}
+
+FUNCTION %_CkObCp(ordObject, ordSTP: LONGINT): LONGINT;
+    VAR objClassName:   TS8;
+        desClassName:   TS8;
+BEGIN
+    %_CkObCp := ordObject;
+    IF ordObject <> 0 THEN
+        IF NOT %_InObCp(ordObject, ordSTP) THEN
+            BEGIN
+            CpToCn(TPSliceTable(Handle(ordObject)^^), objClassName);
+            CpToCn(TPSliceTable(ordSTP), desClassName);
+            {$IFC fDbgClascal}
+            CLABreak(CONCAT('Attempt to coerce an object of class ',
+                            CONCAT(objClassName,
+                                   CONCAT(' to a value of type ',
+                                          desClassName))),
+                     0);
+            {$ELSEC}
+            CLAFail(0);
+            {$ENDC}
+            EXIT(%_CkObCp);
+            END;
+END;
+
+
+FUNCTION %_CkObCn(ordObject: LONGINT; VAR className: TS8): LONGINT;
+    VAR objClassName:   TS8;
+BEGIN
+    %_CkObCn := ordObject;
+    IF ordObject <> 0 THEN
+        IF NOT %_InObCn(ordObject, className) THEN
+            BEGIN
+            CpToCn(TPSliceTable(Handle(ordObject)^^), objClassName);
+            {$IFC fDbgClascal}
+            CLABreak(CONCAT('Attempt to coerce an object of class ',
+                            CONCAT(objClassName,
+                                   CONCAT(' to a value of type ',
+                                          className))),
+                     0);
+            {$ELSEC}
+            CLAFail(0);
+            {$ENDC}
+            EXIT(%_CkObCn);
+            END;
+END;
+
+
+{MUST BE IN A DIFFERENT SEGMENT FROM %_Class, i.e., NOT IN SgPASini}
+FUNCTION GetPJmp%_Class: ProcPtr;
+BEGIN
+    GetPJmp%_Class := @%_Class;
+END;
+
+
+{$S SgPASini}
+
+
+PROCEDURE InitClascal(PROCEDURE FinishedProc(error: INTEGER));
+BEGIN
+    pFinishedProc    := @FinishedProc;
+    pleaseInitClascal := FALSE;
+END;
+
+
+PROCEDURE StoreCn(index: INTEGER; VAR classAlpha: TA8);
+    VAR charsApart: BOOLEAN;
+        dictAddr:   LONGINT;
+        i:          INTEGER;
+BEGIN
+    dictAddr := FindCn(index, charsApart);
+    IF charsApart THEN
+        FOR i := 1 TO 8 DO
+            BEGIN
+            TPByte(dictAddr)^ := TByte(classAlpha[i]);
+            dictAddr := dictAddr + 4;
+            END
+    ELSE
+        TPA8(dictAddr)^ := classAlpha;
+END;
+
+
+PROCEDURE _Abstract;
+BEGIN
+    {$IFC fDbgClascal}
+    CLABreak('An ABSTRACT method has been called: you can''t continue', 0);
+    {$ELSEC}
+    CLAFail(0);
+    {$ENDC}
+END;
+
+
+PROCEDURE InsStack(addrOfGrownArray, afterByte, bytesToInsert: LONGINT);
+
+    PROCEDURE AdjustPArray(VAR addrOfOtherArray: LONGINT; which: TS32);
+    BEGIN
+        {$IFC fTrcClascal}
+        Write('... ', which, ' moved from ', addrOfOtherArray:12, ' to ');
+        {$ENDC}
+        IF (addrOfGrownArray + afterByte) >= addrOfOtherArray THEN
+            addrOfOtherArray := addrOfOtherArray - bytesToInsert;
+        {$IFC fTrcClascal}
+        WriteLn(addrOfOtherArray:12);
+        {$ENDC}
+    END;
+
+BEGIN
+    {$IFC fTrcClascal}
+    WriteLn('$$$ About to insert ', bytesToInsert:4, ' bytes after byte ', afterByte:3,
+            ' of ', addrOfGrownArray:5, '$$$');
+    {$ENDC}
+    %_InsStack(addrOfGrownArray + afterByte, bytesToInsert); {bytesToInsert must be even and at least 4}
+    AdjustPArray(LONGINT(pAuthors), 'pAuthors');
+    AdjustPArray(LONGINT(pAliases), 'pAliases');
+    AdjustPArray(LONGINT(pClasses), 'pClasses');
+    AdjustPArray(LONGINT(pSTables), 'pSTables');
+    AdjustPArray(LONGINT(pMethods), 'pMethods');
+    AdjustPArray(LONGINT(pHashName),'pHashName');
+    AdjustPArray(LONGINT(pHashUnit),'pHashUnit');
+END;
+
+
+FUNCTION MAllocate(numNeeded, numToGrowBy: INTEGER): LONGINT;
+        {** NO VAR PARAMETERS ALLOWED THAT ARE REFERENCED AFTER CALLING InsStack **}
+    VAR numBytes:       LONGINT;
+        bytesToInsert:  LONGINT;
+BEGIN
+    numBytes := 4 * numNeeded;
+    mAllocAddr := mAllocAddr - numBytes;
+    MAllocate := mAllocAddr;
+    bytesToInsert := ORD(pMethods) - mAllocAddr;
+    IF bytesToInsert > 0 THEN
+        BEGIN
+        IF bytesToInsert < (4 * numToGrowBy) THEN
+            bytesToInsert := 4 * numToGrowBy;
+        InsStack(ORD(pMethods), 0, bytesToInsert);
+        END;
+    {$IFC fTrcClascal}
+    WriteLn('******* Allocated ', numNeeded:3, ' method entries at ', mAllocAddr:5, '********');
+    {$ENDC}
+END;
+
+
+FUNCTION RAllocate(bytesPerRec, numNow, numToGrowBy, numRoomFor, maxNumAllowed: INTEGER;
+                   whutzits: TS8; ordPArray: LONGINT): INTEGER;
+        {** NO VAR PARAMETERS ALLOWED THAT ARE REFERENCED AFTER CALLING InsStack **}
+        {bytesPerRec must be even; this function returns the new numRoomFor value}
+    VAR bytesToInsert: INTEGER;
+BEGIN
+    IF (numRoomFor + numToGrowBy) > maxNumAllowed THEN
+        numToGrowBy := maxNumAllowed - numRoomFor;
+
+    IF numToGrowBy <= 0 THEN
+        {$IFC fDbgClascal}
+        CLABreak(CONCAT('Too many ', whutzits), maxNumAllowed);
+        {$ELSEC}
+        CLAFail(0);
+        {$ENDC}
+
+    bytesToInsert := bytesPerRec * numToGrowBy;
+    InsStack(ordPArray, bytesPerRec * numNow, bytesToInsert);
+    RAllocate := numRoomFor + numToGrowBy;
+END;
+
+
+FUNCTION LookupAuthor(VAR classAuthor: TA32): INTEGER;
+        {There should be room for two Authors (a ClassAuthor & a UnitAuthor) because %_Class checked}
+    VAR addr:   LONGINT;
+        i:      INTEGER;
+BEGIN
+    addr := ORD(pAuthors);
+    FOR i := 1 TO numAuthors DO
+        BEGIN
+        IF TPA32(addr)^ = classAuthor THEN
+            BEGIN
+            LookupAuthor := i;
+            EXIT(LookupAuthor);
+            END;
+        addr := addr + 32;
+        END;
+
+    IF numAuthors >= limAuthors THEN
+        CLAFail(0)
+    ELSE
+        BEGIN
+        numAuthors := numAuthors + 1;
+        TPA32(addr)^ := classAuthor;
+        LookupAuthor := numAuthors;
+        END;
+END;
+
+
+{** I tried merging the routines above and below, but I don't think it is worth it **}
+
+
+FUNCTION LookupAlias(VAR classAlias: TA8): INTEGER;
+        {There should be room for one alias because %_Class checked}
+    VAR addr:   LONGINT;
+        i:      INTEGER;
+BEGIN
+    addr := ORD(pAliases);
+    FOR i := 1 TO numAliases DO
+        BEGIN
+        IF TPA8(addr)^ = classAlias THEN
+            BEGIN
+            LookupAlias := i;
+            EXIT(LookupAlias);
+            END;
+        addr := addr + 8;
+        END;
+
+    IF numAliases >= limAliases THEN
+        CLAFail(0)
+    ELSE
+        BEGIN
+        numAliases := numAliases + 1;
+        TPA8(addr)^ := classAlias;
+        LookupAlias := numAliases;
+        END;
+END;
+
+
+PROCEDURE QUnitAuthor(VAR companyAndAuthor: TA32);
+BEGIN
+    IF classesInitialized THEN
+        CLAFail(0);
+    authorOfUnit := LookupAuthor(companyAndAuthor);
+END;
+
+
+PROCEDURE QClassAuthor(VAR companyAndAuthor: TA32);
+BEGIN   {Must call procedures before the WITH because Lookups might move pClasses^}
+    IF classesInitialized THEN
+        CLAFail(0);
+    pClasses^[numClasses].companyAndAuthor := LookupAuthor(companyAndAuthor);
+END;
+
+
+PROCEDURE QClassAlias(VAR classAlias: TA8);
+BEGIN   {Must call procedures before the WITH because Lookups might move pClasses^}
+    IF classesInitialized THEN
+        CLAFail(0);
+    pClasses^[numClasses].classAlias := LookupAlias(classAlias);
+END;
+
+
+PROCEDURE QClassVersion(itsVersion, oldestItCanRead: TByte);
+BEGIN
+    IF classesInitialized THEN
+        CLAFail(0);
+    WITH pClasses^[numClasses] DO
+        BEGIN
+        version := itsVersion;
+        oldestReadableVersion := oldestItCanRead;
+        END;
+END;
+
+
+FUNCTION NumSlices(classIndex: INTEGER): INTEGER;
+    VAR n: INTEGER;
+BEGIN
+    n := 0;
+    WHILE classIndex > 0 DO
+        BEGIN
+        classIndex := pClasses^[classIndex].superIndex;
+        n := n + 2;
+        END;
+    NumSlices := n;
+END;
+
+
+FUNCTION  CallCallPC: LONGINT;
+    VAR dummy:      INTEGER;    { must be first local and two bytes long }
+BEGIN
+    CallCallPC := TPLint(TPLint(TPLint(ORD(@dummy) + 2)^)^ + 4)^;   {caller's caller's return address}
+END;
+
+
+FUNCTION  CallPC: LONGINT;
+    VAR dummy:      INTEGER;    { must be first local and two bytes long }
+BEGIN
+    CallPC := TPLint(TPLint(ORD(@dummy) + 2)^ + 4)^;             {caller's return address}
+END;
+
+
+PROCEDURE SetCallPC(pc: LONGINT);
+    VAR dummy:      INTEGER;    { must be first local and two bytes long }
+        addrOfPC:   LONGINT;
+BEGIN
+    addrOfPC := TPLint(ORD(@dummy) + 2)^ + 4;
+    TPLint(addrOfPC)^ := pc;          {caller's return address}
+END;
+
+
+FUNCTION LookupInHashArray(tblSize: INTEGER; hashKey: LONGINT; toInsert: BOOLEAN;
+                FUNCTION Compare(index: INTEGER): THashCompare): INTEGER;
+        {toInsert, return: -index if entry already there, index (>0) if a hole found}
+        {not toInsert, return: index (> 0) if entry found, -index if not there}
+        {return 0 if table is full}
+    VAR probe:          INTEGER;
+        origProbe:      INTEGER;
+        hashCompare:    THashCompare;
+BEGIN               {This could be made faster -- and probably should be}
+    LookupInHashArray := 0;
+    probe := hashKey;
+    probe := (ABS(probe) MOD tblSize) + 1;
+    origProbe := probe;
+    REPEAT
+        hashCompare := Compare(probe);
+        IF hashCompare <> cMismatch THEN
+            BEGIN
+            IF toInsert = (hashCompare = cHole) THEN
+                LookupInHashArray := probe
+            ELSE
+                LookupInHashArray := - probe;
+            EXIT(LookupInHashArray);
+            END;
+        probe := probe + 1;
+        IF probe > tblSize THEN
+            probe := 1;
+      UNTIL probe = origProbe;
+END;
+
+
+{$IFC fTrcClascal}
+PROCEDURE DumpArrays;
+    VAR index:          INTEGER;
+        itsSTP:         TPSliceTable;
+        slices:         INTEGER;
+        s:              TS8;
+        j:              INTEGER;
+        i:              INTEGER;
+        level:          INTEGER;
+        methArrPtr:     TPMethodArray;
+        numAtThatLevel: INTEGER;
+BEGIN
+    WriteLn;
+    WriteLn(' *************** ARRAYS *************** ');
+    WriteLn;
+    FOR index := 1 TO numClasses DO
+        BEGIN
+        Write('Class Index = ', index:3);
+        itsSTP := pSTables^[index];
+        Write('  Class Pointer = ', ORD(itsSTP):10);
+        slices := NumSlices(index);
+        Write('  Number of slices = ', slices:3);
+        s[0] := CHAR(8);
+        FOR j := 1 TO 8 DO
+            s[j] := pClasses^[index].classAlpha[j];
+        WriteLn('  Name = ', s);
+        i := index;
+        FOR level := slices - 1 DOWNTO 0 DO
+            BEGIN
+            Write('   Level ', level:1);
+            Write('   Index ', i:2);
+
+            methArrPtr := itsSTP^[level];
+            Write(' Method array ptr = ', ORD(methArrPtr):10);
+
+            numAtThatLevel := TPWords(pSTables^[i])^[ORD(ODD(level))-2];
+            Write(' numAtThatLevel ', numAtThatLevel:2);
+
+            IF methArrPtr = NIL THEN
+                WriteLn(', ... all Abstract')
+            ELSE
+                BEGIN
+                WriteLn;
+                FOR j := 1 TO numAtThatLevel DO
+                    WriteLn(j:10, ORD(methArrPtr^[j]):10);
+                END;
+
+            IF NOT ODD(level) THEN
+                i := pClasses^[i].superIndex;
+            WriteLn;
+            END;
+        WriteLn;
+        END;
+END;
+{$ENDC}
+
+
+{The main program starts with:
+    JSR %_Pgm1      ; Defined below
+    JSR unit#m      ; for every unit USEd by the main program within $CLASSES+ (in order USEd)...
+    ...
+    JSR unit#n
+    JSR %_Pgm2      ; Defined below}
+
+PROCEDURE %_Pgm1;
+    VAR methads:        ARRAY [1..minMethods] OF ProcPtr;     {!!! MUST MUST MUST be the first VAR !!!}
+        aliases:        ARRAY [1..minAliases] OF TA8;         {!!! Should be in this group of VARs !!!}
+        authors:        ARRAY [1..minAuthors] OF TA32;        {!!! Should be in this group of VARs !!!}
+        sTables:        ARRAY [1..minClasses] OF TPSliceTable;{!!! Should be in this group of VARs !!!}
+        classes:        ARRAY [1..minClasses] OF TClassInfo;  {!!! Should be in this group of VARs !!!}
+      {The arrays above can grow; only one ptr to each is maintained in a global variable, e.g., pMethods}
+        excepName:      T_Ex_Name;      {These all stay allocated until the end of %_Pgm2}
+        error:          INTEGER;
+        addr:           LONGINT;
+        i:              INTEGER;
+        hashUnit:       TUnitArray;
+        hashName:       TIdxArray;
+
+BEGIN
+   {Install Default Finished procedure}
+    pFinishedProc := @DefaultFinished;
+
+   {Initialize global interface variables}
+
+    pleaseInitClascal := TRUE;      {A global set to FALSE in InitClascal}
+    classesInitialized := FALSE;    {A global set TRUE in %_Pgm2}
+
+    pClasses := @classes;
+    pSTables := @sTables;
+    pAuthors := @authors;
+    pAliases := @aliases;
+    pMethods := @methads;   {methads spelled funny because METHODS is a reserved word}
+        {NOTE: pMethods^[] is never written; the "ARRAY" can be > 32K bytes if necessary}
+
+    limClasses := minClasses;
+    limAuthors := minAuthors;
+    limAliases := minAliases;
+    limMethods := minMethods;
+
+    numClasses := 0; {incremented by %_Class}
+    numAuthors := 0; {never modified in this unit; UOBJECT manages them}
+    numAliases := 0; {never modified in this unit; UOBJECT manages them}
+    numMethods := 0; {incremented by FillArraysFrom, called by %_Class}
+
+   {Set the scheduling mode}
+    Sched_Class(error, TRUE);
+    IF error > 0 THEN
+        CLAFail(error);
+
+   {Set six bytes at 0(A5) to JMP %_MethodCall in XFER}
+    addr := %_GetA5;
+    TPInt(addr)^ := $4EF9; {JMP fullAddr}
+    addr := addr + 2;
+    TPLint(addr)^ := ORD(@%_MethodCall);
+
+   {Clear hash tables}
+    FOR i := 1 TO maxUnits DO
+        hashUnit[i] := 0;
+    FOR i := 1 TO maxClasses DO
+        hashName[i] := 0;
+
+   {Initialize global implementation variables}
+
+    pHashName  := @hashName;
+    pHashUnit  := @hashUnit;
+
+    authorOfUnit := 0;
+    mAllocAddr := ORD(pMethods) + limMethods * 4;
+    biggestAbstractClass := 1;      {Could be 0, but this produces a more comprehensible memory dump}
+    currCallCallPC := 0;
+
+    p%_Class    := @%_Class;        {The %_NextMethod loop in %_Class stops at a JSR %_Class}
+    pJmp%_Class := GetPJmp%_Class;  {A function in another segment must get the jump table address for me}
+
+   {We can never return because we need our locals around during the unit initializations and need
+       the method tables around forever}
+    %_JmpTo(CallPC);
+END;
+
+
+PROCEDURE EndPreviousUnit;  {We don't require companyAndAuthor--but client could do so at the end of %_Pgm2}
+    VAR i: INTEGER;
+BEGIN
+    IF authorOfUnit <> 0 THEN
+        FOR i := oldNumClasses + 1 TO numClasses DO
+            WITH pClasses^[i] DO
+                IF companyAndAuthor = 0 THEN
+                    companyAndAuthor := authorOfUnit;
+    authorOfUnit := 0;
+    oldNumClasses := numClasses;
+END;
+
+
+PROCEDURE %_Pgm2;
+        {** NO VAR PARAMETERS ALLOWED THAT ARE REFERENCED AFTER CALLING MAllocate **}
+    VAR dummy:          LONGINT; {MUST BE FIRST VAR AND 4 BYTES LONG!!!}
+        pAbstracts:     TPMethodArray;
+        index:          INTEGER;
+        extraLongs:     LONGINT;
+        itsSTP:         TPSliceTable;
+        slices:         INTEGER;
+        level:          INTEGER;
+        objSize:        INTEGER;
+        pInt:           TPInt;
+        pLint:          TPLint;
+BEGIN
+    EndPreviousUnit;
+
+  {For any slice that was fully abstract, we will make it point at a special block of @_Abstract}
+    pAbstracts := TPMethodArray(MAllocate(biggestAbstractClass, 16));
+    numMethods := numMethods + biggestAbstractClass;
+    FOR index := 1 TO biggestAbstractClass DO
+        pAbstracts^[index] := ORD(@ _Abstract);
+
+  {Assure sufficient room for names}
+    dictBase := mAllocAddr + (numMethods * 4);
+    firstPackedName := (numMethods DIV 8) + 1;
+    extraLongs := 2 * (numClasses - firstPackedName + 1);
+    IF extraLongs > 0 THEN
+        dummy := MAllocate(extraLongs, 0);
+
+    {$IFC fTrcClascal}
+    WriteLn('biggestAbstractClass   = ', biggestAbstractClass:6);
+    WriteLn('numMethods allocated   = ', numMethods:6);
+    WriteLn('firstPackedName        = ', firstPackedName:6);
+    WriteLn('extraLongs             = ', extraLongs:6);
+    WriteLn('mAllocAddr             = ', mAllocAddr:6);
+    WriteLn('dictBase               = ', dictBase:6);
+    WriteLn('pClasses               = ', ORD(pClasses):6);
+    WriteLn('pSTables               = ', ORD(pSTables):6);
+    {$ENDC}
+
+  {Search back from call to %_PGM2 for a MOVE.L A7, xxxx(A5) (opcode $2B4F); if found, calculate the
+        address that contains the saved A7 and stuff in mAllocAddr instead.  Stop searching if we
+        find a LINK A5, xxxx instruction.}
+    pLint := Pointer(Ord(@dummy) + 8); {pLint^ should be our return address}
+    pInt := Pointer(pLint^);
+
+    WHILE (pInt^ <> $2B4F {MOVE.L A7, xxxx(A5)}) AND (pInt^ <> $4E55 {LINK A5, xxxx}) DO
+        pInt := Pointer(Ord(pInt) - 2);
+    IF pInt^ = $2B4F THEN
+        BEGIN
+        pInt := Pointer(Ord(pInt) + 2);
+        pLint := Pointer(pInt^ + %_GetA5);
+        pLint^ := mAllocAddr;
+        END;
+
+  {Final initialization of each class in turn}
+    FOR index := 1 TO numClasses DO
+        BEGIN
+      {Fill in missing slices}
+        itsSTP := pSTables^[index];
+        slices := NumSlices(index);
+        FOR level := 0 TO slices - 1 DO
+            IF itsSTP^[level] = NIL THEN
+                itsSTP^[level] := pAbstracts;
+
+      {Copy the name to the method table area}
+        StoreCn(index, pClasses^[index].classAlpha);
+
+      {The class index is recorded in the slice table, bytes 0 and 4 (high and low order bytes)}
+      {The object size is recorded in the slice table, bytes 8 and 12, unless there are only two slices,}
+      {..in which case the long before the slice table has a -1 in the even word and the object size
+         in the odd word, instead of a superlink}
+
+        objSize := pClasses^[index].objectSize;
+        IF slices > 2 THEN
+            BEGIN
+            TPOctets(itsSTP)^[8]  := TPOctets(@objSize)^[0];
+            TPOctets(itsSTP)^[12] := TPOctets(@objSize)^[1];
+            itsSTP^[-1] := TPMethodArray(pSTables^[pClasses^[index].superIndex]);
+            END
+        ELSE
+            BEGIN
+            TPWords(itsSTP)^[-2] := -1;
+            TPWords(itsSTP)^[-1] := objSize;
+            END;
+
+        TPOctets(itsSTP)^[0] := TPOctets(@index)^[0];
+        TPOctets(itsSTP)^[4] := TPOctets(@index)^[1];
+        END;
+
+  {Report success to higher levels and let it copy the tables it may desire before we destroy them}
+    CallFinishedProc(DefaultFinishedProc, 0);
+    pClasses    := NIL;
+    pSTables    := NIL;
+    pAuthors    := NIL;
+    pAliases    := NIL;
+    pMethods    := NIL;
+
+  {Just to keep things clean and consistent}
+    pHashName   := NIL;
+    pHashUnit   := NIL;
+
+  {Disable UnitAuthor, ClassAuthor, ClassVersion, ClassSize, and FinishedProc}
+    classesInitialized := TRUE;
+
+  {Exit from %_Pgm1, finally freeing its local storage below the TMethodArray}
+    %_ExitPoppingTo(mAllocAddr);
+END;
+
+
+{Each unit ends with:
+    .PROC unit#i
+    JSR %_Unit      ; Defined below
+    JSR unit#x      ; for every unit USEd by the unit within $CLASSES+ (in order USEd)...
+    ...
+    JSR unit#z
+    JSR class-init#1  ; for every class implemented in unit#i...
+    ...
+    JSR class-init#k
+    RTS             }
+
+PROCEDURE %_Unit;
+
+    VAR unitPC:         LONGINT;
+        hashUNIndex:    INTEGER;
+
+    FUNCTION CompareUnit(hashIndex: INTEGER): THashCompare;
+        VAR pc:   LONGINT;
+    BEGIN
+        pc := pHashUnit^[hashIndex];
+        IF pc = 0 THEN
+            CompareUnit := cHole
+        ELSE
+        IF pc = unitPC THEN
+            CompareUnit := cMatch
+        ELSE
+            CompareUnit := cMismatch;
+    END;
+
+BEGIN
+    unitPC := CallPC;
+    hashUNIndex := LookupInHashArray(maxUnits, unitPC, TRUE, CompareUnit);
+    IF hashUNIndex > 0 THEN         {first time here -- let the initialization happen}
+        pHashUnit^[hashUNIndex] := unitPC
+    ELSE
+        %_ExitCaller(0);            {exit from .PROC unit#i because we have already initialized this unit}
+END;
+
+
+    {toInsert, return: -index if class already there or if table full, index (> 0) if a hole found}
+    {not toInsert, return: index (> 0) if class found, -index if not there}
+    {return 0 if table is full}
+FUNCTION LookupClassAlpha(keyA8: TA8; toInsert: BOOLEAN): INTEGER;
+
+    FUNCTION CompareName(hashIndex: INTEGER): THashCompare;
+        VAR myIndex:    INTEGER;
+    BEGIN
+        myIndex := pHashName^[hashIndex];
+        IF myIndex = 0 THEN
+            CompareName := cHole
+        ELSE
+        IF pClasses^[myIndex].classAlpha = keyA8 THEN
+            CompareName := cMatch
+        ELSE
+            CompareName := cMismatch;
+    END;
+
+BEGIN
+    LookupClassAlpha := LookupInHashArray(maxClasses, ORD(keyA8[2])*ORD(keyA8[4])+ORD(keyA8[6]),
+                                          toInsert, CompareName);
+END;
+
+
+FUNCTION FillArraysFrom(pc: LONGINT; itsLevelNumber: INTEGER; superSTP: TPSliceTable;
+                        itsSTP: TPSliceTable; itsOddMethods: INTEGER): LONGINT;
+        {** NO VAR PARAMETERS ALLOWED THAT ARE REFERENCED AFTER CALLING MAllocate **}
+    VAR impLevelNumber:         INTEGER;
+        impMethNumber:          INTEGER;
+        targetLocation:         ProcPtr;
+        fini:                   BOOLEAN;
+        impMethodArrayPtr:      TPMethodArray;
+        index:                  INTEGER;
+        level:                  INTEGER;
+        numAtThatLevel:         INTEGER;
+        superMethodArrayPtr:    TPMethodArray;
+        canInherit:             BOOLEAN;
+        methodNumber:           INTEGER;
+BEGIN
+    impLevelNumber := itsLevelNumber;
+    impMethNumber := 0;
+
+    REPEAT
+        targetLocation := %_NextMethod(pc, impLevelNumber, impMethNumber);
+        fini := (targetLocation = p%_Class) OR (targetLocation = pJmp%_Class);
+        IF NOT fini THEN
+            BEGIN
+            impMethodArrayPtr := itsSTP^[impLevelNumber];
+            IF impMethodArrayPtr = NIL THEN
+                BEGIN
+                index := numClasses;
+                level := itsLevelNumber;    {always even}
+                {$IFC fTrcClascal}
+                WriteLn('pClasses = ', ORD(pClasses));
+                WriteLn('Index       Level',  '  impLevelNumber = ', impLevelNumber:3);
+                WriteLn(index:3, level:12);
+                {$ENDC}
+                WHILE level > impLevelNumber DO
+                    BEGIN
+                    index := pClasses^[index].superIndex;
+                    level := level - 2;
+                    {$IFC fTrcClascal}
+                    WriteLn(index:3, level:12);
+                    {$ENDC}
+                    END;
+
+                {$IFC fTrcClascal}
+                WriteLn('-- In FillArrays, making a new method table --');
+                WriteLn('pc = ', pc:12, '  itsLevelNumber = ', itsLevelNumber:3,
+                        '  superSTP = ', ORD(superSTP):12, '  itsSTP = ', ORD(itsSTP):12);
+                WriteLn('  itsOddMethods = ', itsOddMethods:3,
+                        '  impMethNumber = ', impMethNumber:3,
+                        '  targetLocation = ', ORD(targetLocation):12);
+                WriteLn('  index = ', index:3,
+                        '  level = ', level:3,
+                        '  word[-2] = ', TPWords(pSTables^[index])^[-2]:7,
+                        '  word[-1] = ', TPWords(pSTables^[index])^[-1]:7);
+                {$ENDC}
+
+                numAtThatLevel := TPWords(pSTables^[index])^[ORD(ODD(impLevelNumber))-2];
+
+                {$IFC fTrcClascal}
+                WriteLn('numAtThatLevel = ', numAtThatLevel:3);
+                {$ENDC}
+
+                impMethodArrayPtr := TPMethodArray(MAllocate(numAtThatLevel, growMethods));
+                numMethods := numMethods + numAtThatLevel;
+                itsSTP^[impLevelNumber] := impMethodArrayPtr;
+
+                IF superSTP = NIL THEN
+                    superMethodArrayPtr := NIL
+                ELSE
+                    superMethodArrayPtr := superSTP^[impLevelNumber]; {may be NIL}
+
+                canInherit := (impLevelNumber < itsLevelNumber) AND (superMethodArrayPtr <> NIL);
+
+                FOR methodNumber := 1 TO numAtThatLevel DO
+                    IF canInherit THEN
+                        impMethodArrayPtr^[methodNumber] := superMethodArrayPtr^[methodNumber]
+                    ELSE
+                        impMethodArrayPtr^[methodNumber] := ORD(@ _Abstract);
+                END;
+            impMethodArrayPtr^[impMethNumber] := ORD(targetLocation);
+            END;
+    UNTIL fini;
+
+  {For any inherited slice that had no overrides, make it point at the same slice as the superclass}
+    FOR level := 0 TO itsLevelNumber - 1 DO
+        IF itsSTP^[level] = NIL THEN
+            itsSTP^[level] := superSTP^[level]; {may be NIL, too}
+
+  {If the odd slice has only ABSTRACT methods, then use a global to tell %_Pgm2 what to do}
+    IF itsSTP^[itsLevelNumber + 1] = NIL THEN
+        IF itsOddMethods > biggestAbstractClass THEN
+            biggestAbstractClass := itsOddMethods;
+
+    {$IFC fTrcClascal}
+    DumpArrays;                 {*************************************************************************}
+    {$ENDC}
+
+    FillArraysFrom := pc;
+END;
+
+
+{The class-init routine of TFoo = SUBCLASS OF TSuperclass starts with:
+    JSR %_Class('TFOO    ', 'TSUPERCL', @sliceTable, sizeOfEvenSlice, sizeOfOddSlice, objSize); Defined below
+    JSR method#1(sliceNumber*256 + methodNumber)    ; for every method in the IMPLEMENTATION
+    ...                                             ; these calls are not executed: %_Class interprets them
+    JSR method#r(sliceNumber*256 + methodNumber)    ; slice 0 is TObject, method 1 is first method
+    JSR %_Class             ; just a terminator (The first call on %_Class interprets through here)}
+
+PROCEDURE %_Class(itsClassName, itsSuperName: TS8; itsSTP: TPSliceTable;
+                   itsEvenMethods, itsOddMethods, itsObjSize: INTEGER);
+        {** NO VAR PARAMETERS ALLOWED THAT ARE REFERENCED AFTER CALLING RAllocate & FillArraysFrom **}
+    VAR i:                  INTEGER;
+        itsAlpha:           TA8;
+        superAlpha:         TA8;
+        nameHashIndex:      INTEGER;
+        superClIndex:       INTEGER;
+        superSTP:           TPSliceTable;
+        itsLevelNumber:     INTEGER;
+        pc:                 LONGINT;
+        level:              INTEGER;
+BEGIN
+  {First class of a unit?}
+    IF CallCallPC <> currCallCallPC THEN
+        BEGIN
+        EndPreviousUnit;
+        currCallCallPC := CallCallPC;
+        END;
+
+  {Increment numClasses but first be sure there is room in the arrays... this could move ALL the arrays!}
+    IF numClasses > (limClasses - 2) THEN
+        BEGIN
+        i {dummy}  := RAllocate(SIZEOF(TClassInfo), numClasses,
+                                growClasses, limClasses, maxClasses, 'Classes', ORD(pClasses));
+        limClasses := RAllocate(SIZEOF(TPSliceTable), numClasses,
+                                growClasses, limClasses, maxClasses, 'Classes', ORD(pSTables));
+        END;
+    numClasses := numClasses + 1;
+
+  {Convert names from TS8 to TA8 type}
+    FOR i := 1 TO 8 DO
+        BEGIN
+        itsAlpha[i] := itsClassName[i];
+        superAlpha[i] := itsSuperName[i];
+        END;
+
+  {Enter this class into the name hash table}
+    nameHashIndex := LookupClassAlpha(itsAlpha, TRUE);   {Temporary variable needed because stack may quake}
+    IF nameHashIndex > 0 THEN
+        pHashName^[nameHashIndex] := numClasses
+    ELSE
+    {$IFC fDbgClascal}
+    IF nameHashIndex < 0 THEN
+        CLABreak('Class name appeared twice', numClasses)
+    ELSE
+        CLABreak('Class Name Hash table full', maxClasses);
+    {$ELSEC}
+        CLAFail(0);
+    {$ENDC}
+
+  {Hash the name of the superclass}
+    IF itsSuperName = 'NIL     ' THEN
+        BEGIN           {This class has no superclass (e.g., TObject)}
+        superClIndex := 0;
+        itsLevelNumber := 0;
+        superSTP := NIL;
+        END
+    ELSE
+        BEGIN
+        superClIndex := pHashName^[LookupClassAlpha(superAlpha, FALSE)];
+        itsLevelNumber := NumSlices(superClIndex);
+        superSTP := pSTables^[superClIndex];
+        END;
+
+  {Fill this slice table with NILs for the moment}
+    FOR level := 0 TO itsLevelNumber + 1 DO
+        itsSTP^[level] := NIL;
+
+  {To be referenced from FillArraysFrom to calculate numAtThatLevel}
+    TPWords(itsSTP)^[-2] := itsEvenMethods;
+    TPWords(itsSTP)^[-1] := itsOddMethods;
+
+  {Initialize the fields of the class record}
+    WITH pClasses^[numClasses] DO
+        BEGIN
+        classAlpha := itsAlpha;
+        superIndex := superClIndex;
+        objectSize := itsObjSize;       {may be changed by a call on  ClassSize from the class-init block}
+        classAlias := 0;                {may be supplied by a call on ClassAuthor from the class-init block}
+        companyAndAuthor := 0;          {may be supplied by a call on ClassAuthor or UnitAuthor}
+        version := 1;                   {may be changed  by a call on ClassVersion from the class-init block}
+        oldestReadableVersion := 1;     {may be changed  by a call on ClassVersion from the class-init block}
+        END;
+
+  {Record the slice table pointer}
+    pSTables^[numClasses] := itsSTP;
+
+  {Before running the user's class-init code, be sure there is space for him to add an Alias and two Authors}
+    IF numAuthors > (limAuthors - 2) THEN
+        limAuthors := RAllocate(SIZEOF(TA32), numAuthors,
+                                growAuthors, limAuthors, maxAuthors, 'Authors', ORD(pAuthors));
+
+    IF numAliases > (limAliases - 1) THEN
+        limAliases := RAllocate(SIZEOF(TA8), numAliases,
+                                growAliases, limAliases, maxAliases, 'Aliases', ORD(pAliases));
+
+    {$IFC fTrcClascal}
+    WriteLn(' End of %_Class!, stp = ', ORD(itsSTP):5);
+    {$ENDC}
+
+  {[Interpret and] skip the MOVE/JSR pairs after the call of this procedure}
+    SetCallPC(FillArraysFrom(CallPC, itsLevelNumber, superSTP, itsSTP, itsOddMethods));
+END;
+
+
+END.
+
+ÿ

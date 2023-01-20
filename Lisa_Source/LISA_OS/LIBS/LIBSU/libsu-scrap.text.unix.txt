@@ -1,0 +1,1626 @@
+{
+cl:scrap
+
+
+
+gl:scrap
+obj:scrap
+{{          This compiles this unit          }
+
+
+{$S SegScrapVeryHot}
+UNIT Scrap;
+
+
+(* Copyright 1983, Apple Computer Inc. *)
+
+INTRINSIC SHARED;
+
+{ spr 4/19/84 -- Added global refums to Interface so that the filer could close them}
+{ spr 2/23/84 -- Fixed InitScrap handling of new UTD data seg size}
+{ med 2/21/84 -- Password protection}
+{ r_p 19Apr83 -- GetCSscrap moved from SegHotScrap to SegScrapVeryHot segment}
+{ s_w 14Apr83 -- eraseRect(scrapFolder^.portRect) added to undoInheritScrap, reviveScrapOwner, and
+                     inheritScrap to fix Lotus problem }
+{ s_w 03Jan83 -- currScrapSet, new Global interface variable, added; to initialize and
+                     maintain this, changes made in InitScrap, InheritScrap, PutScrap, PutGrScrap,
+                     PutCsScrap, EraseScrapData, and UndoInheritScrap.
+              -- CONST for ScrapUG added, and the value for the CONST ScrapCs changed }
+
+{ s_w 16Nov82 -- removed functionality of OpenScrap; in its place, added 2 procs:
+                   assureDSOpen -- assures that if the process has not yet opened a Scrap data
+                                    segment, it gets done.  Also controls binding state.
+                   assureCSOpen -- ditto, for the UTDseg
+                 Inclusion of these 2 procs results in changes in most of the procs of the unit,
+                 as well as changes in the DSegOfProc data structure...
+
+                 Note that a process need no longer call OpenScrap; whenever a process
+                 calls any procedure in this unit which requires access to a data segment,
+                 the segment will be opened (if not already open) before further processing
+
+                 ShrinkScrap will now not actually shrink if it finds that the data segment
+                 has never been opened by the process--instead, it returns back a 'warning'
+                 status of DataSegNotOpened.  This is so that a process need not pay the price
+                 of opening scrap data segment(s) unnecessarily at start-up time just because
+                 it likes to call 'AcceptInheritScrap'.
+
+                 UndoInheritScrap now kills scrap picture file}
+
+{ jrm 11/5/82 -- put ClaimScrap in SegColdScrap; pmdecl added to USES chain }
+{ s_w 5Nov82  -- Changes made so that the UTDSeg is not always memory resident:
+                    ** added csRefNum and csIsBound fields to DSegOfProc data structure
+                    ** InitScrap unbinds UTDSeg after initialization
+                    ** OpenScrap unbinds it after opening [NB: 15Nov82--this comment now invalid]
+                    ** procedures bindUTDSeg and unBindUTDSeg added.
+                    ** PutCSScrap binds UTDSEg before doing its thing, but only unbinds it on exit
+                          if it found it unbound on entry.
+  s_w 4Nov82  -- GrowScrap changed so that it gets the refNum of the data segment to grow via
+                     info_Address from the hz passed in.  Makes it more bullet-proof and also
+                     makes it work properly for growing the UTDSeg.
+  s_w 1Nov82  -- $D+ option made dependent on fSymOK
+  s_w oct 82  -- shrinkScrap   --  called by InitScrap, inheritScrap,  and AcceptInheritScrap
+              -- debugging code added, including debugging proc 'dumpScrapInfo'
+              -- new CONSTS to determine disc/mem sizes for data segments; 'scrapsize' removed
+              -- growScrap modified to respond to different mem/disc sizes
+              -- ClaimScrap no longer calls wmKillPic
+              -- inheritScrap calls shrinkScrap, and sets handles and ff.icsff to suitable nil values.
+              -- 'ff' record moved out from DSegOfProc ; this implies changes in
+                      InitScrap , putCsScrap , and getCsScrap
+              -- 'fExists' field added to type tFfInfo, to indicate whether corresponding ics is
+                      currently valid or just a leftover from a previous cut/copy; changes in
+                      InheritScrap, InitScrap, putCsScrap, and getCsScrap made
+              -- new segment 'SegScrapVeryHot' (name dreamt up by jrm) deployed; segmentation changes
+              -- many comments added or corrected }
+{ jrm 9/ 7/82 -- initialized error return in PutCSScrap }
+{ jpy 8/25/82 -- procedure DrawUScrap, Error ScrapNotPicture, USES WmlStd Wmlsb }
+{ jpy 8/20/82 -- added constant ScrapPert }
+{ jpy 8/12/82 -- added claim scrap and changed growscrap }
+{ jrm 7/23/82 -- new LDSN assignments; new Make_DataSeg parameter }
+{ jpy 7/20/82 -- added error info }
+{ jrm 7/ 6/82 -- added CleanIfil call }
+{ jrm 6/29/82 -- moved USES UnitFile }
+
+{*******************************************************************************************************}
+
+{======================================Notes on segmentation============================================
+
+     SegInitScrap     :  initialization code (InitScrap )
+     SegHotScrap      :  routines called frequently from Lotus or when using Universal Text
+                           (PutCSScrap and bind/unBind UTDseg)
+     SegColdScrap     :  infrequently called routines (KillScrapOwner, reviveScrapOwner, backOutOfScrap)
+     SegPxScrap       :  debugging routines
+     SegScrapVeryHot  :  all other routines ( callable directly or indirectly by most applications
+                            in the normal course of affairs )
+
+     SegHotScrap contains considerable code from the other units in ScrapLib, and hence the intention
+     is that its routines should not normally be called from non-Lotus applications.  The small
+     segment SegScrapVeryHot (also known as simply SegScrap) contains all procs that should be
+     invoked frequently fom all applications.
+
+ *******************************************************************************************************}
+
+INTERFACE
+USES
+     {$U libsm/UnitStd} UnitStd,
+     {$U libsm/UnitHz} UnitHz,
+     {$U libos/SysCall    } SysCall,
+     {$U libsu/UnitFile   } UnitFile,
+     {$U libqd/QuickDraw} QuickDraw,
+     {$U libfm/FontMgr    } FontMgr,
+     {$U libqd/Storage    } Storage,
+     {$U libwm/Events  } Events,
+     {$U libwm/Folders } Folders,
+     {$U libsb/WmlStd     } WmlStd,
+     {$U libsb/Wmlsb      } Wmlsb,
+     {$U libsu/UnitFmt    } UnitFmt,
+     {$U libpm/PmDecl     } PmDecl,
+     {$U libpr/PrStdInfo  } PrStdInfo,
+     {$U libsu/UnitCS     } UnitCS,
+     {$U libsu/UnitFigAtom} UnitFigAtom,
+     {$U libsu/UnitFf     } UnitFf;
+
+
+
+{============================== Constants ==============================}
+CONST
+
+  { Application specific scrap types. }
+     ScrapNil  = 0;               { no data                             }
+     ScrapFE   = 2;               { Field Editor field                  }
+     ScrapMtx  = 3;               { LisaCalc matrix (range of cells)    }
+     ScrapBGraf= 4;               { Business Graphics graph             }
+     ScrapList = 5;               { List Manager list                   }
+     ScrapDwg  = 6;               { Graphics Editor drawing             }
+     ScrapPert = 7;               { Pert chart }
+
+  { The two Non-Application-Specific scraps }
+     ScrapCs   = 12;              { Universal Text             }
+     ScrapUG   = 13;              { Universal Graph            }
+
+  { Scrap Errors, 4050-4099 }
+     SecondOpenScrapCall = 4050;
+     HZINITfailed = 4051;
+     NoUndoScrap = 4052;
+     TooManyProcesses = 4053;
+     ProcCalledByNonOwner = 4054;
+     ProcessNotFound = 4055;
+     {---------These Errors Actually declared in UnitFile-----------
+     ifilRangeWarn   = -4056;
+     noMFileErr      =  4057;
+     ifilNotOpenWarn = -4058;
+     ---------------------------------------------------------------}
+     ScrapNotPicture = 4059;
+     DataSegNotOpen  = -4060 ;  { returned by ShrinkScrap if asked to shrink unopened dataseg }
+{================================================ Types ================================================}
+TYPE
+
+    ScrapType = 0..15;
+
+{============================================== Variables ==============================================}
+VAR
+
+    icsFfScrap: TB;   { these two variables appear not to be used anywhere }
+    ifilScrap:  TB;   { by anyone, and hence may someday be removed        }
+
+    CurrScrapSet:  SET OF ScrapType  ;  { which Scrap types are currently in the Scrap }
+
+    Scrap1Figures_RefNum,   { For the filer to use to close files }
+    Scrap2Figures_RefNum,
+    Scrap1Lotus_RefNum,
+    Scrap2Lotus_RefNum: TL;
+
+{============================================== Routines ===============================================}
+
+{----- Filer Scrap routines -----}
+
+PROCEDURE InitScrap (VAR InitErr: Integer);
+     { Function: called at boot time by Filer to initialize the Scrap.
+       Errors: errors returned will be from  Make_dataseg or hzinit. }
+
+PROCEDURE KillScrapOwner (Who: ProcessId; VAR KillErr: TC);
+     { Function: called by the Filer to claim the Scrap if its owner has died.
+       Errors: (formerly) process not found to kill. (currently) No error returns }
+
+PROCEDURE ReviveScrapOwner (Who: ProcessId);
+     { called by the Filer to transfer the Scrap back to its revived owner }
+
+{----- Application general Scrap routines -----}
+
+PROCEDURE DrawUScrap(VAR DrawErr: TC);
+     { Function: Draws the univeral picture in the scrap.
+       Errors: ScrapNotPicture. }
+
+PROCEDURE BackOutOfScrap;
+     { Function: Removes the current scrap and restores the undo scrap     }
+
+PROCEDURE OpenScrap(VAR OpenErr: Integer);
+     { Function: FORMERLY Called once by each application to get access to the Scrap.
+       Now obsolete and empty, but still callable }
+
+FUNCTION DSegOfScrap: Integer;
+     { Function: returns the refnum of the currently bound scrap }
+
+FUNCTION AddrofScrapDSeg: LongInt;
+     { Returns the address of the current scrap data segment }
+
+FUNCTION HzOfScrap: THz;
+     { returns the heap zone of the scrap }
+
+{----- Ownership -----}
+
+PROCEDURE ClaimScrap;
+     { Called to gain ownership of the scrap without affecting its contents }
+
+PROCEDURE InheritScrap (SaveOld: Boolean);
+     { called by the application to claim ownership of the scrap }
+     { should be the first thing done during a Cut/Copy operation }
+     { sets the Window Manager variable scrapProcess to the current process }
+     { Can remember the old zone for Undo, if SaveOld is True }
+
+PROCEDURE UndoInheritScrap(VAR UndoErr: integer);
+     { Function: Restores the previous scrap.
+       Errors: No scrap to undo. }
+
+PROCEDURE AcceptInheritScrap;
+     { called to finally accept the previous InheritScrap (i.e. no more Undo) }
+     { in particular, it frees up any saved old Scrap data segment }
+
+{----- Writing data into the Scrap (e.g. for a cut/copy) -----}
+
+PROCEDURE EraseScrapData (VAR EraseErr: integer);
+     { Function: Called to erase the data from the current Scrap contents
+                 does so by creating a new heap zone in the scrap data segment
+                 should be called just before putting any data into a new Scrap.
+       Errors: call to info_DataSeg or hzinit }
+
+PROCEDURE StartPutScrap(VAR PutErr:integer);
+     { Function: Allows access to the Scrap's data segment for a write operation.
+       Error: OS error or StartPutScrap called by non owner. }
+
+PROCEDURE PutScrap (which: ScrapType; what: TH; VAR PutErr:integer);
+     { Function: sets the type and handle to the application specific data.
+       Error: PutScrap called by non owner. }
+
+PROCEDURE PutGrScrap (What: PicHandle; VAR PutErr:integer);
+     { Function: Sets the universal graph handle to WHAT. }
+
+PROCEDURE PutCsScrap (icsContents: TB; VAR PutCSErr:integer);
+     { Function: sets the Universal Text Stream for the Scrap's contents.
+       Error: PutCsScrap called by non owner. }
+
+PROCEDURE EndPutScrap(VAR PutErr:integer);
+     { Function: Indicates the completion of a write operation.
+       Error: OS error. }
+
+{----- Reading data from the Scrap (e.g. for a paste) -----}
+
+PROCEDURE StartGetScrap(VAR GetErr: integer);
+     { Function: Allows access to the Scrap's data segment for a read operation.
+       Error: OS error }
+
+PROCEDURE GetScrap (VAR which: ScrapType; VAR what: TH);
+     { returns the type and handle to the application specific
+       data for the Scrap's contents }
+
+PROCEDURE GetGrScrap (VAR What: PicHandle);
+     { Function: Returns the universal graph handle.
+       Note: User is responsible for setting universal graph to nil if the scrap
+             is no longer of type scrap. }
+
+PROCEDURE GetCsScrap (VAR Contents: TB);
+     { returns the Universal Text Stream for the Scrap's contents. }
+
+PROCEDURE EndGetScrap(VAR GetErr: integer);
+     { Function: indicates the completion of a read operation.
+       Error: OS error }
+
+PROCEDURE bindUTDSeg ( VAR BindErr:  integer ) ;
+{  Binds the universal-text data segment into memory }
+
+PROCEDURE unBindUTDSeg ( VAR UnBindErr:  integer ) ;
+{  Unbinds the universal-text data segment }
+
+
+{*************************************************************************}
+
+IMPLEMENTATION
+
+{$SETC DebugScrap := fDBGOK }
+{$IFC fSymOk}
+   {$D+}
+{$ELSEC}
+   {$D-}
+{$ENDC}
+
+
+{$R- }
+
+{============================== Constants ==============================}
+
+CONST
+{$IFC NOT DebugScrap}
+     testScrap = false  ;
+{$ENDC}
+
+     NoValue =  $80000000;
+
+     NoProcess = -1;
+
+     HeapBlocks = 16;
+
+     MinProcIndx = 0;        { Bounds of Process table entries }
+     MaxProcIndx = 31;
+     NoProcIndx = -1;        { index for "not found" }
+
+     ldsnCS = 13;
+     ldsnPrivate = 14;
+
+     MinMemDSSize       = 1024  ;    { minimum memory size for a scrap data segment }
+     MinDiscDSSize      = 2048  ;    { minimum disc size for a scrap data segment   }
+     MaxMemDormantSize  = 2048  ;    { threshhold of allowable mem size for scrap ds without forcing shrink }
+     MaxDiscDormantSize = 4096  ;    { threshhold of allowable disc size for scrap data segment before
+                                        shrinking is forced }
+
+
+{============================== Types ==============================}
+
+TYPE
+
+     ScrapInfo = RECORD
+                    Process: ProcessId;   { the process currently owning the scrap }
+                    DSeg:    Boolean;     { which of the 2 scrap data segs the data are in }
+                    Hz:      THz;         { the Heap Zone of the application-specific scrap }
+                    Which:   ScrapType;   { Identification of what type of Scrap is in here }
+                    What:    TH;          { handle to the Application-specific scrap data }
+                    UnivGr:  PicHandle    { handle to the Universal Graph data }
+                 END;
+
+     TFfInfo = RECORD
+                  icsFf:   TB;
+                  icsFig:   TB;
+                  ifil:    TC;
+                  fExists: TF       {whether the icsFf has current data in it}
+               END;
+
+
+{=========================================== Variables ====================================================}
+
+VAR
+
+   ScrapAddr: LongInt;
+
+   DSegOfProc: ARRAY [MinProcIndx .. MaxProcIndx] OF  { table of process-dependent variables }
+         RECORD
+           Process   :  Longint;   { which process this entry refers to }
+
+           {---------- Information about the two application-specific scrap data segments ----------}
+           RefNums   :  Array [Boolean] OF Integer;  { RefNums for the 2 DS's as viewed from Process}
+           dsOpened  :  Array [Boolean] of boolean; {whether each DS has been opened by process yet}
+           dsIsBound :  Array [Boolean] of boolean; {whether each DS is currently bound by process}
+
+           {------------------- Information about the Universal-text data segment ------------------}
+           csRefNum  :  integer ; { Refnum for UTDSeg }
+           csOpened  :  boolean ; { whether UTDSeg has yet been opened by process }
+           csIsBound :  boolean  { whether UTDSeg is currently bound by this process }
+         END;
+
+   ScrapCurrent:  ScrapInfo;
+
+   ScrapPrevious: ScrapInfo;
+
+   hzCs: Thz;
+
+   ff:      Array [Boolean] of TffInfo;
+
+{$IFC DebugScrap}
+   testScrap:     boolean ;
+{$ENDC}
+
+{============================================== Routines =================================================}
+
+
+{--------------------------------------------- IndxOfProc ------------------------------------------------}
+{ returns the table index of a given process; NoProcIndx if not found }
+{$S SUwork}
+FUNCTION IndxOfProc (TargetProc: Longint): Integer;
+VAR
+     Indx: Integer;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   FOR Indx := MinProcIndx To MaxProcIndx DO      { look for this process }
+        IF DSegOfProc [Indx].Process = TargetProc THEN  { found desired entry }
+             BEGIN
+                IndxOfProc := Indx;    { return index }
+                Exit (IndxOfProc);
+             END;
+   IndxOfProc := NoProcIndx;    { return "not found" }
+END;
+{--------------------------------------------- ProcIndex ---------------------------------------------------}
+{ This function returns the index in the DSegOfProc table of a given process; if none there,
+  it adds the current process to the table unless the table is full, in which case function
+  value will be NoProcIndx }
+
+{$S SUwork}
+function ProcIndex(TargetProc:  LongInt)  :  integer ;
+
+VAR Indx:  integer ;
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   Indx := IndxOfProc ( TargetProc ) ;
+   if Indx = NoProcIndx then     { process not in table yet; try to add it }
+      begin
+         Indx := IndxOfProc ( noProcess ) ;
+         if Indx <> NoProcIndx then  { successfully got new Index }
+            with DSegOfProc[Indx] do  { initialize DSegOfProc fields for the current process }
+               begin
+                  if testScrap then writeln('ProcIndex: adding entry');
+                  process := TargetProc ;
+                  dsOpened[true]   := false ;    { none of the   }
+                  dsIsBound[true]  := false ;    { data          }
+                  dsOpened[false]  := false ;    { segments      }
+                  dsIsBound[false] := false ;    { yet           }
+                  csOpened         := false ;    { opened,       }
+                  csIsBound        := false      { no less bound }
+               end
+      end  ; { adding this process to table }
+   ProcIndex := Indx
+end ;  { procIndex }
+
+{-----------------------------------------------assureDSOpen------------------------------------------------}
+{$S SUothrwk}
+procedure assureDSOpen ( whichDSeg:  boolean ; leaveBound:  boolean; VAR assureStatus: integer );
+
+{ assures that the Scrap data segment 'whichDSeg' is opened by this process; leaves it bound on
+  exit if leaveBound is TRUE... }
+
+VAR
+   errNum:     integer;
+   SegName:    pathname;
+   Indx:       integer;
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+  errNum := 0 ;
+   Indx := ProcIndex ( my_id ) ; { will force addition of this process to table, if needed }
+   if Indx = noProcIndx then
+      begin
+         assureStatus := tooManyProcesses;
+         if testScrap then writeln('assureDsOpen: too many processes');
+         exit (assureDSOpen)
+      end;
+
+   with DSegOfProc[Indx] do
+      begin
+         if not dsOpened[whichDSeg] then   { segment not yet opened }
+            begin
+               IF WhichDSeg THEN
+                    SegName := 'ScrapOne'
+               ELSE
+                    SegName := 'ScrapTwo';
+               if testScrap then writeln('AssureDsOpen--need to open ',segName);
+               Open_DataSeg (ErrNum, SegName,
+                                     RefNums [WhichDSeg],
+                                     ScrapAddr, ldsnPrivate);
+               if ErrNum > 0 then
+                  begin
+                     assureStatus := errNum;
+                     if testScrap then writeln('assureDsOpen--error from opendataseg:',errnum);
+                     exit(assureDSOpen)
+                  end;
+               dsOpened[whichDSeg] := true ;   {make a note that this ds now opened}
+               if leaveBound then dsIsBound[whichDSeg] := true
+               else {don't leave bound}
+                  begin
+                     Unbind_DataSeg (ErrNum, RefNums [WhichDSeg]);  {unbind the data segment }
+                     if testScrap then if errnum<>0 then
+                        writeln('AssureDsOpen--error on unbinding:',errnum:1);
+                     dsIsBound[whichDSeg] := false
+                  end { unbinding the data segment just opened }
+            end { needed to open data segment }
+
+         else { data segment was already open -- bind/unbind it as required... }
+            if leaveBound <> dsIsBound[whichDSeg] then
+               begin    { desired state doesn't match current state }
+                  if leaveBound then
+                     begin
+                        bind_dataSeg ( errNum , refNums[whichDSeg] );
+                        if testScrap then if errnum<>0 then
+                           writeln('AssureDsOpen--error on binding:',errnum:1);
+                        dsIsBound[whichDSeg] := true
+                     end
+                  else { currently bound, need to unbind }
+                     begin
+                        unBind_dataSeg ( errNum , refNums[whichDSeg] );
+                        if testScrap then if errnum<>0 then
+                           writeln('AssureDsOpen--error on unbinding:',errnum:1);
+                        dsIsBound[whichDSeg] := false
+                     end
+               end { binding or unbinding to make sure state on exit is as desired }
+      end;
+
+   assureStatus := errNum
+end; { assureDSOpen }
+
+{-----------------------------------------------assureUTOpen------------------------------------------------}
+{$S SUlwop1}
+procedure assureUTOpen (  leaveBound:  boolean; VAR assureStatus: integer );
+
+{ assures that the Universal Text Scrap data segment is opened by this process; leaves it bound on
+  exit if leaveBound is TRUE... }
+
+VAR
+   errNum:     integer;
+   SegName:    pathname;
+   Indx:       integer;
+   CsAddr:     LongInt;
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   Indx := ProcIndex ( my_id ) ; { will force addition of this process to table, if needed }
+   if Indx = noProcIndx then
+      begin
+         assureStatus := tooManyProcs;
+         if testScrap then writeln('assureUTOpen--too many processes');
+         exit (assureUTOpen)
+      end;
+
+   errnum := 0 ;
+   with DSegOfProc[Indx] do
+      begin
+         if not csOpened then   { UT data segment not yet opened by this process}
+            begin
+               { Open Universal Text data segment }
+               SegName := 'UTDSeg';
+               Open_DataSeg (ErrNum, SegName, CsRefNum, CsAddr, ldsnCS);
+               if testScrap then if errnum<>0 then
+                  writeln('AssureUTOpen--error on opening:',errnum:1);
+               if ErrNum <= 0 then { UTDSeg successfully opened }
+                  begin
+                     csOpened := true ;  { UT segment has now been opened by this process }
+                     SetAccess_DataSeg (ErrNum, CsRefnum, FALSE);   { Access R/W }
+                     if testScrap then if errnum<>0 then
+                        writeln('AssureUTOpen--error on setaccess:',errnum:1);
+                     csIsBound := true  { for the moment, UTDSeg is bound }
+                  end
+            end ; { needed to open the cs data segment }
+
+         if leaveBound then  { make certain that on exit, data seg is bound }
+            begin
+               if not csIsBound then { need to bind }
+                  begin
+                     bind_dataSeg ( errNum , CsRefNum ) ;  { bind it }
+                     if testScrap then if errnum<>0 then
+                        writeln('AssureUTOpen--error on binding:',errnum:1);
+                     csIsBound := true                     { mark as bound }
+                  end
+            end { leave it in a bound state }
+
+         else { leave it in an unbound state }
+            begin
+               if csIsBound then { need to unbind }
+                  begin
+                     unBind_dataSeg ( errNum , CsRefNum ); { unbind it }
+                     if testScrap then if errnum<>0 then
+                        writeln('AssureUTOpen--error on unbinding:',errnum:1);
+                     csIsBound := false                    { mark as unbound }
+                  end
+            end { leave it in an unbound state }
+      end;
+
+   assureStatus := errNum
+end; { assureUTOpen }
+
+{$ifc debugScrap}
+{--------------------------------------------DumpScrapInfo--------------------------------------- }
+{$S SegPxScrap}
+procedure DumpScrapInfo;
+   begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      writeln('Process #',my_Id:3,' CurrSeg =',ScrapCurrent.DSeg,'  PrevSeg =',
+               ScrapPrevious.DSeg)
+   end ;
+{$endc}
+
+{$S SUlwop1} {???}
+{----------------------------------------- bindUTDSeg --------------------------------------------------}
+{  Binds the universal-text data segment into current process's working data set  }
+
+PROCEDURE bindUTDSeg { VAR BindErr:  integer } ;
+   begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      assureUTOpen ( true  , BindErr ) {opens it if necessary, and in any case leaves it bound }
+   end;
+
+{---------------------------------------- unBindUTDSeg --------------------------------------------------}
+{  unBinds the universal-text data segment from current process's working data set  }
+
+{$S SUcold}
+PROCEDURE unBindUTDSeg { VAR UnBindErr:  integer } ;
+   begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      assureUTOpen ( false , unBindErr ) { opens if necessary, and in any case leaves it unbound }
+   end ;
+
+{--------------------------------------------- ShrinkScrap ----------------------------------------}
+{ Shrinks a Scrap Data Segment down to reasonable memory/disc size           }
+{ DSegToggle indicates which data segment is to be shrunk, 'true' or 'false' }
+{ This procedure only carries out the actual shrinkage if it seems reasonable to do so --
+    it may decide not to... }
+
+{ errors:  the return variable 'status' can pass on foul results from info_dataSeg or size_dataSeg }
+
+{$S SUwork}
+procedure ShrinkScrap ( DSegToggle :  boolean ; VAR status: integer ) ;
+VAR
+   DSegInfo      :  DsInfoRec ;
+   Indx          :  integer   ;
+   theRefNum     :  integer   ;
+
+   DMemSize,
+   DDiscSize,
+   NewMemSize,
+   NewDiscSize   :  longInt ;
+
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   Indx := ProcIndex(my_id) ;
+   if Indx = noProcIndx then
+      begin
+         status := tooManyProcesses ;
+         exit (shrinkScrap)
+      end ;
+   if not DSegOfProc[Indx].dsOpened[DSegToggle] then { data segment not open for process }
+      begin
+         status := DataSegNotOpen ;  { just return without shrinking if requested data seg not open }
+         if testScrap then
+            writeln('ShrinkScrap, did nothing because dataSeg not open');
+         exit(shrinkScrap)
+      end;
+
+   DMemSize  := 0 ;
+   DDiscSize := 0 ;
+
+   theRefNum := DSegOfProc[Indx].refNums[DSegToggle];  { refNum of data seg to shrink }
+
+   Info_dataSeg(Status, theRefNum, DSegInfo );              { get info on data seg sizes }
+   if status <= 0 then with DSegInfo do
+      begin
+         if Disc_Size > MaxDiscDormantSize then      { disc size is too big--must shrink }
+             DDiscSize := MinDiscDSSize - Disc_Size ;{ set increment such that result size is minDiscDSSize }
+
+         if Mem_Size > MaxMemDormantSize then      { memory size is too big--must shrink }
+             DMemSize := MinMemDSSize - Mem_Size ; { set increment such that result size is minMemDSSize }
+{$ifc debugScrap}
+         if testScrap then
+            begin
+               writeLn('--shrinkScrap--For the ',DSegToggle:5,' scrap:');
+               DumpScrapInfo
+            end;
+{$endc}
+         if (DDiscSize <> 0) or ( DMemSize <> 0 ) then  { really do it }
+            begin
+               if Mem_Size <> minMemDSSize then DMemSize := MinMemDSSize - Mem_Size ;
+                 { viz, if we're going to call size_dataSeg to shrink the disc, may as well shrink
+                   the memory size as well... }
+               size_DataSeg ( status , theRefNum , DMemSize , NewMemSize , DDiscSize, NewDiscSize ) ;
+               if testScrap then
+                  begin
+                     if status<>0 then writeln('shrinkScrap err on sizedataseg call:',status:1);
+                     writeln('MEMORY--old:',Mem_Size:5, ' New:',newMemSize:5,
+                                          ' DISC--old:',disc_Size:3,' New:',newdiscSize:3)
+                  end
+            end
+         else { decided not to shrink }
+            if testScrap then
+               writeln('ShrinkScrap--no shrinking; mem:',Mem_Size:5, ' Disc:',disc_Size:3)
+      end  {with }
+end ;  { shrinkScrap }
+
+
+{= = = = = = = = = = = = = = = = = = = = = = = = Ownership = = = = = = = = = = = = = = = = = = = = = = = =}
+
+{-------------------------------------------- DSegOfScrap ------------------------------------------------}
+{ returns the refnum of the scrap data segment }  {returns 0 if error}
+{$S SUothrwk}
+FUNCTION DSegOfScrap(*: Integer*);
+VAR
+     status   : Integer ;
+     Indx     : integer ;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   Indx := ProcIndex(my_id) ;
+   if Indx = noProcIndx then
+      begin
+         dSegOfScrap := 0 ;
+         exit(DSegOfScrap)
+      end;
+   assureDSOpen ( scrapCurrent.Dseg , DSegOfProc[Indx].dsIsBound[ScrapCurrent.Dseg] , status ) ;   {make sure "current" data segment is open }
+   if testScrap then if status<>0 then
+      writeln('DSegOfScrap--error from AssureDSOpen:',status:1);
+   IF (status <= 0)
+      THEN DSegOfScrap := DSegOfProc[Indx].RefNums[ScrapCurrent.DSeg]   { set refnum as fn value }
+      ELSE DSegOfScrap := 0
+END;
+
+{-------------------------------------------- AddrofScrapDSeg --------------------------------------------}
+{ returns the address of the scrap data segment }
+
+{$S SUcold}
+FUNCTION AddrofScrapDSeg(*: LongInt*);
+   BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      AddrofScrapDSeg := ScrapAddr
+   END;
+
+{---------------------------------------------- HzOfScrap ------------------------------------------------}
+{ returns the heap zone of the scrap }
+
+{$S SUothrwk}
+FUNCTION HzOfScrap (*: THz*);
+   BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      HzOfScrap := ScrapCurrent.Hz
+   END;
+
+{--------------------------------------------- GrowScrap -------------------------------------------------}
+{$S SUcold}
+FUNCTION GrowScrap(hz: Thz; bytesNeeded: INTEGER): INTEGER;
+CONST discMultiplier = 4 ;  { when the disc size of the data segment must be grown, this indicates
+                              the ratio of the increments by which it should be grown to
+                              the size by which memory is grown }
+{ notes:
+   -- minimum of 1024 bytes expansion is made
+   -- normally only the memory size is expanded, as long as new memory size does not exceed disc size
+   -- but IF disc size also needs expanding, then:
+        *** disc size is grown at a faster rate than memory size, so that we it doesn't need growing
+            as often ...   }
+
+VAR discExpansion,
+    memExpansion,
+    newDiscSize,
+    newMemSize      : longint;
+    status          : integer;
+    dsInfo          : dsinforec;
+    ScrapRefNum     : integer ;
+
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+
+    IF bytesneeded < 2*512 then memExpansion := 2*512
+    else memExpansion := bytesneeded;
+
+    info_Address ( status , ord(hz) , ScrapRefNum ) ;  { to determine RefNum of data Seg to be grown }
+
+    Info_dataseg(Status,ScrapRefNum,dsInfo);  { determine existing size }
+    with dsInfo do
+       if ( mem_size + memExpansion > disc_size ) then discExpansion := memExpansion * discMultiplier
+                                                  else discExpansion := 0 ;
+    size_dataseg( status, ScrapRefNum, memExpansion, newMemSize, discExpansion, newDiscSize );
+
+{$ifc debugScrap}
+    if testScrap then
+       begin
+          write('growScrap-- ');
+          DumpScrapInfo ;
+          writeln('----needed=',bytesNeeded:1,
+                      ' disc+=',discExpansion:1,
+                     ' newMem=',newMemSize:1,
+                    ' newDisc=',newDiscSize:1,
+                     ' status=',status:1)
+       end;
+{$endc}
+
+    if status > 0 then
+       begin  { failed to get size required; before quitting, try to grow such that disc = memory }
+          with dsInfo do discExpansion := ( mem_size + memExpansion ) - disc_size ;
+          size_dataseg(status,ScrapRefNum,memExpansion,newMemSize,discExpansion,newDiscSize);
+
+          if testScrap then    writeln('growScrap retry:',
+                                               '  disc+=',discExpansion:1,
+                                              '  newMem=',newMemSize:1,
+                                             '  newDisc=',newDiscSize:1,
+                                              '  status=',status:1)
+
+       end ;
+    if status  > 0 then   { still couldn't make it }
+       GrowScrap := 0
+    ELSE
+       GrowScrap := newMemSize - dsinfo.mem_size
+end { growScrap } ;
+
+
+
+{= = = = = = = = = = = = = = = = = = = = = = =  Filer Scrap routines = = = = = = = = = = = = = = = = = = = = =}
+{$S SUinit}
+{--------------------------------------------------- InitScrap -----------------------------------------------}
+{ called at boot time by Filer to initialize the Scrap }
+
+PROCEDURE InitScrap (*VAR InitErr: integer;*);
+LABEL 1;
+VAR
+     ErrNum:      Integer;
+     WhichDSeg:   Boolean;
+     SegName:     PathName;
+     ProcIndx:    Integer;
+     Csaddr:      LongInt;
+     CsErrNum:    integer;
+     Cssize:      integer;
+     ffleader:    Tffleader;
+     cError:      TC;
+     OpenErrNum:  Integer;
+     InfoErrNum:  Integer;
+     KillErrNum:  Integer;
+     setaccT:     TSetaccess;
+     UTDsInfo:    DsInfoRec;
+
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+
+{$IFC debugScrap}
+writeln('initScrap');
+testScrap := true  ;      {+} {temporary-17Nov82}
+{$ENDC}
+
+FOR ProcIndx := MinProcIndx To MaxProcIndx DO     { all process entries }
+     DSegOfProc [ProcIndx].Process := NoProcess;  { zero }
+
+with DSegOfProc[minProcIndx] do
+   begin
+      process := My_Id ;
+      FOR WhichDSeg := False To True DO
+         BEGIN
+            IF WhichDSeg THEN
+                 SegName := 'ScrapOne'
+            ELSE
+                 SegName := 'ScrapTwo';
+            Open_DataSeg (OpenErrNum, SegName,
+                                  RefNums [WhichDSeg],
+                                  ScrapAddr,
+                                  ldsnPrivate);
+            IF OpenErrNum <= 0 THEN
+                BEGIN
+                   SetAccess_DataSeg(ErrNum, RefNums [WhichDSeg], FALSE);
+                   dsOpened[whichDSeg] := true ;   {mark as now opened for Filer process}
+                   dsIsBound[whichDSeg]:= true ;   { for the moment, it is bound }
+                   ShrinkScrap ( WhichDSeg , ErrNum )         {+Shrink down to something reasonable+}
+                END
+            ELSE
+                BEGIN
+                   if testScrap then writeln('open failed; killing and making');
+                   Kill_DataSeg (KillErrNum, SegName);
+                   Make_DataSeg (ErrNum, SegName,
+                                 MinMemDSSize , MinDiscDSSize ,
+                                 RefNums [WhichDSeg],
+                                 ScrapAddr, ldsnPrivate, ds_shared);
+                   if ErrNum > 0 then
+                      begin
+                         goto 1
+                      end ;
+                   dsOpened[whichDSeg] := true ;   {mark as now opened for Filer process}
+                   dsIsBound[whichDSeg]:= true     { for the moment, it is bound }
+                END;
+
+            Unbind_DataSeg (ErrNum, RefNums[WhichDSeg]);
+            if ErrNum > 0 then
+               begin
+                  if testScrap then writeln('InitScrap, error in unbind#1:',errnum:1);
+                  goto 1  { highly unlikely escape }
+               end
+            else { all ok } dsIsBound[whichDSeg] := false
+         END ;   { FOR }
+
+
+      { Create Universal Text data segment and heap zone }
+
+      CSsize := 10240;
+      segname := 'UTDSeg';
+      Open_DataSeg ( OpenErrNum, SegName, csRefNum, CsAddr, ldsnCS );
+      IF OpenErrNum > 0 THEN
+          BEGIN
+             Kill_DataSeg (KillErrNum, SegName);  {*** remove when OS error fixed }
+             Make_DataSeg (ErrNum, SegName,
+                           CsSize, CsSize,
+                           CsRefNum,
+                           CsAddr, ldsnCS, ds_shared);
+             if ErrNum > 0 then
+                begin
+                   goto 1
+                end
+          END
+      ELSE BEGIN
+        Info_DataSeg ( InfoErrNum, CsRefNum, UTDsInfo ); {Be sure it is NEW size}
+        IF (OpenErrNum < 0) OR (UTDsInfo.Mem_Size < CSsize) THEN
+            BEGIN
+               Kill_DataSeg (KillErrNum, SegName);  {*** remove when OS error fixed }
+               Close_DataSeg (ErrNum, csRefNum);
+               if ErrNum > 0 then
+                  begin
+                     goto 1
+                  end;
+               Make_DataSeg (ErrNum, SegName,
+                             CsSize, CsSize,
+                             CsRefNum,
+                             CsAddr, ldsnCS, ds_shared);
+               if ErrNum > 0 then
+                  begin
+                     goto 1
+                  end
+            END
+         ELSE
+            BEGIN
+               SetAccess_DataSeg (ErrNum, CsRefnum, FALSE);   { Access R/W }
+               IF ErrNum > 0 THEN
+                  GOTO 1;
+            END;
+      END;
+
+      csOpened  := true  ;  { Filer process has now opened this segment }
+      csIsBound := true   { for the moment, this process has bound the data segment }
+   END ; { with }
+
+hzCs := HzInit (Pointer (CSAddr),                 { create a Heap on UTDSeg }
+              Pointer (CSAddr + CSsize),
+              @fnoinvalidate,
+              18,               { This should be inputed or something }
+              6,
+              @GrowScrap,
+              @FilCbOfN, @FilFSwapInN, @FilSwapOutN);
+if ord(hzCs) = 1 then
+   begin
+   InitErr := HZINITfailed;
+   exit(InitScrap);
+   end;
+
+{$IFC fDbgOk}
+    fTstFf := FALSE;
+    fTstFile := FALSE;
+    fTstCs := FALSE;
+    fTstFmt := FALSE;
+{$ENDC}
+
+InitFiles(hzCs);
+InitFmt;
+InitCs(hzCs);
+InitFf; InitFig;
+
+setaccT := [global_Refnum, dRead, dWrite, Append];
+ff[TRUE].ifil := IFilOpen(cError, 'SCRAP1.LOTUS', cbPgFf, setaccT, hzCs,'');
+Scrap1Lotus_RefNum := Scrap_RefNum;
+ff[TRUE].icsFf := icsNil;  { Should call
+                             IcsFfCreate(ff[TRUE].ifil, hzCs, ffleader);
+                             but it won't work (now) for "open for write"
+                             when a lotus file does not exist
+                           }
+ff[TRUE].icsFig := IcsFigCreate(cError, 'SCRAP1.FIGURES', setaccT, hzCs,'');
+Scrap1Figures_RefNum := Scrap_RefNum;
+ff[TRUE].fExists := false ;
+
+ff[FALSE].ifil := IFilOpen(cError, 'SCRAP2.LOTUS', cbPgFf, setaccT, hzCs,'');
+Scrap2Lotus_RefNum := Scrap_RefNum;
+ff[FALSE].icsFf := icsNil; { Should call
+                             IcsFfCreate(ff[FALSE].ifil, hzCs, ffleader);
+                             but it won't work (now) for "open for write"
+                             when a lotus file does not exist
+                             }
+ff[FALSE].icsFig := IcsFigCreate(cError, 'SCRAP2.FIGURES', setaccT, hzCs,'');
+Scrap2Figures_RefNum := Scrap_RefNum;
+ff[FALSE].fExists := false ;
+
+unBindUTDSeg ( errNum ) ;    { unbind the universal-text data segment }
+
+WITH ScrapCurrent DO
+     BEGIN
+        Process := my_id;        { initially, filer owns scrap window }
+        DSeg := True;            { start out with one of the data segs }
+        Hz := Nil;               { no heap zone yet }
+        Which := ScrapNil;       { empty scrap }
+        What := Nil;             { no handle yet to app-specific scrap }
+        UnivGr := Nil            {  ... nor to univ. graph srap        }
+     END;
+
+CurrScrapSet := [] ;     {=}     { no scrap of any kind yet }
+
+ScrapProcess := ScrapCurrent.Process;     { Transfer control }
+GiveWindow (ScrapFolder, ScrapProcess);
+
+ScrapPrevious.Process := NoProcess;     { no previous Scrap at startup }
+
+
+1: InitErr := ErrNum
+END; {InitScrap}
+
+
+{------------------------------------------- KillScrapOwner ------------------------------------------------}
+{ called by the Filer to claim the Scrap if its owner has died }
+{$S SUcold}
+PROCEDURE KillScrapOwner (*Who: ProcessId; VAR KillErr: TC*);
+VAR
+     Indx: Integer;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   if testScrap then writeln('killScrapOwner');
+   KillErr := 0;
+   IF ScrapProcess = Who THEN
+        BEGIN
+           ScrapCurrent.Process := FilerProcess;     { Transfer control to Filer }
+           ScrapProcess := ScrapCurrent.Process;
+           GiveWindow (ScrapFolder, ScrapProcess);
+        END;
+   IF ScrapPrevious.process = Who THEN
+        ScrapPrevious.process := FilerProcess;  { likewise }
+   Indx := IndxOfProc (Who);
+   IF Indx <> NoProcIndx THEN
+        DSegOfProc [Indx].Process := NoProcess  { zero }
+   (* ELSE
+        KillErr := ProcessNotFound; >>> commented out, sw 9Nov82; may now be possible legitimately
+                                        for process not to be in table... *)
+END;
+
+
+{------------------------------------------- ReviveScrapOwner ---------------------------------------------}
+{ called by the Filer to transfer the Scrap back to its revived owner }
+
+{$S SUcold}
+PROCEDURE ReviveScrapOwner (*Who: ProcessId*);
+VAR savePort : grafPtr ;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+if testScrap then writeln('ReviveScrapOwner');
+IF ScrapProcess = FilerProcess THEN
+     BEGIN
+     ScrapCurrent.Process := Who;     { Transfer control back to previous owner }
+     ScrapProcess := ScrapCurrent.Process;
+     GiveWindow (ScrapFolder, ScrapProcess);
+
+     getPort(savePort) ;                   { clear out scrap window -- fixes Lotus Bug }
+     setPort(scrapFolder) ;
+     eraseRect(scrapFolder^.portRect) ;
+     setPort(savePort) ;
+
+     END;
+END;
+
+{= = = = = = = = = = = = = = = = = = =  Application general Scrap routines  = = = = = = = = = = = = = = = =}
+{$S SUcold}
+{----------------------------------------------- DrawUScrap -----------------------------------------------}
+     { Function: Draws the univeral picture in the scrap. }
+
+PROCEDURE DrawUScrap{Var DrawErr: TC};
+var
+   Pic: PicHandle;
+   PicRect, ScrapRect: Rect;
+   TempPort: Grafptr;
+   dummy: TC;
+
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+if testScrap then
+   begin
+      write('drawUScrap--');
+      DumpScrapInfo
+   end;
+{$endc}
+GetGrScrap(Pic);
+if Pic = nil then
+   DrawErr := ScrapNotPicture
+else
+   begin
+   DrawErr := 0;
+   StartPutScrap(DrawErr); { unclear why Put rather than Get used here and below in the EndPutScrap }
+   if DrawErr <> 0 then
+      begin
+      EndPutScrap(dummy);
+      Exit(DrawUScrap);
+      end;
+
+{ set the port, clipping, etc. }
+   GetPort(tempPort);
+   SetPort(ScrapFolder);
+   scrapRect := ScrapFolder^.portRect;
+   with scrapRect do
+      begin
+      right := (right - dhsBox) + 1;
+      bottom := (bottom - dvsBox) + 1;
+      end;
+   ClipRect (scrapRect);
+   EraseRect (scrapRect); { erase the whole folder, less scroll bars }
+
+{ now draw the picture }
+   PicRect := pic^^.PicFrame;
+   offsetrect(PicRect,-PicRect.left,-PicRect.top);
+   DrawPicture(Pic, PicRect);
+
+   EndPutScrap(Dummy);
+
+   SetPort(tempPort);
+   end;
+end;
+
+{----------------------------------------- BackOutOfScrap ----------------------------------------------}
+{ Called if an unrecoverable error occurs while accessing the scrap.
+  Removes the current scrap and restores the undo scrap     }
+{$S SUcold}
+PROCEDURE BackOutOfScrap;
+Var BackErr: TC;
+   begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+      if testScrap then
+         begin
+            write('BackOutOfScrap--on entry--,');
+            DumpScrapInfo
+         end;
+{$endc}
+      {if Dsegisbound then}
+      endputscrap(BackErr);            { unbind current data segment }
+      UndoinheritScrap(BackErr);       { flip-flop to alternate data segment }
+      endputscrap(backerr);            {   ... and unbind it            }
+      AcceptinheritScrap;              { wipe out <and maybe shrink> the undo data segment }
+   end;
+
+{------------------------------------------- OpenScrap -------------------------------------------------}
+{ Called once by each application to gain access to the scrap           }
+{>>>>>>>>>>>>>>>>>>>>>>>>>>>> This proc has become vacuous now -- 9 Nov 82 <<<<<<<<<<<<<<<<<<<<<<<<<<<< }
+{$S SUopen1} { moved to this hottest of segs so apps still calling this at least won't have
+                       to swap in the SegInitScrap segement }
+PROCEDURE OpenScrap(*VAR OpenErr: Integer*);
+{$ifc debugScrap}
+   VAR
+      reply:  char;
+   BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+      if EventDebug then { set-debugging-flag opportunity }
+         begin
+            write('Open Scrap:  trace Scrap?' );
+            readln(reply) ;
+            testScrap := reply in ['y','Y']
+         end ;
+      OpenErr := 0
+   END ;
+{$elsec}
+begin
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+OpenErr := 0
+end ;
+{$endc}
+
+{---------------------------------------------- ClaimScrap -------------------------------------------------}
+{ Called to gain ownership of the Scrap without changing its contents }
+
+{$S SUcold}
+PROCEDURE ClaimScrap;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('ClaimScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+   ScrapCurrent.Process := My_Id;
+   ScrapProcess := ScrapCurrent.Process;     { Transfer control }
+                                                                {+19Oct82:no longer calls wmKillPic+}
+   GiveWindow (ScrapFolder, ScrapProcess)
+END;
+
+{-------------------------------------------- InheritScrap -------------------------------------------------}
+{ called by the application to claim ownership of the scrap }
+{ should be the first thing done during a Cut/Copy operation }
+{ sets the Window Manager variable scrapProcess to the current process }
+{ Can remember the old zone for Undo, if SaveOld is True }
+
+{$S SUwork}
+PROCEDURE InheritScrap (*SaveOld: Boolean*);
+   VAR status:  integer;
+       savePort: grafPtr ;
+   BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+      if testScrap then
+         begin
+            writeln('InheritScrap');
+            DumpScrapInfo
+         end;
+{$endc}
+      ScrapPrevious := ScrapCurrent;  { save incoming Scrap for possible Undo }
+
+      WITH ScrapCurrent DO       { establish initial values for new Scrap }
+           BEGIN
+              Process := My_Id;
+              Which := ScrapNil;  { no app-specific scrap type }
+              What := Nil;        { -- null handle to app scrap }
+              UnivGr := Nil;      { -- null handle to univ graph scrap }
+              IF SaveOld THEN
+                   DSeg := NOT DSeg ;  { swap to other data segment }
+              ff[DSeg].fExists := false  { make note that this ics does not hold good data }
+           END;
+      CurrScrapSet := [] ;   { no scrap types current }
+      ShrinkScrap ( ScrapCurrent.Dseg , status ) ; { adjust data-seg size downward, if it's big }
+      ScrapProcess := ScrapCurrent.Process;        { Transfer control }
+      GiveWindow (ScrapFolder, ScrapProcess);
+
+      getPort(savePort) ;                   { clear out scrap window -- fixes Lotus Bug }
+      setPort(scrapFolder) ;
+      eraseRect(scrapFolder^.portRect) ;
+      setPort(savePort) ;
+
+      WmKillPicture(scrapfolder)                  { kill Scrap's Picture File }
+   END;
+
+
+{-------------------------------------------- UndoInheritScrap ----------------------------------------------}
+{ restores the previous scrap }
+
+{$S SUwork}
+PROCEDURE UndoInheritScrap(*VAR UndoErr: integer*);
+VAR
+     Temp: ScrapInfo;
+     savePort: GrafPtr ;
+
+
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+if testScrap then
+   begin
+      write('UndoInheritScrap--on entry:');
+      DumpScrapInfo
+   end;
+{$endc}
+IF ScrapPrevious.Process = NoProcess THEN     { no previous Scrap available }
+     UndoErr := NoUndoScrap
+ELSE
+     BEGIN
+     UndoErr := 0;
+     Temp := ScrapCurrent;                { remember current Scrap's info }
+     ScrapCurrent := ScrapPrevious;       { previous Scrap becomes the current }
+     ScrapPrevious := Temp;        { what was current becomes the previous }
+
+     CurrScrapSet := [] ;
+     with ScrapCurrent do
+        begin
+           if which <> scrapNil then CurrScrapSet := CurrScrapSet + [ which ] ;
+           if UnivGr <> Nil then   CurrScrapSet := CurrScrapSet + [ ScrapUG ];
+           with ff[DSeg] do
+              if fExists then if icsFF <> icsNil then CurrScrapSet := CurrScrapSet + [ ScrapCs ]
+        end;
+
+     ScrapProcess := ScrapCurrent.Process;     { Transfer control }
+
+     GiveWindow (ScrapFolder, ScrapProcess);
+     WmKillPicture(scrapfolder)    ;              { kill Scrap's Picture File, if any }
+
+     getPort(savePort) ;                   { clear out scrap window -- fixes Lotus Bug }
+     setPort(scrapFolder) ;
+     eraseRect(scrapFolder^.portRect) ;
+     setPort(savePort) ;
+
+     InvalidateRgn (ScrapFolder, ScrapFolder^.VisRgn); { repaint previous }
+     END;
+END;
+
+
+{------------------------------------------- AcceptInheritScrap ---------------------------------------------}
+{ called to finally accept the previous InheritScrap (i.e. no more Undo) }
+{ in particular, it frees up any saved old Scrap data segment }
+
+{$S SUothrwk}
+PROCEDURE AcceptInheritScrap;
+VAR status:  integer ;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('acceptInheritScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+   ScrapPrevious.Process := NoProcess;     { no previous Scrap now }
+   ShrinkScrap ( NOT ScrapCurrent.DSeg , status ) { shrink the alternate segment }  {+}
+END;
+
+
+{= = = = = = = = = = = = =  Writing data into the Scrap (e.g. for a cut/copy) = = = = = = = = = = = = = = = =}
+
+
+{---------------------------------------- EraseScrapData ----------------------------------------------------}
+{ called to erase the data from the current Scrap contents }
+{ does so by creating a new heap zone in the scrap data segment }
+{ should be called just before putting any data in a new Scrap }
+
+{$S SUothrwk}
+PROCEDURE EraseScrapData (*VAR EraseErr: integer*);
+VAR
+     ErrNum: Integer;
+     DSegInfo: DsInfoRec;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('eraseScrapData:');
+         DumpScrapInfo
+      end;
+{$endc}
+EraseErr := 0;
+WITH ScrapCurrent DO       { establish initial values for new Scrap }
+     BEGIN     { construct a new heap zone }
+     StartPutScrap(EraseErr);
+     if EraseErr > 0 then
+       Exit(EraseScrapData);
+
+     Info_DataSeg (EraseErr, DSegOfScrap, DSegInfo);         { get current size info for data seg }
+     if EraseErr > 0 then
+       begin
+       EndPutScrap(Errnum);
+       Exit(EraseScrapData);
+       end;
+
+     Hz := HzInit (Pointer (ScrapAddr),
+                   Pointer (ScrapAddr + DSegInfo.Mem_Size),    { create a }
+                   Nil,
+                   HeapBlocks,                                 { new Heap Zone }
+                   0,
+                   @GrowScrap,                                 { in the data Segment }
+                   Nil, Nil, Nil);
+     if ord(hz) = 1 then
+        begin
+        EraseErr := HZINITfailed;
+        Exit(EraseScrapData)
+        end;
+
+     EndPutScrap(EraseErr);
+     Which := ScrapNil;  { empty scrap }
+     What := Nil;
+     UnivGr := Nil;
+
+     CurrScrapSet := []
+
+     END;
+END;
+
+
+{-------------------------------------------- StartPutScrap ------------------------------------------------}
+{ Allows access to the Scrap's data segment for a write operation }
+
+{$S SUothrwk}
+PROCEDURE StartPutScrap(*VAR PutErr: integer*);
+var indx:  integer;
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('startPutScrap--');
+         DumpScrapInfo
+      end;
+{$endc}
+IF ScrapProcess <> My_Id THEN
+     PutErr := ProcCalledByNonOwner
+else
+   begin
+      assureDSOpen ( ScrapCurrent.Dseg , true , PutErr )  ; {assures entry in table plus binding }
+      if PutErr <= 0 then
+            SetAccess_DataSeg (PutErr, dSegOfScrap, FALSE)   { Access R/W }
+   end;
+END;
+
+
+{------------------------------------------------ PutScrap --------------------------------------------------}
+{ sets the type and handle to the application specific data }
+
+{$S SUothrwk}
+PROCEDURE PutScrap (*Which: ScrapType; What: TH; VAR PutErr:integer*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('PutScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+IF ScrapProcess <> My_Id THEN
+     PutErr := ProcCalledByNonOwner
+ELSE
+   BEGIN
+      ScrapCurrent.Which := Which;
+      ScrapCurrent.What := What;
+      PutErr := 0;
+      CurrScrapSet := CurrScrapSet + [ which ]
+
+   END;
+END;
+
+
+{---------------------------------------------- PutGrScrap --------------------------------------------------}
+{ sets the type and handle to the application specific data }
+
+{$S SUothrwk}
+PROCEDURE PutGrScrap (*What: TH; VAR PutErr:integer*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('putGrScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+IF ScrapProcess <> My_Id THEN
+     PutErr := ProcCalledByNonOwner
+ELSE
+   BEGIN
+   ScrapCurrent.UnivGr := What;
+   CurrScrapSet := CurrScrapSet + [ scrapUG ] ;
+   PutErr := 0;
+   END;
+END;
+
+{---------------------------------------------- PutCsScrap --------------------------------------------------}
+{ sets the Universal Text Stream for the Scrap's contents }
+
+{$S SUcold}
+PROCEDURE PutCsScrap (*icsContents: TB; VAR PutCSErr: integer*);
+{!problem of conflict between wasBound state and bind state for assureUTOpen MAY be solved...!}
+VAR
+   pglp            : TPglp;
+   ifilFf, ifilFig : TB;
+   ffleader        : TFfleader;
+   indx            : integer  ;  { for process index }
+   wasBoundOnEntry : boolean ;   { tells whether, on entry to this proc, the UTDSeg was bound }
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('putCSScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+PutCSErr := 0;
+IF ScrapProcess <> My_Id THEN
+   begin
+   PutCSErr := ProcCalledByNonOwner;
+   exit(PutCSScrap);
+   end;
+
+indx := procIndex ( my_id ) ;   { may have to Open the segment first }
+if indx = noProcIndx then
+   begin
+      PutCSErr := TooManyProcesses ;
+      exit ( putCSScrap )
+   end;
+WasBoundOnEntry := DSegOfProc[indx].csIsBound ;  { stash the bind-state of UTDSeg on entry }
+
+bindUTDSeg ( PutCSErr ) ;                   { bind the cs data segment, 'UTDSeg' }
+if putCSErr > 0 then exit ( PutCsScrap ) ;
+IF icsContents = icsNil THEN with ff[ScrapCurrent.Dseg] do
+     BEGIN
+        FreeIcs(icsFf);      { nb: this branch is basically bulletproofing, since }
+        icsFf := icsNil;     {     it is not anticipated that anyone would want to}
+        fExists := false     {     call putCSScrap with icsNil...                 }
+     END
+ELSE BEGIN
+     pglp := pglpStd;
+             (*
+                   pglp.icsHdr := icsNil;
+                   pglp.icsFtr := icsNil;
+              *)
+     ifilFf := ff[ScrapCurrent.Dseg].ifil;
+     ifilFig := IfilOfFig(ff[ScrapCurrent.Dseg].icsFig);
+     IF ifilFf <> ifilNil THEN
+          BEGIN
+             CleanIfil(PutCSErr, hzCs, ifilFf, TRUE);
+             WriteIcsFf(icsContents, pglp, tyrluEnglish, ifilFf, ifilFig, hzCs);
+             WITH ff[ScrapCurrent.Dseg] DO
+                begin
+                IF icsFf = icsNil THEN
+                     BEGIN
+                        {This crock would not be necessary if we could init icsFf in InitScrap}
+                        icsFf := IcsFfCreate(ifilFf, icsFig, hzCs, ffleader);
+                        mpicsprcs^[icsFf] := FilerProcess;
+                     END
+                ELSE SetLeaderOfIcsFfFromIFil(icsFf, ifilFf, hzCs);
+                fExists := true ; { mark as not only existing but having real data in it }
+                CurrScrapSet := CurrScrapSet + [scrapCs];
+                { Kludge # 794 - The streams may have been created before the
+                                 image proc's were bound to the stream
+                                 so re-copy the cspd }
+                IF icsFf <> icsNil THEN rghcs^[icsFf]^^.cspd := cspdFf;
+                IF icsFig <> icsNil THEN rghcs^[icsFig]^^.cspd := cspdFig;
+                end { with }
+          END { ifilFf not nil }
+     END ; { icsContents not nil }
+if not wasBoundOnEntry then unBindUTDSeg ( putCSErr )  { unbind UTDSeg if it was unbound on entry }
+END;
+
+
+{--------------------------------------------- EndPutScrap --------------------------------------------------}
+{ indicates the completion of a write operation }
+
+{$S SUothrwk}
+PROCEDURE EndPutScrap(*VAR PutErr: integer*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   {$ifc debugScrap}
+      if testScrap then
+         begin
+            writeln('endPutScrap');
+            DumpScrapInfo
+         end;
+   {$endc}
+   IF ScrapProcess <> My_Id THEN
+      PutErr := ProcCalledByNonOwner
+   else
+      begin
+         assureDSOpened ( ScrapCurrent.DSeg , false , PutErr ) ;
+         if PutErr <= 0 then SetAccess_DataSeg (PutErr, DSegOfScrap, True)   { back to access R only }
+      end
+END;
+
+
+{= = = = = = = = = = = = = =  Reading data from the Scrap (e.g. for a paste)  = = = = = = = = = = = = = = =}
+
+
+{----------------------------------------- StartGetScrap --------------------------------------------------}
+{ Allows access to the Scrap's data segment for a read operation }
+
+{$S SUothrwk}
+PROCEDURE StartGetScrap(*VAR GetErr: integer*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   {$ifc debugScrap}
+      if testScrap then
+         begin
+            writeln('startGetScrap');
+            DumpScrapInfo
+         end;
+   {$endc}
+   assureDSOpened ( ScrapCurrent.DSeg , true , GetErr )  { make sure data seg is open and bound }
+END;
+
+
+{-------------------------------------------- GetScrap ----------------------------------------------------}
+{ returns the type and handle to the application specific
+  data for the Scrap's contents }
+
+{$S SUothrwk}
+PROCEDURE GetScrap (*VAR Which: ScrapType; VAR What: TH*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('getScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+Which := ScrapCurrent.Which;
+What := ScrapCurrent.What;
+END;
+
+
+{-------------------------------------------- GetGrScrap ---------------------------------------------------}
+{ Function: Returns the universal graph handle.
+  Note: User is responsible for setting universal graph to nil if the scrap
+        is no longer of type scrap. }
+
+{$S SUothrwk}
+PROCEDURE GetGrScrap (*VAR What: TH*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('getGrScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+What := ScrapCurrent.UnivGr;
+END;
+
+
+{------------------------------------------- GetCsScrap ----------------------------------------------------}
+{ returns the Universal Text Stream for the Scrap's contents }
+
+{$S SUothrwk}
+PROCEDURE GetCsScrap (*VAR Contents: TB*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+{$ifc debugScrap}
+   if testScrap then
+      begin
+         writeln('getCsScrap');
+         DumpScrapInfo
+      end;
+{$endc}
+   with ff[ScrapCurrent.DSeg] do
+      if fExists then Contents := icsFf        { return the index if current cs scrap is valid }
+                 else Contents := icsNil       {  ... else return nil                          }
+END;
+
+
+{------------------------------------------ EndGetScrap ----------------------------------------------------}
+{ indicates the completion of a read operation }
+
+{$S SUothrwk}
+PROCEDURE EndGetScrap(*VAR GetErr: integer*);
+BEGIN
+{$IFC fTraceSU}    LogCall;     {$ENDC}
+   {$ifc debugScrap}
+      if testScrap then
+         begin
+            writeln('endGetScrap');
+            DumpScrapInfo
+         end;
+   {$endc}
+   assureDSOpen(ScrapCurrent.DSeg , false , getErr ) { leaves data seg unbound }
+END;
+
+
+{************************************************************************************************************}
+
+END. { Unit Scrap }
+ÿ

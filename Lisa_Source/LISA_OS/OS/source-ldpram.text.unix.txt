@@ -1,0 +1,316 @@
+;Copyright 1983, 1984, Apple Computer Inc.
+
+;file source/ldpram (contents of the boot block)
+
+        .proc LDRLDR                    ;priam loader loader
+        .NOLIST
+
+    ;**********
+    ;* Description:
+    ;*   This is the copy of the loader loader with a PRIAM device driver.
+    ;*
+    ;* Input Parameters:
+    ;*   The boot prom tells the size and base address of physical memory, and
+    ;*   where we are booting from.  WBT deposits information into a small
+    ;*   data area at the front of this block, showing the amount of the loader's
+    ;*   global data and code, the offset to the loader's entrypoint, and the
+    ;*   block address of the first page of the filesystem, ie, the MDDF.
+    ;*
+    ;*   The slot prom passes two parameters:
+    ;*       (SP) - the address of the slot prom's 'read a block' procedure,
+    ;*         A0 - a 'logic base address' pointer (a parameter to the 'read a
+    ;*             block' routine).
+    ;*
+    ;* Output Parameters:
+    ;*   The loader loader reports to the loader the block address of MDDF, the
+    ;*   logical volume number of the boot device (though that's only used for
+    ;*   twiggy, the block address
+    ;*   of the first usable page of the boot volume (exclusive of this block),
+    ;*   the address of the loader database and where the loader began execution.
+    ;*
+    ;**********
+
+        .INCLUDE        SOURCE/LDEQU.TEXT
+        .LIST
+
+timeout         equ     $900000 ;about 100 seconds
+
+
+;**********
+;
+; Here begins the body of loader loader.
+;
+;**********
+ldr_base
+        jmp     over_ldr_data           ;dont execute loader data
+                                        ; written by boot track writer
+
+;---------
+;
+; reserve enough space for the 'write_boot_tracks' utility
+;  to store primitive config information here:
+        .word boot_id,ldr_version       ;note loader version and that it's bootable
+        .word 0,0,0,0                   ;save bytes for loader self-description space
+
+;allocate space for slot-boot ldrldr variables:
+drvr_base       ;pointer to boot device driver
+        .word 0,0
+
+drvr_ptr        ;logic ptr param, for use with boot device driver
+        .word 0,0
+
+
+over_ldr_data                           ; execution continues from here
+;
+;pick where to re-position the loader
+        move.l  prom_realsize,d0
+        lsr.l   #1,d0                   ;use midpoint
+        move.l  d0,ldbaseptr            ;remember our choice (both in D0 and in
+                                        ;     ldbaseptr)
+; Relocate the loader to ldbase
+        move.l  d0,a1                   ; a1 := destination ptr (D0 has ldbase)
+        move.l  #prom_assumes,a2        ; a2 := source ptr
+        lea     ldr_base,a3             ; a3 := end marker (accounting for extra
+        add.l   #preloaded,a3           ;   slot code that may be drug along}
+move_loop
+        cmpa.l  a3,a2
+        bgt.s   exit_loop
+        move.l  (a2)+,(a1)+
+        bra.s   move_loop
+exit_loop
+        lea     real_code,a4            ;get into code just copied to ldbase
+        add.l   d0,a4                   ; (D0 has ldbase)
+        sub.l   #prom_assumes,a4
+        jmp     (a4)                    ; (distance from where the prom has
+real_code                               ;  loaded the loader to where I've
+                                        ;  relocated it.)
+
+;----
+; here begins the REAL ldrldr functions:
+;----
+        lea     drvr_ptr,a1             ;store away drvr's logic ptr
+        move.l  a0,(a1)
+        lea     drvr_base,a1            ;store away (potential) driver base adr
+        move.l  (SP),(a1)
+        add.l   d0,(a1)                 ;correct for its relocation (D0 has ldbase)
+        sub.l   #prom_assumes,(a1)
+
+        move.l  d0,a7                   ;get a fresh stack
+        sub     #init_sp,a7
+
+;
+; Define (and initialize) some registers:
+;    a6 holds the pointer to the next byte to load the loader into
+;    d6 holds the amount of code still to be loaded
+;    d7 holds the where the next block is on disk
+        lea     ldr_base,a6     ; (one sector already loaded)
+        move.l  a6,a0
+        add.l   #preloaded,a6
+        adda    #codesize,a0
+        move    (a0),d6
+        sub     #preloaded,d6
+        move.l  #8,d7           ; (skip mount table, at block 7  )
+        move    d7,vol_starts   ; (and pass it along to loader,  )
+        addq    #1,d7           ; (but skip block 0, within vol  )
+
+;
+;MAIN LOOP STARTS HERE: (while codesize>0 do)
+main_loop:
+        move    d6,d6
+        bmi     start_pascal            ;exit once negative
+        bsr.s   ldr_read_block
+        add     #block_size,a6          ;increment destination ptr
+        sub     #block_size,d6          ;decrement bytes still to be read
+        add     #1,d7                   ;increment sector number
+        jmp     main_loop
+
+
+
+;*************************************************************)
+;*
+;*  procedure bootbomb;
+;*
+;* Description:
+;*    Display a crash diagnostic. (error number is in a3)
+;*
+;*************************************************************)
+bootbomb
+        move.l  d0,d6                   ;stash prom's io error number in bomb shelter
+        move.l  prom_realsize,d0        ;tell prom where the main screen is,
+        sub.l   #screensize,d0          ;   (top of mem minus screensize)
+        move.l  d0,prom_screen          ; in unmapped terminology.
+
+        suba.l  a2,a2                   ;no icon
+        move.l  a3,d0                   ;error number, new format
+        move.l  d0,d1                   ;error number, old format
+        suba.l  a3,a3                   ;no textual messages, please.
+        jmp     prom_monitor            ;BYE-BYE time
+
+
+
+;****************************************************
+;
+; LDR_READ_BLOCK - reads one block into memory, assuming header is in FRONT
+;                       of the data block.
+; Input Parameters:
+;       A6 - the destination address.
+;       D7 - the sector to read
+;
+; Notes:
+;    The prom expects:
+;       A0 - Address of logic base for channel (required for slot boot ONLY)
+;       A1 - Destination adr of header
+;       A2 - Destination adr of data
+;       D1 - 32-bit sector number (upper byte must be zero)
+;       D2 - timeout ($900,000 translates to 100 seconds)
+;
+;       D0    return error indications (0 means OK)  )
+;
+;   Two different drivers exists for the same device so that one can be small
+;   and simpleminded and fit in the first block (ldr_read_block), while the
+;   second (asm_read_block) can still do header handling.
+;
+;****************************************************
+ldr_read_block:
+        move.l  d7,d1                   ;sector address goes in d1
+        move.l  a6,a2
+        move.l  a6,a1
+        add     #block_size,a1          ;put header after data
+        move.l  #timeout,d2
+        movem.l a1/a2/a6/d6-d7,-(SP)    ;save registers
+        lea     drvr_base,a0            ;get drvr entrypoint
+        move.l  (a0),a3
+        lea     drvr_ptr,a0             ;get drvr logic ptr
+        move.l  (a0),a0
+        jsr     (a3)                    ;READ IT!
+        movem.l (SP)+,a1/a2/a6/d6-d7    ;restore registers
+        bcc.s   got_it                  ;carry set by prom if error
+        move.l  #bombed,a3              ;pass error number
+        bra.s   bootbomb                ;(never returns)
+got_it  rts
+
+
+;*************************************************************)
+;
+; Here is the boundary of the stuff that has to fit in the first block.
+;
+;*************************************************************)
+
+
+; ENTER EXECUTION OF THE LOADER
+
+start_pascal
+        lea     ldr_base,a0             ;pass MDDF location to loader
+        adda    #fs_block0,a0
+        move    (a0),ld_fs_block0
+
+        clr.l   -(SP)                   ;clear 'C'
+        clr.l   -(SP)                   ;clear 'V'
+        clr.l   -(SP)                   ;clear 'os/mon flag'
+
+        lea     ldr_base,a0
+        adda    #globalsize,a0
+        move    (a0),a1                 ;tell pascal how much global data
+        move.l  a1,-(SP)
+
+        clr.l   -(SP)                   ;init output buffer addresses
+        clr.l   -(SP)                   ;init input buffer addresses
+
+        clr.l   -(SP)                   ;enter nil return address
+
+        lea     ldr_base,a0             ;find entrypoint
+        move.l  a0,a1
+        adda    #pc_offset,a1
+        move    (a1),a1
+        adda.l  a0,a1
+        jmp     (a1)                    ;enter pascal execution of the loader
+
+
+
+        .def    asm_read_block
+;****************************************************
+;
+;       procedure read_block(var err: integer;
+;                                drive: integer;
+;                                block: longint;
+;                            var buffer,header : integer;
+;
+; ASM_READ_BLOCK - reads one block into memory and unpacks the header.
+;
+;  (the prom expects:
+;       A0 - Address of logic base for channel (required for slot boot ONLY)
+;       A1 - Destination adr of header
+;       A2 - Destination adr of data
+;       D1 - 32-bit sector number (upper byte must be zero)
+;       D2 - timeout ($900,000 translates to 100 seconds)
+;
+;       D0 return error indication (0 means OK)  )
+;
+; Note:
+;   Two different drivers exists for the same device so that one can be small
+;   and simpleminded and fit in the first block (ldr_read_block), while the
+;   second (asm_read_block) can still do header handling.
+;
+;****************************************************
+asm_read_block:
+        move.l  (SP)+,a1        ;transfer return address around parms
+
+        move.l  (SP)+,d2        ;d2 (temporarily) := header destination adr
+        move.l  (SP)+,a0        ;a0 := data destination adr
+        move.l  (SP)+,d0        ;d0 := block number
+        move    (SP)+,d1        ;discard drive number
+
+     ; (leave error address, return address on stack)
+        move.l  (SP)+,a2        ;get error var address
+        move.l  a1,-(SP)        ;push return address back
+        move.l  a2,-(SP)        ; UNDER re-pushed error var address
+
+        movem.l d4-d7/a3-a6,-(SP) ;save away registers used by language
+
+        clr.l   d1                      ;zero upper part of register
+        move    d0,d1                   ;pass sector address
+        move.l  d2,a1                   ;hdr destination address in a1
+        move.l  a0,a2                   ;data adr in a2
+        move.l  #timeout,d2
+
+        movem.l a1-a2,-(SP)             ; (old proms clobber these registers)
+        lea     drvr_base,a0            ;get drvr entrypoint
+        move.l  (a0),a3
+        lea     drvr_ptr,a0             ;get drvr logic ptr
+        move.l  (a0),a0
+        jsr     (a3)                    ;READ IT!
+        movem.l (SP)+,a1-a2             ; (old proms clobber these registers)
+        bcc.s   gotit                   ;prom sets carry if error
+err_path
+        move    #-1,d0                  ;signal error (general case)
+        bra     exitter
+gotit   clr     d0              ;return no error
+exitter
+        movem.l (SP)+,d4-d7/a3-a6 ;restore registers used by language
+
+        move.l  (SP)+,a0        ;return error code
+        move    d0,(a0)
+
+        rts
+
+
+        .def    shutdown
+;****************************************************
+;
+;       procedure shutdown(device:integer);
+;
+;       General case boot device shutdown sometimes needs
+;       an opportunity to eject the media.  For priam,
+;       this is a no-op.
+;
+;****************************************************
+shutdown:
+        move.l  (SP)+,a0        ;get return address
+        move.w  (sp)+,a1        ;dump parameter
+        jmp     (a0)            ;return
+
+
+
+        .END
+
+ÿ

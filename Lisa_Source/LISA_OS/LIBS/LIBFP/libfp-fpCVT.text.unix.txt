@@ -1,0 +1,189 @@
+;-----------------------------------------------------------
+; 03JUL82: WRITTEN BY JEROME COONEN
+; 12AUG82: TIDIED UP (JTC)
+; 13OCT82: CHANGE INVALID SIGNALS ON EXT --> COMP (JTC).
+; 28DEC82: FIX CASE OF LEFT SHIFT IN IALIGN (JTC).
+; 29DEC82: FIX BUG IN FORCING CHOP MODE. (JTC)
+; 30DEC82: UNFIX 28DEC82 FIX -- UNNECESSARY (JTC).
+;
+;-----------------------------------------------------------
+
+;-----------------------------------------------------------
+; CONVERSIONS TO EXTENDED ARE TRIVIAL, REQUIRING COERCION
+; ONLY FOR FINITE, NONZERO VALUES
+;-----------------------------------------------------------
+CVT2E:
+        TST.W   D3              ; IS IT 0 OR INF?
+        BEQ     COERCE          ; COERCE IF NOT
+        RTS
+
+;-----------------------------------------------------------
+; ROUND TO INTEGER REQUIRES RIGHT ALIGNMENT FOR TINIES,
+; NOTHING FOR LARGE, 0, OR INF VALUES
+;-----------------------------------------------------------
+RINT:
+        TST.W   D3              ; 0 OR INF?
+        BEQ.S   @1
+        RTS                     ; SKIP IF 0 OR INF
+@1:
+        BSR.S   IPALIGN         ; ALIGN BIN PT AT RIGHT
+        MOVEA.W (A0),A2         ; SAVE MODES, ARTIFICIALLY
+        BRA.S   COMINT
+
+;-----------------------------------------------------------
+; TRUNC TO INTEGER REQUIRES RIGHT ALIGNMENT FOR TINIES,
+; NOTHING FOR LARGE, 0, OR INF VALUES
+;-----------------------------------------------------------
+TINT:
+        TST.W   D3              ; 0 OR INF?
+        BEQ.S   @1
+        RTS                     ; SKIP IF 0 OR INF
+@1:
+;-----------------------------------------------------------
+; NOW FAKE CHOP MODE BITS, BUT BE CAREFUL NOT TO LOSE
+; ERROR FLAGS OR OLD MODE.
+; BUG: CHOP CHANGED FROM 01 TO 11 AT LAST MINUTE IN DESIGN,
+; BUT CHANGE WAS MISSED HERE.
+;-----------------------------------------------------------
+        BSR.S   IPALIGN         ; ALIGN BIN PT AT RIGHT
+        MOVEA.W (A0),A2         ; SAVE MODES ETC.
+        BSET    #RNDHI,(A0)     ; CHOP = 11
+        BSET    #RNDLO,(A0)
+COMINT:
+        BSR     COERCE          ; COERCE, MAYBE 0
+        MOVE.W  A2,(A0)         ; RECALL MODES
+
+;-----------------------------------------------------------
+; AFTER COERCE MAY HAVE 0, UNNORM, OR NORMALIZED.
+;-----------------------------------------------------------
+        TST.L   D4              ; IF NORMALIZED, ALL SET
+        BMI.S   @9
+        BNE.S   @5
+
+        TST.L   D5
+        BNE.S   @5
+
+        SUBA.L  A4,A4           ; SET TO 0
+        BRA.S   @9
+@5:
+        SUBQ.L  #1,A4
+        ADD.L   D5,D5
+        ADDX.L  D4,D4
+        BPL.S   @5
+@9:
+        RTS
+
+
+;-----------------------------------------------------------
+; IPALIGN SETS UP BINARY POINT NO FURTHER RIGHT THAN 24,
+; 53, 64 BITS AS SPECIFIED BY THE COERCION INFO.
+;-----------------------------------------------------------
+IPALIGN:
+        TST.L   D6              ; IS IT SINGLE? (#SPREC)
+        BMI.S   @1
+        BTST    #DPREC+16,D6    ; IS IT DOUBLE
+        BEQ.S   IALIGN          ; USUAL EXTD CASE
+
+        MOVEQ   #52,D0
+        BRA     FINALIGN
+@1:
+        MOVEQ   #23,D0
+        BRA     FINALIGN
+IALIGN:
+        MOVEQ   #63,D0
+FINALIGN:
+        ADDI.W  #$3FFF,D0
+        MOVE.W  D0,D1           ; SAVE POSSIBLE NEW EXP
+        SUB.L   A4,D0           ; INTEXP - EXP
+        BGT.S   @7
+        RTS                     ; RETURN LE IF TOO BIG
+@7:
+        MOVEA.W D1,A4           ; PLACE NEW EXP
+        BSR     RTSHIFT
+        MOVE    #0000,CCR       ; FUDGE CCR = GT
+        RTS
+
+
+;-----------------------------------------------------------
+; CONVERSIONS FROM EXTENDED ARE MORE COMPLICATED, IF THE
+; RESULT IS INTXX OR COMP64, BECAUSE OF THE OVERFLOW CASES.
+;-----------------------------------------------------------
+CVTE2:
+        BTST    #DSTINT+16,D6   ; 1 -> INTEGER
+        BEQ.S   CVT2E           ; AS ABOVE FOR FLOATS
+
+;-----------------------------------------------------------
+; FIRST BYPASS O, INF CASES.
+;-----------------------------------------------------------
+        CMPI.W  #2,D3           ; 2 -> ZERO, DONE
+        BNE.S   @2
+        RTS
+@2:
+        CMPI.W  #4,D3           ; 4 -> INF -> OFLOW
+        BNE.S   @4
+        MOVEQ   #-1,D4          ; ENSURE OVERFLOW FOUND
+        BRA.S   IOFLOW
+
+;-----------------------------------------------------------
+; USE IALIGN TO PUT BIN PT TO RIGHT OF D5, RETURNING LE IF
+; INTEGER OVERFLOW (NO SPECIAL HANDLING REQUIRED SINCE THE
+; VALUE IS ASSURED TO BE NORMALIZED, FORCING OVERFLOW).
+;-----------------------------------------------------------
+@4:
+        BSR.S   IALIGN
+        BLE.S   IOFLOW          ; MUST HAVE LEADING ONE
+
+;-----------------------------------------------------------
+; SET UP CALL TO ROUND AS THOUGH RESULT IS EXT.  SINCE LEAD
+; BIT IS 0, ROUNDING CANNOT CARRY OUT AND MODIFY EXP.
+;-----------------------------------------------------------
+        CLR.L   D1              ; PUT EXT INC INFO
+        MOVEQ   #1,D2
+        BTST    #0,D5           ; GET NOT LSB TO Z FOR ROUND
+        BSR     ROUND
+
+;-----------------------------------------------------------
+; NOW CHECK THE HORRENDOUS CASES FOR INTEGER OVERFLOW,
+; FOR EACH OF THE THREE FORMATS.
+; FORMAT CODES:  4-INT16  5-INT32  6-COMP64
+; LET INTXX CASES SHARE CODE.
+;-----------------------------------------------------------
+IOFLOW:
+        MOVEQ   #1,D1           ; $80000000 --> D1
+        ROR.L   #1,D1
+
+        BTST    #DSTLO+16,D6    ; CHECK FOR INT32
+        BNE.S   @21
+        BTST    #DSTMD+16,D6    ; CHECK FOR COMP64
+        BNE.S   @41
+
+        SWAP    D1              ; $00008000 --> D1
+@21:
+        TST.L   D4              ; ANY HI BITS?
+        BNE.S   @25
+        CMP.L   D1,D5           ; BIGGEST MAGNITUDE
+        BHI.S   @25
+        BCS.S   @23             ; NO OFLOW
+        TST.B   D6              ; IS IT NEGATIVE
+        BPL.S   @25             ; NO, OFLOW
+@23:
+        TST.B   D6              ; NEGATIVE INTEGER?
+        BPL.S   @24
+        NEG.L   D5              ; NEGATE ALL 64 BITS
+        NEGX.L  D4
+@24:
+        RTS
+@25:
+        MOVE.L  D1,D5
+@27:
+        BSET    #ERRI+8,D6
+        bclr    #errx+8,d6      ; Clear inexact if invalid.
+        RTS
+@41:
+        TST.L   D4              ; JUST CHECK LEAD BIT
+        BPL.S   @23
+        CLR.L   D5
+        MOVE.L  D1,D4           ; D1 IS $80000000
+        BRA.S   @27
+
+ÿ

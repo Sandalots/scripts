@@ -1,0 +1,1033 @@
+                                   {Copyright 1983, 1984, Apple Computer Inc.}
+UNIT UQPGraph;  INTRINSIC;
+          {QuickPort quickdraw panel unit, will use standard terminal unit to get to the window}
+
+
+INTERFACE
+
+  USES
+    {$U tklib}           UObject,
+    {$U sys1lib}         QuickDraw,
+    {$U tklib}           UDraw,
+    {$U tklib}           UABC,
+    {$U tk2lib}          UTKUniversalText,
+
+    {$U tk2lib}          UText,
+    {$U tk2lib}          UDialog,
+
+    {$U iospaslib}       Blkiointr,                    {paslib's unit, should not be before UObject}
+    {$U libqp/UStdterm}  UStdterm,
+    {$U libos/Syscall}   Syscall;
+
+
+
+
+  TYPE
+
+    TQPGraph = SUBCLASS of TObject                {just to generate class init to tell this unit is used.}
+
+        FUNCTION  {TQPGraph.}CREATE : TQPGraph;
+        END;
+
+
+
+
+{mouse input routines}
+
+  PROCEDURE VGetMouse (VAR pt : Point);      {same as GetMouse, but name conflict with SYS1LIB}
+
+  FUNCTION MouseButton : BOOLEAN;
+
+  FUNCTION MouseEvent (VAR aMouseEvent : TMouseEvent) : BOOLEAN;
+             {Return a mouse event if there is one in the queue; otherwise, return false. A mouse event is a
+              mouse button down, mouse click, double clicks or triple clicks. Mouse move without button
+              pressed down is not a mouse event. If you get a mouseDown event, several different mouseLoc
+              events may be returned in subsequent calls, and they are always ended with a mouse up event. If
+              double clicks, events of down, up, down, up are returned, with the second down event's clicknum
+              = 2. If triple clicks, events of down, up, down, up, down, up are returned, with the second down
+              event's clicknum = 2, and third down event's clicknum = 3.  If mouseDown field is false, other
+              fields are meaningless. }
+
+  FUNCTION VStillDown : BOOLEAN;
+             {same as StillDown. True only if mouse button currently down and no more mouse events in the queue}
+
+  PROCEDURE WaitMouseEvent (VAR aMouseEvent : TMouseEvent);
+             {This procedure gets a mouse event in a similar way to READ and READLN in PASCAL, ie, it will
+              block the caller until there is a mouse event in the queue. Program should use this call instead
+              of the above call to avoid polling and wasting CPU time. This call would also make program more
+              reponsive to user events such as pulling down menus, clicking to other windows, etc. when
+              program is waiting for mouse input.}
+
+  PROCEDURE WaitEvent (VAR fromKeyboard : BOOLEAN);
+             {This procedure is combination of READ and WaitMouseEvent. It will block the caller until there
+              is either keyboard or mouse input. Program that is interested in getting both keyboard and
+              mouse input should use this call instead of KEYPRESS and MouseEvent.}
+
+  FUNCTION QPGrafPicSize : INTEGER;
+             {This function returns the current size of the picture used to save all the graphic output in
+              the graphic panel.}
+
+  PROCEDURE QPScrollRect (dstRect : Rect; dh, dv : INTEGER; updateRgn : RgnHandle);
+             {This procedure is equivalent to ScrollRect. Because QuickDraw does not capture this call, user
+              can not call ScrollRect directly, has to call this one instead.}
+
+
+
+IMPLEMENTATION
+
+{Implementation Notes:
+   This unit is to be used in main program if it uses QuickDraw. There is only one window, but two panels. One
+ for the text output, one for the graphic output. This unit does not have the window subclass. TVanWindow's
+ BlankStationary will create the graphic panel if this unit is used, by setting the qdpUsed flag in TQPGraph's
+ creation block.
+   If later on, we want to create graphic panel in later time such as a call to this unit : OpenGrPanel, then
+ we can use panel.divide to size down the text panel and window.update to refresh the window.
+   How to get attention when text penel is closed, or when the window is not active, and the program is doing a
+ read or readln ?
+}
+
+
+{$IFC fRngQP}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC fSymQP}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+
+{$S sQPortRes}                               {resident code segment - writeln and readln}
+
+CONST
+    buttoncode = 6;
+    phPicTooBig = 1006;                      {alert for picture getting too big}
+    phOpenPict = 1007;                       {alert for program calling openpicture too}
+
+TYPE
+    KeyCap = 0..127;
+
+VAR
+    qdpGProcs    : QDProcs;
+    QPgRgn       : RgnHandle;           {have a rgn so that we don't have to do newRgn in capture procs}
+    (*
+    initclipRgn  : RgnHandle;
+    *)
+    unionQDPRect : Rect;                {union of all rects of all graphic drawing}
+    pichasroom   : BOOLEAN;             {qdpPicture has room or not}
+
+
+PROCEDURE MouseLocation (VAR x : INTEGER; VAR y : INTEGER);  EXTERNAL;      {in HWINT, but we can't use it}
+
+FUNCTION KeyIsDown (key : KeyCap) : BOOLEAN;  EXTERNAL;
+
+
+
+
+
+PROCEDURE ProcEvents;
+BEGIN
+    {$IFC fTrace}BP(20);{$ENDC}
+    process.ObeyEvents (NotToWait);
+    CkPutAway;                                    {no return if document got put away}
+
+    Consterm.window.graphPanel.selection.MarkChanged;      {markchange does not care about which selection}
+    SetPort (qdpGPtr);                            {restore graphPanel's grafport}
+    {$IFC fTrace}EP;{$ENDC}
+END;  {ProcEvents}
+
+
+
+
+PROCEDURE VGetMouse {(VAR pt : Point)};
+VAR errnum : INTEGER;
+
+    PROCEDURE GMouseOnThePad;
+    VAR lPtInView : LPoint;
+    BEGIN
+        MouseLocation (pt.h, pt.v);
+        GlobalToLocal (pt);                  {convert to view relative using ToolKit's grafport}
+        (*
+        thePad.PtToLPt (pt, lPtInView);      {convert to view relative}
+        noPad.LPtToPt (lPtInView, pt);
+        *)
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                             {have to bind documnet first before accessing window}
+    Consterm.window.graphPanel.OnAllPadsDo (GMouseOnThePad);            {have to use Toolkit's grafport}
+    ProcEvents;                              {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                       {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {VGetMouse}
+
+
+
+
+FUNCTION MouseButton {: BOOLEAN};
+BEGIN
+    MouseButton := KeyIsDown (buttoncode);       {mouse button code}
+END;
+
+
+
+FUNCTION MouseEvent {(VAR aMouseEvent : TMouseEvent) : BOOLEAN};
+             {Return a mouse event if there is one in the queue; otherwise, return false. If mouseDown is
+              false, other fields are meaningless. If got a mouseDown event, several different mouseLoc events
+              may be returned in subsequent calls, and they are always ended with a mouse up event. If double
+              clicks, events of down, up, down, up are returned, with the second down event's clicknum = 2. If
+              triple clicks, events of down, up, down, up, down, up are returned, with the second down event's
+              clicknum = 2, and third down event's clicknum = 3}
+
+VAR pmouseevent : TPMouseEvent;
+    errnum : INTEGER;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                        {have to bind documnet first before accessing window}
+    IF qMouseEvents.size > 0 THEN                  {dequeue one mouseState from our queue}
+      BEGIN
+        pmouseevent := TPMouseEvent (qMouseEvents.First);
+        aMouseEvent := pmouseevent^;
+        qMouseEvents.DelFirst;
+        MouseEvent := TRUE;
+      END
+    ELSE
+      WITH aMouseEvent DO
+        BEGIN
+          mouseDown := FALSE;
+          mouseLoc.h := 0;
+          mouseLoc.v := 0;
+          clicknum := 0;
+          meShift := FALSE;
+          meApple := FALSE;
+          meOption := FALSE;
+          MouseEvent := FALSE;
+        END;
+    ProcEvents;                         {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {FUNCTION MouseEvent}
+
+
+
+
+FUNCTION VStillDown : BOOLEAN;
+             {same as StillDown. True only if mouse button currently down and no more mouse events in the queue}
+VAR errnum : INTEGER;
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                        {have to bind documnet first before accessing window}
+    VStillDown := FALSE;
+    IF MouseButton AND (qMouseEvents.size = 0) THEN VStillDown := TRUE;
+
+    ProcEvents;                         {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {FUNCTION VStillDown}
+
+
+
+
+PROCEDURE WaitMouseEvent {(VAR aMouseEvent : TMouseEvent)};
+             {This procedure is equivalent to READ and READLN in PASCAL. It will block the caller until there is
+              a mouse event in the queue. Program should use this call instead of the above call to avoid polling
+              and wasting CPU time. This call would also make program more reponsive to user events such as
+              pulling down menus, clicking to other windows, etc. when program is waiting for mouse input.}
+
+VAR errnum : INTEGER;
+
+    FUNCTION WaitForMouseInput : BOOLEAN;
+    BEGIN
+      IF currentDocument <> NIL THEN
+        IF currentDocument <> clipboard THEN WaitForMouseInput := qMouseEvents.size > 0
+        ELSE WaitForMouseInput := FALSE
+      ELSE WaitForMouseInput := docList.Size = 0;              {return true only if has input or put away}
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                             {have to bind documnet first before accessing window}
+
+    IF qMouseEvents.size <= 0 THEN
+      BEGIN
+        inBackGround := FALSE;               {so that ToolKit will treat me as normal apps, and suspend
+                                              me when I am deactivated}
+        IF NOT currentWindow.IsActive THEN   {in background}
+          BEGIN
+            currentWindow := NIL;            {so that I'll get suspended in getevent}
+            currentDocument.Deactivate;      {donot tie up data segments when suspended}
+          END;
+        Process.ObeyEvents (WaitForMouseInput);
+        inBackGround := TRUE;
+      END
+    ELSE Process.ObeyEvents (NotToWait);
+    CkPutAway;                               {no return if document got put away}
+
+    IF MouseEvent (aMouseEvent) THEN;        {get a mouse event out of queue}
+    Sched_Class (errnum, FALSE);             {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {PROCEDURE WaitMouseEvent}
+
+
+
+
+PROCEDURE WaitEvent {(VAR fromKeyboard : BOOLEAN)};
+             {This procedure is combination of READ and WaitMouseEvent. It will block the caller until there
+              is either keyboard or mouse input. Program that is interested in getting both keyboard and
+              mouse input should use this call instead of KEYPRESS and MouseEvent.}
+
+VAR vanWindow : TVanWindow;
+    errnum : INTEGER;
+
+    FUNCTION WaitForEitherInput : BOOLEAN;
+    BEGIN
+      IF currentDocument <> NIL THEN
+        IF currentDocument <> clipboard THEN
+          WaitForEitherInput := (qMouseEvents.size > 0) OR (vanWindow.inputcount > 0)
+        ELSE WaitForEitherInput := FALSE
+      ELSE WaitForEitherInput := docList.Size = 0;              {return true only if has input or put away}
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                             {have to bind documnet first before accessing window}
+    vanWindow := Consterm.window;
+
+    IF (qMouseEvents.size <= 0) AND (vanWindow.inputcount <= 0) THEN
+      BEGIN
+        inBackGround := FALSE;               {so that ToolKit will treat me as normal apps, and suspend
+                                              me when I am deactivated}
+        IF NOT currentWindow.IsActive THEN   {in background}
+          BEGIN
+            currentWindow := NIL;            {so that I'll get suspended in getevent}
+            currentDocument.Deactivate;      {donot tie up data segments when suspended}
+          END;
+        Process.ObeyEvents (WaitForEitherInput);
+        inBackGround := TRUE;
+      END
+    ELSE Process.ObeyEvents (NotToWait);
+    CkPutAway;                               {no return if document got put away}
+
+    fromkeyboard := vanWindow.inputcount > 0;     {keyboard takes precedence}
+    SetPort (qdpGPtr);                            {restore graphPanel's grafport}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {PROCEDURE WaitEvent}
+
+
+
+
+
+FUNCTION QPGrafPicSize : INTEGER;
+             {This procedure returns the current size of the picture used to save all the graphic output in
+              the graphic panel.}
+VAR aPicture : PicHandle;
+    graphView : TGraphView;
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    {$IFC fTrace}BP(30);{$ENDC}
+    BindDocHeap;                             {have to bind documnet first before accessing window}
+    graphView := TGraphView (Consterm.window.graphPanel.view);
+    QPGrafPicSize := graphView.qdpPicture^^.picSize;
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {PROCEDURE WaitEvent}
+
+
+
+
+
+PROCEDURE SetQDPProcs;  FORWARD;             {set up the capture procs to ours}
+
+
+
+
+FUNCTION CkOpenPicture : BOOLEAN;      {make sure that the qd panel's picture is open, and the picture
+                                        size is within the limit, to be called by every
+                                        quickdraw capture proc.}
+VAR oldpic, aPicture : PicHandle;
+    graphView : TGraphView;
+    currHeap  : THeap;
+    errnum : INTEGER;
+    savergn, savepoly : QDHandle;
+BEGIN
+    Sched_Class (errnum, TRUE);                        {switch to non-preemptive class}
+    BindDocHeap;                                       {have to bind documnet first before accessing window}
+    CkOpenPicture := pichasroom;
+    IF pichasroom THEN
+      BEGIN
+        IF NOT qdpPicOpen THEN                             {picture could be closed in view.draw}
+          BEGIN
+            graphView := TGraphView (Consterm.window.graphPanel.view);
+            oldpic := graphView.qdpPicture;
+            GetHeap (currHeap);
+            SetHeap (graphView.heap);                      {use view's heap so that picture would be saved in doc.}
+            IF qdpGPort.picSave <> NIL THEN                 {user must call openpicture too.}
+              BEGIN
+                process.Stop (phOpenPict);                 {put up alert say tool will be terminated.}
+                Halt;
+              END;
+            aPicture := OpenPicture (qdpViewRect);         {or we can save in multiple pictures }
+                                 {or use one picture until it reaches 32k (picsize ?), then open another one}
+
+            graphView.qdpPicture := aPicture;
+            IF oldpic <> NIL THEN
+              BEGIN
+                savergn := qdpGPort.rgnSave;
+                qdpGPort.rgnSave := NIL;                    {we dont want to drawpicture to user's rgn}
+                savepoly := qdpGPort.polySave;
+                qdpGPort.polySave := NIL;                   {we dont want to drawpicture to user's poly}
+                SetStdProcs (qdpGProcs);                    {we dont want to cature the picture}
+                CopyRgn (qdpGPort.cliprgn, QPgRgn);         {temporarily save user's clipRgn}
+                ClipRect (qdpViewRect);
+                EraseRect (qdpViewRect);        {so that a cliprgn opcode is saved in the new picture, else
+                                                 nothing is drawn if this is right after user set cliprgn.}
+                DrawPicture (oldpic, qdpViewRect);          {draw the old picture}
+                CopyRgn (QPgRgn, qdpGPort.cliprgn);         {restore user's clipRgn}
+
+                SetQDPProcs;                                {restore our capture procs back}
+                qdpGPort.rgnSave := savergn;                {restore user rgn}
+                qdpGPort.polySave := savepoly;              {restore user poly}
+                KillPicture (oldpic);
+              END;
+            qdpPicOpen := TRUE;
+            SetHeap (currHeap);                             {restore heap}
+          END;
+
+        graphView := TGraphView (Consterm.window.graphPanel.view);
+        aPicture := graphView.qdpPicture;
+        IF aPicture^^.picSize > MAXINT - 512 THEN          {QuickDraw grows in 256 chunk, leave some room for it}
+          BEGIN
+            ClosePicture;                                  {close picture since it is getting too big}
+            qdpPicOpen := FALSE;
+            pichasroom := FALSE;
+            process.Stop (phPicTooBig);
+            Consterm.window.graphPanel.Invalidate;         {the whole panel, force redraw at next update}
+            CkOpenPicture := FALSE;
+          END;
+      END;
+END;  {CkOpenPicture}
+
+
+
+PROCEDURE QPSetClipRgn;            {set cliprgn before drawing, to be call from all capture procs inside pad}
+VAR lPtInView : LPoint;
+BEGIN
+    (*
+    IF NOT equalRgn (initclipRgn, qdpGPort.cliprgn) THEN         {only if user set the cliprgn}
+    *)
+      BEGIN                                                 {QuickDraw's initial cliprgn can not be offset,
+                                                             it will come out as empty after SectRgn.}
+        thePad.PtToLPt (zeroPt, lPtInView);                 {all other capture procs have to set clipRgn too}
+        CopyRgn (qdpGPort.cliprgn, QPgRgn);                 {user's clipRgn}
+        OffsetRgn (QPgRgn, -lPtInView.h, -lPtInView.v);     {offset user cliprgn to window relative}
+                                                            {but toolkit set the clipRgn to the pad now}
+        SectRgn (thePort^.clipRgn, QPgRgn, thePort^.clipRgn);   {intersect toolkit's with user's}
+                                                       {if toolkit did not set clipRgn, we need not do this}
+      END;
+END;  {QPSetClipRgn}
+
+
+
+PROCEDURE QPScrollRect (dstRect : Rect; dh, dv : INTEGER; updateRgn : RgnHandle);
+             {This procedure is equivalent to ScrollRect. Because QuickDraw does not capture this call, user
+              can not call ScrollRect directly, has to call this one instead.}
+
+VAR panel : TPanel;
+    errnum : INTEGER;
+    graphView : TGraphView;
+
+    PROCEDURE ScrollOnThePad;
+    BEGIN
+      ScrollRect (dstRect, dh, dv, QPgRgn);
+      thePad.InvalRect (QPgRgn^^.rgnBBox);
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    IF CkOpenPicture THEN
+        ScrollRect (dstRect, dh, dv, updateRgn);      {to the picture before toolkit change the grafport}
+                                                      {But QuickDraw does not scroll the picture !}
+    panel := Consterm.window.graphPanel;          {to work around to QuickDraw's scrollRect problem}
+    graphView := TGraphView (panel.view);
+    graphView.scrolldh := dh + graphView.scrolldh;        {so we have to save dh, dv and offset when we
+                                                             draw picture in view.draw.}
+    graphView.scrolldv := dv + graphView.scrolldv;
+                                                  {Note: this accumulation does not work, we have to put in
+                                                   picture comment in the picture to do scrollrect whenever
+                                                   called.}
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel.OnAllPadsDo (ScrollOnThePad);           {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QPScrollRect}
+
+
+
+PROCEDURE StayInMemory (textAddr : QDPtr);  EXTERNAL;
+
+{============== QuickDraw capture procedures =================}
+
+PROCEDURE QDPText (byteCount : integer; textAddr : QDPtr; numer, denom : Point);
+VAR panel : TPanel;
+    tpoint : Point;
+    errnum : INTEGER;
+
+    PROCEDURE TextOnThePad;
+    (*
+    VAR lPtInView : LPoint;
+        originPt : Point;
+        originPort : GrafPtr;
+    *)
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        IF qdpGPort.txFont <> thePort^.txFont THEN TextFont (qdpGPort.txFont);
+        IF qdpGPort.txFace <> thePort^.txFace THEN TextFace (qdpGPort.txFace);
+        IF qdpGPort.txMode <> thePort^.txMode THEN TextMode (qdpGPort.txMode);
+        IF qdpGPort.txSize <> thePort^.txSize THEN TextSize (qdpGPort.txSize);
+        IF qdpGPort.spExtra <> thePort^.spExtra THEN SpaceExtra (qdpGPort.spExtra);
+        MoveTo (tpoint.h, tpoint.v);
+        StayInMemory (textAddr);                       {asm routine to do a TST to get text brought in memory
+                                                        in case it is a string constant in user code seg.
+                                                        QuickDraw should have done this check rather than crash}
+        StdText (byteCount, textAddr, numer, denom);   {to the screen}
+
+        (*
+           {the following works but with toolkit setting the clipRgn, we have to do extra to make it work}
+           {the portBits and portRect setting have not been checked out yet.}
+        thePad.PtToLPt (zeroPt, lPtInView);
+        originPort := thePort;                     {save toolkit's grafport}
+        SetPort (qdpGPtr);                         {use our grafport except the portBits and portRect}
+        SetPortBits (originPort^.portBits);        {do this in case our grafport's is not the same}
+        thePort^.portRect := qdpGPtr^.portRect;
+        originPt := qdpGPtr^.portRect.topleft;
+        SetOrigin (lPtInView.h, lPtInView.v);      {does not affect clipRgn which is window relative}
+                                                   {but toolkit set the clipRgn to the pad now}
+        OffsetRgn (originPort^.clipRgn, lPtInView.h, lPtInView.v);  {temp offset clipRgn to view relative}
+        CopyRgn (qdpGPtr^.clipRgn, QPgRgn);
+        SectRgn (originPort^.clipRgn, QPgRgn, originPort^.clipRgn);   {intersect with ours}
+        SetClip (originPort^.clipRgn);                  {if toolkit didnot set clipRgn, we need not do this}
+        MoveTo (tpoint.h, tpoint.v);
+        StdText (byteCount, textAddr, numer, denom);    {to the screen}
+
+        SetClip (QPgRgn);                         {restore clipRgn}
+        SetPortBits ();                            {restore qdpGPort's so that drawing to picture can be
+                                                    done properly}
+        SetOrigin (originPt.h, originPt.v);        {restore portRect}
+        SetPort (originPort);                      {restore Toolkit's grafport}
+        *)
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPen (tpoint);                              {incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StayInMemory (textAddr);                       {asm routine to do a TST to make text brought in memory
+                                                        in case it is a string constant in user code seg.
+                                                        QuickDraw should have done this check rather than crash}
+        StdText (byteCount, textAddr, numer, denom);  {to the picture before toolkit change the grafport}
+      END;
+                                  {we dont want toolkit debug writeln to go out before we done with our grafport}
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (TextOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPText}
+
+
+
+PROCEDURE QDPLine (newPt : Point);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE LineOnThePad;
+    (*
+    VAR savePortbits, bm : Bitmap;
+        lPtInView, offset : LPoint;
+        originPt : Point;
+    *)
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        MoveTo (pnState.pnLoc.h, pnState.pnLoc.v);
+        StdLine (newPt);                     {to the screen}
+
+        (* This works but not needed since ToolKit is doing all these now.
+        thePad.PtToLPt (zeroPt, lPtInView);
+        originPt := thePort^.portRect.topleft;
+        SetOrigin (lPtInView.h, lPtInView.v);        {does not affect clipRgn which is window relative}
+        GetClip (QPgRgn);                                  {but toolkit set the clipRgn to the pad now}
+        OffsetRgn (QPgRgn, lPtInView.h, lPtInView.v);      {temp offset clipRgn to view relative}
+        SetClip (QPgRgn);
+        SetPenState (pnState);
+        MoveTo (pnState.pnLoc.h, pnState.pnLoc.v);
+        StdLine (newPt);
+        SetOrigin (originPt.h, originPt.v);
+        OffsetRgn (QPgRgn, -lPtInView.h, -lPtInView.v);    {offset clipRgn back to window relative}
+        SetClip (QPgRgn);
+        *)
+    END;
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                   {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+        StdLine (newPt);                         {to the picture before toolkit change the grafport}
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (LineOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPLine}
+
+
+
+PROCEDURE QDPRect (verb : GrafVerb; r : Rect);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+    graphView : TGraphView;
+
+    PROCEDURE RectOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillRect (r, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdRect (verb, r);               {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    BindDocHeap;                                  {have to bind documnet first before accessing window}
+    panel := Consterm.window.graphPanel;
+    IF verb = erase THEN
+      IF RectsNest (r, unionQDPRect) THEN         {rect to erase fully contains all the graphic output}
+        BEGIN
+          IF qdpPicOpen THEN
+            ClosePicture;                         {have to close picture before picture can be killed}
+          qdpPicOpen := FALSE;
+          graphView := TGraphView (panel.view);
+          KillPicture (graphView.qdpPicture);
+          graphView.qdpPicture := NIL;
+          SetRect (unionQDPRect, 0, 0, 0, 0);
+        END;
+
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdRect (verb, r);                            {to the picture before toolkit change the grafport}
+
+        UnionRect (unionQDPRect, r, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel.OnAllPadsDo (RectOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPRect}
+
+
+
+
+PROCEDURE QDPRRect (verb : GrafVerb; r : Rect; ovalwidth, ovalheight : integer);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE RRectOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillRoundRect (r, ovalwidth, ovalheight, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdRRect (verb, r, ovalwidth, ovalheight);          {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdRRect (verb, r, ovalwidth, ovalheight);    {to the picture before toolkit change the grafport}
+        UnionRect (unionQDPRect, r, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (RRectOnThePad);            {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPRRect}
+
+
+
+
+PROCEDURE QDPOval (verb : GrafVerb; r : Rect);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE OvalOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillOval (r, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdOval (verb, r);          {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdOval (verb, r);                            {to picture before grafport is changed}
+        UnionRect (unionQDPRect, r, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (OvalOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPOval}
+
+
+
+
+PROCEDURE QDPArc (verb : GrafVerb; r : Rect; startAngle, arcAngle : integer);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE ArcOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillArc (r, startAngle, arcAngle, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdArc (verb, r, startAngle, arcAngle);         {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdArc (verb, r, startAngle, arcAngle);       {to the picture before toolkit change the grafport}
+        UnionRect (unionQDPRect, r, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (ArcOnThePad);              {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPArc}
+
+
+
+
+PROCEDURE QDPPoly (verb : GrafVerb; poly : PolyHandle);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE PolyOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillPoly (poly, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdPoly (verb, poly);                           {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdPoly (verb, poly);                         {to the picture before toolkit change the grafport}
+        UnionRect (unionQDPRect, poly^^.polyBBox, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (PolyOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPPoly}
+
+
+
+
+PROCEDURE QDPRgn (verb : GrafVerb; rgn : RgnHandle);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE RgnOnThePad;
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        SetPenState (pnState);
+        IF verb = fill THEN FillRgn (rgn, qdpGPort.fillPat)
+        ELSE
+          BEGIN
+            IF verb = erase THEN BackPat (qdpGPort.bkPat);
+            StdRgn (verb, rgn);                             {to the screen}
+          END;
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    GetPenState (pnState);                        {get penState incase ToolKit changed it}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdRgn (verb, rgn);                           {to the picture before toolkit change the grafport}
+        UnionRect (unionQDPRect, rgn^^.rgnBBox, unionQDPRect);    {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (RgnOnThePad);              {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPRgn}
+
+
+
+
+PROCEDURE QDPBits (VAR srcBits : BitMap; VAR srcRect, dstRect : Rect;
+                   mode : integer; maskRgn : RgnHandle);
+VAR panel : TPanel;
+    pnState  : PenState;
+    errnum : INTEGER;
+
+    PROCEDURE BitsOnThePad;
+    (*
+    VAR lPtInView : LPoint;
+        originPt : Point;
+    *)
+    BEGIN
+        QPSetClipRgn;                        {set up cliprgn in case user has set cliprgn}
+
+        (*
+                               {This is the only way to draw bitmap in the pad}
+        thePad.PtToLPt (zeroPt, lPtInView);
+        originPt := thePort^.portRect.topleft;
+        SetOrigin (lPtInView.h, lPtInView.v);               {does not affect clipRgn which is window relative}
+        GetClip (QPgRgn);                                   {toolkit set the clipRgn to the pad}
+        OffsetRgn (QPgRgn, lPtInView.h, lPtInView.v);       {temp offset clipRgn to view relative}
+        SetClip (QPgRgn);
+        *)
+
+        StdBits (srcBits, srcRect, dstRect, mode, maskRgn);
+        (*
+        SetOrigin (originPt.h, originPt.v);
+        OffsetRgn (QPgRgn, -lPtInView.h, -lPtInView.v);     {offset clipRgn back to window relative}
+        SetClip (QPgRgn);
+        *)
+    END;
+
+BEGIN
+    {$IFC fTrace}PasTerm.InWindow (TRUE);{$ENDC}
+    IF CkOpenPicture THEN     {must call this first, set PasTerm.InWindow to TRUE, and Sched_Class to TRUE}
+      BEGIN
+        StdBits (srcBits, srcRect, dstRect, mode, maskRgn);     {to the picture before toolkit change the grafport}
+        UnionRect (unionQDPRect, dstRect, unionQDPRect);        {collect all rects so we can check for erase.}
+      END;
+
+    {$IFC fTrace}BP(30);{$ENDC}
+    panel := Consterm.window.graphPanel;
+    panel.OnAllPadsDo (BitsOnThePad);             {will forcus in Pad and change to Toolkit's grafport}
+
+    ProcEvents;                                   {handle any event pending and deal with ToolKit update stuff}
+    Sched_Class (errnum, FALSE);                  {switch back to preemptive class}
+    {$IFC fTrace}EP;{$ENDC}
+    {$IFC fTrace}PasTerm.InWindow (FALSE);{$ENDC}
+END;  {QDPBits}
+
+
+(* needed ?
+PROCEDURE QDPComment (kind, dataSize : integer; dataHandle : Handle);
+BEGIN
+    CkOpenPicture;
+END;
+
+
+PROCEDURE QDPTxMeas (byteCount : integer; textBuf: Ptr; VAR numer, denom : Point;
+                     VAR info : FontInfo) : integer;
+BEGIN
+END;
+
+
+PROCEDURE QDPGetPic (dataPtr : QDPtr; byteCount : integer);
+BEGIN
+    BindDocHeap;                        {have to bind documnet first before accessing window}
+END;
+
+
+PROCEDURE QDPPutPic (dataPtr : QDPtr; byteCount : integer);
+BEGIN
+    BindDocHeap;                        {have to bind documnet first before accessing window}
+END;
+*)
+
+
+
+PROCEDURE SetQDPProcs;             {set up the capture procs to ours}
+BEGIN
+    WITH qdpGProcs DO
+      BEGIN
+        textProc  := @QDPText;
+        lineProc  := @QDPLine;
+        rectProc  := @QDPRect;
+        rRectProc := @QDPRRect;
+        ovalProc  := @QDPOval;
+        arcProc   := @QDPArc;
+        polyProc  := @QDPPoly;
+        rgnProc   := @QDPRgn;
+        bitsProc  := @QDPBits;
+                                                       {commentProc, txMeasProc, getPicProc, putPicProc ?}
+      END;
+END;  {SetQDPProcs}
+
+
+
+
+{$S sQPortInit}                         {initialization code segment}
+
+PROCEDURE OpenGrPort;        {open QuickDraw grafport for programs, should be called before any Quickdraw routines.}
+VAR savegp : grafptr;
+
+BEGIN
+    GetPort (savegp);
+    qdpGPtr := @qdpGPort;
+    OpenPort (qdpGPtr);
+    qdpGPort.grafProcs := @qdpGProcs;
+    SetStdProcs (qdpGProcs);                      {set everything to standard ones first}
+    SetQDPProcs;                                  {set our capture procs}
+    ClipRect (qdpViewRect);                       {if we have cliprgn be very big as it is inited by QuickDraw
+                                                   the printing does not work because of offseting this cliprgn
+                                                   will result in incorrect cliprgn.}
+
+    QPgRgn := NewRgn;
+    (*
+    initclipRgn := NewRgn;
+    CopyRgn (thePort^.clipRgn, initclipRgn);      {save the initial clipRgn, so that we can tell whether user
+                                                   set cliprgn or not.}
+    *)
+    SetPort (savegp);
+END;  {OpenGrPort}
+
+
+
+
+
+METHODS OF TQPGraph;
+    {This class is used to initialize the qdpUsed flag in UStdTerm unit, so that TVanWindow.BlankStationary
+     can check the flag and create graphic panel.}
+
+    FUNCTION {TQPGraph.}CREATE {: TQPGraph};
+    BEGIN
+        {$IFC fTrace}BP(30);{$ENDC}
+        SELF := NewObject (mainHeap, THISCLASS);
+        {$IFC fTrace}EP;{$ENDC}
+    END;  {TQPGraph.CREATE}
+
+
+BEGIN          {TQPGraph class init routine}
+
+    qdpGPtr := NIL;
+    qdpUsed := TRUE;
+    qdpPicOpen := FALSE;
+    pichasroom := TRUE;
+    OpenGrPort;
+
+    WITH unionQDPRect DO
+      BEGIN
+        left := 0;
+        top := 0;
+        right := 0;
+        bottom := 0;
+      END;
+END;  {METHODS OF TQPGraph}
+
+
+END.
+ÿ

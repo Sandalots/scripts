@@ -1,0 +1,808 @@
+unit ObjIO;     { Object File Reading Routines }
+
+  { Copyright 1983, 1984, Apple Computer Inc. }
+
+  { the interface of this unit should be kept as close as possible to the
+    interface of the ObjIO unit used by the development system group. }
+
+interface
+uses
+  (*$U object/driverdefs.obj *)    DriverDefs,
+  (*$U object/hwint.obj *)         HWInt,
+  (*$U object/sysglobal.obj *)     GLOBALDATA,
+  (*$U object/procprims.obj *)     Proc_Prims,
+  (*$U object/mmprim.obj *)        MMPRIMITIVES,
+  (*$U object/asynctr.obj *)       asynctr,
+  (*$U object/clock.obj *)         clock,
+  (*$U object/genio.obj *)         genio,
+  (*$U object/twiggy.obj *)        twiggy,
+  (*$U object/vmstuff.obj *)       vmstuff,
+  (*$U object/sfileio.obj *)       sfileio,
+  (*$U object/fsprim.obj *)        fs_primitives,
+  (*$U object/fsui.obj *)          FS_Interface;
+
+  (* Note: distinctions --      *)
+  (*      OldExecutable (old compilers, either machine) *)
+  (*      PhysicalExec  (New compiler, old linker, either machine, physical) *)
+  (*      Executabe (New compiler, either linker, new machine, logical) *)
+  (* New linker links Intrinsic Units and produces a version control record. *)
+
+    type
+      BlockType = (
+                      { Module Blocks: $80..$89 }
+                   ModuleName, EndBlock,
+                   CodeBlock,
+                   OldExecutable,
+                      { Main programs, units & segments, name strings: $97..$9E }
+                   PhysicalExec, Executable, VersionCtrl,
+                   SegmentTable, UnitTable, SegLocation, UnitLocation, StringBlock,
+                      { Packed code: $A0..$A1 }
+                   PackedCode, PackTable,
+                      { Software systems and dependencies, O.S.: $B0..$B2 }
+                   OSData,
+                      { End of file and unexpected blocks: $00 and other values }
+                   EOFMark, UnknownBlock);
+
+      VariantType = (NoVariant, { must be first }
+                     Comments, SegVariant, UnitVariant, SegLocVariant,
+                     UnitLocVariant, StringVariant,
+                     JumpTVariant, JTSegVariant,
+                     ObjectCode, OldJumpTV, OldJTSegV,
+                     { must be last } UnknownVariant);
+
+      FileAddr = int4;      (* 0 based, byte address within a file *)
+      MemAddr = int4;       (* 24-bit virtual address *)
+      SegAddr = int4;       (* 0 based, byte address within a segment *)
+
+      oPtr = ^int4;         (* Ptr to data for getting obj file byte sequences *)
+
+      ObjName = packed array[1..8] of char;   (* names in obj file variants *)
+
+      ObjFileType = (OldObjFile, IUDirectory, IULibrary, MainProg, IntrinUnit,
+                     RegUnit, RegModule, DbgFile);
+
+      VersNum = -1..127;
+
+      VersVal = record
+                  case boolean of
+                    true:  (VersLong: int4);
+                    false: (System, Release, Version, InterFLevel: VersNum)
+                end;
+
+      ModVal = record
+                 case boolean of
+                   true:  (ModInt: int2);
+                   false: (ImplLevel, FixLevel: VersNum)
+               end;
+
+
+                (* Variant Definitions *)
+
+      iSegVariant = record { 1st release only }
+        SegName: ObjName;
+        SegNumber: integer;
+        Version1: longint;
+        Version2: longint;
+      end;
+
+      iUnitVariant = record { 1st release only }
+        UnitName: ObjName;
+        UnitNumber: integer;
+        UnitType: integer;
+      end;
+
+      iSegLocVariant = record
+        SegName: ObjName;
+        SegNumber: integer;
+        UseDescPtr: longint;
+        UseCount: integer;
+        SysNumber: integer;
+        FileNumber: integer;
+        FileLocation: FileAddr;
+        { sizes in bytes (IU) or unsigned words (IL) }
+        SizePacked: integer;    (* size of PackedCode record *)
+        SizeUnpacked: integer;  (* size of CodeBlock record *)
+      end;
+
+      iUnitLVariant = record
+        UnitName: ObjName;
+        UnitNumber: integer;
+        FileNumber, UnitType: int1;
+        DataSize: longint;
+      end;
+
+      iStringVariant = record  { 1st release called this FileNames }
+        ObjectNumber: integer;
+        NameAddr: FileAddr;
+        (* one per file, followed by string table *)
+      end;
+
+      iJumpTVariant = record
+          JumpL: integer;
+          AbsAddr: MemAddr;
+      end;
+
+      iOldJumpTV = record
+          RelOffset: longint;
+          Noop: integer;        (* not in Memory = JMP.L *)
+          Jump: integer;        (* not in Memory = Adrress of %%LOADIT *)
+          PCRel: integer;
+      end;
+
+      iOldJTSegV = record
+          Addr1: MemAddr;       (* Address of First Proc Descriptor *)
+          FileLoc: FileAddr;
+          CodeSize: longint;
+          MemLoc: MemAddr;
+          RetAddr: MemAddr;
+          RefCount: longint;
+          ActiveList: MemAddr;  (* -1 = End Of List ?? *)
+          Reserved: longint;
+      end;
+
+      iJTSegVariant = record
+          SegmentAddr: FileAddr;        (* points to CodeBlock or PackedCode *)
+          { sizes in bytes (IU) or unsigned words (IL) }
+          SizePacked: integer;          (* size of PackedCode record *)
+          SizeUnpacked: integer;        (* size of CodeBlock record *)
+          MemLoc: MemAddr;              (* Logical Addr *)
+      end;
+
+
+
+                (* Invariant Definitions: *)
+
+      iModuleName=record
+        ModuleName,
+        SegmentName: ObjName;
+        CSize: LongInt;
+        (* Comments *)
+      end;
+
+      iEndBlock=record
+        CSize: LongInt;
+      end;
+
+      iCodeBlock=record
+        Addr: SegAddr;
+        (* ObjectCode *)
+      end;
+
+      iUnitBlock=record
+        UnitName: ObjName;
+        CodeAddr,
+        TextAddr: FileAddr;
+        TextSize,
+        GlobalSize: LongInt;
+        UnitType: integer;      (* 0=Reg, 1=Intrin, 2=Shared *)
+      end;
+
+      iExecutable=record
+        JTLaddr: MemAddr;
+        JTSize,
+        DataSize,               (* Global Area, Reg Units *)
+        MainSize,               (* Global Area, Main Program *)
+        JTSegDelta,             (* Jump Table Segment Delta *)
+        StkSegDelta,            (* Stack Segment Delta *)
+        DynStack,               (* Initial Dynamic Stack Size *)
+        MaxStack,               (* Max. Total Stack Size *)
+        MinHeap,                (* Initial Heap Size *)
+        MaxHeap: LongInt;       (* Max. Total Heap Size *)
+        (* Unknown = numSegs + JTSegVariants +
+                     numDescriptors + JumpTVariants + other stuff *)
+      end;
+
+      iOldExecutable=record
+        JTLaddr: MemAddr;
+        JTSize,
+        DataSize: LongInt;      (* Global Area, Reg Units *)
+        (* Unknown = numSegs + OldJTSegVs + OldJumpTVs + other stuff *)
+      end;
+
+      iPhysicalExec=record
+        JTLaddr: MemAddr;
+        JTSize,
+        DataSize,               (* Global Area, Reg Units *)
+        MainSize,               (* Global Area, Main Program *)
+        JTSegDelta,             (* Jump Table Segment Delta *)
+        StkSegDelta: LongInt;   (* Stack Segment Delta *)
+        (* Unknown = numSegs + OldJTSegVs +
+                     DummyPtr + OldJumpTVs + other stuff *)
+      end;
+
+      iVersionCtrl = record
+        case boolean of
+          true:
+            (sysNum, minSys,
+             maxSys, Reserv1,
+             Reserv2, Reserv3: longint);
+          false:
+            (FileType: ObjFileType;
+             ILibNum: VersNum;
+             Config: VersVal;
+             ModLevel: ModVal;
+             IntfTime, ImplTime: longint;
+             MinConfig, MaxConfig: VersVal);
+      end;
+
+      iSegmentTable = record
+        nSegments: integer;
+        (* SegVariant *)
+      end;
+
+      iUnitTable = record
+        nUnits,
+        maxunit: integer;
+        (* UnitVariant *)
+      end;
+
+      iSegLocation = record
+        nSegments: integer;
+        (* SegLocVariant *)
+      end;
+
+      iUnitLocation = record
+        nUnits: integer;
+        (* UnitLVariant *)
+      end;
+
+      iOSData = record
+        reserved: integer;
+        (* unknown (512 byte) variant *)
+
+      end;
+
+      iStringBlock = record
+        nStrings: integer;
+        (* Unknown = StringVariant + string table *)
+      end;
+
+      iPackedCode = record
+        addr: MemAddr;
+        csize: longint;
+        (* Unknown = packed object code *)
+      end;
+
+      iPackTable = record
+        packversion: longint;
+        (* Unknown = translation table *)
+      end;
+
+      iUnknown=record
+         (* UnknownVariant *)
+      end;
+
+     ObjBlock=record
+        Variant: VariantType;
+        NrVariants: LongInt;
+        case BlockHeader: BlockType of
+          ModuleName:   (bModuleName:             iModuleName);
+          EndBlock:     (bEndBlock:               iEndBlock);
+          CodeBlock:    (bCodeBlock:              iCodeBlock);
+          OldExecutable:(bOldExecutable:          iOldExecutable);
+          PhysicalExec: (bPhysicalExec:           iPhysicalExec);
+          Executable:   (bExecutable:             iExecutable);
+          VersionCtrl:  (bVersionCtrl:            iVersionCtrl);
+          SegmentTable: (bSegmentTable:           iSegmentTable);
+          UnitTable:    (bUnitTable:              iUnitTable);
+          SegLocation:  (bSegLocation:            iSegLocation);
+          UnitLocation: (bUnitLocation:           iUnitLocation);
+          StringBlock:  (bStringBlock:            iStringBlock);
+          PackedCode:   (bPackedCode:             iPackedCode);
+          PackTable:    (bPackTable:              iPackTable);
+          OSData:       (bOSData:                 iOSData);
+          UnknownBlock: (bUnknown:                iUnknownBlock);
+      end;
+
+      ObjVarBlock = record
+        case VarHeader: VariantType of
+          SegVariant:     (bSegVariant:           iSegVariant);
+          UnitVariant:    (bUnitVariant:          iUnitVariant);
+          SegLocVariant:  (bSegLocVariant:        iSegLocVariant);
+          UnitLocVariant: (bUnitLVariant:         iUnitLVariant);
+          StringVariant:  (bStringVariant:        iStringVariant);
+          OldJumpTV:      (bOldJumpTV:            iOldJumpTV);
+          OldJTSegV:      (bOldJTSegV:            iOldJTSegV);
+          JumpTVariant:   (bJumpTVariant:         iJumpTVariant);
+          JTSegVariant:   (bJTSegVariant:         iJTSegVariant)
+      end;
+
+      Filebyte = -128..127;
+      fBuff_ptr = ^fileBuffer;
+      fileBuffer = array[0..32767] of Filebyte;
+
+      FileHandle = ^FileDesc;
+      FileDesc = record
+                   refnum    : int2;          { refnum for obj file }
+                   buffer    : fBuff_ptr;     { buffer for obj file }
+                   buff_size : int2;          { size of buffer in bytes }
+                   actual    : int4;          { # bytes last read into buffer }
+                   BuffTop   : int2;          { file byte # last in buffer }
+                   BuffIndx  : int2;          { 'read/write' index in buffer }
+                   BlockNo0  : int2           { file block # at start of buffer }
+                 end;
+
+      BlockDesc = record  { Block Type Info }
+                    HeaderByte : int2;        { header identifying byte in block }
+                    InvarSize  : int2;        { size of 'invariant' part }
+                    Variant    : VariantType  { type of variant in block }
+                  end;
+
+      ObjHandle = ^ObjDesc;
+      ObjDesc = record
+                  ObjFile     : FileHandle;     { associated file object }
+                  NextBlock   : FileAddr;       { ptr to next 'invariant' block }
+                  error       : int2;           { errors encountered doing i/o }
+
+                  { tables for scanning obj blocks }
+                  BlockInfo   : array [BlockType] of BlockDesc;
+                  VariantSize : array [VariantType] of Integer;
+                end;
+
+
+    procedure InitObjFile (var ObjPtr: ObjHandle; nBlocks: integer);
+      (* InitObjFile initializes ObjPtr and allocates a buffer of nBlocks *)
+
+    procedure OpenObjFile (var ObjPtr: ObjHandle; FileName: pathname;
+        NewFile: Boolean);
+      (* OpenObjFile initializes ObjPtr to the file FileName.  The file is *)
+      (* scratched if NewFile is set. *)
+
+    procedure CloseObjFile (ObjPtr: ObjHandle; Save: Boolean);
+      (* CloseObjFile closes an object file.  If Save is set then the file is *)
+      (* locked.  Otherwise, the file is left in the state it was in before *)
+      (* it was opened. *)
+
+    procedure GetObjPtr (ObjPtr: ObjHandle; var BytePtr: FileAddr);
+      (* GetObjPtr returns the position of ObjPtr's "read/write head". *)
+
+    procedure SetObjPtr (ObjPtr: ObjHandle; BytePtr: FileAddr);
+      (* SetObjPtr positions the "read/write head" BytePtr bytes from the *)
+      (* beginning of ObjPtr.  The invariant access flow is not altered, *)
+      (* that is to say the next (Get/Put)ObjInvar accesses the sequentially *)
+      (* next invariant following the variant that we're in before calling *)
+      (* SetObjPtr. *)
+
+    procedure SkipObjBytes (ObjPtr: ObjHandle; NrBytes: LongInt);
+      (* SkipObjBytes moves the file pointer of file ObjPtr NrBytes bytes. *)
+
+    procedure GetObjInvar (ObjPtr: ObjHandle; var Stuff: ObjBlock);
+      (* GetObjInvar reads the invariant part of an object block.  *)
+      (* The user can read the variant part, if so desired. *)
+
+    procedure GetObjVar (ObjPtr: ObjHandle; VarType: VariantType;
+                        var Stuff: ObjVarBlock);
+      (* GetObjVar reads a variant part of the specified type *)
+      (* into the ObjVarBlock *)
+
+    procedure GetObjSeq (ObjPtr: ObjHandle; Stuff: oPtr; NrBytes: Integer);
+      (* GetObjSeq moves NrBytes bytes from ObjPtr to the area pointed to by *)
+      (* Stuff. *)
+
+    {procedure PutObjInvar (ObjPtr: ObjHandle; var Stuff: ObjBlock);}
+      (* PutObjInvar writes the invariant part of an object block.  *)
+
+    procedure PutObjSeq (ObjPtr: ObjHandle; Stuff: oPtr; NrBytes: Integer);
+      (* PutObjSeq moves NrBytes bytes from the area pointed to by Stuff *)
+      (* to ObjPtr. *)
+
+
+
+implementation
+
+  const
+    buffblksize = 512;                           { size of buffer 'blocks' }
+
+(*$S ProcStart *)
+
+  procedure InitObjFile (* var ObjPtr : ObjHandle; nBlocks : integer *);
+    { procedure to initialize the object descriptor pointed to by ObjPtr.  The
+      associated data structures are allocated in syslocal and initialized with
+      the sizes, types, etc. of several object blocks. }
+
+    var
+      Blk : BlockType;
+      Vnt : VariantType;
+      objblk_size : int2;
+      ord_ptr : absptr;
+
+    procedure InitInfo;
+      procedure Stuffit (b : BlockType;  hdr : Filebyte;  sz : integer;
+                         vr : VariantType);
+        begin
+          with ObjPtr^.BlockInfo[b] do
+            begin
+              HeaderByte := hdr;
+              InvarSize := sz;
+              Variant := vr
+            end
+        end { Stuffit };
+
+      begin  { InitInfo }
+        (*$R- *)
+        StuffIt (ModuleName,   -128 {$80}, SizeOf (iModuleName),   Comments);
+        StuffIt (EndBlock,     -127 {$81}, SizeOf (iEndBlock),     NoVariant);
+        StuffIt (CodeBlock,    -123 {$85}, SizeOf (iCodeBlock),    ObjectCode);
+        StuffIt (OldExecutable,-113 {$8F}, SizeOf (iOldExecutable),UnknownVariant);
+        StuffIt (PhysicalExec, -105 {$97}, SizeOf (iPhysicalExec), UnknownVariant);
+        StuffIt (Executable,   -104 {$98}, SizeOf (iExecutable),   UnknownVariant);
+        StuffIt (VersionCtrl,  -103 {$99}, SizeOf (iVersionCtrl),  NoVariant);
+        StuffIt (SegmentTable, -102 {$9A}, SizeOf (iSegmentTable), SegVariant);
+        StuffIt (UnitTable,    -101 {$9B}, SizeOf (iUnitTable),    UnitVariant);
+        StuffIt (SegLocation,  -100 {$9C}, SizeOf (iSegLocation),  SegLocVariant);
+        StuffIt (UnitLocation, -99  {$9D}, SizeOf (iUnitLocation), UnitLocVariant);
+        StuffIt (StringBlock,  -98  {$9E}, SizeOf (iStringBlock),  UnknownVariant);
+        StuffIt (PackedCode,   -96  {$A0}, SizeOf (iPackedCode),   UnknownVariant);
+        StuffIt (PackTable,    -95  {$A1}, SizeOf (iPackTable),    UnknownVariant);
+        StuffIt (OSData,       -78  {$B2}, SizeOf (iOSData),       UnknownVariant);
+        StuffIt (EOFMark,       0   {$00}, 0,                      NoVariant);
+        StuffIt (UnknownBlock,  0   {$00}, 0,                      UnknownVariant);
+        (*$R+ *)
+      end { InitInfo };
+
+    begin  { InitObjFile }
+      objblk_size := Sizeof (ObjDesc) + Sizeof (FileDesc) + nBlocks*buffblksize;
+      if not GetSpace (objblk_size, b_syslocal_ptr, ord_ptr) then
+        begin
+          ObjPtr := nil;
+          exit (InitObjFile)
+        end
+      else
+        ObjPtr := pointer(ord_ptr);
+
+      with ObjPtr^ do
+        begin
+          ObjFile := pointer(ord(ObjPtr) + Sizeof (ObjDesc));
+          NextBlock := 0;
+          error := 0;
+
+          { fill in the info arrays }
+          InitInfo;
+          for Vnt := NoVariant to UnknownVariant do
+              VariantSize [Vnt] := 1;
+          VariantSize [SegVariant    ] := SizeOf (iSegVariant);
+          VariantSize [UnitVariant   ] := SizeOf (iUnitVariant);
+          VariantSize [SegLocVariant ] := SizeOf (iSegLocVariant);
+          VariantSize [UnitLocVariant] := SizeOf (iUnitLVariant);
+          VariantSize [StringVariant ] := SizeOf (iStringVariant);
+          VariantSize [JumpTVariant  ] := SizeOf (iJumpTVariant);
+          VariantSize [JTSegVariant  ] := SizeOf (iJTSegVariant);
+          VariantSize [OldJumpTV     ] := SizeOf (iOldJumpTV);
+          VariantSize [OldJTSegV     ] := SizeOf (iOldJTSegV)
+        end { with ObjPtr^ };
+
+      with ObjPtr^.ObjFile^ do
+        begin
+          refnum := -1;
+          buffer := pointer(ord(ObjPtr^.ObjFile) + Sizeof (FileDesc));
+          buff_size := nBlocks * buffblksize
+        end
+    end { InitObjFile };
+
+
+  procedure OpenObjFile (* var ObjPtr : ObjHandle;  FileName : pathname;
+                           NewFile : Boolean *);
+    { procedure to open the specified object file and associate it with the
+      object descriptor pointed to by ObjPtr.  The file itself is opened and the
+      1st nBlocks are read into the buffer. }
+
+    var
+      accessAllowed : boolean;                { true if access allowed on file }
+      scavenged : boolean;                    { true if file was scavenged }
+
+    begin
+      with ObjPtr^ do
+        begin
+          POpen (error, FileName, ObjFile^.refnum, [dread, dwrite], accessAllowed);
+
+          if error > 0 then
+            begin
+              (*$IFC debug3 *)
+              if Trace (pm, 90) then
+                writeln ('   OpenObjFile : Open error = ', error)
+              (*$ENDC *)
+            end
+          else
+            begin  { file was opened ok }
+              with ObjFile^ do
+                begin  { get the 1st buffer }
+                  if error = -1176 { scavenged } then scavenged := true
+                    else scavenged := false;
+
+                  Read_Data (error, refnum, ord(buffer), buff_size, actual,
+                             sequential, 0);
+                  if (error <> 0) or (actual <> buff_size) then
+                    begin
+                      (*$IFC debug3 *)
+                      if Trace (pm, 90) then
+                        writeln ('   OpenObjFile : Read_Data error = ', error,
+                                 ' actual = ', actual);
+                      (*$ENDC *)
+                      if error = 848 { EOF } then error := 0
+                    end;
+
+                  BuffTop := actual - 1;
+                  BuffIndx := 0;   BlockNo0 := 0;
+
+                  if (error = 0) and scavenged then
+                    error := -1176;   { fake scavenged warning }
+                  if (error = 0) and not accessAllowed then
+                    error := 1130   { fake privilege violation }
+                end { get 1st buffer };
+
+              NextBlock := 0
+            end { successful open }
+        end { with ObjPtr^ }
+    end { OpenObjFile };
+
+
+  procedure CloseObjFile (* ObjPtr : ObjHandle;  Save : Boolean *);
+    { procedure to close the object file pointed to by ObjPtr.  The file itself
+      is closed and the syslocal space allocated to the control blocks and
+      file buffer is released. }
+
+    begin
+      with ObjPtr^ do
+        begin
+          if ObjFile^.refnum <> -1 then
+            begin
+              Close_Object (error, ObjFile^.refnum);
+              (*$IFC debug3 *)
+              if error > 0 then
+                begin
+                  writeln ('   CloseObjFile : Close_Object error = ', error);
+                  readln
+                end
+              (*$ENDC *)
+            end;
+        end;
+
+      RelSpace (ord(ObjPtr), b_syslocal_ptr)
+    end { CloseObjFile };
+
+
+  procedure GetObjPtr (* ObjPtr : ObjHandle;  var BytePtr : FileAddr *);
+    { procedure to return the current 'read/write' byte pointer for the
+      object file specified by ObjPtr. }
+
+    begin
+      with ObjPtr^.ObjFile^ do
+        BytePtr := ord4(BlockNo0) * buffblksize + BuffIndx;
+    end { GetObjPtr };
+
+
+  procedure Set0 (ObjPtr : ObjHandle;  block_num, block_index : int2);
+    { procedure to establish the specified block number in the object file
+      pointed to by ObjPtr as the new block at the start of the file buffer.
+      The specified index is established as the current 'read/write' index
+      for the file. }
+
+    begin
+      with ObjPtr^.ObjFile^ do
+        begin
+          BlockNo0 := block_num;
+          Read_Data (ObjPtr^.error, refnum, ord(buffer), buff_size, actual,
+                     { sequential, 0 } absolute, BlockNo0*buffblksize);
+
+          if (ObjPtr^.error <> 0) or (actual <> buff_size) then
+            begin
+              (*$IFC debug3 *)
+              if Trace (pm, 90) then
+                writeln ('   Set0 : Read_Data error = ', ObjPtr^.error,
+                         ' actual = ', actual);
+              (*$ENDC *)
+              if ObjPtr^.error = 848 { EOF } then ObjPtr^.error := 0
+            end;
+
+          BuffTop := actual - 1;
+          BuffIndx := block_index
+        end
+    end { Set0 };
+
+
+  procedure GetObjSeq (* ObjPtr : ObjHandle;  Stuff : oPtr;  NrBytes : Integer *);
+    { procedure to get a sequence of bytes from the object file pointed to
+      by ObjPtr and place them in the area pointed to by Stuff. }
+
+    type
+      Sequence = array[0..32767] of Filebyte;
+      SeqPtr = ^Sequence;
+
+    var
+      ByteNr : int2;                          { ptr to copy position in Stuff }
+      to_move : int2;                         { # bytes to move each time in loop }
+      SeqStuff : SeqPtr;                      { array form of Stuff }
+
+    begin
+      (*$R- *)
+      SeqStuff := pointer(ord(Stuff));
+      ByteNR := 0;
+
+      with ObjPtr^.ObjFile^ do
+        while ByteNr < NrBytes do
+          begin
+            to_move := NrBytes - ByteNr;
+            if to_move > BuffTop - BuffIndx + 1 then
+              to_move := BuffTop - BuffIndx + 1;
+
+            MoveLeft (buffer^[BuffIndx], SeqStuff^[ByteNr], to_move);
+
+            BuffIndx := BuffIndx + to_move;
+            ByteNr := ByteNr + to_move;
+
+            if BuffIndx > BuffTop then
+              begin  { get another buffer }
+                Set0 (ObjPtr, BlockNo0 + actual DIV buffblksize, 0);
+                if ObjPtr^.error <> 0 then
+                  ByteNr := NrBytes   { abort the loop }
+              end
+          end { while }
+      (*$IFC debug2 *)
+      (*$R+ *)
+      (*$ENDC *)
+    end { GetObjSeq };
+
+
+  procedure SetObjPtr (* ObjPtr : ObjHandle;  BytePtr : FileAddr *);
+    { procedure to set the 'read/write' pointer associated with object file
+      pointed to by ObjPtr to the specified position in the file. }
+
+    var
+      NewBlkNum : int2;                           { block # containing BytePtr }
+      NewBlkIndx : int2;                          { index in block for BytePtr }
+
+    begin
+      with ObjPtr^.ObjFile^ do
+        begin
+          NewBlkNum := BytePtr DIV buffblksize;
+          NewBlkIndx := BytePtr MOD buffblksize;
+
+          if (NewBlkNum < BlockNo0) or
+             (NewBlkNum > BlockNo0 + actual DIV buffblksize - 1) then
+            Set0 (ObjPtr, NewBlkNum, NewBlkIndx)
+          else
+            BuffIndx := (NewBlkNum - BlockNo0)*buffblksize + NewBlkIndx
+        end { with ObjPtr^.ObjFile^ }
+    end { SetObjPtr };
+
+
+  procedure SkipObjBytes (* ObjPtr : ObjHandle;  NrBytes : LongInt *);
+    { procedure to advance the object file 'read/write' pointer associated
+      with ObjPtr the specified number of bytes. }
+
+    var
+      BytePtr : int4;                         { new position for file ptr }
+
+    begin
+      GetObjPtr (ObjPtr, BytePtr);
+      BytePtr := BytePtr + NrBytes;
+      SetObjPtr (ObjPtr, BytePtr)
+    end { SkipObjBytes };
+
+
+  procedure GetObjInvar (* ObjPtr : ObjHandle;  var Stuff : ObjBlock *);
+    { procedure to get the 'invariant' portion of the next object block in the
+      object file pointed to by ObjPtr.  The invariant ptr and 'read/write' ptr
+      for the file are advanced to the next invariant, the type of the invariant
+      is determined, and the return block is set. }
+
+    var
+      HeaderByte : Filebyte;                  { header byte from next invar block }
+      BlockSize : LongInt;                    { size of block }
+      iBlockSize : int2;                      { integer form of BlockSize }
+      InvSize : Integer;                      { 'invariant' size of block }
+
+    begin
+      with ObjPtr^, Stuff do
+        begin
+          SetObjPtr (ObjPtr, NextBlock);
+
+          GetObjSeq (ObjPtr, @BlockSize, 4);
+          HeaderByte := BlockSize DIV $1000000 - 1;
+          iBlockSize := BlockSize MOD $1000000;
+          BlockSize := iBlockSize;
+
+          BlockHeader := ModuleName;
+          while (HeaderByte <> BlockInfo[BlockHeader].HeaderByte) and
+                (BlockHeader <> UnknownBlock) do
+            BlockHeader := succ(BlockHeader);
+
+          if BlockHeader <> EOFMark then
+            begin
+              InvSize := BlockInfo[BlockHeader].InvarSize;
+              GetObjSeq (ObjPtr, @bUnknownBlock, InvSize);
+
+              Variant := BlockInfo[BlockHeader].Variant;
+              NrVariants := (BlockSize - InvSize - 4) DIV VariantSize[Variant];
+              NextBlock := NextBlock + BlockSize
+            end
+          else
+            begin  { unrecognized block }
+              (*$IFC debug3 *)
+              if Trace (pm, 90) then
+                begin
+                  writeln ('   GetObjInvar : unrecognized block - ');
+                  writeln ('     HeaderByte = ', HeaderByte, 'iBlockSize = ',
+                           iBlockSize, ' BlockSize = ', BlockSize)
+                end;
+              (*$ENDC *)
+              NrVariants := 0
+            end
+        end { with ObjPtr^, Stuff }
+    end { GetObjInvar };
+
+
+  procedure GetObjVar (* ObjPtr : ObjHandle;  VarType : VariantType;
+                         var Stuff : ObjVarBlock *);
+    { procedure to get the next 'variant' record in the current 'invariant' block
+      of the object file pointed to by ObjPtr. }
+
+    begin
+      with Stuff do
+        begin
+          VarHeader := VarType;
+          GetObjSeq (ObjPtr, @bSegVariant, ObjPtr^.VariantSize[VarType])
+        end
+    end { GetObjVar };
+
+
+{  procedure PutObjInvar (* ObjPtr: ObjHandle; var Stuff: ObjBlock *);}
+    { procedure to put the 'invariant' portion of the next object block in the
+      object file pointed to by ObjPtr.  The invariant ptr and 'read/write' ptr
+      for the file are advanced to the next invariant, the type of the invariant
+      is determined, and the return block is set. }
+
+(*    var
+      BlockSize : LongInt;                    { size of block }
+      iBlockSize : int2;                      { integer form of BlockSize }
+      InvSize : Integer;                      { 'invariant' size of block }
+
+    begin
+      with ObjPtr^, Stuff do
+        begin
+          SetObjPtr (ObjPtr, NextBlock);
+
+          if BlockHeader <> EOFMark then
+            begin
+              InvSize := BlockInfo[BlockHeader].InvarSize;
+              iBlockSize := NrVariants * VariantSize[Variant] + InvSize + 4;
+              BlockSize := BlockInfo[BlockHeader].HeaderByte * $1000000;
+              BlockSize := BlockSize + iBlockSize;
+              NextBlock := NextBlock + iBlockSize;
+
+              with ObjFile^ do
+                begin
+                  MoveLeft (BlockSize, buffer^[BuffIndx], 4);
+                  MoveLeft (bUnknownBlock, buffer^[BuffIndx+4], InvSize);
+                  BuffIndx := BuffIndx + InvSize + 4;
+                  Write_Data (ObjPtr^.error, refnum, ord(buffer), buff_size, actual,
+                              absolute, BlockNo0*buffblksize);
+                  if ObjPtr^.error > 0 then
+                    writeln ('PutObjInvar: error = ', error:1)
+                end;
+
+              { PutLong (ObjPtr, BlockSize);
+                PutObjSeq (ObjPtr, Stuff, InvSize); }
+            end
+        end { with ObjPtr^, Stuff }
+    end { PutObjInvar };*)
+
+
+  procedure PutObjSeq (* ObjPtr: ObjHandle; Stuff: oPtr; NrBytes: Integer *);
+    { procedure to put a sequence of bytes from the area pointed to by Stuff
+      and place them in the object file pointed to by ObjPtr. }
+
+    begin
+      with ObjPtr^, ObjFile^ do
+        begin
+          Write_Data (error, refnum, ord(Stuff), NrBytes, actual, absolute,
+                      BlockNo0*buffblksize + BuffIndx);
+          if error > 0 then
+            writeln ('PutObjInvar: error = ', error:1)
+        end
+    end { PutObjSeq };
+
+
+ end.
+
+ÿ

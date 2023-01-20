@@ -1,0 +1,518 @@
+{#F     libdb/vlinsert.text }
+{$S access }
+{************************************************************************
+
+                                entrysize
+
+        see interface.
+
+*************************************************************************}
+
+function entrysize{(firstfld,
+                    lastfld,
+                    doitfld,
+                    isize  : integer;
+                    pedesc : ptrrecptr;
+                    prec : ptrdata) : integer};
+        EXTERNAL;
+{**************************************************************************
+
+                                deladjust
+
+        see actual declaration.
+
+**************************************************************************}
+
+procedure deladjust(var kresult : integer;
+                        state : integer;
+                        fileid : integer;
+                        slevel : integer;
+                        rpage,
+                        closestsib : fileptr;
+                        rbuff : integer);
+        forward;
+
+{**********************************************************************
+
+                          insertsplit
+
+        inserts the key pushed up be a leaf page split.  upper level
+        pages may also be split up to creating a new root page.
+        pstack must accurately reflect the path from the root page
+        to the leaf page that split.
+
+        this is where we update maxlevel, the maximum depth of all open
+        trees, which is used by pstack_validate to make sure pstack
+        is big enough.
+
+
+        Input Parameters:
+
+            kresult - noerr if ok, ... i/o error, 127 inconsistent
+                file
+            fileid - file for insert
+            slevel - level in stack that lbuff & rbuff are from
+            lbuff,
+            rbuff - buffer number of left & right page of split pair
+
+**********************************************************************}
+
+{$S access }
+procedure insertsplit(var kresult : integer;
+                          fileid : integer;
+                          slevel : integer;
+                          lbuff,
+                          rbuff : integer);
+label
+        2;
+var
+        upps,
+        ps : ptrstackrec;
+        pptr : ptrfileptr;
+        leftsib,
+        rightsib,
+        sibpage,
+        dumipage,
+        page1,
+        page2 : fileptr;
+        insresult : integer;
+        canmove,
+        haver,
+        havel,
+        haveup : boolean;
+        lresult,
+        dumiindex,
+        size,
+        pooff,
+        upprio,
+        lowprio,
+        locdepth,
+        tempbuff,
+        newrbuff,
+        upbuff : integer;
+        por,pol,pou : ptroffsets;
+        pbr,pbl,pbu : ptrdata;
+        pdu : ptrpagedesc;
+        por_1,pol_1,pou_1,pou_2 : ^ integer;
+
+
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if bdebug then
+            begin
+            writeln(dumpfile,'is');
+            dumpfl(fileid);
+            dumpps(fileid);
+            end;
+{$ENDC }
+
+        haver := true;
+        havel := true;
+        haveup := false;
+        page1 := buffpool^[lbuff].page;
+        page2 := buffpool^[rbuff].page;
+
+        with pfiletable^[fileid]^ do
+            begin
+            pooff := pagesize-sizeof(pagedesc)-sizeof(integer);
+            insresult := isplit;
+            locdepth := depth;
+            if slevel = depth then lowprio := isleaf
+            else lowprio := isnonleaf;
+
+            ps := @pstack^[slevel];
+
+        {   split at higher successive levels until pages cease splitting
+            or we create a new root.  }
+
+            while insresult = isplit do
+                begin
+
+            {   record the recovery info - until we split, the current level
+                requires no recovery, hence vact = undone.  we are only called
+                after a split at slevel, hence we set vact = unsplit for that
+                level  }
+
+                ps := pointer(ord(ps) - sizeof(stackrec));
+                slevel := slevel - 1;
+                ps^.vact := undone;
+                if slevel <=  1 then upprio := isroot
+                else upprio := isnonleaf;
+
+            {   get the upper level page into which the high key of the split
+                will be inserted.  }
+
+                if slevel = 0 then   { need new root }
+                    allocpage(lresult,fileid,upbuff)
+                else            { read next highest level }
+                    begin
+                    relbuff(lresult,lbuff,lowprio);
+                    havel := false;
+                    getpage(lresult,upbuff,fileid,ps^.page,true);
+                    end;
+                if lresult <> noerr then goto 2;
+                haveup := true;
+
+                pbr := buffpool^[rbuff].pbuff;
+                por := pointer(ord(pbr)+pooff);
+                por_1 := pointer(ord(por)-sizeof(integer));
+                if slevel = 0 then { create new root }
+                    begin
+                    insresult := noflow;
+
+{$IFC debug }
+                    if bdebug then writeln(dumpfile,'nr');
+{$ENDC }
+
+                    pbl := buffpool^[lbuff].pbuff;
+                    pbu := buffpool^[upbuff].pbuff;
+                    pou := pointer(ord(pbu)+pooff);
+                    pdu := pointer(ord(pou)+sizeof(integer));
+                    pou_1 := pointer(ord(pou)-sizeof(integer));
+                    pou_2 := pointer(ord(pou_1)-sizeof(integer));
+
+                    pou^[0] := 0;
+                    if locdepth = 1 then { split pages were leaf }
+                        begin
+                        pou_1^ := entrysize(firstvfld,lastvsfld,lastvsfld,
+                                  kvflds,pedesc,pbl) + sizeof(fileptr);
+                        pou_2^ := pou_1^ + sizeof(fileptr) +
+                                  entrysize(firstvfld,lastvsfld,lastvsfld,
+                                            kvflds,pedesc,pbr);
+                        end
+                    else  { split pages were nonleaf }
+                        begin
+                        pol_1 := pointer(ord(pbl)+pooff-sizeof(integer));
+                        pou_1^ := pol_1^;
+                        pou_2^ := pou_1^ + por_1^;
+                        pbl := pointer(ord(pbl)+sizeof(fileptr));
+                        pbr := pointer(ord(pbr)+sizeof(fileptr));
+                        end;
+                    extractkey(pedesc,pedesc,nsort,
+                               pbl,pointer(ord(pbu)+sizeof(fileptr)),
+                               kvflds);
+                    pptr := @pbu^;
+                    pptr^ := page1;
+                    extractkey(pedesc,pedesc,nsort,
+                               pbr,pointer(ord(pbu)+sizeof(fileptr)+pou_1^),
+                               kvflds);
+                    pptr := pointer(ord(pbu)+pou_1^);
+                    pptr^ := page2;
+                    with pdu^ do
+                        begin
+                        nkeys := 2;
+                        ptype := nonleaftype;
+                        end;
+
+{$IFC debug }
+                    if bdebug then
+                        begin
+                        dumpfl(fileid);
+                        dumpp(fileid,upbuff);
+                        end;
+{$ENDC }
+
+                    post(lresult,upbuff);
+                    if lresult <> noerr then goto 2;
+
+                    locdepth := locdepth + 1;
+                    depth := locdepth;
+
+                {   we keep a running count of the deepest tree so that
+                    pstack_validate can increase pstack where necessary }
+
+                    if locdepth > maxdepth then maxdepth := locdepth;
+                    root := buffpool^[upbuff].page;
+
+                    end
+                else { promote the high key of the right page to upper page }
+                    begin
+                    if slevel = (locdepth-1)  then { split pages are leaf }
+                        begin
+                        size := entrysize(firstvfld,lastvsfld,lastvsfld,
+                                          kvflds,pedesc,pbr)+sizeof(fileptr);
+                        canmove := false;
+                        end
+                    else          { split pages nonleaf }
+                        begin
+                        size := por_1^-por^[0];
+                        canmove := true;
+                        end;
+
+                    ps^.index := ps^.index + 1;
+                    insresult := noflow;
+                    if quickinsert(fileid,nonleaftype,pbr,size,@page2,canmove,
+                                   ps^.index,upbuff,dumipage,dumiindex) then
+                        begin { split or rotate neccessary }
+
+                        Creche(lresult,fileid,slevel,
+                               pagesize-sizeof(pagedesc),rightsib,leftsib);
+                        if lresult <> noerr then goto 2;
+                        insresult :=
+                            splitORrotate(lresult,fileid,nonleaftype,
+                                          pbr,size,@page2,canmove,
+                                          ps^.index,upbuff,leftsib,rightsib,
+                                          newrbuff,dumipage,dumiindex,
+                                          ps,
+                                          sibpage);
+                        haveup := false;
+                        if lresult <> noerr then goto 2; { upbuff freed on error }
+
+{$IFC debug }
+                        if bdebug then
+                            begin
+                            dumpfl(fileid);
+                            end;
+{$ENDC }
+
+
+                        if insresult = isplit then
+                            begin
+                            lbuff := upbuff;
+                            havel := true;
+
+{$IFC debug }
+                            if bdebug then dumpp(fileid,newrbuff);
+{$ENDC }
+
+                            page1 := ps^.page;
+                            page2 := buffpool^[newrbuff].page;
+                            relbuff(lresult,rbuff,lowprio);
+                            rbuff := newrbuff;
+                            if lresult <> noerr then goto 2;
+                            end
+                        else if insresult = rotate then
+                            begin
+                            relbuff(lresult,rbuff,lowprio);
+                            rbuff := newrbuff;
+                            if lresult <> noerr then goto 2;
+                            deladjust(lresult,rotate,fileid,slevel,ps^.rec_rpage,
+                                      sibpage,rbuff);
+                            haver := false;
+                            goto 2;
+                            end;
+                        end; { split or rotate }
+                    end; { promote high key from right page }
+
+                lowprio := isnonleaf;
+                end; { while }
+
+
+2 :         insresult := noerr;
+            if havel then relbuff(insresult,lbuff,lowprio);
+            if haver then relbuff(insresult,rbuff,lowprio);
+            if haveup then relbuff(insresult,upbuff,upprio);
+            if (insresult <> noerr)and(lresult = noerr) then lresult := insresult;
+            end; { with }
+        kresult := lresult;
+end; { insertsplit }
+{^E}
+{**************************************************************************
+
+                               find_for_update
+
+            call find to determine either the starting point of the
+                search (if duplicates are allowed) or the exact
+                insertion point (if duplicates are not allowed)
+
+            if duplicates are allowed, call findduplicate to find
+                the exact insertion point
+
+        Input Parameters
+                fileid - file for find
+                pkey - search key for find
+
+        Output Parameters
+                kresult : return result
+                buffer : buffer holding found record
+                pstack is setup: the leaf entry of pstack has the
+                    page and index for the found record; the other levels
+                    are set to the initial values from the find.  if
+                    stackinvalid is left or right (finduplicates went
+                    left or right from the page returned by find) then
+                    fixstack must be called before splitting,
+                    coallescing or merging pages
+                stackinvalid - whether the leaf entry of pstack is left,
+                    right or the same as (okay) the leaf returned by find
+
+        Return Results
+
+                notfound
+                inconsistent
+
+***************************************************************************}
+
+{$S access }
+procedure find_for_update(var kresult : integer;
+                              fileid : integer;
+                              pkey : ptrdata;
+                          var buffer,
+                              stackinvalid : integer);
+var
+        ps : ptrstackrec;
+        pd : ptrpagedesc;
+        pbd : ^ buffdesc;
+        psdesc : ptrrecptr;
+        rightsib,
+        leftsib : fileptr;
+        insresult,
+        lresult,
+        tresult : integer;
+begin
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+        dont_use_freelist := false;
+        with pfiletable^[fileid]^ do
+            begin
+            ps := @pstack^[depth];
+            psdesc := pkdesc;
+            if psdesc = nil then psdesc := pedesc;
+
+            find(lresult,
+                 exact,
+                 nkeys,
+                 fileid,
+                 psdesc,
+                 pkey,
+                 buffer);
+
+            if (nsort <> nkeys) then
+                begin
+                if (lresult <= notfound) then
+                    begin
+                    findduplicate(lresult,
+                                  fileid,
+                                  pedesc,
+                                  psdesc,
+                                  nkeys,
+                                  true,
+                                  true,
+                                  pkey,
+                                  buffer,
+                                  ps^.index,
+                                  stackinvalid);
+                    if lresult <= notfound then
+                        begin
+                        pbd := @buffpool^[buffer];
+                        ps^.page := pbd^.page;
+                        pd := pointer(ord(pbd^.pbuff)+pagesize-sizeof(pagedesc));
+                        ps^.numkeys := pd^.nkeys;
+                        end;
+                    end;
+                end
+            else stackinvalid := ok;
+            end; { with }
+        kresult := lresult;
+end; { find_for_update }
+{^E}
+{**************************************************************************
+
+                               insertkeyed
+
+        see interface.
+
+***************************************************************************}
+
+{$S access }
+procedure insertkeyed{(var kresult : integer;
+                           fileid : integer;
+                           pkey : ptrdata;
+                           size : integer;
+                       var ipage : fileptr;
+                       var iindex : integer)};
+label
+        1;
+var
+        ps : ptrstackrec;
+        canmove : boolean;
+        stackinvalid : integer;
+        leftsib,
+        rightsib,
+        sibpage : fileptr;
+        insresult,
+        lresult,
+        tresult,
+        buff2,
+        buffer : integer;
+begin
+
+{$IFC fTraceDB}    LogCall;     {$ENDC}
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'insertkeyed');
+{$ENDC }
+
+        if size > maxrsize then
+            begin
+            lresult := rectoobig;
+            goto 1;
+            end;
+
+    {   note, pageinsert and pagedelete recover from immediate errors,
+        so we need only call recover when we ran out of room after
+        mucking up nonleaf page }
+
+        with pfiletable^[fileid]^ do
+            begin
+            find_for_update(lresult,fileid,pkey,buffer,stackinvalid);
+            if lresult = notfound then
+                begin
+                ps := @pstack^[depth];
+                if quickinsert(fileid,leaftype,pkey,size,nil,pkdesc=nil,
+                               ps^.index,buffer,ipage,iindex) then
+                    begin { have to split or rotate }
+                    fixstack(lresult,stackinvalid,fileid);
+                    if lresult = noerr then
+                        begin
+                        Creche(lresult,fileid,depth,pagesize-sizeof(pagedesc),
+                               rightsib,leftsib);
+                        if lresult = noerr then
+                            begin
+                            insresult :=
+                                splitORrotate(lresult,fileid,leaftype,
+                                              pkey,size,nil,pkdesc=nil,
+                                              ps^.index,buffer,
+                                              leftsib,rightsib,
+                                              buff2,ipage,iindex,
+                                              ps,
+                                              sibpage);
+                            if lresult <> noerr then goto 1;
+
+{$IFC debug }
+                            if bdebug then
+                                writeln(dumpfile,'insresult ',insresult);
+{$ENDC }
+
+                            if insresult = isplit then
+                                insertsplit(lresult,fileid,depth,buffer,buff2)
+                            else if insresult = rotate then
+                                deladjust(lresult,rotate,fileid,depth,
+                                          ps^.rec_rpage,sibpage,buff2);
+                            if lresult = noroom then recover(lresult,fileid);
+                            end
+                        else relbuff(tresult,buffer,isleaf);
+                        end
+                    else relbuff(tresult,buffer,isleaf);
+                    end
+                else relbuff(lresult,buffer,isleaf);
+                end
+            else if lresult = noerr then
+                begin
+                lresult := duplkey;
+                relbuff(tresult,buffer,isleaf);
+                if tresult <> noerr then lresult := tresult;
+                end
+            else if lresult = fileempty then
+                firstleaf(lresult,fileid,leaftype,pkey,size,ipage,iindex);
+
+            if lresult = noerr then nrecs := nrecs + 1;
+
+            end; { with }
+1:      kresult := lresult;
+
+{$IFC debug }
+        if bdebug then writeln(dumpfile,'ink:re',kresult);
+{$ENDC }
+end; { insertkeyed }
+
+ÿ

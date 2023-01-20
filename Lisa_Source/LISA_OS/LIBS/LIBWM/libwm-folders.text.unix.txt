@@ -1,0 +1,2163 @@
+
+UNIT Folders;
+
+{ CopyRight 1983, Apple Computer, Inc. }
+{ Written by Bill Atkinson             }
+
+INTRINSIC SHARED;
+
+INTERFACE
+
+USES {$U libhw/HWInt       }  HWInt,
+     {$U libsm/UnitStd     }  UnitStd,
+     {$U libsm/UnitHz      }  UnitHz,
+     {$U libqd/Storage     }  Storage,
+     {$U libqd/QuickDraw   }  QuickDraw,
+     {$U libfm/FontMgr     }  FontMgr,
+     {$U libos/SysCall     }  SysCall,
+     {$U libwm/Events      }  Events,
+{$IFC wmOS }
+     {$U libpm/PmDecl      }   PmDecl,
+     {$U libpm/Pmm         }   Pmm,
+{$ENDC }
+     {$U libwm/Windows     }  Windows;
+
+
+CONST maxWindWidth  = 720;
+      maxWindHeight = 364;
+      minWindWidth  = 50;
+      minWindHeight = 14;
+
+      noIcon        = 255;    { no overlay for NewFolder.overlay }
+
+
+TYPE  WindowInfo = RECORD
+                     visible:    BOOLEAN;
+                     hasTab:     BOOLEAN;
+                     okMove:     BOOLEAN;
+                     okGrow:     BOOLEAN;
+                     okFront:    BOOLEAN;
+                     okClose:    BOOLEAN;
+                     okActivate: BOOLEAN;
+                   END;
+
+
+
+PROCEDURE BeginUpdate   (folder: WindowPtr);
+PROCEDURE DialogHeight  (height: INTEGER; fUpdate: BOOLEAN);
+PROCEDURE DisposeFolder (folder: WindowPtr);
+PROCEDURE EndUpdate     (folder: WindowPtr);
+PROCEDURE FlushInput    (window:  WindowPtr);
+PROCEDURE FlushWindow   (window:  WindowPtr);
+PROCEDURE FlushProcess  (process: ProcessID);
+PROCEDURE FolderSize    (folder: WindowPtr; width,height: INTEGER; fUpdate: BOOLEAN);
+FUNCTION  GetFldrRefCon (folder: WindowPtr): LongInt;
+PROCEDURE GetFldrTitle  (folder: WindowPtr; VAR title: Str255);
+PROCEDURE GetWindInfo   (window:  WindowPtr; VAR info: WindowInfo);
+PROCEDURE GiveControl   (event:  EventRecord);
+PROCEDURE GiveWindow    (window:  WindowPtr; toProcess: ProcessId);
+PROCEDURE HeDied        (deadProcess: ProcessID);
+PROCEDURE HideFolder    (folder: WindowPtr);
+PROCEDURE HiLiteTab     (folder: WindowPtr; fHiLite: BOOLEAN);
+PROCEDURE ImDying;
+PROCEDURE InitWM;
+PROCEDURE InvalidateRgn (folder: WindowPtr; rgn: RgnHandle);
+PROCEDURE InvalRect     (badRect:  Rect);
+PROCEDURE InvalRgn      (badRgn:   RgnHandle);
+PROCEDURE LocateDialog  (top, height: integer);
+PROCEDURE MakeFldrActive(folder: WindowPtr; reasonWhy: LongInt);
+PROCEDURE MakeTopActive;
+PROCEDURE MoveFolder    (folder: WindowPtr; hGlobal,vGlobal: INTEGER);
+FUNCTION  NewFolder     (folderRect: Rect;
+                         title:      Str255;
+                         visible:    BOOLEAN;
+                         behind:     WindowPtr;
+                         refCon:     LongInt;
+                         process:    ProcessId;
+                         whichIcon:  INTEGER;
+                         overlay:    INTEGER): WindowPtr;
+PROCEDURE OpenWM;
+PROCEDURE SetFldrTitle  (folder: WindowPtr; title: Str255);
+PROCEDURE SetFldrRefCon (folder: WindowPtr; data: LongInt);
+PROCEDURE SetWindInfo   (window:  WindowPtr; VAR info: WindowInfo);
+PROCEDURE ShowFolder    (folder: WindowPtr);
+PROCEDURE TakeControl   (event:  EventRecord; keepMenus,keepDialog: BOOLEAN);
+PROCEDURE TakeWindow    (window:  WindowPtr);
+PROCEDURE ValidRect     (goodRect: Rect);
+PROCEDURE ValidRgn      (goodRgn:  RgnHandle);
+PROCEDURE WMClosePicture;
+PROCEDURE WMKillPicture (window: WindowPtr);
+PROCEDURE WMKillProcess (process: ProcessID);
+PROCEDURE WMOpenPicture (window: WindowPtr);
+PROCEDURE WMStartDoc(window: WindoWPtr);
+
+
+IMPLEMENTATION
+
+{$IFC wmDebug}
+{$R+}
+{$ELSEC}
+{$R-}
+{$ENDC}
+
+{$IFC wmSymbols}
+{$D+}
+{$ELSEC}
+{$D-}
+{$ENDC}
+
+
+
+CONST dialogLeft = 0;
+      dialogTop  = 16;
+      dialogWd   = 720;
+      dialogHt   = 30;
+      titleLeft  = 55;
+      ovWd       = 30;
+      ovHt       = 20;
+
+
+VAR ignoreButton:  BOOLEAN;  { used to skip extra btnDown on double-click }
+    wmDsSize:      LongInt;  { current memory size }
+    lastPic:       WindowPeek;
+
+
+PROCEDURE InitMenus;                                               EXTERNAL;
+FUNCTION  BitTst(addr: Ptr; bitNumber: LONGINT): BOOLEAN;          EXTERNAL;
+PROCEDURE ClearMenuBar;                                            EXTERNAL;
+
+PROCEDURE CalcFldrRgns(windPeek: WindowPeek);                      FORWARD;
+PROCEDURE CalcRoundRgns(windPeek: WindowPeek);                     FORWARD;
+FUNCTION  ClickClose(cornerRect: Rect) : BOOLEAN;                  FORWARD;
+FUNCTION  DragRect(dstRect: Rect; startPt: Point; VAR deltaPt: Point): BOOLEAN;
+                                                                   FORWARD;
+FUNCTION  DragRRect(dstRect: Rect; startPt: Point; VAR deltaPt: Point): BOOLEAN;
+                                                                   FORWARD;
+PROCEDURE DrawFolder(windPeek: WindowPeek);                        FORWARD;
+PROCEDURE DrawRound(windPeek: WindowPeek);                         FORWARD;
+PROCEDURE EmptyProc(windPeek:  WindowPeek;
+                    message: WindowMessage;
+                    param:   LongInt);                             FORWARD;
+PROCEDURE FolderProc(windPeek:  WindowPeek;
+                     message: WindowMessage;
+                     param:   LongInt);                            FORWARD;
+FUNCTION  GrowHeap(Hz: THz; BytesNeeded: INTEGER): INTEGER;        FORWARD;
+PROCEDURE HitFolder(windPeek: WindowPeek; param: LongInt);         FORWARD;
+PROCEDURE HitRound(windPeek: WindowPeek; param: LongInt);          FORWARD;
+PROCEDURE RoundProc(windPeek:  WindowPeek;
+                     message: WindowMessage;
+                     param:   LongInt);                            FORWARD;
+
+
+
+{$S WMscrol }
+{--------------------------------------------------------------------------}
+PROCEDURE BeginUpdate(* folder: WindowPtr *);
+{--------------------------------------------------------------------------}
+{ Called by application when it receives update event   }
+{ Saves intersects updateRgn with his visRgn,           }
+{ then clears out his updateRgn.                        }
+VAR windPeek: WindowPeek;
+    dh,dv: INTEGER;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(folder));
+  WITH windPeek^ DO
+    BEGIN
+      dh := port.portBits.bounds.left;
+      dv := port.portBits.bounds.top;
+      OffsetRgn(port.visRgn,-dh,-dv);             { offset visRgn to global }
+      SectRgn(port.visRgn,updateRgn,port.visRgn); { put update in visRgn }
+      OffsetRgn(port.visRgn,dh,dv);               { offset update to local }
+      SetEmptyRgn(updateRgn);                     { clear updateRgn }
+    END;
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE CalcFldrRgns{windPeek: WindowPeek};
+{--------------------------------------------------------------------------}
+{ calculates the structure region and content region for a folder }
+{ call while in wmPort; all regions calculated in global coords  }
+VAR folderRect: Rect;
+    i:          INTEGER;
+    ptTab:      Point;
+    dh,dv:      INTEGER;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WITH windPeek^ DO
+    BEGIN
+      IF NOT visible THEN
+        BEGIN
+          SetEmptyRgn(strucRgn);
+          SetEmptyRgn(contRgn);
+          SetEmptyRgn(port.visRgn);
+          EXIT(CalcFldrRgns);
+        END;
+
+      folderRect := port.portRect;
+      dh := port.portBits.bounds.left;
+      dv := port.portBits.bounds.top;
+      OffsetRect(folderRect,-dh,-dv);   { convert portRect to global }
+
+      RectRgn(contRgn,folderRect);
+
+      IF windPeek^.hasTab THEN folderRect.top := folderRect.top-15;
+
+      WITH folderRect DO
+        BEGIN
+          left := left-1;
+          top := top-1;
+          right := right +3;
+          bottom := bottom+2;
+        END;
+      RectRgn(strucRgn,folderRect);
+
+    END;
+END;
+
+
+{$S WMcold}
+{--------------------------------------------------------------------------}
+PROCEDURE CalcRoundRgns{windPeek: WindowPeek};
+{--------------------------------------------------------------------------}
+{ calculates the structure region and content region for a roundRect window }
+{ call while in wmPort; all regions calculated in global coords  }
+VAR windRect: Rect;
+    i:          INTEGER;
+    ptTab:      Point;
+    dh,dv:      INTEGER;
+    tempRgn:    RgnHandle;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WITH windPeek^ DO
+    BEGIN
+      IF NOT visible THEN
+        BEGIN
+          SetEmptyRgn(strucRgn);
+          SetEmptyRgn(contRgn);
+          SetEmptyRgn(port.visRgn);
+          EXIT(CalcRoundRgns);
+        END;
+
+      windRect := port.portRect;
+      dh := port.portBits.bounds.left;
+      dv := port.portBits.bounds.top;
+      OffsetRect(windRect,-dh,-dv);   { convert portRect to global }
+
+      OpenRgn;
+        FrameRoundRect(windRect,ovWd-2,ovHt-2);
+      CloseRgn(contRgn);
+
+      IF hasTab THEN
+        BEGIN
+          tempRgn := NewRgn;
+          WITH windRect DO SetRectRgn(tempRgn,left,top,right,top+16);
+          UnionRgn(contRgn,tempRgn,contRgn);
+          DisposeRgn(tempRgn);
+          windRect.top := windRect.top-15;
+        END;
+
+      { define structure region }
+      InsetRect(windRect,-1,-1);
+      OpenRgn;
+        FrameRoundRect(windRect,ovWd,ovHt);
+      CloseRgn(strucRgn);
+      tempRgn := NewRgn;
+      CopyRgn(strucRgn,tempRgn);
+      OffsetRgn(tempRgn,2,1);
+      UnionRgn(strucRgn,tempRgn,strucRgn);
+      DisposeRgn(tempRgn);
+    END;
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+FUNCTION  ClickClose{cornerRect: Rect) : BOOLEAN};
+{--------------------------------------------------------------------------}
+{ checks for double click in corner icon }
+LABEL 1;
+VAR
+    nextKey:   KeyEvent;
+    shifts:    INTEGER;
+    flagPtr:   Ptr;
+    hitPt:     Point;
+    clickTime: LONGINT;
+    start:     LONGINT;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  ClickClose := FALSE;
+
+  IF KeybdPeek (FALSE,1,nextKey)
+  THEN start := nextKey.time DIV 10      { double click from 1st bttn up to next bttn down }
+  ELSE start := Time;
+
+  IF KeybdPeek (FALSE,2,nextKey) THEN    { look past the button up }
+    BEGIN                                { user already pushed next key }
+    IF (nextKey.time DIV 10) > (start + clickDelay) THEN GOTO 1;
+    shifts := nextKey.state;
+    flagPtr := @shifts;
+    IF NOT BitTst(flagPtr, 11) THEN GOTO 1;  { not a mouse button }
+    hitPt.h := nextKey.mouseX;
+    hitPt.v := nextKey.mouseY;
+    END
+
+  ELSE
+    BEGIN                                { wait for next button }
+    clickTime := start + clickDelay;
+    REPEAT
+      IF Time > clickTime THEN GOTO 1;   { no button push during allotted time }
+    UNTIL Button;
+    GetMouse(hitPt);
+    END;
+
+  IF PtInRect(hitPt,cornerRect) THEN
+    BEGIN
+    ignoreButton := TRUE;                { kill the next down stroke }
+    ClickClose := TRUE;
+    END;
+
+1:
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE DialogHeight(* height: INTEGER; fUpdate: BOOLEAN *);
+{--------------------------------------------------------------------------}
+VAR savePort:    GrafPtr;
+    windPeek:      WindowPeek;
+    saveHeap:           THz;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(dialogFolder));
+
+  GetPort(savePort);
+  SetPort(wmPort);
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+
+  WITH dialogFolder^.portRect DO bottom := top+height;
+  IF height <= 0 THEN HideFolder(dialogFolder)
+  ELSE
+    BEGIN
+      SaveOld(windPeek);
+      windPeek^.visible := TRUE;
+      CalcFldrRgns(windPeek);
+      DrawNew(windPeek,fUpdate);
+    END;
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMclose }
+{--------------------------------------------------------------------------}
+PROCEDURE DisposeFolder(* folder: WindowPtr *);
+{--------------------------------------------------------------------------}
+{ Dispose of a window and re-draw uncovered stuff }
+{ Discard any events already pending for that folder, }
+VAR windPeek:     WindowPeek;
+    savePort:     GrafPtr;
+    saveHeap:     THz;
+    event:        EventRecord;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(folder));
+  IF NOT windPeek^.okDispose THEN EXIT(DisposeFolder);
+
+  GetPort(savePort);
+  SetPort(wmPort);
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+
+  FlushWindow(folder);   { delete all pending events }
+
+  WMKillPicture(folder);
+
+  WITH windPeek^ DO
+    BEGIN
+      DeleteWindow(windPeek);   { take it out of the window list }
+      PaintBehind(nextWindow,strucRgn);
+      CalcVisBehind(nextWindow,strucRgn);
+      DisposeRgn(strucRgn);
+      DisposeRgn(contRgn);
+      DisposeRgn(updateRgn);
+      DisposeRgn(port.visRgn);
+      DisPoseRgn(port.clipRgn);
+      DisposeString(titleHandle);
+      available := TRUE;
+    END;
+
+  IF folder=activeFolder THEN SetActWindow(Pointer(ORD(filerFolder)));
+
+  IF folder=keyWindow THEN   { dump it on the filer }
+    BEGIN
+      keyWindow := filerFolder;
+      keyProcess := filerProcess;
+      event.who := filerFolder;
+      event.what := folderActiveat;
+      event.why := whyNot;
+      event.fromFolder := Nil;
+      event.fromProcess := NilProcess;
+      SendEvent(event,filerProcess);
+    END;
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE DrawFolder{windPeek: WindowPeek};
+{--------------------------------------------------------------------------}
+{ Draw the structure of a folder in global coords, called while in wmPort. }
+{ The clipping region has already been set up; Don't mess with it }
+
+VAR tabWidth:   INTEGER;
+    titleLoc:   INTEGER;
+    tabRect:    Rect;
+    titleRect:  Rect;
+    tempRect:   Rect;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  IF NOT windPeek^.visible THEN EXIT(DrawFolder);
+
+  tempRect := windPeek^.strucRgn^^.rgnBBox;
+  tempRect.right := tempRect.right-2;
+  tempRect.bottom := tempRect.bottom-1;
+  FrameRect(tempRect);
+  MoveTo(tempRect.left,tempRect.bottom);    { draw shadow }
+  LineTo(tempRect.right,tempRect.bottom);
+  PenSize(2,1);
+  LineTo(tempRect.right,tempRect.top);
+  PenNormal;
+
+  IF NOT windPeek^.hasTab THEN EXIT(DrawFolder);
+
+  MoveTo(tempRect.left,tempRect.top+15);      { seperate tab from body }
+  LineTo(tempRect.right,tempRect.top+15);
+
+  tabRect := windPeek^.contRgn^^.rgnBBox;
+  tabRect.top := tabRect.top-15;
+  tabRect.bottom := tabRect.top+14;
+  tabWidth := tabRect.right-tabRect.left;
+
+  EraseRect(tabRect);
+
+  { draw the close icon }
+  TextFont(wmFont);
+  MoveTo(tabRect.left + 3,tabRect.top-1);
+  DrawChar(CHR(windPeek^.closeIcon));
+      IF windPeek^.iconOverlay <> noIcon THEN
+        BEGIN
+          MoveTo(tabRect.left + 3,tabRect.top-1);
+          DrawChar(CHR(windPeek^.iconOverlay));
+        END;
+  TextFont(sysText);
+
+  { draw the title }
+  titleLoc := tabRect.left + tabWidth*7 DIV 16 - windPeek^.titleWidth*7 DIV 16;
+  IF titleLoc < tabRect.left + titleLeft
+  THEN titleLoc := tabRect.left + titleLeft;
+  MoveTo(titleLoc,tabRect.top+11);
+  DrawString(windPeek^.titleHandle^^);
+
+  IF windPeek^.hilited THEN
+    BEGIN
+      titleRect := tabRect;
+      titleRect.left := titleLoc;
+      titleRect.right := titleRect.left + windPeek^.titleWidth;
+      IF titleRect.right > tabRect.Right THEN titleRect.right := tabRect.right;
+      InvertRect(titleRect);
+      TextFont(wmFont);
+      MoveTo(titleRect.left-24,titleRect.top-1);
+      DrawChar('X');
+      MoveTo(titleRect.right,titleRect.top-1);
+      DrawChar('Y');
+      TextFont(sysText);
+    END;
+END;
+
+
+{$S WMmovrs }
+{--------------------------------------------------------------------------}
+FUNCTION DragRect{dstRect: Rect; startPt: Point; VAR deltaPt: Point): BOOLEAN};
+{--------------------------------------------------------------------------}
+{ returns true if deltaPt <> 0 }
+LABEL 9;
+VAR oldPt,newPt: Point;
+    dh,dv:       INTEGER;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  PenPat(gray);
+  PenMode(notPatXor);
+  FrameRect(dstRect);  { draw initial frame }
+
+  { give a little hysteresis }
+  REPEAT
+    GetMouse(newPt);
+    dh := ABS(newPt.h-startPt.h);
+    dv := ABS(newPt.v-startPt.v);
+    IF NOT Button THEN   { user let go before moving enough }
+      BEGIN
+        newPt := startPt;
+        GOTO 9;
+      END;
+  UNTIL (dh > 3) OR (dv > 2);
+
+  newPt := startPt;
+  REPEAT
+    oldPt := newPt;
+    GetMouse(newPt);
+    IF newPt.v < 20 THEN newPt.v := 20;
+    IF newPt.v > 344 THEN newPt.v := 344;
+    IF newPt.h < 20 THEN newPt.h := 20;
+    IF newPt.h > 700 THEN newPt.h := 700;
+    dh := newPt.h-oldPt.h;
+    dv := newPt.v-oldPt.v;
+    IF (dh <> 0) OR (dv <> 0) THEN
+      BEGIN
+        { move the xor  frame }
+        FrameRect(dstRect);
+        OffsetRect(dstRect,dh,dv);
+        FrameRect(dstRect);
+      END;
+  UNTIL NOT Button;
+
+
+9: deltaPt := newPt;
+  SubPt(startPt,deltaPt);
+  FrameRect(dstRect);  { erase final frame }
+  DragRect  :=  (deltaPt.h <> 0) OR (deltaPt.v <> 0);
+  PenNormal;
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE DrawRound{windPeek: WindowPeek};
+{--------------------------------------------------------------------------}
+{ Draw the structure of a roundrect window in global coords, }
+{ called while in wmPort. }
+{ The clipping region has already been set up; Don't mess with it }
+
+VAR tabWidth:   INTEGER;
+    titleLoc:   INTEGER;
+    tabRect:    Rect;
+    titleRect:  Rect;
+    tempRect:   Rect;
+    saveClip:   RgnHandle;
+    tabRgn:     RgnHandle;
+    tempRgn:    RgnHandle;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WITH WindPeek^ DO
+    BEGIN
+      IF NOT visible THEN EXIT(DrawRound);
+
+      tempRect := strucRgn^^.rgnBBox;
+      tempRect.right := tempRect.right-2;       { account for shadow }
+      tempRect.bottom := tempRect.bottom-1;
+      InsetRect(tempRect,1,1);                  { get inside part }
+
+      tempRgn := NewRgn;
+      OpenRgn;
+        FrameRgn(strucRgn);                      { get strucRgn }
+        FrameRoundRect(tempRect,ovWd-2,ovHt-2);  { subtract inside part }
+      CloseRgn(tempRgn);
+      PaintRgn(tempRgn);
+      DisposeRgn(tempRgn);
+      IF NOT hasTab THEN EXIT(DrawRound);
+
+      MoveTo(tempRect.left,tempRect.top+14);    { separate tab from body }
+      LineTo(tempRect.right,tempRect.top+14);
+
+      tabRect := contRgn^^.rgnBBox;
+      tabRect.top := tabRect.top-15;
+      tabRect.bottom := tabRect.top+14;
+      tabWidth := tabRect.right-tabRect.left;
+
+      tabRgn := NewRgn;
+      RectRgn(tabRgn,tabRect);
+      saveClip := NewRgn;
+      GetClip(saveClip);
+      SectRgn(saveClip,tabRgn,thePort^.clipRgn);
+      EraseRoundRect(tempRect,ovWd-2,ovHt-2);
+
+      { draw the close icon }
+      TextFont(wmFont);
+      MoveTo(tabRect.left + 8,tabRect.top-1);
+      DrawChar(CHR(closeIcon));
+      IF iconOverlay <> noIcon THEN
+        BEGIN
+          MoveTo(tabRect.left + 8,tabRect.top-1);
+          DrawChar(CHR(iconOverlay));
+        END;
+      TextFont(sysText);
+
+      { draw the title }
+      titleLoc := tabRect.left + tabWidth*7 DIV 16 - titleWidth*7 DIV 16;
+      IF titleLoc < tabRect.left + titleLeft
+      THEN titleLoc := tabRect.left + titleLeft;
+      MoveTo(titleLoc,tabRect.top+11);
+      DrawString(titleHandle^^);
+
+      IF hilited THEN
+        BEGIN
+          InvertRoundRect(tempRect,ovWd-2,ovHt-2);
+(*
+          titleRect := tabRect;
+          titleRect.left := titleLoc;
+          titleRect.right := titleRect.left + titleWidth;
+          IF titleRect.right > tabRect.Right THEN titleRect.right := tabRect.right;
+          InvertRect(titleRect);
+          TextFont(wmFont);
+          MoveTo(titleRect.left-24,titleRect.top-1);
+          DrawChar('X');
+          MoveTo(titleRect.right,titleRect.top-1);
+          DrawChar('Y');
+          TextFont(sysText);
+*)
+        END;
+
+      SetClip(saveClip);
+      DisposeRgn(tabRgn);
+      DisposeRgn(saveClip);
+
+    END;  { with windPeek^ }
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+FUNCTION DragRRect{dstRect: Rect; startPt: Point; VAR deltaPt: Point): BOOLEAN};
+{--------------------------------------------------------------------------}
+{ returns true if deltaPt <> 0 }
+LABEL 9;
+VAR oldPt,newPt: Point;
+    dh,dv:       INTEGER;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  PenPat(gray);
+  PenMode(notPatXor);
+  FrameRoundRect(dstRect,ovWd,ovHt);  { draw initial frame }
+
+  { give a little hysteresis }
+  REPEAT
+    GetMouse(newPt);
+    dh := ABS(newPt.h-startPt.h);
+    dv := ABS(newPt.v-startPt.v);
+    IF NOT Button THEN   { user let go before moving enough }
+      BEGIN
+        newPt := startPt;
+        GOTO 9;
+      END;
+  UNTIL (dh > 3) OR (dv > 2);
+
+  newPt := startPt;
+  REPEAT
+    oldPt := newPt;
+    GetMouse(newPt);
+    IF newPt.v < 20 THEN newPt.v := 20;
+    IF newPt.v > 344 THEN newPt.v := 344;
+    IF newPt.h < 20 THEN newPt.h := 20;
+    IF newPt.h > 700 THEN newPt.h := 700;
+    dh := newPt.h-oldPt.h;
+    dv := newPt.v-oldPt.v;
+    IF (dh <> 0) OR (dv <> 0) THEN
+      BEGIN
+        { move the xor  frame }
+        FrameRoundRect(dstRect,ovWd,ovHt);
+        OffsetRect(dstRect,dh,dv);
+        FrameRoundRect(dstRect,ovWd,ovHt);
+      END;
+  UNTIL NOT Button;
+
+
+9: deltaPt := newPt;
+  SubPt(startPt,deltaPt);
+  FrameRoundRect(dstRect,ovWd,ovHt);  { erase final frame }
+  DragRRect  :=  (deltaPt.h <> 0) OR (deltaPt.v <> 0);
+  PenNormal;
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE EmptyProc{windPeek:  WindowPeek;
+                    message: WindowMessage;
+                    param:   LongInt};
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+END;
+
+
+{$S WMscrol }
+{--------------------------------------------------------------------------}
+PROCEDURE EndUpdate(* folder: WindowPtr *);
+{--------------------------------------------------------------------------}
+{ called by application after update is complete to restore visRgn }
+VAR savePort:  GrafPtr;
+    saveHeap:  THz;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetPort(savePort);
+  SetPort(wmPort);
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+
+  CalcVis(Pointer(ORD(folder)));
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE FolderProc{windPeek:  WindowPeek;
+                     message: WindowMessage;
+                     param:   LongInt};
+{--------------------------------------------------------------------------}
+{ this procedure receives all messages from Unit Windows }
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  CASE message OF
+    draw:     DrawFolder(windPeek);
+    hit:      HitFolder(windPeek,param);
+    calcRgns: CalcFldrRgns(windPeek);
+  END;
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE FolderSize(* folder:       WindowPtr;
+                       width,height: INTEGER;
+                       fUpdate:      BOOLEAN *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  IF width > maxWindWidth THEN width := maxWindWidth;
+  IF width < minWindWidth THEN width := minWindWidth;
+  IF height > maxWindHeight THEN height := maxWindHeight;
+  IF height < minWindHeight THEN height := minWindHeight;
+  WindowSize(Pointer(ORD(folder)),width,height,fUpdate);
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE FlushInput(* window:  WindowPtr *);
+{--------------------------------------------------------------------------}
+{ discard button, key, activate, deactivate, and abort events }
+{ IF window = Nil THEN do so for all windows }
+
+VAR evHandle:   EventHandle;
+    nextEv:     EventHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  evHandle := FirstEvent;
+  WHILE evHandle <> Nil DO
+    BEGIN
+      nextEv := NextEvent(evHandle);
+      IF (evHandle^^.what <= folderDeactivate)
+      AND ((window = Nil) OR (evHandle^^.who = window))
+      THEN DeleteEvent(evHandle);
+      evHandle := nextEv;
+    END;
+
+  IF (window = Nil)
+  OR (window = keyWindow)
+  THEN
+    BEGIN
+      keyWindow := activeFolder;
+      keyProcess := activeProcess;
+    END;
+
+  BringToFront(Pointer(ORD(activeFolder)),TRUE);
+  queueLocked := FALSE;
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE FlushProcess(* process: ProcessID *);
+{--------------------------------------------------------------------------}
+{ flush all events to or folderDeactivate from a given process }
+VAR windPeek:   WindowPeek;
+    evHandle:   EventHandle;
+    nextEv:     EventHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  evHandle := FirstEvent;
+  WHILE evHandle <> Nil DO
+    BEGIN
+      nextEv := NextEvent(evHandle);
+      IF (evHandle^^.toProcess = process)
+      OR ((evHandle^^.fromProcess = process) AND (evHandle^^.what = folderDeactive))
+      THEN DeleteEvent(evHandle);
+      evHandle := nextEv;
+    END;
+  queueLocked := FALSE;
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE FlushWindow(* window: WindowPtr *);
+{--------------------------------------------------------------------------}
+{ flush all events to or folderDeactivates from a given window }
+VAR evHandle:   EventHandle;
+    nextEv:     EventHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  evHandle := FirstEvent;
+  WHILE evHandle <> Nil DO
+    BEGIN
+      nextEv := NextEvent(evHandle);
+      IF (evHandle^^.who = window)
+      OR ((evHandle^^.fromFolder = window) AND (evHandle^^.what = folderDeactivate))
+      THEN DeleteEvent(evHandle);
+      evHandle := nextEv;
+    END;
+
+  IF window = keyWindow THEN
+    BEGIN
+      keyWindow := activeFolder;
+      keyProcess := activeProcess;
+    END;
+  queueLocked := FALSE;
+END;
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+FUNCTION GetFldrRefCon(* folder: WindowPtr): LongInt *);
+{--------------------------------------------------------------------------}
+VAR windPeek:   WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(folder));
+  GetFldrRefCon := windPeek^.refCon;
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE GetFldrTitle(* folder: WindowPtr; VAR title: Str255 *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetWindTitle(Pointer(ORD(folder)),title);
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE GetWindInfo(* window:  WindowPtr; VAR info: WindowInfo *);
+{--------------------------------------------------------------------------}
+VAR windPeek: WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(window));
+  WITH windPeek^ DO
+    BEGIN
+      info.visible := visible;
+      info.hasTab  := hasTab;
+      info.okMove  := okMove;
+      info.okGrow  := okGrow;
+      info.okFront := okFront;
+      info.okClose := okClose;
+      info.okActivate := okActivate;
+    END;
+END;
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+PROCEDURE GiveControl(* event: EventRecord *);
+{--------------------------------------------------------------------------}
+{ standard protocol when a folderDeactivate event is recieved }
+VAR errNum:    INTEGER;
+    toFolder:  WindowPtr;
+    toProcess: ProcessID;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+{$IFC wmDebug}
+  (*
+  IF NOT ImActive THEN WRITELN
+  ('OOPS, GiveControl says ImActive FALSE, activeProcess = ',activeProcess);
+   ** EB **
+  *)
+{$ENDC}
+  BusyDelay(0);  { make hourglass show immediately }
+
+  HiLiteTab(event.who,FALSE);                     { turn off my tab   }
+  activeProcess := NilProcess;                    { nobody's active   }
+  activeFolder := Nil;
+  event.what := folderActivate;
+  toProcess := event. fromProcess;
+  toFolder := event. fromFolder;
+  event.fromFolder := event.who;
+  event.fromProcess := event.toProcess;
+  event.who := toFolder;
+  event.toProcess := toProcess;
+  PushEvent(event);                               { push at front of Queue }
+  queueLocked := FALSE;
+  SetPriority_Process(errNum,My_ID,120);          { lower my priority }
+  WakeUpHead;
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE GiveWindow(* window: WindowPtr; toProcess: ProcessId *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WmKillPicture(window);
+  ChangeProcess(window,toProcess);
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+FUNCTION GrowHeap{Hz: THz; BytesNeeded: INTEGER): INTEGER};
+{--------------------------------------------------------------------------}
+{ this function gets called when wmHeap is full }
+VAR errNum,refNum: INTEGER;
+    newMemSize,newDiskSize: LongInt;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GrowHeap := 0;   { can't grow on monitor }
+{$IFC wmOs }
+
+  { get process' refnum for the wmheap }
+  Info_Address(errnum,ord(hz),refnum);
+{$IFC wmDebug }
+  IF errNum <> 0 then writeln('WM GrowHeap info_Address error',errNum);
+{$ENDC }
+
+  IF bytesNeeded < 2048 THEN bytesNeeded := 2048;    { grow in chunks }
+  Size_DataSeg(errNum,refnum,bytesNeeded,newMemSize,0,newDiskSize);
+{$IFC wmDebug }
+  (*
+  WRITELN('WmHeap has been Grown to ',newMemSize);
+  *)
+{$ENDC}
+
+  IF ErrNum <= 0 THEN
+    BEGIN
+      GrowHeap := newMemSize - wmDSsize;
+      wmDSsize := newMemSize;
+    END;
+
+{$ENDC}  { if wmOs }
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE HeDied(* deadProcess: ProcessID *);
+{--------------------------------------------------------------------------}
+{ called by a process from its terminate exception handler }
+VAR event:      EventRecord;
+    errNum:     INTEGER;
+    wasActive:  BOOLEAN;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  SetPort(deskPort);
+
+  wasActive := ImActive OR (activeProcess = nilProcess);
+  IF wasActive THEN
+    BEGIN
+      HiliteTab(activeFolder,FALSE);
+      SetActWindow(Pointer(ORD(filerFolder)));
+    END;
+
+  FlushInput(Nil);   { for everybody }
+  FlushProcess(deadProcess);
+
+  IF wasActive THEN   { wrench control away from dying active window }
+    BEGIN
+      event.why := whyDied;
+      event.toProcess := deadProcess;  { these will get swapped by GiveControl }
+      event.who := Nil;
+      event.fromProcess := filerProcess;
+      event.fromFolder  := filerFolder;
+      GiveControl(event);  {*** can cause 'OOPS' msg from GiveControl: FL ***}
+    END
+  ELSE
+    BEGIN   { ask living active window to make filer active }
+      event.why := whyNot;
+      MakeActive(Pointer(ORD(filerFolder)),event);  { activate the filer }
+    END;
+
+  event.who  := filerFolder;
+  event.what := diedEvent;
+  event.fromProcess := deadProcess;
+  event.fromFolder := Nil;
+  event.why  := whyNot;
+  SendEvent(event,filerProcess);    { Send the filer a diedEvent }
+
+  { make sure the owner of the queue head is alive }
+  WakeUpHead;
+END;
+
+
+{$S WMalert}
+{--------------------------------------------------------------------------}
+PROCEDURE HideFolder(* folder: WindowPtr *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  HideWindow(Pointer(ORD(folder)));
+END;
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+PROCEDURE HiLiteTab(* folder: WindowPtr; fHiLite: BOOLEAN *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  HiliteWindow(Pointer(ORD(folder)),fHilite);
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE HitFolder{windPeek: WindowPeek; param: LongInt};
+{--------------------------------------------------------------------------}
+{ called via FolderProc while in wmPort }
+LABEL 1;
+VAR eventPtr:   ^EventRecord;
+    hitPt:      Point;
+    cornerRect: Rect;
+    deltaPt:    Point;
+    doubleTime: LongInt;
+    dialogPeek: WindowPeek;
+    nextKey:    KeyEvent;
+    tempRect:   Rect;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  IF ignoreButton THEN
+    BEGIN
+      ignoreButton := FALSE;
+      EXIT(HitFolder);
+    END;
+
+  eventPtr := Pointer(param);
+  hitPt := eventPtr^.where;
+
+  WITH windPeek^ DO
+    BEGIN
+      IF PtInRgn(hitPt,contRgn) THEN
+        BEGIN
+          HitContent(windPeek,eventPtr^);
+          EXIT(hitFolder);
+        END;
+
+      IF NOT windPeek^.hasTab THEN EXIT(HitFolder);
+
+      cornerRect := strucRgn^^.rgnBBox;
+      WITH cornerRect DO
+        BEGIN
+          right := left+24;
+          bottom := top+15;
+        END;
+
+      IF hitPt.v >= cornerRect.bottom THEN EXIT(HitFolder);
+
+      dialogPeek := Pointer(ORD(dialogFolder));
+      SetClip(grayRgn);
+      ClipAbove(dialogPeek^.nextWindow);
+
+      { drag window by its tab }
+      tempRect := windPeek^.strucRgn^^.rgnBBox;
+      tempRect.right := tempRect.right-2;         { account for shadow }
+      tempRect.bottom := tempRect.bottom-1;
+
+      IF NOT windPeek^.okMove
+      THEN REPEAT UNTIL NOT Button
+      ELSE IF NOT KeybdPeek(FALSE,1,NextKey)      { has user released the mouse btn? }
+           THEN IF DragRect(tempRect,hitPt,deltaPt) THEN
+             BEGIN   { window was dragged }
+               MoveWindow(windPeek,deltaPt.h,deltaPt.v,TRUE);
+               GOTO 1;
+             END;
+
+      { not okMove or user let go without moving minimum delta }
+
+      IF NOT PtInRect(hitPt,cornerRect) THEN GOTO 1;
+      { just bring to front and activate }
+
+      IF ClickClose(cornerRect) THEN
+        BEGIN
+          IF windPeek^.okClose THEN
+            BEGIN
+              eventPtr^.why := whyClose;
+              eventPtr^.userData := ORD(windPeek);
+              MakeActive(Pointer(ORD(filerFolder)),eventPtr^);
+            END;
+          EXIT(HitFolder);
+        END;
+
+
+      { make it active if not already }
+1:    IF windPeek <> Pointer(ORD(keyWindow)) THEN
+        BEGIN
+          eventPtr^.why := whyNot;
+          MakeActive(windPeek,eventPtr^);
+        END;
+
+      BringToFront(windPeek,TRUE);
+    END;  { with windPeek^ }
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE HitRound{windPeek: WindowPeek; param: LongInt};
+{--------------------------------------------------------------------------}
+{ called via RoundProc while in wmPort }
+LABEL 1;
+VAR eventPtr:   ^EventRecord;
+    hitPt:      Point;
+    cornerRect: Rect;
+    deltaPt:    Point;
+    doubleTime: LongInt;
+    dialogPeek: WindowPeek;
+    nextKey:    KeyEvent;
+    tempRect:   Rect;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  IF ignoreButton THEN
+    BEGIN
+      ignoreButton := FALSE;
+      EXIT(HitRound);
+    END;
+
+  eventPtr := Pointer(param);
+  hitPt := eventPtr^.where;
+
+  WITH windPeek^ DO
+    BEGIN
+      IF PtInRgn(hitPt,contRgn) THEN
+        BEGIN
+          HitContent(windPeek,eventPtr^);
+          EXIT(hitRound);
+        END;
+
+      IF NOT hasTab THEN EXIT(HitRound);
+
+      cornerRect := strucRgn^^.rgnBBox;
+      WITH cornerRect DO
+        BEGIN
+          right := left+24;
+          bottom := top+15;
+        END;
+
+      IF hitPt.v >= cornerRect.bottom THEN EXIT(HitRound);
+
+      dialogPeek := Pointer(ORD(dialogFolder));
+      SetClip(grayRgn);
+      ClipAbove(dialogPeek^.nextWindow);
+
+      { drag window by its tab }
+      tempRect := strucRgn^^.rgnBBox;
+      tempRect.right := tempRect.right - 2;    { account for shadow }
+      tempRect.bottom := tempRect.bottom - 1;
+
+      IF NOT okMove
+      THEN REPEAT UNTIL NOT Button
+      ELSE IF NOT KeybdPeek(FALSE,1,nextKey)   { did user release mouse btn? }
+           THEN IF DragRRect(tempRect,hitPt,deltaPt) THEN
+             BEGIN   { window was dragged }
+               MoveWindow(windPeek,deltaPt.h,deltaPt.v,TRUE);
+               GOTO 1;
+             END;
+
+      { not okMove or user let go without moving minimum delta }
+
+      IF NOT PtInRect(hitPt,cornerRect) THEN GOTO 1;
+      { just bring to front and activate }
+
+      IF ClickClose(cornerRect) THEN
+        BEGIN
+          IF okClose THEN
+            BEGIN
+              eventPtr^.why := whyClose;
+              eventPtr^.userData := ORD(windPeek);
+              MakeActive(Pointer(ORD(filerFolder)),eventPtr^);
+            END;
+          EXIT(HitRound);
+        END;
+
+
+      { make it active if not already }
+1:    IF windPeek <> Pointer(ORD(keyWindow)) THEN
+        BEGIN
+          eventPtr^.why := whyNot;
+          MakeActive(windPeek,eventPtr^);
+        END;
+
+      BringToFront(windPeek,TRUE);
+    END;  { with windPeek^ }
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE ImDying;
+{--------------------------------------------------------------------------}
+{ called by a process from its terminate exception handler }
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  HeDied(My_ID);
+END;
+
+
+{$S WMinit }
+{--------------------------------------------------------------------------}
+PROCEDURE InitWM;
+{--------------------------------------------------------------------------}
+{ once only initialization for window manager, called at boot by filer }
+
+CONST docIcon = 80;
+      scrapIcon = 100;
+
+{$IFC wmOS }
+dsSize = $4000;   { start with 16K bytes for OS }
+{$ELSEC }
+dsSize = $8000;   { 32K bytes for now }
+{$ENDC }
+
+
+VAR errNum:             INTEGER;
+    wmDsAddr:           LongInt;
+    wmDsName:           PathName;
+    menuWindow:         WindowPeek;
+    alertWindow:        WindowPeek;
+    dialogWindow:       WindowPeek;
+    filerWindow:        WindowPeek;
+    scrapWindow:        WindowPeek;
+    i:                  INTEGER;
+    saveHeap:           THz;
+{$IFC wmOS }
+    dsInfo:             DsInfoRec;
+    InputRec:           TInputStuff;
+
+{$ENDC}
+    refNum:             INTEGER;
+    newDiskSize:        LongInt;
+    openErrNum:         INTEGER;
+    fontID:             TLfntID;
+
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  wmSpare1 := 0;        {don't repeat control keys}
+  SetPriority_Process(errNum,My_ID,130);
+
+  FMInit(errNum);
+  IF errNum <> 0 THEN
+    BEGIN
+{$IFC wmDebug}
+      WRITELN('InitWm called FMInit and got errNum = ',errNum);
+{$ENDC}
+      IF errNum > 0 THEN HALT;
+    END;
+
+  { lock down standard system fonts }
+  fontID.seteface := [];
+  fontID.dev := devScreen;
+  fontID.fam := sysText;
+  FMLockFont(fontID,TRUE,errNum);
+  fontID.fam := wmFont;
+  FMLockFont(fontID,TRUE,errNum);
+
+  GetHeap(saveHeap);
+  wmDsSize := dsSize;
+
+  { create the wm data segment and init wmheap }
+
+  wmDsName := 'WMDATA';
+  Open_DataSeg(openErrNum,wmDsName,refnum,wmDsAddr,15);
+  IF openErrNum <= 0 THEN
+    BEGIN
+      SetAccess_DataSeg(errNum,refnum,FALSE);
+{$IFC wmOS }
+      Info_DataSeg(errNum,refnum,dsInfo);
+      Size_Dataseg(errNum,refnum,
+                   dsSize - dsInfo.mem_Size, wmDsSize,
+                   0 - dsInfo.disc_size, newDiskSize);
+      IF errNum > 0 THEN
+        BEGIN
+{$IFC wmDebug}
+          WRITELN('InitWM failed on Size_Dataseg');
+{$ENDC}
+          Halt;
+        END;
+{$ENDC}
+    END
+  ELSE
+    BEGIN  { openErrNum > 0  --> hard error }
+
+      Kill_DataSeg(errNum,wmDsName);
+
+{$IFC wmOS }
+      Make_DataSeg(errNum,wmDsName,dsSize,0,refnum,wmDsAddr,15,ds_shared);
+{$ELSEC }
+      Make_DataSeg(errNum,wmDsName,dsSize,0,refnum,wmDsAddr,15);
+{$ENDC }
+      IF errnum > 0 THEN
+        BEGIN
+{$IFC wmDebug}
+          WRITELN('InitWM failed on Make_DataSeg. err=',errNum);
+{$ENDC}
+          Halt;
+        END
+    END;
+
+  InitHeap(Pointer(wmDsAddr),Pointer(wmDsAddr+wmDsSize),@GrowHeap);
+  GetHeap(wmHeap);
+
+  { allocate desk port }
+  deskPort := @dPort;
+  OpenPort(deskPort);
+
+  InitEvents;
+
+  FOR i := 0 TO lastWindow DO windowArray[i].available := TRUE;
+
+  { allocate wmPort and paint screen gray }
+  wmPort := @wPort;
+  OpenPort(wmPort);
+  TextFont(sysText);
+  SetRectRgn(wmPort^.visRgn,-30000,-30000,30000,30000);
+  PaintRect(wmPort^.portRect);                 { black to clear corners }
+  FillRoundRect(wmPort^.portRect,27,18,gray);  { paint screen gray }
+  SetRectRgn(wmPort^.clipRgn,0,0,720,16);      { clip for half-round }
+  EraseRoundRect(wmPort^.portRect,27,18);      { draw white menu bar }
+  MoveTo(0,15); Line(719,0);                     { and its black line }
+
+  { set up grayRgn with rounded corners and excluding menuBar }
+  grayRgn := NewRgn;
+  PenMode(-1);
+  OpenRgn;
+    FrameRoundRect(wmPort^.portRect,27,18);    { define grayRgn }
+  CloseRgn(grayRgn);
+  PenNormal;
+  DiffRgn(grayRgn,wmPort^.clipRgn,grayRgn);    { subtract menuBar }
+  SetClip(grayRgn);
+
+{------------------------------------------------------------------}
+{                                                                  }
+{  INITIAL STATE OF EACH KIND OF WINDOW:                           }
+{                                                                  }
+{               menu    alert   dialog  scrap   filer   normal     }
+{                                                                  }
+{  visible      FALSE   FALSE   FALSE   FALSE   TRUE    FALSE      }
+{  hilited      FALSE   FALSE   FALSE   FALSE   FALSE   FALSE      }
+{  hasTab       FALSE   FALSE   FALSE   TRUE    FALSE   TRUE       }
+{  okMove       FALSE   TRUE    TRUE    TRUE    FALSE   TRUE       }
+{  okGrow       FALSE   TRUE    TRUE    TRUE    FALSE   TRUE       }
+{  okFront      FALSE   TRUE    TRUE    TRUE    FALSE   TRUE       }
+{  okClose      FALSE   FALSE   FALSE   TRUE    FALSE   TRUE       }
+{  okActivate   FALSE   FALSE   FALSE   TRUE    TRUE    TRUE       }
+{  okDispose    FALSE   FALSE   FALSE   FALSE   FALSE   TRUE       }
+{                                                                  }
+{------------------------------------------------------------------}
+
+
+  { allocate the filer folder }
+  { the filer window is always the farthest folder away }
+  { it is never brought to the front or folders inserted after it }
+
+  filerWindow := @windowArray[3];
+  filerFolder := Pointer(ORD(filerWindow));
+  OpenPort(filerFolder);
+  TextFont(sysText);
+  MovePortTo(0,16);
+  PortSize(720,364-16);
+  CopyRgn(grayRgn,filerFolder^.visRgn);
+  OffsetRgn(filerFolder^.visRgn,0,-16);  { convert to local }
+  WITH filerWindow^ DO
+    BEGIN
+      dataHandle := Nil;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      windowPic := Nil;
+      windowProc := @FolderProc;
+      refcon := 0;
+      process := MY_ID;
+      titleHandle := NewString('Filer');
+      titleWidth := StringWidth(titleHandle^^);
+      nextWindow := Nil;  { never folders after this one }
+      filerProcess := process;
+      closeIcon := docIcon;
+      iconOverlay := noIcon;
+      available := FALSE;
+      visible := TRUE;
+      hilited := FALSE;
+      hasTab  := FALSE;
+      okMove  := FALSE;
+      okGrow  := FALSE;
+      okFront := FALSE;
+      okClose := FALSE;
+      okActivate := TRUE;
+      okDispose := FALSE;
+    END;
+  CalcFldrRgns(Pointer(ORD(filerFolder)));
+
+
+  { allocate the scrap folder }
+
+  scrapWindow := @windowArray[4];
+  scrapFolder := Pointer(ORD(scrapWindow));
+  OpenPort(scrapFolder);
+  TextFont(sysText);
+  MovePortTo(20,320);
+  PortSize(650,35);
+  SetEmptyRgn(scrapFolder^.visRgn);
+  WITH scrapWindow^ DO
+    BEGIN
+      dataHandle := Nil;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      windowPic := Nil;
+      windowProc := @FolderProc;
+      refcon := 0;
+      process := MY_ID;
+      titleHandle := NewString('The Scrap');
+      titleWidth := StringWidth(titleHandle^^);
+      nextWindow := filerWindow;
+      scrapProcess := process;
+      closeIcon := scrapIcon;
+      iconOverlay := noIcon;
+      available := FALSE;
+      visible := FALSE;
+      hilited := FALSE;
+      hasTab  := TRUE;
+      okMove  := TRUE;
+      okGrow  := TRUE;
+      okFront := TRUE;
+      okClose := TRUE;
+      okActivate := TRUE;
+      okDispose := FALSE;
+    END;
+
+
+  { allocate dialog folder }
+
+  dialogWindow := @windowArray[2];
+  dialogFolder := Pointer(ORD(dialogWindow));
+  OpenPort(dialogFolder);
+  TextFont(sysText);
+  MovePortTo(dialogLeft,dialogTop);
+  PortSize(dialogWd,dialogHt);
+  SetEmptyRgn(dialogFolder^.visRgn);
+  WITH dialogWindow^ DO
+    BEGIN
+      dataHandle := Nil;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      windowPic := Nil;
+      windowProc := @FolderProc;
+      refcon := 0;
+      process := MY_ID;
+      titleHandle := NewString('Dialog');
+      titleWidth := StringWidth(titleHandle^^);
+      nextWindow := scrapWindow;
+      closeIcon := docIcon;
+      iconOverlay := noIcon;
+      available := FALSE;
+      visible := FALSE;
+      hilited := FALSE;
+      hasTab  := FALSE;
+      okMove  := TRUE;
+      okGrow  := TRUE;
+      okFront := TRUE;
+      okClose := FALSE;
+      okActivate := FALSE;
+      okDispose := FALSE;
+    END;
+
+
+  { allocate alert folder }
+
+  alertWindow := @windowArray[1];
+  alertFolder := Pointer(ORD(alertWindow));
+  OpenPort(alertFolder);
+  TextFont(sysText);
+  PortSize(0,0);
+  SetEmptyRgn(alertFolder^.visRgn);
+  WITH alertWindow^ DO
+    BEGIN
+      dataHandle := Nil;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      windowPic := Nil;
+      windowProc := @FolderProc;
+      refcon := 0;
+      process := MY_ID;
+      titleHandle := NewString('Alert');
+      titleWidth := StringWidth(titleHandle^^);
+      nextWindow := dialogWindow;
+      closeIcon := docIcon;
+      iconOverlay := noIcon;
+      available := FALSE;
+      visible := FALSE;
+      hilited := FALSE;
+      hasTab  := FALSE;
+      okMove  := TRUE;
+      okGrow  := TRUE;
+      okFront := TRUE;
+      okClose := FALSE;
+      okActivate := FALSE;
+      okDispose := FALSE;
+    END;
+
+
+  { allocate menu folder }
+
+  menuWindow := @windowArray[0];
+  menuFolder := Pointer(ORD(menuWindow));
+  OpenPort(menuFolder);
+  TextFont(sysText);
+  WITH menuWindow^ DO
+    BEGIN
+      dataHandle := Nil;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      windowPic := Nil;
+      windowProc := @EmptyProc;
+      refcon := 0;
+      process := MY_ID;
+      titleHandle := NewString('Menu');
+      titleWidth := StringWidth(titleHandle^^);
+      nextWindow := alertWindow;
+      closeIcon := docIcon;
+      iconOverlay := noIcon;
+      available := FALSE;
+      visible := FALSE;
+      hilited := FALSE;
+      hasTab  := FALSE;
+      okMove  := FALSE;
+      okGrow  := FALSE;
+      okFront := FALSE;
+      okClose := FALSE;
+      okActivate := FALSE;
+      okDispose := FALSE;
+    END;
+
+  activeFolder := filerFolder;
+  activeProcess := filerProcess;
+  keyWindow := filerFolder;
+  keyProcess := filerProcess;
+
+{$IFC wmOS }
+  pmReadInput(InputRec);
+  clickDelay := InputRec.doubleclick * 10;            { double click time }
+{$ELSEC }
+  clickDelay := 50;            { double click time }
+{$ENDC }
+  caretOnTime := 50;           { caret blink time  }
+  caretOffTime := 35;
+
+  buttonWindow := Nil;
+  saveUpdate := TRUE;
+  paintWhite := TRUE;
+  ignoreButton := FALSE;
+
+  SetHeap(saveHeap);
+  SetPort(deskPort);
+
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE InvalidateRgn(* folder: WindowPtr; rgn: RgnHandle *);
+{--------------------------------------------------------------------------}
+{ kept for backwards compatibility }
+VAR savePort: GrafPtr;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetPort(savePort);
+  SetPort(folder);
+  InvalRgn(rgn);
+  SetPort(savePort);
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE InvalRect(* badRect: Rect *);
+{--------------------------------------------------------------------------}
+{ invalidate a rectangle of the current window }
+VAR saveHeap: THz;
+    badRgn: RgnHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+  badRgn := NewRgn;
+  RectRgn(badRgn,badRect);
+  InvalRgn(badRgn);
+  DisposeRgn(badRgn);
+  SetHeap(saveHeap);
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE InvalRgn(* badRgn: RgnHandle *);
+{--------------------------------------------------------------------------}
+{ invalidate a region of the current window }
+VAR saveHeap: THz;
+    delta:    Point;
+    windPeek: WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+  delta := thePort^.portBits.bounds.topLeft;
+  OffsetRgn(badRgn,-delta.h,-delta.v);     { offset to global }
+  windPeek := Pointer(ORD(thePort));
+  WITH WindPeek^ DO
+  UnionRgn(updateRgn,badRgn,updateRgn);    { accumulate update }
+  OffsetRgn(badRgn,delta.h,delta.v);       { restore to local }
+  SetHeap(saveHeap);
+END;
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+PROCEDURE LocateDialog(* top, height: integer *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  HideFolder(dialogFolder);           {be sure it's hidden initially}
+  IF (top+height) > screenBits.bounds.bottom
+  THEN top := screenBits.bounds.bottom - height;        {not too low}
+  IF top < dialogTop THEN top := dialogTop;             {not too high}
+  MoveFolder(dialogFolder,dialogLeft,top);  {specify desired location}
+  IF height > 0 THEN
+    BEGIN
+      DialogHeight(height, FALSE);      {specify desired height}
+      ShowFolder(dialogFolder);         {make it visible}
+    END;
+END;
+
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+PROCEDURE MakeFldrActive(* folder: WindowPtr; reasonWhy: LongInt *);
+{--------------------------------------------------------------------------}
+VAR windPeek:  WindowPeek;
+    savePort:  GrafPtr;
+    saveHeap:  THz;
+    event:     EventRecord;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetPort(savePort);
+  SetPort(wmPort);
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+
+  event.why := reasonWhy;
+  event.fromProcess := My_ID;
+  windPeek := Pointer(ORD(folder));
+  MakeActive(windPeek,event);
+  BringToFront(windPeek,TRUE);
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE MakeTopActive;
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  TopActive;
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE MoveFolder(* folder: WindowPtr; hGlobal,vGlobal: INTEGER *);
+{--------------------------------------------------------------------------}
+VAR dh,dv: INTEGER;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WITH folder^ DO
+    BEGIN
+      dh := hGlobal - (portRect.left - portBits.bounds.left);
+      dv := vGlobal - (portRect.top - portBits.bounds.top);
+      MoveWindow(Pointer(ORD(folder)),dh,dv,FALSE);
+    END;
+END;
+
+
+{$S WMopen2 }
+{--------------------------------------------------------------------------}
+FUNCTION  NewFolder(* folderRect: Rect;
+                      title:      Str255;
+                      visible:    BOOLEAN;
+                      behind:     WindowPtr;
+                      refCon:     LongInt;
+                      process:    ProcessId;
+                      whichIcon:  INTEGER;
+                      overlay:    INTEGER): WindowPtr *);
+{--------------------------------------------------------------------------}
+{ create a new folder, insert into display list, and draw it }
+
+LABEL 1;
+VAR savePort:   GrafPtr;
+    saveHeap:   THz;
+    folder:     WindowPtr;
+    windPeek:   WindowPeek;
+    behindWind: WindowPeek;
+    i:          INTEGER;
+    roundFlag:  BOOLEAN;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  { look for an unused window in windowArray }
+  FOR i := 5 TO lastWindow DO IF windowArray[i].available THEN GOTO 1;
+  NewFolder := Nil;
+  EXIT(newFolder);  { couldn't find one }
+
+1:
+  GetPort(savePort);
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+
+  windPeek := @windowArray[i];
+  folder := Pointer(ORD(windPeek));
+
+  { don't let it get in front of dialogFolder or behind filerFolder }
+  IF (behind=menuFolder)
+  OR (behind=alertFolder)
+  OR (behind=filerFolder)
+  THEN behind := dialogFolder;
+
+  behindWind := Pointer(ORD(behind));
+  OpenPort(folder);
+  WITH folderRect DO
+    BEGIN
+      MovePortTo(left,top);
+      PortSize(right-left,bottom-top);
+    END;
+
+  roundFlag := (whichIcon < 0);  { kludge for now }
+
+  IF roundFlag THEN whichIcon := -whichIcon;
+  windPeek^.visible := visible;
+  windPeek^.refCon := refCon;
+  windPeek^.process := process;
+  WITH windPeek^ DO
+    BEGIN
+      SetPort(wmPort);
+      windowPic := Nil;
+      IF roundFlag
+      THEN windowProc := @RoundProc
+      ELSE windowProc := @FolderProc;
+      strucRgn := NewRgn;
+      contRgn := NewRgn;
+      updateRgn := NewRgn;
+      hilited := FALSE;
+      titleHandle := NewString(title);
+      titleWidth := StringWidth(title);
+      closeIcon := whichIcon;
+      iconOverlay := overlay;
+      available := FALSE;
+      hilited := FALSE;
+      hasTab  := TRUE;
+      okMove  := TRUE;
+      okGrow  := TRUE;
+      okFront := TRUE;
+      okClose := TRUE;
+      okActivate := TRUE;
+      okDispose := TRUE;
+    END;
+
+  IF roundFlag
+  THEN CalcRoundRgns(windPeek)
+  ELSE CalcFldrRgns(windPeek);
+
+  InsertWindow(windPeek,behindWind);
+  saveUpdate := FALSE;   { disable update accumulation }
+  PaintOne(windPeek,windPeek^.strucRgn);
+  saveUpdate := TRUE;
+  CalcVisBehind(windPeek,windPeek^.strucRgn);
+  NewFolder := folder;
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMopen1 }
+{--------------------------------------------------------------------------}
+PROCEDURE OpenWM;
+{--------------------------------------------------------------------------}
+{ called by each application to get shared data segment mapped }
+VAR errNum,refNum: INTEGER;
+    wmDsAddr:   LongInt;
+    wmDsName:   PathName;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  errNum := 0;
+  FMOpen(errNum);
+  IF errNum > 0 THEN
+    BEGIN
+{$IFC wmDebug}
+      WRITELN('OpenWm called FMOpen and got errNum = ',errNum);
+{$ENDC}
+      HALT;
+    END;
+
+  wmDsName := 'WMDATA';
+  Open_DataSeg(errNum,wmDsName,refNum,wmDsAddr,15);
+  IF errnum > 0 THEN
+    BEGIN
+{$IFC wmDebug}
+      WRITELN('OpenWM failed on Open_DataSeg');
+{$ENDC}
+      Halt;
+    END
+  ELSE
+    BEGIN
+      SetAccess_DataSeg(errNum,refNum,FALSE);
+      IF errnum > 0 THEN
+        BEGIN
+{$IFC wmDebug}
+          WRITELN('OpenWM failed on SetAccess_DataSeg');
+{$ENDC}
+         Halt;
+        END
+    END;
+
+  SetPort(deskPort);
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE RoundProc{windPeek:  WindowPeek;
+                     message: WindowMessage;
+                     param:   LongInt};
+{--------------------------------------------------------------------------}
+{ this procedure receives all messages from Unit Windows }
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  CASE message OF
+    draw:     DrawRound(windPeek);
+    hit:      HitRound(windPeek,param);
+    calcRgns: CalcRoundRgns(windPeek);
+  END;
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE SetFldrTitle(* folder: WindowPtr; title: Str255 *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  SetWindTitle(Pointer(ORD(folder)),title);
+END;
+
+
+{$S WMopen2 }
+{--------------------------------------------------------------------------}
+PROCEDURE SetFldrRefCon(* folder: WindowPtr; data: LongInt *);
+{--------------------------------------------------------------------------}
+VAR windPeek:   WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(folder));
+  windPeek^.refCon := data;
+END;
+
+
+{$S WMalert }
+{--------------------------------------------------------------------------}
+PROCEDURE ShowFolder(* folder: WindowPtr *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  ShowWindow(Pointer(ORD(folder)));
+END;
+
+
+{$S WMopen2 }
+{--------------------------------------------------------------------------}
+PROCEDURE SetWindInfo(* window:  WindowPtr; VAR info: WindowInfo *);
+{--------------------------------------------------------------------------}
+VAR windPeek: WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(window));
+  WITH windPeek^ DO
+    BEGIN
+      okMove     := info.okMove;
+      okGrow     := info.okGrow;
+      okFront    := info.okFront;
+      okClose    := info.okClose;
+      okActivate := info.okActivate;
+      hasTab     := info.hasTab;
+      IF visible <> info.visible THEN
+        BEGIN
+          IF info.visible
+          THEN ShowFolder(window)
+          ELSE HideFolder(window);
+        END;
+    END;
+END;
+
+
+{$S WMact }
+{--------------------------------------------------------------------------}
+PROCEDURE TakeControl(* event:  EventRecord; keepMenus,keepDialog: BOOLEAN *);
+{--------------------------------------------------------------------------}
+{ standard protocol when a folderActivate event is received }
+VAR errNum: INTEGER;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  wmSpare1 := 0;  {don't repeat control characters}
+  IF queueLocked THEN
+    BEGIN
+      queueLocked := FALSE;
+{$IFC wmDebug}
+      WRITELN('Oops, queue locked at TakeControl');
+{$ENDC}
+    END;
+
+  WMKillPicture(event.who);  { flush windowPic for new active window }
+
+  HiLiteTab(event.who,TRUE);                    { hilite my tab      }
+  SetActWindow(Pointer(ORD(event.who)));        { I'm active }
+  SetCursor(arrow);
+
+{$IFC wmOS }
+  CursorReInit;
+{$ELSEC}
+  CursorInit;
+{$ENDC}
+
+  IF NOT keepDialog THEN LocateDialog(0,0);
+  IF NOT keepMenus THEN ClearMenuBar;
+END;
+
+
+{$S WMopen2 }
+{--------------------------------------------------------------------------}
+PROCEDURE TakeWindow(* window: WindowPtr *);
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  WmKillPicture(window);
+  ChangeProcess(window,My_ID);
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE ValidRect(* goodRect: Rect *);
+{--------------------------------------------------------------------------}
+{ validate a rectangle of the current window }
+VAR saveHeap: THz;
+    goodRgn: RgnHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+  goodRgn := NewRgn;
+  RectRgn(goodRgn,goodRect);
+  ValidRgn(goodRgn);
+  DisposeRgn(goodRgn);
+  SetHeap(saveHeap);
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE ValidRgn(* goodRgn: RgnHandle *);
+{--------------------------------------------------------------------------}
+{ validate a region of the current window }
+VAR saveHeap: THz;
+    delta:    Point;
+    windPeek: WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetHeap(saveHeap);
+  SetHeap(wmHeap);
+  delta := thePort^.portBits.bounds.topLeft;
+  OffsetRgn(goodRgn,-delta.h,-delta.v);     { offset to global     }
+  windPeek := Pointer(ORD(thePort));
+  WITH WindPeek^ DO
+  DiffRgn(updateRgn,goodRgn,updateRgn);     { subtract from update }
+  OffsetRgn(goodRgn,delta.h,delta.v);       { restore to local     }
+  SetHeap(saveHeap);
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE WMClosePicture;
+{--------------------------------------------------------------------------}
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  IF lastPic = Nil THEN ShowPen    { we didn't make one }
+  ELSE
+    BEGIN
+      ClosePicture;
+      IF lastPic^.windowPic^^.picSize < 0
+      THEN WMKillPicture(Pointer(ORD(lastPic)));
+    END;
+END;
+
+
+{$S WMwork }
+{--------------------------------------------------------------------------}
+PROCEDURE WMKillPicture(* window: WindowPtr *);
+{--------------------------------------------------------------------------}
+VAR windPeek: WindowPeek;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  windPeek := Pointer(ORD(window));
+  IF windPeek^.windowPic <> Nil THEN
+    BEGIN
+      KillPicture(windPeek^.windowPic);
+      windPeek^.windowPic := Nil;
+    END;
+END;
+
+
+{$S WMcold }
+{--------------------------------------------------------------------------}
+PROCEDURE WMKillProcess(* process: ProcessID *);
+{--------------------------------------------------------------------------}
+{ delete all windows and events for a given process }
+VAR i:     INTEGER;
+    event: EventRecord;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  { kill any events for this process }
+  FlushProcess(process);
+
+  { dont touch menu,alert,dialog,filer,scrap }
+  FOR i := 5 TO lastWindow DO
+    BEGIN
+      IF  (NOT windowArray[i].available)
+      AND (windowArray[i].process = process)
+      THEN DisposeFolder(@windowArray[i]);
+    END;
+
+  IF process=activeProcess THEN SetActWindow(Pointer(ORD(filerFolder)));
+END;
+
+
+{$S WMothrwk }
+{--------------------------------------------------------------------------}
+PROCEDURE WMOpenPicture(* window: WindowPtr *);
+{--------------------------------------------------------------------------}
+{ start collecting a refresh picture into WMHeap }
+VAR windPeek: WindowPeek;
+    saveHeap: THz;
+    savePort: GrafPtr;
+
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+  GetPort(savePort);
+  GetHeap(saveHeap);
+  SetHeap(WMHeap);
+  WMKillPicture(window);  { discard old picture if any }
+  SetPort(window);
+  windPeek := Pointer(ORD(window));
+
+  IF windPeek^.visible
+  THEN
+    BEGIN
+      lastPic := windPeek;
+      windPeek^.windowPic := OpenPicture(window^.portRect);
+    END
+  ELSE
+    BEGIN
+      lastPic := Nil;   { don't make a picture for closed window }
+      HidePen;
+    END;
+
+  SetHeap(saveHeap);
+  SetPort(savePort);
+END;
+
+
+{$S WMopen2}
+{--------------------------------------------------------------------------}
+PROCEDURE WMStartDoc(* window: WindoWPtr *);
+{--------------------------------------------------------------------------}
+VAR errNum:     INTEGER;
+    me:         ProcessID;
+    windPeek:   WindowPeek;
+    event:      EventRecord;
+    evHandle:   EventHandle;
+BEGIN
+{$IFC fTraceWM}    LogCall;     {$ENDC}
+
+(* new code to EXIT if activate or deActivate event in queue. *)
+
+  evHandle := FirstEvent;
+  WHILE evHandle <> Nil DO
+    BEGIN
+      IF (evHandle^^.what = folderActivate)
+      OR (evHandle^^.what = folderDeactivate)
+      THEN EXIT(WMStartDoc);
+      evHandle := NextEvent(evHandle);
+    END;
+
+
+  BusyDelay(0);    { make hourGlass show }
+  IF activeFolder <> Nil THEN HiliteTab(activeFolder,false);
+  HiliteTab(window,true);
+  windPeek := Pointer(ORD(window));
+  keyProcess := windPeek^.process;
+  keyWindow := window;
+  SetActWindow(POINTER(ORD(window)));
+END;
+
+
+END.  { of unit }
+
+
+
+ÿ

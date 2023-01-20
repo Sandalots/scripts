@@ -1,0 +1,787 @@
+(* File Libfp/CorrBDImp, Version 16 January 1984. *)
+
+{*
+** Conversions between UnpDec and UnpBin records.  For convenience in
+** packing the results of Dec2Bin, if e.pre is not a multiple of
+** BITSDIG then the e.pre output bits are right-aligned in the leading
+** ((e.pre div BITSDIG) + 1) bytes of b.dig[].  Of course the implicit
+** binary point is still to the right of the first bit of b.dig[0].
+*}
+
+procedure Dec2Bin(var e : D2BEnv; d : UnpDec; var b : UnpBin); forward ;
+
+procedure Bin2Dec(var e : B2DEnv; b : UnpBin; var d : UnpDec); forward ;
+
+{*
+** Bin2Dec and Dec2Bin employ exactly the same conversion strategies,
+** so together they are serviced by corresponding sets of utilities for
+** handling DBufs and BBufs.  Here is a list of the utilities:
+**
+** BDZero            -- clear two Bufs to zero.
+** BRight,   DRight  -- shift a Buf right n digs.
+** BTimes2,  DTimes2 -- Buf * 2.
+** BInc              -- add 0-9 in the last dig of a BBuf.
+** BTimes10          -- BBuf * 10.
+** BWidth            -- find width of a BBuf in bits.
+** BUflow,   DUflow  -- denormalize a Buf, if necessary, before rounding.
+** BRound,   DRound  -- round a Buf.
+** BOflow,   DOflow  -- check and handle Buf overflow, after rounding.
+**
+** Both Bin2Dec and Dec2Bin require two BBufs and DBufs, a working Buf
+** and a temporary for intermediate calculations.  For efficiency, a
+** temporary is passed as a var parameter to any utility itself
+** requiring a temporary Buf.
+*}
+
+
+
+{*
+** Called by Dec2Bin and Bin2Dec to initialize.
+*}
+procedure BDZero(var bx : BBuf; var dx : DBuf);
+var
+    i : integer;
+begin
+    for i := 0 to BBUFLEN do
+        bx.dig[i] := 0;         { set all digs to 0 }
+    bx.head := BBUFLEN;         { set head and tail to last dig }
+    bx.tail := BBUFLEN;
+    
+    for i := 0 to DBUFLEN do
+        dx.dig[i] := 0;
+    dx.head := DBUFLEN;
+    dx.tail := DBUFLEN
+end;
+
+
+
+{*
+** Called by BRound to remove Guard and Sticky bit positions, by BUflow
+** to denormalize, and by Dec2Bin to remove excess integer digits.
+** bx.head is not updated rightward if all bits are shifted from the
+** leading word.  Since bit shifts are only done for the last
+** (n mod BITSDIG) bits, this is not a particularly time-consuming
+** routine.
+*}
+procedure BRight(var bx : BBuf; n : integer);
+var
+    i, j, k : integer;
+    S : boolean;
+        i0, i1, j1 : integer ;
+begin
+    S := false;
+    
+    k := n div BITSDIG;   { number of full bytes to be shifted }
+    if k < 0 then k := 0 ;
+    if k > (bbuflen+1) then k := bbuflen + 1 ;
+    i0 := bbuflen - k + 1 ;
+    if i0 < bx.head then i0 := bx.head ;
+    for i := (i0) to BBUFLEN do
+        S := S or (bx.dig[i] <> 0);     { OR doomed bits to S }
+    for i := (BBUFLEN - k) downto bx.head do
+        bx.dig[i + k] := bx.dig[i];     { shift right k bytes }
+    i1 := bx.head + k - 1 ;
+    if i1 > bbuflen then i1 := bbuflen ;
+    for i := bx.head to (i1) do
+        bx.dig[i] := 0;                 { clear lead k bytes }
+    
+    j1 := bx.head + k ;
+    if j1 < 1 then j1 := 1 ;
+    
+    for i := 1 to (n mod BITSDIG) do
+    begin
+        S := S or odd(bx.dig[bx.tail]);  { record lowest bit }
+        
+        for j := BBUFLEN downto (j1) do
+            if odd(bx.dig[j - 1]) then    { bx.head > 1 here }
+                bx.dig[j] := MAXB2 + (bx.dig[j] div 2)
+            else
+                bx.dig[j] := bx.dig[j] div 2 ;
+        if (bx.head+k) = 0 then bx.dig[0] := bx.dig[0] div 2 ;
+
+    end;
+    
+    { force sticky bit }
+    if S and (not odd(bx.dig[BBUFLEN])) then
+        bx.dig[BBUFLEN] := bx.dig[BBUFLEN] + 1
+end;
+
+
+
+{*
+** Called by Bin2Dec to convert integer, Dec2Bin to convert fraction.
+** Replace by external assembly-language routine for high speed.
+*}
+procedure BTimes2(var bx : BBuf);   { external; }
+var
+    i, sum, iC : integer;
+begin
+    iC := 0;  { integer Carry flag }
+    for i := bx.tail downto bx.head do
+    begin
+        sum := bx.dig[i] + bx.dig[i] + iC;
+        if sum > MAXB then
+        begin
+            iC := 1;
+            bx.dig[i] := sum - (MAXB + 1)
+        end
+        else
+        begin
+            iC := 0;
+            bx.dig[i] := sum
+        end
+    end;
+    
+    if iC <> 0 then  { check for carry out of bx.dig[bx.head] }
+    begin
+        bx.head := bx.head - 1;
+        bx.dig[bx.head] := 1
+    end
+end;
+
+
+
+
+{*
+** Called by BRound to add 1 ulp, and by Dec2Bin to add a digit.
+** Add  0 <= m <= 9 into BBuf bx by adding m into low byte and
+** propagating carry.  Return true if and only if there is a
+** carry out of the bx.dig[bx.head].
+*}
+function BInc(m : integer; var bx : BBuf) : boolean;
+var
+    i, sum : integer;
+    C : boolean;
+begin
+    BInc := false;              { assume no carry out }
+    sum := bx.dig[BBUFLEN] + m;
+    if sum <= MAXB then
+        bx.dig[BBUFLEN] := sum  { easy case, no carry out }
+    else
+    begin
+        bx.dig[BBUFLEN] := sum - (MAXB + 1);
+        C := true;
+        i := BBUFLEN;
+        while C do
+        begin
+            i := i - 1;
+            sum := bx.dig[i] + 1;
+            C := sum > MAXB;
+            if C then
+                bx.dig[i] := 0
+            else
+                bx.dig[i] := sum
+        end;
+        
+        if i < bx.head then
+        begin
+            BInc := true;
+            bx.head := i  { in this case i = bx.head-1 }
+        end
+    end
+end;
+
+
+
+{*
+** Called by Bin2Dec to convert fraction digits and by Dec2Bin
+** to convert integer digits.  Replace by external assembly-
+** language routine for high speed.
+*}
+procedure BTimes10(var bx : BBuf);   { external; }
+var
+    i, sum, iC : integer;
+begin
+    iC := 0;
+    for i := bx.tail downto bx.head do
+    begin
+        sum := (10 * bx.dig[i]) + iC;
+        bx.dig[i] := sum mod (MAXB + 1);
+        iC := sum div (MAXB + 1)
+    end;
+    if iC <> 0 then
+    begin
+        bx.head := bx.head - 1;
+        bx.dig[bx.head] := iC
+    end
+end;
+
+
+
+{*
+** Called by Dec2Bin to determine how many fraction bits to find.
+** Lead dig <> 0, since BRight() has not been called yet.
+*}
+function BWidth(var bx : BBuf) : integer;
+var
+    i, j : integer;
+begin
+    { overshoot, as though lead bit of lead dig is 1 }
+    i := (BBUFLEN - bx.head + 1) * BITSDIG;
+    
+    { correct by decrementing i for leading 0s of leading dig }
+    j := bx.dig[bx.head];
+    while j < MAXB2 do
+    begin
+        i := i - 1;
+        j := j + j
+    end;
+    
+    BWidth := i
+end;
+
+
+
+{*
+** Called by Dec2Bin.
+*}
+procedure BUflow(var bx : BBuf; var b : UnpBin; var e : D2BEnv);
+begin
+    if e.minexp > b.exp then
+    begin
+        BRight(bx, e.minexp - b.exp);    { denormalize }
+        e.uflow := true;   { mark tiny; BRound determines true Uflow }
+        b.exp   := e.MinExp
+    end
+    else
+        e.uflow := false
+end;
+
+
+
+{*
+** Called by Dec2Bin.
+*}
+procedure BRound(var bx : BBuf; var b : UnpBin; var e : D2BEnv);
+var
+    i, LowDig  : integer;
+    L, G, S, A : boolean;
+begin
+    { bx has 2 extra trailing bits, Guard and Sticky }
+    LowDig := bx.dig[BBUFLEN];
+    S := odd(LowDig);
+    if S then
+        LowDig := LowDig - 1;
+    G := odd(LowDig div 2);
+    if G then
+        LowDig := LowDig - 2;
+    
+    L := odd(LowDig div 4);      { least significant bit }
+    bx.dig[BBUFLEN] := LowDig;   { replace stripped low byte }
+    BRight(bx, 2);               { right-align significand }
+    
+    { set inexact flag, and suppress uflow if exact }
+    e.inexact := G or S;
+    e.uflow   := e.uflow and e.inexact;
+    
+    { A := whether to add 1 in L's bit position }
+    case e.rnd of
+    RZERO: A := false;
+    RUP:   A := (b.sgn = 0) and (G or S);
+    RDOWN: A := (b.sgn = 1) and (G or S);
+    RNEAR: A := G and (S or L)
+    end;
+    
+    if A then    { add an ULP and check for carry-out }
+        if BInc(1, bx) then
+        begin
+            BRight(bx, 1);
+            b.exp := b.exp + 1
+        end
+end;
+
+
+
+{*
+** Called by Dec2Bin.
+** Set to HUGE or INFINITY according to P754/P854 criteria.
+** HUGE has maximum exponent and all 1 bits; INFINITY has just
+** larger exponent and bits 1000...00
+*}
+procedure BOflow(var bx : BBuf; var b : UnpBin; var e : D2BEnv);
+var
+    i, fix : integer;
+begin
+    e.oflow := b.exp > e.MaxExp;
+    if e.oflow then
+    begin
+        e.inexact := true;      { force inexact on any overflow }
+        
+        { decide between HUGE and INFINITY }
+        if (e.rnd = RNEAR) or ((e.rnd = RUP) and (b.sgn = 0))
+            or ((e.rnd = RDOWN) and (b.sgn = 1)) then
+            fix := 1
+        else
+            fix := 0;
+            
+        b.exp := e.MaxExp + fix;    { force excessive exponent }
+        BRight(bx, (e.pre - 1));    { clear all but leading 1 }
+        for i := 1 to (e.pre - 1) do    { renormalize }
+        begin
+            BTimes2(bx);
+            bx.dig[BBUFLEN] := bx.dig[BBUFLEN] + (1 - fix)
+        end
+    end
+end;
+
+
+
+
+{*
+** Called by DUflow to denormalize, by DRound to remove Guard and Sticky
+** digit positions, and by Bin2Dec to remove excess integer digits.
+** dx.head is not incremented.
+*}
+procedure DRight(var dx : DBuf; n : integer);
+var
+    i : integer;
+    S : boolean;
+begin
+    S := false;
+    for i := (DBUFLEN - n + 1) to DBUFLEN do
+        S := S or (dx.dig[i] <> 0);     { OR doomed digits to S }
+    for i := (DBUFLEN - n) downto dx.head do
+        dx.dig[i + n] := dx.dig[i];     { move right n digits }
+    for i := dx.head to (dx.head + n - 1) do
+        dx.dig[i] := 0;                 { clear lead n digits }
+    
+    if S then
+        dx.dig[DBUFLEN] := dx.dig[DBUFLEN] + 1  { OK if > 9 }
+end;
+
+
+
+{*
+** Called by Bin2Dec to convert integer, by Dec2Bin to convert fraction.
+** Replace by external assembly-language routine for high speed.
+*}
+procedure  DTimes2(var dx : DBuf);   { external; }
+var
+    i, sum, iC : integer;
+begin
+    iC := 0;  { integer Carry flag }
+    for i := dx.tail downto dx.head do
+    begin
+        sum := dx.dig[i] + dx.dig[i] + iC;
+        if sum > 9 then
+        begin
+            iC := 1;
+            dx.dig[i] := sum - 10
+        end
+        else
+        begin
+            iC := 0;
+            dx.dig[i] := sum
+        end
+    end;
+    
+    if iC <> 0 then  { check for carry out of dx.dig[dx.head] }
+    begin
+        dx.head := dx.head - 1;
+        dx.dig[dx.head] := 1
+    end
+end;
+
+
+
+
+
+{*
+** Called by Bin2Dec.
+*}
+procedure DUflow(var dx : DBuf; var d : UnpDec; var e : B2DEnv);
+begin
+    if e.minexp > d.exp then
+    begin
+        DRight(dx, e.minexp - d.exp);    { denormalize }
+        e.uflow := true;   { mark tiny; DRound determines true Uflow }
+        d.exp   := e.MinExp
+    end
+    else
+        e.uflow := false
+end;
+
+
+
+{*
+** Called by Bin2Dec.
+*}
+procedure DRound(var dx : DBuf; var d : UnpDec; var e : B2DEnv);
+var
+    i, iG, sum : integer;
+    L, S, A    : boolean;
+begin
+    { dx has 2 extra trailing digits, Guard and Sticky, to be ignored }
+    S := dx.dig[DBUFLEN] <> 0;
+    iG := dx.dig[DBUFLEN - 1];
+    L := odd(dx.dig[DBUFLEN - 2]);  { low bit of LSD }
+    
+    { set inexact flag, and suppress uflow if exact }
+    e.inexact := (iG <> 0) or S;
+    e.uflow   := e.uflow and e.inexact;
+    
+    { A := whether to add 1 in L's bit position }
+    case e.rnd of
+    RZERO: A := false;
+    RUP:   A := (d.sgn = 0) and ((iG <> 0) or S);
+    RDOWN: A := (d.sgn = 1) and ((iG <> 0) or S);
+    RNEAR: A := (iG > 5) or ((iG = 5) and (L or S))
+    end;
+    
+    if A then    { add an ULP and check for carry-out }
+    begin
+        S := true;              { use to propagate carry }
+        i := DBUFLEN - 1;       { will discard low 2 digits }
+        while S do
+        begin
+            i := i - 1;
+            sum := dx.dig[i] + 1;
+            S := sum > 9;
+            if S then
+                dx.dig[i] := 0
+            else
+                dx.dig[i] := sum
+        end;
+        
+        if (i < dx.head) then
+            if (e.style = FloatStyle) then
+            begin
+                dx.dig[dx.head] := 1;       { carry out of left side }
+                d.exp := d.exp + 1
+            end
+            else
+                dx.head := i
+    end
+end;
+
+
+
+{*
+** Called by Bin2Dec.
+** Set to HUGE or INFINITY according to P754/P854 criteria.
+** HUGE has maximum exponent and all nines; INFINITY has just
+** larger exponent and decimal digits 1000...00.
+*}
+procedure DOflow(var dx : DBuf; var d : UnpDec; var e : B2DEnv);
+var
+    i, fix : integer;
+begin
+    e.oflow := d.exp > e.MaxExp;
+    if e.oflow then
+    begin
+        e.inexact := true;      { force inexact on any overflow }
+        
+        { decide between HUGE and INFINITY }
+        if (e.rnd = RNEAR) or ((e.rnd = RUP) and (d.sgn = 0))
+            or ((e.rnd = RDOWN) and (d.sgn = 1)) then
+            fix := 0
+        else
+            fix := 1;
+            
+        d.exp := e.MaxExp + 1 - fix;       { force big exponent }
+        dx.dig[dx.head] := (8 * fix) + 1;  { either 9 or 1 }
+        for i := (dx.head + 1) to (DBUFLEN - 2) do
+            dx.dig[i] := 9 * fix          { either 9 or 0 }
+    end
+end;
+
+
+
+{*
+** Both conversions Bin2Dec and Dec2Bin follow the same strategy:
+**
+** (0) If input has all zero digits, then the resulut is 0; else...
+**
+** (1) Align input in Buf as 0.XXXXXXX * RADIX^exp, with dig[0] = 0
+**     and the significand shifted far enough right that exp >= 0.
+**
+** (2) Convert integer part, that is until exp = 0.
+**
+** (3) If no nonzero output digit has been found, then convert
+**     the fraction up to the first nonzero digit.
+**
+** (4) The object is to have exactly p+2 significant digits/bits,
+**     the last one sticky in the sense of P754 rounding.  If there
+**     are too many already, then right shift and gather lost digits
+**     in sticky; otherwise, convert until there are just p+2.
+**     Gather unconverted digits/bits into sticky.
+**
+** (5) If result is tiny in the sense of P754, then right shift
+**     (denormalize) it until the exponent is the minimum allowed.
+**
+** (6) Round the result to p digits/bits.
+**
+** (7) Deal with overflow according to P754, that is, replacing an
+**     overflowed result with either INFINITY or HUGE.
+**
+** Both conversions align their input to the left of a Buf, up to
+** dig[0], and form their output aligned to the right in its Buf.
+**
+** The conversions set flags inexact, oflow, and uflow in the
+** environment record according to P754, except that the flags are
+** NOT STICKY.  A full P754 system would 'logically OR' these flags
+** into the system's true exception flags after each conversion.
+**
+** A P754 trapping mechanism is not supported here.
+*}
+
+procedure Bin2Dec { (var e : B2DEnv; b : UnpBin; var d : UnpDec) } ;
+var
+    i, j, BExp : integer;
+    S : boolean;
+    bx : BBuf;
+    dx : DBuf;
+    nancode : integer ;
+    
+begin
+    d.sgn := b.sgn;    { copy sign }
+    for i := 0 to DDIGLEN do    { place all zero digits }
+        d.dig[i] := 0;
+    
+    e.oflow := false ; e.uflow := false ; e.inexact := false ;
+    
+    if b.exp = -bexpmax then
+        begin (* minimum exponent *)
+        d.exp := e.minexp ;
+        end   (* minimum exponent *)
+        else
+    if b.exp = +bexpmax then
+        begin (* maximum exponent *)
+        d.exp := e.maxexp + 1 ;
+        nancode := b.dig[1] ;
+        for i := 2 downto 0 do
+                begin
+                d.dig[i] := nancode mod 10 ;
+                nancode := nancode div 10 ;
+                end ;
+        end   (* maximum exponent *)
+        else
+        
+        begin (* normal *)
+    { Step 0: check for all zeros. }
+    S := true;    { assume the significand is zero }
+    for i := 0 to BDIGLEN do
+        S := S and (b.dig[i] = 0);
+        
+    if S then    { process zero }
+        d.exp := e.MinExp
+    
+    else
+    begin
+        BExp := b.exp + 1;     { align binary point left of lead bit }
+        if BExp >= 0 then      { significand in dig[(0+j)...] }
+            j := 1
+        else
+            j := 2 - (BExp div BITSDIG);
+            
+        { Step 1: set bx to input b, aligned. }
+        BDZero(bx, dx);
+        bx.head := 1;
+        bx.tail := BDIGLEN + j;
+        for i := 0 to BDIGLEN do
+            bx.dig[i+j] := b.dig[i];
+        
+        { Adjust BExp < 0, since bx shifted right to the nearest byte. }
+        BExp := (BITSDIG * (j - 1)) + BExp;  { j=1 when BExp >= 0 }
+        
+        d.exp :=  e.pre + 1;  { dec point after lead dig, with G and S extra }
+        
+        { Step 2: convert integer part of bx. }
+        while BExp > 0 do
+        begin
+            DTimes2(dx);    { make way for the next bit }
+            BTimes2(bx);    { get next bit in bx.dig[0] }
+            BExp := BExp - 1;
+            if bx.dig[0] <> 0 then
+            begin
+                dx.dig[DBUFLEN] := dx.dig[DBUFLEN] + 1;  { no carry-out }
+                bx.dig[0] := 0
+            end
+        end;
+            
+        { Step 3: guarantee some nonzero digit in dx. }
+        while dx.dig[dx.head] = 0 do
+        begin
+            BTimes10(bx);
+            dx.dig[DBUFLEN] := bx.dig[0];
+            d.exp := d.exp - 1
+        end;
+        bx.dig[0] := 0;
+        
+        { Step 4: check for too many or too few digits. }
+        if e.style = FloatStyle then
+            j := (DBUFLEN - dx.head + 1) - (e.pre + 2)
+        else
+            j := -e.pre;  { number of 'fraction' digits }
+            
+        if j < 0 then    { j too few digits }
+        begin
+            for i := dx.head to DBUFLEN do
+            begin    { make room for -j more digits }
+                dx.dig[i + j] := dx.dig[i];
+                dx.dig[i]   := 0
+            end;
+            dx.head := dx.head + j;
+            
+            for i := (DBUFLEN + 1 + j) to DBUFLEN do
+            begin    { get -j fraction digits }
+                BTimes10(bx);
+                dx.dig[i] := bx.dig[0];
+                bx.dig[0] := 0
+            end
+        end
+        
+        else    { j too many digits already }
+        begin
+            DRight(dx, j);
+            dx.head := dx.head + j
+        end;
+        
+        { Fix exp for j-char shift. }
+        d.exp   := d.exp + j;
+        
+        S := false;
+        for i := bx.head to bx.tail do
+            S := S or (bx.dig[i] <> 0);  { unconverted bits --> sticky }
+        if S then
+            dx.dig[DBUFLEN] := dx.dig[DBUFLEN] + 1;
+        
+        DUflow(dx, d, e);
+        DRound(dx, d, e);
+        DOflow(dx, d, e);
+        
+        for i := dx.head to (DBUFLEN - 2) do
+            d.dig[i - dx.head] := dx.dig[i]
+    end
+end (* normal *) ;
+end;
+
+
+
+procedure Dec2Bin { (var e : D2BEnv; d : UnpDec; var b : UnpBin) } ;
+var
+    i, j, k, DExp : integer;
+    S : boolean;
+    bx : BBuf;
+    dx : DBuf;
+    t : integer ;
+    nancode, eprefactor : integer ;
+    
+begin
+    b.sgn := d.sgn;    { copy sign }
+    for i := 0 to BDIGLEN do    { place all zero bits }
+        b.dig[i] := 0;
+    
+    e.oflow := false ; e.uflow := false ; e.inexact := false ;
+    
+    eprefactor := 8 - e.pre mod 8 ;
+    if eprefactor = 8 then eprefactor := 0 ;
+    if d.exp = -dexpmax then
+        begin (* minimum exponent *)
+        b.exp := e.minexp + eprefactor ;
+        end   (* minimum exponent *)
+        else
+    if d.exp = +dexpmax then
+        begin (* maximum exponent *)
+        b.exp := e.maxexp + 1 + eprefactor ;
+        nancode := 0 ;
+        for i := 0 to 2 do nancode := 10 * nancode + d.dig[i] ;
+        if eprefactor = 0 then b.dig[1] := nancode else
+                begin (* double *)
+                b.dig[1] := nancode div 8 ;
+                b.dig[2] := 32 * (nancode mod 8) ;
+                end   (* double *) ;
+        end   (* maximum exponent *)
+        else
+        
+        begin (* normal *)
+    { Step 0: check for all zeros. }
+    S := true;    { assume the significand is zero }
+    for i := 0 to DDIGLEN do
+        S := S and (d.dig[i] = 0);
+        
+    if S then    { process zero }
+        b.exp := e.MinExp
+    
+    else
+    begin
+        { Steps 1 and 2: convert integer part and align fraction in dx. }
+        BDZero(bx, dx);         { initialize bx and dx }
+        b.exp :=  e.pre + 1;    { dec point after lead dig, with G and S extra }
+        DExp := d.exp + 1;      { align binary point before dig[0] }
+        
+        if DExp >= 0 then
+        begin
+            for i := 0 to (DExp - 1) do    { compute integer part }
+            begin
+                BTimes10(bx);
+                if i <= DDIGLEN then
+                    S := BInc(d.dig[i], bx)  { but ignore carry-out S }
+            end;
+            
+            j := DExp     { index of first fraction digit }
+        end
+        else
+            j := 0;       { index of first fraction digit }
+            
+        for i := j to DDIGLEN do    { align fraction digits }
+            dx.dig[i + 1 - DExp] := d.dig[i];
+        
+        dx.head := 1;
+        dx.tail := DDIGLEN + 1 - DExp;
+        if dx.tail < dx.head then
+            dx.tail := dx.head;
+        
+        { Step 3: guarantee some nonzero digit in bx. }
+        while bx.dig[bx.head] = 0 do
+        begin
+            DTimes2(dx);
+            bx.dig[bx.head] := dx.dig[0];
+            b.exp := b.exp - 1
+        end;
+        dx.dig[0] := 0;
+        
+        { Step 4: check for too many or too few bits. }
+        j := BWidth(bx) - (e.pre + 2);
+            
+        if j < 0 then    { -j too few bits }
+        begin
+            for i := 1 to -j do
+            begin
+                BTimes2(bx);    { make room for fraction bit }
+                DTimes2(dx);    { next fraction bit in dig[0] }
+                t := bx.dig[bbuflen] ;
+                bx.dig[BBUFLEN] := t               + dx.dig[0];
+                dx.dig[0] := 0
+            end
+        end
+        
+        else    { j too many bits already }
+            BRight(bx, j);
+        
+        { Final adjustments according to shift above. }
+        b.exp   := b.exp + j;
+        
+        S := false;
+        for i := dx.head to dx.tail do
+            S := S or (dx.dig[i] <> 0);  { unconverted digits --> sticky }
+        t := bx.dig[bbuflen] ;
+        if S and (not odd(t              )) then
+            bx.dig[BBUFLEN] := t               + 1;
+        
+        BUflow(bx, b, e);
+        BRound(bx, b, e);
+        BOflow(bx, b, e);
+        
+        { Finally, store trailing e.pre bits, right adjusted. }
+        { Fix exponent for possible leading 0s in first byte. }
+        j := e.pre mod BITSDIG;
+        if j <> 0 then
+            b.exp := b.exp + (BITSDIG - j);
+        j := bx.tail - ((e.pre - 1) div BITSDIG);
+        for i := j to bx.tail do
+            b.dig[i - j] := bx.dig[i]
+    end
+        end   (* normal *) ;
+end;
+ÿ

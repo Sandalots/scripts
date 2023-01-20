@@ -1,0 +1,5839 @@
+{ ApDm/Desk2 - Copyright 1983, 1984, Apple Computer Inc. }
+
+{$S flrAll }
+PROCEDURE MakeObjActive{* obj: ObjectHandle *};
+
+{ Causes a new object to be made active.  If the objects window is owned by
+  another process then we do the fast activate protocol, "WMStartDoc", otherwise
+  we go through the normal handshake protocol, "MakeFldrActive."  }
+
+VAR err: INTEGER;
+    newProcess: BOOLEAN;
+    window: WindowPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MakeObjActive',WriteName(obj));
+window := obj^^.objWindow;
+IF (obj^^.objWindow = keyWindow) OR   { active or to become active }
+   (obj = nilObject) OR
+   (window = NIL) THEN EXIT(MakeObjActive);
+
+{ Flush all typeahead.  This is done because there may be typeahead already
+  classified incorrectly.  Note: This is a window manager/Desk architecture
+  problem which should be fixed someday. }
+
+FlushTypeAhead(FALSE);
+
+IF (obj^^.kind IN docToolSet)          { a doc or tool window }
+AND NOT MyWindow(window)               { that belongs to another process }
+AND NOT (obj^^.setAside) THEN          { that just started up }
+   BEGIN
+   DeactObject(TRUE,TRUE);             { pretend I received a deactivate  }
+   AdjustDesktopMenu;
+   ClearMenuBar;                       { app won't do a TakeControl }
+   WmStartDoc(window);                 { special activate, does it now }
+   END
+ELSE
+   MakeFldrActive(window,whyNot);
+END;
+
+
+
+{$S flrDm }
+FUNCTION MakeObject{* father:      ObjectHandle;
+                      name:        FmaxStr;
+                      whatKind:    ObjectKind;
+                      whatTool:    LongInt;
+                      where:       Point;
+                      windRect:    Rect;
+                      newState:    ObjectState;
+                      whatView:    ViewType;
+                      whichVol:    TentryHdl;
+                      recId:       TcatRID;
+                      createTime:  LongInt;
+                      modTime:     LongInt;
+                      diskSize:    LongInt;
+                      diskSplit:   BOOLEAN;
+                      accessCtrl:  BOOLEAN): ObjectHandle *};
+
+{ Allocate a new object and insert at the head of contents. }
+{ Does not draw it }
+
+VAR thisObject: ObjectHandle;
+    listHead: ObjectHandle;
+    aNameHdl: FmaxStrHdl;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MakeObject');
+IF dbgFiler THEN WRITELN('   making object: kind is ',ORD(whatKind):1);
+MakeObject := NIL;
+
+   { allocate a head/tail node if necessary }
+
+IF father^^.contents = nilObject THEN   { add head/tail node if empty list }
+   BEGIN
+   thisObject := NewObjList(father);
+   IF thisObject = NIL THEN EXIT(MakeObject);    { out of heap space }
+   father^^.contents := thisObject;
+   END;
+
+   { allocate the new object }
+
+thisObject := Pointer(ORD(NewHdl(SizeOf(ObjectRecord))));
+IF thisObject = NIL THEN EXIT(MakeObject);    { out of heap space }
+
+   { initialize the fields of the new object }
+
+listHead := father^^.contents;
+aNameHdl := NewStrg(name);
+
+WITH thisObject^^ DO
+   BEGIN
+   prev        := listHead;
+   next        := listHead^^.next;
+   prev^^.next := thisObject;
+   next^^.prev := thisObject;
+   nameHdl     := aNameHdl;
+   loc         := where;
+   kind        := whatKind;
+   toolNumber  := whatTool;
+   volHdl      := whichVol;
+   catRID      := recID;
+   state       := newState;
+   viewMode    := whatView;
+   isOpen      := FALSE;
+   dirty       := FALSE;
+   wasOpened   := FALSE;
+   toBeCopied  := FALSE;
+   updateLabel := FALSE;
+   visible     := TRUE;
+   split       := diskSplit;
+   passworded  := accessCtrl;
+   userPassword:= '';
+   container   := father;
+   contents    := nilObject;
+   objWindow   := NIL;
+   scrollDh    := 0;
+   scrollDv    := 0;
+   hThumbPos   := 0;
+   vThumbPos   := 0;
+   listSeqNum  := 0;
+   created     := createTime;
+   modified    := modTime;
+   size        := diskSize;
+   viewMode    := whatView;
+   windowRect  := windRect;
+   freeSpace   := 0;
+   backedup    := 0;
+   SetRect(nameRect,0,0,0,0);     { gets set by DrawName }
+   END;
+
+MakeObject := thisObject;
+END;
+
+
+
+{$S flrCold }
+PROCEDURE MakePadContents{* obj: ObjectHandle; whichState: ObjectState *};
+
+{ Change selected documents/folders into a pads and redraw.  Returns FALSE if a
+  document refuses to shut down or if user aborts. }
+
+LABEL 34;
+VAR son,listHead: ObjectHandle;
+
+
+   FUNCTION FoundTool(pToolRec: PtrCatRec; pFsInfo: PtrFs_Info): BOOLEAN;
+
+   { Gets called by "ToolCheck" when a tool is found.  Tells user that a folder
+     pad cannot contain tools }
+
+   VAR catRID: TcatRID;
+       name: FmaxStr;
+   BEGIN
+   FoundTool := TRUE;
+   GetObjTitle(son,TRUE,name);
+   ArgAlert(1,name);                     { folder name }
+   catRID.fatherID := pToolRec^.parentID;
+   catRID.uniqueID := pToolRec^.selfId;
+   GetObjName(son^^.volHdl,catRID,name);
+   ArgAlert(2,name);                     { tool name }
+   StopAlert(flrAlert,134);    { folder has tools ... }
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MakePadContents',WriteName(obj));
+
+AutoScroll(obj,hilited);  { make the selection visible }
+
+listHead := obj^^.contents;
+son := listHead^^.prev;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF UserAbort THEN Exit(MakePadContents);   { check for abort request }
+   IF son^^.state = whichState THEN
+   IF son^^.passworded THEN
+      BEGIN
+      ArgAlert(1,son^^.nameHdl^^);
+      StopAlert(flrAlert,157);
+      END
+   ELSE IF son^^.split THEN
+      BEGIN
+      ArgAlert(1,son^^.nameHdl^^);
+      StopAlert(flrAlert,150);
+      END
+   ELSE
+      BEGIN
+      IF son^^.size > 300 THEN
+         BEGIN
+         ArgAlert(1,son^^.nameHdl^^);
+         IF AskAlert(flrAlert,360) = 1 THEN GOTO 34;   { skip this large object }
+         END;
+
+      son^^.dirty := TRUE;
+
+      IF (son^^.kind = folderKind) OR (son^^.kind = letterKind) THEN
+         BEGIN
+         IF ToolCheck(son^^.volHdl,son^^.catRID,FoundTool) THEN
+            EXIT(MakePadContents);
+         IF son^^.kind = folderKind THEN
+            son^^.kind := folderPad
+         ELSE
+            son^^.kind := letterPad;
+         END
+      ELSE IF son^^.kind = docKind THEN
+         BEGIN
+         IF LiveObject(son) THEN    { shut down doc first }
+            IF NOT StopDoc(son,FALSE,FALSE) THEN EXIT(MakePadContents);
+         son^^.kind := docPad;
+         END;
+
+      FlushObject(son);   { update the catalog }
+
+      IF obj^^.viewMode = spatialView THEN
+         ValidIcon(son,FALSE)   { schedule update to draw pad image }
+      ELSE
+         DrawObject(son);       { draw pad image }
+      END;
+34:
+   son := son^^.prev;
+   END;
+
+END;
+
+
+
+{$S flrMisc }
+FUNCTION Match{* target: ObjectHandle; srcSet: KindSet; srcCount: INTEGER): BOOLEAN *};
+{ returns true if OK to hilite target during dragging of an icon }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('Match',WriteName(target));
+
+Match := FALSE;
+
+{ first check that this transfer is legal for each selected object }
+IF NOT (srcSet <= matchTable[target^^.kind]) THEN EXIT(Match);
+
+{ reject movement of a disk plus anything else }
+IF srcCount > 1 THEN IF srcSet*diskSet <> [] THEN EXIT(Match);
+
+IF target^^.toBeCopied THEN EXIT(Match);
+
+{ now check further, e.g., does diskette have enough room on it }
+Match := TRUE;
+END;
+
+
+
+{$S dmMain }
+PROCEDURE MenuCommand{* menu,item: INTEGER *};
+{ Calls the appropriate routine for the given menu item }
+VAR diskObj: ObjectHandle;
+    err:  INTEGER;
+    homeObj: ObjectHandle;
+    listHead: ObjectHandle;
+    son: ObjectHandle;
+    volHdl: TentryHdl;
+    count : INTEGER;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MenuCommand');
+CASE menu OF
+
+   scrapMenu:
+
+      CASE item OF
+
+         mCloseAll:
+            BEGIN
+            IF CloseContents(deskObject,FALSE,FALSE) THEN;
+            MakeObjActive(deskObject);   { desktop is now active }
+            END;
+
+         mClose:
+            BEGIN
+            IF CloseObject(activeObject,FALSE,FALSE,FALSE) THEN;
+            END;
+
+         mPrintStatus:
+            PrBgdDlg;
+
+         END;  { case item }
+
+   filingMenu:
+
+      CASE item OF
+
+         mCloseAll:
+            BEGIN
+            IF CloseContents(deskObject,FALSE,FALSE) THEN;
+            MakeObjActive(deskObject);   { desktop is now active }
+            END;
+
+         mClose:
+            BEGIN
+            IF CloseObject(activeObject,FALSE,FALSE,FALSE) THEN;
+            END;
+
+         mPutBack:
+            BEGIN
+            IF activeObject = deskObject THEN
+               BEGIN
+               IF PutBackContents(deskObject,[hilited],FALSE) THEN;
+               END
+            ELSE
+               BEGIN
+               IF PutBackObject(activeObject,FALSE,FALSE,TRUE,homeObj) THEN
+               END;
+            END;
+
+         mOpen:
+            BEGIN
+            OpenContents(activeObject,hilited);
+            END;
+
+         mDuplicate:
+            DupContents(activeObject,hilited);
+
+         mAttributes:
+            BEGIN
+            count := 0;
+            listHead := activeObject^^.contents;
+            son := listHead^^.prev;
+            WHILE son <> listHead DO
+               BEGIN
+               IF son^^.state = hilited THEN
+                  BEGIN
+                  ShowAttributes(son);
+                  count := count + 1;
+                  END;
+               son := son^^.prev;
+               END;
+            IF count = 0 THEN ShowAttributes(activeObject);
+            END;
+
+         mNew:
+            TearOffContents(activeObject,hilited);
+
+         mMakePad:
+            MakePadContents(activeObject,hilited);
+
+         mPrintStatus:
+            PrBgdDlg;
+
+         END;  { case item }
+
+
+   editMenu:
+      EditCommands(item);
+
+
+   housekeepingMenu:
+      CASE item OF
+         mEject:
+            BEGIN      { try to eject even if we don't think that anything is there }
+            IF UnmountAVolume(lTwigHdl^^.device,TRUE,FALSE,TRUE,131) THEN;
+            EndWaitAlert;
+            END;
+         mAlpha:
+            ChangeView(activeObject,alphaView);
+         mChron:
+            ChangeView(activeObject,chronView);
+         mSpatial:
+            ChangeView(activeObject,spatialView);
+         mCompact:
+            CompactContents(activeObject);
+         mRepair:
+            IF OneDiskSelected(diskObj) THEN RepairDisk(diskObj);
+         mErase:
+            IF OneDiskSelected(diskObj) THEN EraseDisk(diskObj);
+         mEmpty:
+            BEGIN
+            volHdl := firstVol;
+            REPEAT
+               IF EmptyTrashCan(volHdl,TRUE,FALSE) THEN;
+               GetEntry(vol,NIL,volHdl,nilField,volHdl);
+               UNTIL volHdl = NIL;
+            END;
+         END;
+
+
+{$IFC flrDebug }
+
+   specialMenu:
+      BEGIN
+      CASE item OF
+
+          mTrcAll:
+             BEGIN
+             eventDebug  := TRUE;
+             trcFEntry   := TRUE;
+             trcCatalog  := TRUE;
+             trcFDocCtrl := TRUE;
+             trcFVolCtrl := TRUE;
+             trcFiler    := TRUE;
+             trcDialog   := TRUE;
+             trcAttribute:= TRUE;
+             TraceDB(TRUE);
+
+             (*
+             {$IFC FLDDEBUG }
+             SetFldTest(TRUE);
+             {$ENDC }
+             *)
+             END;
+
+          mTrcOff:
+             BEGIN
+             eventDebug  := FALSE;
+             trcFEntry   := FALSE;
+             trcCatalog  := FALSE;
+             trcFDocCtrl := FALSE;
+             trcFVolCtrl := FALSE;
+             trcFiler    := FALSE;
+             trcDialog   := FALSE;
+             trcAttribute:= FALSE;
+             TraceDB(FALSE);
+
+             {$IFC FLDDEBUG }
+             SetFldTest(FALSE);
+             {$ENDC }
+             END;
+
+          mTrcEvents:   eventDebug  := NOT eventDebug;
+          mTrcFEntry:   trcFEntry   := NOT trcFEntry;
+          mTrcCatalog:  trcCatalog  := NOT trcCatalog;
+          mTrcFDocCtrl: trcFDocCtrl := NOT trcFDocCtrl;
+          mTrcFVolCtrl: trcFVolCtrl := NOT trcFVolCtrl;
+          mTrcFiler:    trcFiler    := NOT trcFiler;
+          mTrcDialog:   trcDialog   := NOT trcDialog;
+          mTrcAttribute:trcAttribute:= NOT trcAttribute;
+
+          mPrintDocs :
+             PrintEntry(doc,NIL);
+          mPrintVols :
+             PrintEntry(vol,NIL);
+          mPrintTools :
+             PrintEntry(tool,NIL);
+          mPrintDevs :
+             PrintEntry(dev,NIL);
+
+          mSplit:
+             BEGIN
+             listHead := activeObject^^.contents;
+             son := listHead^^.prev;
+             WHILE son <> listHead DO
+                BEGIN
+                IF son^^.state = hilited THEN SplitObj(son);
+                son := son^^.prev;
+                END;
+             END;
+
+          mQuit:
+             ShutDown;
+          END;
+
+      CheckItem(flrMenus[specialMenu],mTrcEvents,eventDebug);
+      CheckItem(flrMenus[specialMenu],mTrcFEntry,trcFEntry);
+      CheckItem(flrMenus[specialMenu],mTrcCatalog,trcCatalog);
+      CheckItem(flrMenus[specialMenu],mTrcFDocCtrl,trcFDocCtrl);
+      CheckItem(flrMenus[specialMenu],mTrcFVolCtrl,trcFVolCtrl);
+      CheckItem(flrMenus[specialMenu],mTrcFiler,trcFiler);
+      CheckItem(flrMenus[specialMenu],mTrcDialog,trcDialog);
+      CheckItem(flrMenus[specialMenu],mTrcAttribute,trcAttribute);
+      END;
+
+   stressMenu:
+      BEGIN
+      CASE item OF
+
+          mTestIOerr:
+             testIOerr := NOT testIOerr;
+
+          mFakeNoHeap:
+             fakeNoHeap := NOT fakeNoHeap;
+
+          mCheckHeap:
+             theHeap^.fCheck := NOT theHeap^.fCheck;
+
+          mCheckWmHeap:
+             wmHeap^.fCheck := NOT wmHeap^.fCheck;
+
+          mCheckFmHeap:
+             fmHeap^.fCheck := NOT fmHeap^.fCheck;
+
+          mMixHeap:
+             theHeap^.fScramble := NOT theHeap^.fScramble;
+
+          mMixWmHeap:
+             wmHeap^.fScramble := NOT wmHeap^.fScramble;
+
+          mMixFmHeap:
+             fmHeap^.fScramble := NOT fmHeap^.fScramble;
+
+          mFlushing:
+             skipFlushing := NOT skipFlushing;
+
+          mTraceCalls:
+             BEGIN
+             IF (trcCalls) THEN
+                BEGIN
+                AStopCallLog;
+                AListCalls;
+                END
+             ELSE
+                BEGIN
+                AResetTrace(TRUE);
+                AStartCallLog;
+                END;
+             trcCalls := NOT trcCalls;
+             END;
+
+         END;  { case item }
+
+      CheckItem(flrMenus[stressMenu],mTestIOerr,testIOerr);
+      CheckItem(flrMenus[stressMenu],mFakeNoHeap,fakeNoHeap);
+      CheckItem(flrMenus[stressMenu],mFlushing,NOT skipFlushing);
+      CheckItem(flrMenus[stressMenu],mCheckHeap,theHeap^.fCheck);
+      CheckItem(flrMenus[stressMenu],mCheckWmHeap,wmHeap^.fCheck);
+      CheckItem(flrMenus[stressMenu],mCheckFmHeap,fmHeap^.fCheck);
+      CheckItem(flrMenus[stressMenu],mMixHeap,theHeap^.fScramble);
+      CheckItem(flrMenus[stressMenu],mMixWmHeap,wmHeap^.fScramble);
+      CheckItem(flrMenus[stressMenu],mMixFmHeap,fmHeap^.fScramble);
+      CheckItem(flrMenus[stressMenu],mTraceCalls,trcCalls);
+      END;
+
+{$ENDC }
+
+
+   END;  { case menu }
+
+END;
+
+
+
+{$S flrCat }
+FUNCTION MountAll{* mountThem: BOOLEAN *};
+{ Mounts/Dismounts all disks.  Returns FALSE if user aborts or if dismounting
+  and a document refuses to be putback.   Can check the function "Abort" to
+  distinguish the cases }
+VAR devHdl: TentryHdl;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+MountAll := FALSE;
+devHdl := firstDev;
+
+WHILE devHdl <> NIL DO
+  BEGIN
+  IF mountThem THEN
+     BEGIN
+     IF devHdl^^.volHdl = NIL THEN MountAvolume(devHdl^^.device);
+     END
+  ELSE
+     BEGIN
+     IF NOT UnmountAvolume(devHdl^^.device,TRUE,FALSE,TRUE,0) THEN EXIT(MountAll);
+     END;
+  devHdl := devHdl^^.nextHdl;
+  END;
+
+MountAll := TRUE;
+END;
+
+
+
+{$S flrCat }
+PROCEDURE MountAvolume{* device: Tdevice *};
+{ mounts the volume and restores the desktop }
+VAR err: INTEGER;
+    volHdl: TentryHdl;
+    diskObj: ObjectHandle;
+    toolNode: HdlToolNode;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MountAvolume');
+MountVol(err,device,volHdl);
+IF err > 0 THEN
+   DismountVol(device,TRUE,FALSE)       { mount failed, eject if diskette }
+ELSE
+   BEGIN
+   IF NOT copyMode THEN
+      ChangeContents(deskObject,hilited,normal,0,0,TRUE);   { deselect all }
+   EndEdit;
+
+      { reset OEM toolinfo availability flags to that new disk is checked }
+   toolNode := toolList;
+   WHILE toolNode <> NIL DO
+      BEGIN
+      toolNode^^.tryToOpen := TRUE;
+      toolNode := toolNode^^.next;
+      END;
+
+      { restore the desktop state for this disk }
+   IF RestoreDesktop(volHdl,TRUE{newDisk},diskObj) THEN;
+   IF (NOT diskObj^^.isOpen) AND (NOT copyMode) THEN
+      SelectObject(diskObj,FALSE);
+   END;
+
+END;
+
+
+
+{$S flrDraw }
+FUNCTION  MoveContents{* obj:        ObjectHandle;
+                         whichState: ObjectState;
+                         newState:   ObjectHandle;
+                         dh,dv:      INTEGER;
+                         dstObj:     ObjectHandle;
+                         chooseLoc:  BOOLEAN;
+                         eraseDim:   BOOLEAN;
+                         VAR splitflag: BOOLEAN;
+                         VAR joinflag:  BOOLEAN): BOOLEAN *};
+
+{ Move all objects matching whichState to "dstObj" adjusting their spatial
+  locations by dh,dv.  If "chooseLoc is TRUE then ignore dh,dv and choose
+  appropriate locations.  IF eraseDim is TRUE then erase the dim (XOR) image
+  at dh,dv after move is complete.  The function returns TRUE if all were
+  transfered. }
+
+LABEL 1;
+
+VAR son,prevSon,listHead,topObject: ObjectHandle;
+    tallyCount,msgNum: INTEGER;
+    tallySet: KindSet;
+    tallyBBox: Rect;
+    srcVol,dstVol: TentryHdl;
+    movedToHome: BOOLEAN;
+    objName: FMaxStr;
+    partial: BOOLEAN;
+
+   FUNCTION EnoughRoom(dst: ObjectHandle; alertNum: INTEGER): BOOLEAN;
+   { returns TRUE if sufficient disk space to complete the transfer }
+   VAR diskObj:  ObjectHandle;
+       failVol:  TentryHdl;
+       diskName: FmaxStr;
+   BEGIN
+   IF RoomForContents(obj,whichState,dst^^.volHdl,failVol) THEN
+      EnoughRoom := TRUE
+   ELSE IF ((tallyCount = 1)                                    { single object }
+            AND (topObject^^.kind = docKind)                    { doc           }
+            AND (dst^^.volHdl <> obj^^.volHdl)                  { to diff disk  }
+            AND (dst^^.volHdl^^.devHdl^^.removable)             { removable disk}
+            AND (NOT FitOnDisk(topObject^^.size,dst^^.volHdl^^.devHdl))) THEN{ very large    }
+      BEGIN                           { trying to move a single large obj }
+      WITH topObject^^ DO GetObjName(volHdl,catRID,objName);
+      ArgAlert(1,objName);
+      IF LiveObject(topObject) THEN
+         BEGIN
+         {*** alert:  Must Save & Put away first ... }
+         EnoughRoom := FALSE;
+         END
+      ELSE IF AskAlert(flrAlert,153) = 1 THEN
+         EnoughRoom := FALSE
+      ELSE
+         BEGIN
+         UpdateAll;   { cleanup screen after alert }
+         EnoughRoom := TRUE;
+         splitFlag := TRUE;
+         END;
+      END
+   ELSE
+      BEGIN
+      EnoughRoom := FALSE;
+      IF failVol = NIL { aborted } THEN EXIT(EnoughRoom);
+      diskObj := ObjFromVol(failVol);
+      GetObjTitle(diskObj,TRUE,diskName);
+      ParamAlert(diskName,'','');
+      StopAlert(flrAlert,alertNum);   { Not enough room to move/copy ... }
+      END
+   END;
+
+
+   FUNCTION AbleToRebuild(src,dst: ObjectHandle): BOOLEAN;
+   { Returns TRUE if sufficient disk space to rebuild from partial documents.}
+   LABEL 1;
+   VAR blocksNeeded: NumberStr;
+       err: INTEGER;
+       devInfo: Fs_Info;
+       devPathname: Pathname;
+       diskName: FMaxStr;
+       labelRec: LabelFmt;
+       listHead: ObjectHandle;
+       son: ObjectHandle;
+       srcdevName,dstdevName: E_Name;
+       srcVol,dstVol: TentryHdl;
+       srcCatRID,dstCatRID: TcatRID;
+       srcCatRec: TcatRec;
+       srcName,dstName: FmaxStr;
+      BEGIN
+
+      IF tallycount > 1
+      THEN BEGIN
+         listHead := obj^^.contents;  { get name of split icon }
+         son := listHead^^.prev;
+         WHILE son <> listHead DO
+            BEGIN
+            IF (son^^.state = whichState) AND son^^.split THEN GOTO 1;
+            son := son^^.prev;
+            END;
+1:       WITH son^^ DO GetObjName(volHdl,catRID,objName);
+         ArgAlert(1,objName);
+         StopAlert(flrAlert,159);
+         AbleToRebuild := FALSE;
+         END
+      ELSE BEGIN
+         srcVol := src^^.volHdl;
+         srcCatRID := src^^.catRID;
+         dstVol := dst^^.volHdl;
+         dstCatRID := dst^^.catRID;
+
+
+         GetCatRec(err,srcVol,srcCatRID,srcCatRec);
+         ExtObjName(srcCatRec,srcName);
+         ArgAlert(1,srcName);
+         IF ABS(srcCatRec.split) = 1 THEN
+            BEGIN
+            srcdevName := srcVol^^.devHdl^^.nameHdl^^;
+            dstdevName := dstVol^^.devHdl^^.nameHdl^^;
+            IF LabelIO(FALSE,srcdevname,srcCatRec.toolID,srcCatRec.selfID,labelRec) THEN;
+            devPathname := CONCAT('-',dstdevName);
+            Lookup(err,devPathname,devInfo);
+            IF labelRec.totalSize < devInfo.freeCount
+            THEN BEGIN
+               AbleToRebuild := TRUE;
+               joinflag := TRUE;
+               END
+            ELSE
+               BEGIN
+               IntToStr(labelRec.totalSize, blocksNeeded);
+               GetObjName(srcVol,diskCatRID,diskName);
+               ParamAlert(blocksNeeded,srcName,diskName);
+               StopAlert(flrAlert,154);
+               AbleToRebuild := FALSE;
+               END;
+            END
+         ELSE
+            BEGIN
+            StopAlert(flrAlert,152);
+            AbletoRebuild := FALSE;
+            END;
+      END;
+   END;
+
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveContents',WriteName(obj),' to',WriteName(dstObj));
+partial := FALSE;
+TallyContents(obj,whichState,FALSE,partial,tallyCount,tallySet,tallyBBox,topObject);
+IF tallyCount = 0 THEN
+   BEGIN
+   MoveContents := TRUE;
+   EXIT(MoveContents);   { nothing to move }
+   END;
+
+MoveContents := FALSE;
+movedToHome := TRUE;
+listHead := obj^^.contents;
+
+{ de-select all others in destination }
+ChangeContents(dstObj,hilited,normal,0,0,TRUE);
+
+
+   { perform checks before attempting transfer }
+
+CASE dstObj^^.kind OF
+
+   trashKind:
+      BEGIN
+      IF copyMode THEN    { Just destroy duplicates.  Don't empty trash can }
+         BEGIN
+         XorContents(obj,whichState,dh,dv,xorWindow); { erase xor images }
+         KillDuplicates(obj);                        { dispose of pseudo-objects }
+         MoveContents := TRUE;
+         Exit(MoveContents);
+         END;
+      son := listHead^^.next;   { empty appropriate trash cans first }
+      WHILE son <> listHead DO
+         BEGIN
+         IF son^^.state = whichState THEN
+            IF NOT EmptyTrashCan(son^^.volHdl,TRUE,TRUE) THEN EXIT(MoveContents);
+         son := son^^.next;
+         END;
+      END;
+
+   diskKind,disk1Kind,disk2Kind,profileKind,priamKind,folderKind,drawerKind:
+      BEGIN     { make sure there's room on dest vol }
+      IF copyMode THEN
+         msgNum := 102
+      ELSE
+         msgNum := 105;
+      IF NOT EnoughRoom(dstObj,msgNum) THEN EXIT(MoveContents);
+      IF partial AND (obj^^.volHdl <> dstObj^^.volHdl)  {*** FL ***}
+      THEN BEGIN
+         IF NOT IsFather(topObject,dstObj) THEN
+            IF NOT AbleToRebuild(topObject,dstObj)
+            THEN EXIT(MoveContents);
+         END;
+      END;
+
+   deskKind:
+      BEGIN
+      IF copyMode THEN   { moved duplicates to desk, check if room on source }
+         IF NOT EnoughRoom(obj,102) THEN EXIT(MoveContents);
+      END;
+
+   END; { CASE }
+
+
+son := listHead^^.prev;
+
+   { move each object, checking for abort }
+
+WHILE son <> listHead DO
+   BEGIN
+   prevSon := son^^.prev;
+   IF son^^.state = whichState THEN
+      BEGIN
+      IF UserAbort THEN GOTO 1;
+      IF NOT MoveObject(son,newState,dh,dv,dstObj,chooseLoc,eraseDim,splitflag,joinflag)
+      THEN GOTO 1;
+      END;
+   son := prevSon;
+   END;
+
+MoveContents := TRUE;
+
+1:
+FlushVols;            { flush catalogs involved }
+
+{$IFC network }
+AdjustIcon(inBoxObject); { adjust in/out basket icon shapes according to new state }
+AdjustIcon(outBoxObject);
+{$ENDC }
+END;
+
+
+
+{$S flrDraw }
+FUNCTION  MoveObject{* obj:       ObjectHandle;
+                       newState:  ObjectState;
+                       dh,dv:     INTEGER;
+                       dstObj:    ObjectHandle;
+                       chooseLoc: BOOLEAN;
+                       eraseDim:  BOOLEAN;
+                       splitflag: BOOLEAN;
+                       VAR joinflag:  BOOLEAN): BOOLEAN *};
+
+{ Moves an object to a new container, returns TRUE if successful.  If "chooseLoc"
+  is TRUE then dh,dv is ignored and an appropriate location in the destintation
+  container is chosen.  If "eraseDim" is TRUE then an assumed XOR image at dh,dv
+  is erased. }
+
+VAR savePort: GrafPtr;
+    visPt,newLoc,saveglobal: Point;
+    placenameRect: Rect;
+    srcCatRID,newCatRID: TcatRID;
+    placeSeqNum: INTEGER;
+    placeObj,beforeObj,srcContainer,visParent,visPlace,tempObj: ObjectHandle;
+    srcDev,dstDev: TentryHdl;
+    srcVol,dstVol,newVol: TentryHdl;
+    srcIsList,dstIsList,movedToHome,movedToDesk,erasePlaceImage,changed: BOOLEAN;
+    diskgone:  BOOLEAN;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveObject',WriteName(obj),' to',WriteName(dstObj),', splitflag = ',splitflag,
+                          ',joinflag = ',joinflag);
+MoveObject := FALSE;
+diskgone := FALSE;
+beforeObj := nilObject;
+IF eraseDim THEN
+   BEGIN
+   dh := xorDh;
+   dv := xorDv;
+   END;
+
+
+  { gather necessary info }
+
+obj^^.dirty := TRUE;
+srcCatRID := obj^^.catRID;
+srcVol := obj^^.volHdl;
+dstVol := dstObj^^.volHdl;
+srcIsList := InListView(obj);
+dstIsList := dstObj^^.viewMode <> spatialView;
+srcContainer := obj^^.container;
+movedToHome := IsFather(obj,dstObj);       { Moving to it's filing home? }
+movedToDesk := (dstObj = deskObject);      { moving to desktop? }
+placeObj := GetPlaceHolder(obj);           { locate possible placeholder object }
+
+
+   { create head/tail node if necessary }
+
+IF dstObj^^.isOpen THEN
+   BEGIN
+   IF dstObj^^.contents = nilObject THEN
+      BEGIN
+      tempObj := NewObjList(dstObj);
+      IF tempObj = NIL THEN EXIT(MoveObject);  { no heap space, bail out }
+      dstObj^^.contents := tempObj;
+      END;
+   END;
+
+EndEdit;  { stop editing of current object }
+
+
+
+{ determine position in new container }
+newLoc := obj^^.loc;
+IF chooseLoc THEN
+   BEGIN
+   IF movedToHome AND NOT copyMode THEN
+      GetHomeLoc(obj,newLoc)
+   ELSE
+      ChoosePos(dstObj,newLoc);
+   END
+ELSE IF movedToHome AND dstIsList THEN
+   GetHomeLoc(obj,newLoc)
+ELSE WITH obj^^ DO
+   BEGIN
+   IF srcIsList THEN GetListPos(obj,FALSE,newLoc);
+   newLoc.h := newLoc.h + dh;
+   newLoc.v := newLoc.v + dv;
+   GetPort(savePort);
+   SetPort(container^^.objWindow);
+   LocalToGlobal(newLoc);
+   saveglobal := newLoc;
+   SetPort(dstObj^^.objWindow);
+   GlobalToLocal(newLoc);
+   SetPort(savePort);
+   END;
+
+
+   { Attempt the implied action }
+
+IF movedToDesk THEN
+   BEGIN
+   IF NOT MoveToDesk(obj) THEN EXIT(MoveObject);
+   END
+ELSE IF dstObj = trashObject THEN
+   BEGIN
+   IF NOT MoveToTrash(obj) THEN EXIT(MoveObject);
+   END
+ELSE IF srcVol = dstVol THEN  { same volume }
+   BEGIN
+   IF NOT MoveToSameVol(obj,dstObj^^.catRID.uniqueID) THEN EXIT(MoveObject);
+   END
+ELSE
+   BEGIN
+   dstDev := dstVol^^.devHdl;
+   srcDev := srcVol^^.devHdl;
+   IF joinflag THEN
+      WITH obj^^ DO
+      BEGIN                         {temporarily splice object out of tree if doing a join }
+         prev^^.next := next;
+         next^^.prev := prev;
+         xorObj      := obj;     { Record node in global, so that it can be erased before disk eject }
+      END;
+   IF NOT MoveToDiffVol(obj,dstObj,splitflag,joinflag,diskgone) THEN
+      BEGIN
+         IF joinflag and NOT diskgone THEN    {join terminated before ejecting first diskette}
+            BEGIN
+               WITH obj^^ DO
+               BEGIN
+                  prev^^.next := obj;          {Put back object node!!!}
+                  next^^.prev := obj;
+                  joinflag := FALSE;            { RESET joinflag so it looks like a normal copy }
+                  xorObj   := nilObject;
+               END;
+            END;
+         EXIT(MoveObject);
+      END;
+
+   dstVol := dstDev^^.volHdl;
+   srcVol := srcDev^^.volHdl;
+
+   placeObj^^.volHdl := NIL;   { prevents update of non-existant record }
+   END;
+
+   { erase object from old location }
+
+IF (NOT movedToDesk OR (srcContainer = trashObject)) AND NOT joinflag THEN
+   BEGIN
+   EraseObject(obj);                            { erase object from old location }
+   IF srcIsList THEN xorDv := xorDv + lineHt;   { adjust remembered xor point }
+   END;
+
+
+   { remove placeholder object }
+IF NOT joinflag THEN
+BEGIN
+  erasePlaceImage := NOT (movedToHome AND dstIsList);   { erase placeholder image? }
+  WITH placeObj^^ DO
+     BEGIN
+     beforeObj := next;                         { remember where it was }
+     placeSeqNum := listSeqNum;                 { remember it's list number }
+     placeNameRect := nameRect;                 { remember it's nameRect }
+     END;
+  KillObject(placeObj,FALSE,erasePlaceImage);           { remove placeholder }
+END;
+IF trcFiler THEN WRITELN('MoveObject before xorObject call:, splitflag = ',splitflag,
+                          ',joinflag = ',joinflag);
+
+   { erase XOR image }
+IF eraseDim AND
+   NOT joinflag AND
+   NOT splitflag THEN XorObject(obj,dh,dv,xorWindow);
+
+   { set location in new container }
+obj^^.Loc := newLoc;
+IF NOT movedToDesk AND NOT splitFlag THEN SetHomePt(obj,obj^^.loc);
+
+
+   { Update the attributes of the current parentage }
+
+IF NOT joinflag AND ( NOT (copyMode OR movedToHome OR movedToDesk) OR
+   (copyMode AND (movedToHome OR movedToDesk)) )  THEN
+   BEGIN
+   WITH obj^^ DO
+      BEGIN
+      newVol := volHdl;     { temporarily restore old parentage }
+      newCatRID := catRID;
+      volHdl := srcVol;
+      catRID := srcCatRID;
+      END;
+   UpdateAttributes(obj,TRUE {parentsOnly});
+   obj^^.catRID := newCatRID;
+   obj^^.volHdl := newVol;
+   END;
+
+
+   { make the change to the object tree }
+
+IF dstObj^^.isOpen AND NOT splitflag
+THEN
+   BEGIN             { splice object into contents list of new container }
+   WITH obj^^ DO
+      BEGIN
+      state := newState;
+
+      { splice out at old location }
+       IF NOT joinflag THEN
+          BEGIN
+          prev^^.next := next;
+          next^^.prev := prev;
+          END;
+
+      IF movedToHome AND (beforeObj <> nilObject) THEN
+         BEGIN     { splice back in at same location as before }
+         prev := beforeObj^^.prev;
+         next := beforeObj;
+         listSeqNum := placeSeqNum;
+         IF dstIsList THEN nameRect := placeNameRect;
+         END
+      ELSE
+         BEGIN    { splice back in at front of contents of destination object }
+         prev := dstObj^^.contents;
+         next := dstObj^^.contents^^.next;
+         END;
+
+      prev^^.next := obj;
+      next^^.prev := obj;
+      container := dstObj;
+      END;
+
+   SetAttributes(obj,changed);  { fetch from catalog size, modified, etc. }
+
+      { draw the object in the new container }
+   IF dstIsList THEN
+      BEGIN
+      IF movedToHome AND NOT copyMode THEN
+         UpdateRow(obj)
+      ELSE
+         BEGIN
+         SortContents(dstObj,dstObj^^.viewMode);  { move to sort position }
+         DrawContents(dstObj);                    { redisplay the list }
+         END
+      END
+   ELSE
+      DrawObject(obj);
+
+   AdjustObject(obj,FALSE);   { move to non-overlapping position }
+   END
+ELSE       { container is closed, kill the obejct node }
+   KillObject(obj,TRUE {sons},FALSE {erase});
+
+
+   { Update the attributes of the new parentage }
+
+IF NOT (movedToHome OR movedToDesk) AND NOT splitflag
+THEN UpdateAttributes(dstObj,FALSE);
+
+MoveObject := TRUE;
+END;
+
+
+
+{$S flrDraw }
+FUNCTION MoveToDesk{* obj: ObjectHandle): BOOLEAN *};
+{ handles moving an object from a container to the desktop }
+VAR newHomeLoc: Point;
+    placeObj,father: ObjectHandle;
+    name: FmaxStr;
+    aNameHdl: FmaxStrHdl;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveToDesk',WriteName(obj));
+MoveToDesk := FALSE;
+
+   { handle moving blinking duplicates to the desktop }
+IF obj^^.toBeCopied THEN
+   IF NOT copyObject(obj,obj^^.catRID.fatherID,FALSE) THEN EXIT(MoveToDesk);
+
+
+father := obj^^.container;
+WHILE NOT
+    (father^^.kind IN
+     [nilKind,deskKind,trashKind,inBox1Kind,inBox2Kind,outBox1Kind,outBox2Kind]) DO
+   father := father^^.container;
+
+{ If moving from trash can, change home of object to disk so that "PutBack"
+  doesn't return object to trash can }
+
+IF father^^.kind IN [trashKind,inBox1Kind,inBox2Kind,outBox1Kind,outBox2Kind] THEN
+   BEGIN
+   IF NOT ChangeParentID(obj,idDisk) THEN EXIT(MoveToDesk);
+   ValidObject(obj,FALSE);  { erase placeholder image }
+   IF NOT ChooseHome(obj,newHomeLoc) THEN EXIT(MoveToDesk);
+   END
+ELSE
+   BEGIN    { leave a placeholder object behind }
+   placeObj := Pointer(ORD(NewHdl(SIZEOF(ObjectRecord))));
+   IF placeObj = NIL THEN EXIT(MoveToDesk);   { out of heap }
+
+   placeObj^^ := obj^^;
+   GetStrg(obj^^.nameHdl,name);
+   aNameHdl := NewStrg(name);
+
+   WITH placeObj^^ DO
+      BEGIN
+      prev        := obj^^.prev;   { splice placeholder into list }
+      next        := obj;
+      prev^^.next := placeObj;
+      next^^.prev := placeObj;
+      nameHdl     := aNameHdl;
+      state       := placeHolder;
+      isOpen      := FALSE;
+      contents    := nilObject;
+      objWindow   := Nil;
+      toBeCopied  := FALSE;
+      updateLabel := FALSE;
+      dirty       := TRUE;
+      END;
+   END;
+
+MoveToDesk := TRUE;
+END;
+
+
+
+{$S flrCopy }
+FUNCTION MoveToDiffVol{* obj,dstObj: ObjectHandle; splitflag,joinflag: BOOLEAN;
+                       VAR diskgone: BOOLEAN): BOOLEAN *};
+{ handles moving an object to a container on a different volume }
+VAR blocksNeeded: NumberStr;
+    err,alertNumber: INTEGER;
+    devInfo: Fs_Info;
+    devName: E_Name;
+    devPathname: Pathname;
+    foundOne: BOOLEAN;
+    labelRec: LabelFmt;
+    srcDev,dstDev: TentryHdl;
+    srcdevName,dstdevName: E_Name;
+    srcVol,dstVol: TentryHdl;
+    srcCatRID,dstCatRID,newCatRID: TcatRID;
+    srcCatRec: TcatRec;
+    srcName,dstName: FmaxStr;
+
+
+   FUNCTION FoundTool(pToolRec: PtrCatRec; pFsInfo: PtrFs_Info): BOOLEAN;
+   { gets called by "ToolCheck" when a tool is found. }
+   VAR objIsTool,masterCopy: BOOLEAN;
+       alertNum: INTEGER;
+       catRID: TcatRID;
+       name: FmaxStr;
+   BEGIN
+   WITH pFsInfo^ DO
+      masterCopy := protected AND master;
+
+   IF masterCopy THEN
+      BEGIN
+      objIsTool := obj^^.catRID.uniqueID = pToolRec^.selfId;
+      GetObjTitle(obj,TRUE,name);
+      ArgAlert(1,name);
+
+      IF NOT objIsTool THEN
+         BEGIN
+         catRID.fatherID := pToolRec^.parentID;
+         catRID.uniqueID := pToolRec^.selfId;
+         GetObjName(obj^^.volHdl,catRID,name);
+         ArgAlert(2,name);
+         END;
+
+      IF objIsTool THEN alertNum := 143 ELSE alertNum := 144;
+      StopAlert(flrAlert,alertNum);
+      END;
+   FoundTool := masterCopy;  { bail out if master copy }
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveToDiffVol');
+MoveToDiffVol := FALSE;
+
+{ Disallow movement of master copies to different disks }
+IF NOT obj^^.toBeCopied THEN
+   IF ToolCheck(obj^^.volHdl, obj^^.catRID,FoundTool) THEN EXIT(MoveToDiffVol);
+
+FlushObject(obj);  { make sure source record is current }
+
+IF NOT CheckPasswords(obj^^.volHdl,obj^^.catRID,TRUE,foundOne) THEN EXIT(MoveToDiffVol);
+IF foundOne THEN IF dstObj^^.volHdl^^.fsVersion < pwdFsVersion THEN
+   BEGIN
+   GetObjName(obj^^.volHdl,obj^^.catRID,srcName);
+   GetObjName(dstObj^^.volHdl,diskCatRID,dstName);
+   ParamAlert(srcName,dstName,dstObj^^.volHdl^^.devHdl^^.UserNmHdl^^);
+   IF AskAlert(flrAlert,156) = 1 THEN EXIT(MoveToDiffVol);
+   END;
+
+srcVol := obj^^.volHdl;
+srcCatRID := obj^^.catRID;
+dstVol := dstObj^^.volHdl;
+dstCatRID := dstObj^^.catRID;
+
+{ tell the user the source and destination }
+GetCatRec(err,srcVol,srcCatRID,srcCatRec);
+IF LiveObject(obj) OR (srcCatRec.ObjSize > 0) OR (err > 0) THEN
+   BEGIN
+   GetObjTitle(obj,TRUE,srcName);
+   GetObjTitle(dstObj,TRUE,dstName);
+   ParamAlert (srcName, dstName, '');
+   IF joinflag THEN alertNumber := 312          { 'reconstructing' }
+   ELSE IF obj^^.toBeCopied THEN
+           alertNumber := 101
+        ELSE
+           alertNumber := 100;
+        WaitAlert(flrAlert, alertNumber);  { 'transferring...' }
+   END;
+
+{********** Sally Rhodes - need to add code to reject copy of set aside objects if too big for diskette ****}
+
+{ copy the source to the destination }
+IF LiveObject(obj) AND NOT obj^^.toBeCopied THEN
+   BEGIN     { tell the application to copy the document to diff vol }
+   PutDocIn(err,srcVol,srcCatRID,dstVol,dstCatRID.uniqueID,newCatRID);
+   IF err <> 0 THEN
+      BEGIN
+      TellUser (srcVol,NIL,srcCatRID,srcCatRID,err,opMove);
+      EXIT(MoveToDiffVol);
+      END;
+   RemoveWindow(obj,TRUE);
+   END
+ELSE
+   BEGIN
+   { copy the object to the destination }
+   IF trcFiler THEN
+      WRITELN('   MoveToDiff ',srcCatRID.uniqueID:1,' into ',dstCatRID.uniqueID:1);
+   dstDev := dstVol^^.devHdl;
+   srcDev := srcVol^^.devHdl;
+   XferObject(err,srcCatRID,dstCatRID.uniqueID,srcVol,dstVol,TRUE {exclude unfiled},
+              NOT obj^^.toBeCopied,splitflag,joinflag,0,newCatRID,diskgone);
+   dstVol := dstDev^^.volHdl;
+   srcVol := srcDev^^.volHdl;
+   IF err <> 0 THEN
+      BEGIN
+      IF splitflag then dstVol := NIL;
+      IF joinflag AND diskgone THEN srcVol := NIL;
+      TellUser (srcVol,dstVol,srcCatRID,srcCatRID,err,opCopy);
+      EXIT(MoveToDiffVol);
+      END;
+   IF MoveUnfiled(obj) THEN; { unfiled descendants are moved to obj's container }
+   END;
+
+{ Set catalog flush flags for volumes involved }
+IF NOT joinflag AND NOT obj^^.toBeCopied THEN srcVol^^.flush := TRUE;
+IF NOT splitflag THEN dstVol^^.flush := TRUE;
+
+{ Remove the source object if obj isn't a duplicate }
+IF NOT joinflag AND NOT obj^^.toBeCopied THEN
+   IF ShredObject(srcVol,srcCatRID,FALSE,TRUE {can't abort}) THEN;
+
+{ update the cached object catRID to reflect the new home }
+obj^^.catRID := newCatRID;
+obj^^.volHdl := dstVol;
+obj^^.toBeCopied := FALSE;
+
+IF joinflag then obj^^.split := FALSE;
+
+IF splitflag
+THEN BEGIN
+   obj^^.dirty := FALSE;         { prevent update to destination volume which no longer exists }
+   obj^^.updatelabel := FALSE;   { don't try writing label to non-existent volume }
+END;
+
+EndWaitAlert;
+MoveToDiffVol := TRUE;
+END;
+
+
+
+{$S flrDraw }
+FUNCTION MoveToSameVol{* obj: ObjectHandle; newParent: IDType): BOOLEAN *};
+{ handles moving an object to a new container on the same volume }
+VAR err: INTEGER;
+    newCatRID: TcatRID;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveToSameVol',WriteName(obj),'  parent: ',newParent:1);
+MoveToSameVol := FALSE;
+
+IF obj^^.toBeCopied THEN    { do postponed copy now }
+   BEGIN
+   IF NOT copyObject(obj,newParent,FALSE) THEN EXIT(MoveToSameVol);
+   END
+ELSE
+   BEGIN
+   IF (LiveObject(obj) OR IsOrphan(obj)) THEN { shut down doc before moving }
+      BEGIN
+      IF NOT StopDoc(obj,FALSE,FALSE) THEN EXIT(MoveToSameVol);
+      END
+   ELSE IF newParent <> obj^^.catRID.fatherID THEN
+         { change filing home of any unfiled sons to father of obj }
+      IF NOT MoveUnfiled(obj) THEN EXIT(MoveToSameVol);
+
+   { do the transfer (just adjusts catalog record in this case) }
+   IF trcFiler THEN
+      WRITELN('   MoveToSame ',obj^^.catRID.uniqueID:1,' into ',newParent:1);
+
+   IF NOT ChangeParentId(obj,newParent) THEN EXIT(MoveToSameVol);
+   END;
+
+MoveToSameVol := TRUE;
+END;
+
+
+
+{$S flrCopy }
+FUNCTION MoveToTrash{* obj: ObjectHandle): BOOLEAN *};
+{ handles an object moved into the trash can }
+
+VAR toolName: FmaxStr;
+    foundOne: BOOLEAN;
+    password: E_Name;
+
+
+   FUNCTION FoundTool(pToolRec: PtrCatRec; pFsInfo: PtrFs_Info): BOOLEAN;
+   { gets called by "ToolCheck" when a tool is found. }
+   VAR objIsTool,masterCopy,discardTool: BOOLEAN;
+       alertNum: INTEGER;
+       catRID: TcatRID;
+       name: FmaxStr;
+   BEGIN
+   objIsTool := obj^^.catRID.uniqueID = pToolRec^.selfId;
+   GetObjTitle(obj,TRUE,name);
+   ArgAlert(1,name);
+
+   catRID.fatherID := pToolRec^.parentID;
+   catRID.uniqueID := pToolRec^.selfId;
+
+   IF NOT objIsTool THEN
+      BEGIN
+      GetObjName(obj^^.volHdl,catRID,name);
+      ArgAlert(2,name);
+      END;
+
+   WITH pFsInfo^ DO
+      masterCopy := protected AND master;
+
+   IF masterCopy THEN
+      BEGIN
+      IF objIsTool THEN alertNum := 135 ELSE alertNum := 136;
+      discardTool := AskAlert(flrAlert,alertNum) = 2 {trash it};  { ok to destroy? };
+      END
+   ELSE
+      BEGIN
+      IF objIsTool THEN       { don't warn if discarding a copy }
+         discardTool := TRUE
+      ELSE                    { copy is in a folder, get confirmation }
+         discardTool := AskAlert(flrAlert,137) = 2 {trash it};   { ok to destroy? }
+      END;
+
+   IF discardTool THEN
+      BEGIN
+      CloseTool(obj^^.volHdl,catRID);
+      FoundTool := FALSE;    { continue searching for more tools }
+      END
+   ELSE
+      FoundTool := TRUE;     { bail out }
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveToTrash',WriteName(obj));
+MoveToTrash := FALSE;
+
+IF NOT CheckPasswords(obj^^.volHdl, obj^^.catRID, TRUE, foundOne) THEN
+   BEGIN
+   EXIT(MoveToTrash);
+   END;
+
+{ If this is a master copy of a tool then get confirmation from the user }
+IF ToolCheck(obj^^.volHdl, obj^^.catRID,FoundTool) THEN EXIT(MoveToTrash);
+
+{ Documents must be shut down first }
+IF (LiveObject(obj) OR IsOrphan(obj)) THEN
+   BEGIN
+   IF StopDoc(obj,TRUE {suspend},TRUE {must succeed}) THEN;
+   END
+ELSE   { change filing home of any unfiled sons to father of obj }
+   IF NOT MoveUnfiled(obj) THEN
+      BEGIN
+      EXIT(MoveToTrash);
+      END;
+
+IF NOT ChangeParentId(obj,idTrash) THEN
+   BEGIN
+   EXIT(MoveToTrash);
+   END;
+
+MoveToTrash := TRUE;
+END;
+
+
+
+{$S flrDraw }
+FUNCTION MoveUnfiled{* obj: ObjectHandle): BOOLEAN *};
+{ moves all unfiled descendants of obj to the container of obj }
+VAR son,nextSon,listHead,placeObj: ObjectHandle;
+    newHomeLoc: Point;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MoveUnfiled',WriteName(obj));
+IF NOT IsContainer(obj) OR obj^^.toBeCopied THEN
+   BEGIN
+   MoveUnfiled := TRUE;
+   EXIT(MoveUnfiled);
+   END;
+
+MoveUnfiled := FALSE;
+listHead := deskObject^^.contents;
+son := listHead^^.next;
+
+WHILE son <> listHead DO    { check all objects on desk }
+   BEGIN
+   nextSon := son^^.next;
+   IF son <> obj THEN
+      IF son^^.kind IN putBackSet THEN
+         IF IsIn(obj^^.volHdl,son,obj) THEN
+            BEGIN
+            IF NOT ChangeParentID(son,obj^^.catRID.fatherID) THEN EXIT(MoveUnfiled);
+            placeObj := GetPlaceHolder(son);
+            IF NOT ChooseHome(son,newHomeLoc) THEN
+               BEGIN  { back out }
+               IF ChangeParentID(son,obj^^.catRID.uniqueID) THEN;
+               EXIT(MoveUnfiled);
+               END;
+            KillObject(placeObj,FALSE,TRUE);
+            son^^.dirty := TRUE;
+            END;
+   son := nextSon;
+   END;
+
+MoveUnfiled := TRUE;
+END;
+
+
+
+{$S flrAll }
+FUNCTION MyWindow{* window: WindowPtr): BOOLEAN *};
+{ Returns TRUE if this window is currently managed by me }
+VAR wind: WindowPeek;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('MyWindow');
+
+IF window = NIL THEN
+   MyWindow := FALSE
+ELSE
+   BEGIN
+   wind := Pointer(ORD(window));
+   MyWindow := (wind^.process = filerProcess);
+   END;
+END;
+
+
+
+{$S flrDraw }
+FUNCTION NameWidth{* obj: ObjectHandle): INTEGER *};
+{ Returns the width of the icon title }
+VAR savePort: GrafPtr;
+    saveFont: INTEGER;
+    saveFace: Style;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj^^.nameHdl = NIL THEN
+   BEGIN
+   NameWidth := 0;
+   EXIT(NameWidth);
+   END;
+
+GetPort(savePort);
+SetPort(filerFolder);
+
+WITH thePort^ DO
+   BEGIN
+   saveFont := txFont;
+   saveFace := txFace;
+   END;
+
+IF obj^^.container^^.viewMode = spatialView THEN
+   TextFont(iconNamFont)
+ELSE
+   TextFont(listFont);
+TextFace([]);
+NameWidth := StringWidth(obj^^.nameHdl^^) + 4 {pad};
+
+TextFont(saveFont);
+TextFace(saveFace);
+SetPort(savePort);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE NearestEmpty{* obj: ObjectHandle; startLoc: Point;
+                         stayInWindow: BOOLEAN; VAR emptyLoc: Point *};
+
+{ Finds the nearest non-overlapping location for an icon in it's container.
+  Moves outward from "startLoc" in a spiral direction.  Returns "startLoc" if an
+  empty spot can not be found within the bounding rectangle. }
+
+LABEL 1;
+CONST vInc = 4;
+      hInc = 6;
+VAR overlapObj: ObjectHandle;
+    saveState: ObjectState;
+    saveView: ViewType;
+    savePort: GrafPtr;
+    dh,dv,hOffset,vOffset,sign,nSteps,maxSteps: INTEGER;
+    iconRect,titleRect,contentRect: Rect;
+    vert,hitName,hitLeft,hitTop,hitRight,hitBottom: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('NearestEmpty for ',WriteName(obj));
+GetPort(savePort);
+
+WITH obj^^ DO
+   BEGIN
+   SetPort(container^^.objWindow);
+   saveView := container^^.viewMode;
+   container^^.viewMode := spatialView;
+   saveState := state;
+   state := limbo;          { set to limbo so won't hit test against self }
+   END;
+
+GetIconRect(obj,iconRect);
+titleRect := obj^^.nameRect;
+IF stayInWindow OR (obj^^.container = deskObject) THEN
+   BEGIN
+   GetContentRect(obj^^.container,contentRect);
+   WITH contentRect DO
+      BEGIN
+      right := right - (iconRect.right - iconRect.left) + 1;
+      bottom := bottom - (iconRect.bottom - iconRect.top) + 1;
+      END;
+   END
+ELSE
+   SetRect(contentRect,0,0,MAXINT,MAXINT);
+
+hOffset := iconRect.left;
+vOffset := iconRect.top;
+OffsetRect(iconRect,startLoc.h,startLoc.v);
+
+hitLeft   := FALSE;
+hitTop    := FALSE;
+hitRight  := FALSE;
+hitBottom := FALSE;
+
+vert := FALSE;
+sign := 1;
+nSteps := 0;
+maxSteps := 0;
+dh := hInc;
+dv := vInc;
+
+
+WHILE TRUE DO
+   BEGIN
+   IF trcFiler THEN WITH iconRect.topLeft DO WRITELN('   testing: ',h,v);
+   IF PtInRect(iconRect.topLeft,contentRect) THEN  {is this within the container? }
+      BEGIN
+      IF trcFiler THEN WRITELN('   in container, check for overlap');
+      overlapObj := WhichObject(obj^^.container,iconRect,FALSE {watchNames},hitName);
+      IF (overlapObj = nilObject) OR (overlapObj = obj) THEN
+         BEGIN
+         emptyLoc.h := iconRect.left - hOffset;
+         emptyLoc.v := iconRect.top - vOffset;
+         GOTO 1;
+         END;
+      END
+   ELSE WITH iconRect.topLeft,contentRect DO
+      BEGIN
+      IF trcFiler THEN WRITELN('   out of container');
+      { See if all spots have been checked }
+      IF h <= left   THEN hitLeft   := TRUE;
+      IF v <= top    THEN hitTop    := TRUE;
+      IF h >= right  THEN hitRight  := TRUE;
+      IF v >= bottom THEN hitBottom := TRUE;
+      IF hitLeft AND hitTop AND hitRight AND hitBottom THEN
+         BEGIN
+         emptyLoc := startLoc;  { no empty spots, return starting pt }
+         GOTO 1;
+         END;
+      END;
+
+      { choose a new trial position, moving radially outwards }
+
+   nSteps := nSteps + 1;
+
+   IF nSteps >= maxSteps THEN
+      BEGIN
+      nSteps := 0;
+      vert := NOT vert;          { turn left }
+      IF vert THEN
+         BEGIN
+         maxSteps := maxSteps + 1;
+         sign := -1*sign;
+         dv := sign*vInc;
+         dh := 0;
+         END
+      ELSE
+         BEGIN
+         dh := sign*hInc;
+         dv := 0;
+         END;
+      END;
+
+   OffsetRect(iconRect,dh,dv);
+   OffsetRect(titleRect,dh,dv);
+   END;
+
+
+1:
+obj^^.state := saveState;
+obj^^.container^^.viewMode := saveView;
+SetPort(savePort);
+END;
+
+
+
+{$S flrMisc }
+FUNCTION NearList{* listHead: ObjectHandle; pt: Point): ObjectHandle *};
+{ returns the topmost object near pt, nilObject if none }
+VAR obj: ObjectHandle;
+    hitRect: Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('NearList');
+
+NearList := nilObject;  { in case no hit }
+
+SetRect(hitRect,pt.h-iconWidth,pt.v-iconHt,
+                pt.h+iconWidth,pt.v+iconHt);
+
+obj := listHead^^.next;
+WHILE obj <> listHead DO WITH obj^^ DO
+   BEGIN
+   IF PtInRect(loc,hitRect) THEN
+      BEGIN
+      NearList := obj;
+      EXIT(NearList);
+      END;
+   obj:=next;
+   END;
+END;
+
+
+
+{$S  flrDm }
+FUNCTION NewObjList{* father: ObjectHandle): ObjectHandle *};
+
+{ creates the head/tail node for a new container  }
+
+VAR obj: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('NewObjList');
+NewObjList := NIL;
+
+obj := Pointer(ORD(NewHdl(SizeOf(obj^^))));
+IF obj = NIL THEN EXIT(NewObjList);
+
+obj^^ := nilObject^^;
+WITH obj^^ DO
+   BEGIN
+   prev       := obj;   { the list is both the head and tail }
+   next       := obj;
+   nameHdl    := NIL;
+   container  := father;
+   END;
+NewObjList:=obj;
+END;
+
+
+
+{$S flrDm1 }
+FUNCTION NewWindow{* obj: ObjectHandle; title: FmaxStr): WindowPtr *};
+{ creates a window for an object.  Handles too many case. }
+VAR window,behind: WindowPtr;
+    sym: INTEGER;
+    overlay: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('NewWindow',WriteName(obj));
+WITH obj^^ DO
+   BEGIN
+   sym := ORD(tinyData[kind]);
+   IF toolNumber IN [desktool..maxKnownTool]
+   THEN overlay := ORD(tinyOverlay[toolNumber])
+   ELSE overlay := noIcon;
+   END;
+
+{ temp window manager kludge to get new window shapes w/o interface change }
+IF (obj^^.kind = calcKind) OR (obj^^.kind = clockKind) THEN sym := -sym;
+
+IF copyMode THEN
+   behind := TopWindow
+ELSE
+   behind := dialogFolder;
+
+window := NewFolder(obj^^.windowRect,title,FALSE {hidden},behind,0,My_Id,sym,overlay);
+IF window = NIL THEN StopAlert (flrAlert, 206);  { Too many windows }
+NewWindow := window;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE NormalEnvironment{* obj: ObjectHandle *};
+{ sets port, origin, and clipping for dealing with window content }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+SetPort(obj^^.objWindow);
+SetOrigin(obj^^.scrollDh,obj^^.scrollDv);
+ClipContent(obj);
+END;
+
+
+
+{$S flrUtil }
+FUNCTION NumFromObj{* obj: ObjectHandle): INTEGER *};
+{ returns object sequence number given handle }
+VAR son,listHead: ObjectHandle;
+    objCount: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('NumFromObj',WriteName(obj));
+NumFromObj := obj^^.listSeqNum;
+END;
+
+
+
+{$S flrMisc }
+FUNCTION NumGridCols{* obj: ObjectHandle): INTEGER *};
+{ Returns the number of objects to grid in row given the current window size }
+VAR nCols: INTEGER;
+    contentRect: Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+GetContentRect(obj,contentRect);
+nCols := MAX(1,(contentRect.right+(hGrid DIV 2)) DIV hGrid);
+NumGridCols := nCols;
+IF trcFiler THEN WRITELN('NumGridCols = ',nCols:1);
+END;
+
+
+
+{$S flrUtil }
+FUNCTION ObjFromVol{* volHdl: TentryHdl): ObjectHandle *};
+{ return object handle of for a given volume handle }
+VAR obj: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ObjFromVol');
+obj := Pointer(volHdl^^.devHdl^^.objHdl);
+IF obj = NIL THEN
+   BEGIN
+   IF ErrorFound(warnError,-1030,nullErr,NIL) THEN;
+   obj := nilObject;
+   END;
+ObjFromVol := obj;
+END;
+
+
+
+{$S flrDm }
+FUNCTION ObjFromWindow{* window : WindowPtr): ObjectHandle *};
+{ Determines which object owns a given window }
+VAR whichObj: ObjectHandle;
+
+     FUNCTION TreeSearch(listHead : ObjectHandle): ObjectHandle;
+     VAR obj,result: ObjectHandle;
+     BEGIN
+     TreeSearch:=nilObject;
+
+     obj:=listHead^^.next;
+     WHILE obj <> listHead DO   { travel down brother list }
+        BEGIN
+        IF obj^^.isOpen THEN
+           IF (obj^^.objWindow = window) THEN
+              BEGIN
+              TreeSearch:=obj;
+              EXIT(TreeSearch);
+              END;
+                    { check contents (sons) }
+        result:=TreeSearch(obj^^.contents);
+        IF result <> nilObject THEN
+           BEGIN
+           TreeSearch:=result;
+           EXIT(TreeSearch);
+           END;
+        obj:=obj^^.next;
+        END;
+     END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF window = Nil THEN
+   whichObj := nilObject
+ELSE IF window = filerFolder THEN
+   whichObj := deskObject
+ELSE
+   whichObj := TreeSearch(deskObject^^.contents);
+
+ObjFromWindow := whichObj;
+
+IF trcFiler THEN WRITELN('ObjFromWindow =',WriteName(whichObj));
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ObjToBack{* obj: ObjectHandle*};
+{ move an object to the back of the object list }
+VAR listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj = nilObject THEN EXIT(ObjToBack);
+IF InListView(obj) THEN EXIT(ObjToBack);
+
+IF trcFiler THEN WRITELN('ObjToBack',WriteName(obj));
+WITH obj^^ DO
+   BEGIN
+   listHead := container^^.contents;
+
+   { splice out at old location }
+   prev^^.next := next;
+   next^^.prev := prev;
+
+   { splice back in at back }
+   next := listHead;
+   prev := listHead^^.prev;
+   prev^^.next := obj;
+   next^^.prev := obj;
+   END;
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ObjToFront{* obj: ObjectHandle; redraw: BOOLEAN *};
+{ bring an object to the front and re-draw }
+VAR listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj = nilObject THEN EXIT(ObjToFront);
+IF trcFiler THEN WRITELN('ObjToFront',WriteName(obj));
+WITH obj^^ DO
+   BEGIN
+   IF InSpatialView(obj) THEN
+      BEGIN
+      listHead := container^^.contents;
+
+      { splice out at old location }
+      prev^^.next := next;
+      next^^.prev := prev;
+
+      { splice back in at front }
+      prev := listHead;
+      next := listHead^^.next;
+      prev^^.next := obj;
+      next^^.prev := obj;
+      END;
+   END;
+
+IF redraw THEN DrawObject(obj);
+END;
+
+
+
+{$S flrDm }
+FUNCTION OnDesktop{* whichVol: TentryHdl; objID: IDType): BOOLEAN *};
+{ searches desk list for an object }
+VAR obj,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('OnDesktop.  vol: ',ORD(whichVol):1,'  id: ',objID:1);
+listHead := deskObject^^.contents;
+obj:=listHead^^.next;
+WHILE obj <> listHead DO
+   BEGIN
+   IF (obj^^.volHdl = whichVol) AND (obj^^.catRID.uniqueID = objID) THEN
+      BEGIN
+      OnDesktop := TRUE;
+      IF trcCatalog THEN WRITELN('   OnDeskTop = TRUE');
+      EXIT(OnDesktop);
+      END;
+   obj:=obj^^.next;
+   END;
+OnDesktop:=FALSE;
+IF trcFiler THEN WRITELN('   OnDeskTop = FALSE');
+END;
+
+
+
+{$S dmMain }
+FUNCTION OneDiskSelected{* VAR diskObj: ObjectHandle): BOOLEAN *};
+{ returns true if the active window is a disk or if a single disk only is hilited }
+VAR count:      INTEGER;
+    listHead:   ObjectHandle;
+    son:        ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('OneDiskSelected');
+
+{ is the active window a disk window }
+IF activeObject^^.kind IN diskSet THEN
+   BEGIN
+   OneDiskSelected := TRUE;
+   diskObj := activeObject;
+   EXIT(OneDiskSelected);
+   END;
+
+{ scan the desktop for a single selected disk icon }
+diskObj := NIL;
+count := 0;
+listHead := deskObject^^.contents;
+son := listHead^^.next;
+WHILE son <> listHead DO
+   BEGIN
+   IF (son^^.state = hilited) THEN
+      BEGIN
+      count := count + 1;
+      IF son^^.kind IN diskset THEN diskObj := son;
+      END;
+   son := son^^.next;
+   END;
+
+IF (count = 1) AND (diskObj <> NIL) THEN
+   OneDiskSelected := TRUE
+ELSE
+   BEGIN
+   OneDiskSelected := FALSE;
+   diskObj := nilObject;
+   END;
+END;
+
+
+
+{$S flrCold }
+FUNCTION OnGridPt{* obj: ObjectHandle; VAR gridSpot: INTEGER ): BOOLEAN *};
+{ Returns TRUE if the object's spatial location is on a grid point }
+VAR row,col,nGridCols: INTEGER;
+    listHead,whichObj: ObjectHandle;
+    pt: Point;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+OnGridPt := FALSE;
+pt := obj^^.loc;
+WITH pt DO
+   BEGIN
+   h := h - hGridStart;
+   IF (h MOD hGrid) <> 0 THEN EXIT(OnGridPt);
+   v := v - vGridStart;
+   IF (v MOD vGrid <> 0) THEN EXIT(OnGridPt);
+   nGridCols := NumGridCols(obj^^.container);
+   col := h DIV hGrid;
+   IF col >= nGridCols THEN EXIT(OnGridPt);
+   row := v DIV vGrid;
+
+   { check if another object below on same grid pt }
+   listHead := obj^^.container^^.contents;
+   whichObj := obj^^.next;
+   pt := obj^^.loc;
+
+   WHILE whichObj <> listHead DO
+      BEGIN
+      IF whichObj^^.loc.h = pt.h THEN
+         IF whichObj^^.loc.v = pt.v THEN EXIT(OnGridPt);   { on same grid pt }
+      whichObj := whichObj^^.next;
+      END;
+
+   IF obj^^.container = deskObject THEN
+      gridSpot := gridTable[row,col]
+   ELSE
+      gridSpot := row*nGridCols + col;
+   OnGridPt := TRUE;
+   END;
+END;
+
+
+
+{$S flrDm1 }
+PROCEDURE OpenContents{* obj: ObjectHandle; whichState : ObjectState *};
+
+{ Opens all objects in container that are in "whichState." }
+
+VAR son,listHead,lastOpened: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('OpenContents',WriteName(obj));
+lastOpened := nilObject;
+listHead := obj^^.contents;
+son := listHead^^.next;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state = whichState THEN
+      BEGIN
+      IF UserAbort THEN EXIT(OpenContents);
+      IF NOT OpenObject(son,TRUE) THEN EXIT(OpenContents);
+      lastOpened := son;
+      END;
+   son := son^^.next;
+   END;
+
+IF NOT ClickedNewWindow THEN   { no activate ahead }
+   MakeObjActive(lastOpened);  { activate the last object opened }
+END;
+
+
+
+{$S flrDskIn }
+FUNCTION OpenFont{volHdl: TentryHdl; toolNum: LongInt; VAR font: Tfam): BOOLEAN};
+{ attempts to add the icon font for the given toolnumber }
+VAR numStr: NumberStr;
+    fontName: Tstr30;
+    path: Pathname;
+    modifier: Tmodifier;
+    fileInfo: Fs_Info;
+    err: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('OpenFont for tool ',toolNum:1);
+IntToStr(toolNum,numStr);
+fontName := CONCAT('{T',numStr,'}icon');
+fontName := CONCAT('-',volHdl^^.devHdl^^.nameHdl^^,'-',fontName);
+path := fontName;
+
+Lookup(err,path,fileInfo);   { determine if the font file exists }
+IF err <= 0 THEN
+   BEGIN
+   IF trcFiler THEN WRITELN('   add font "',path,'"');
+
+   WITH modifier DO
+      BEGIN
+      seteface := [];
+      mpefaceb[Bold]       := 0;
+      mpefaceb[Italic]     := 0;
+      mpefaceb[Underline] := 0;
+      mpefaceb[Outline]   := 0;
+      mpefaceb[Shadow]     := 0;
+      END;
+
+   font := FMAddFont(path,modifier,devScreen,err);
+   IF dbgFiler THEN IF err <> 0 THEN WRITELN('   FMAddFont err = ',err:1);
+   IF trcFiler THEN IF err = 0 THEN WRITELN('   new font number = ',font:1);
+   END;
+
+OpenFont := (err <= 0);
+END;
+
+
+
+{$S flrDm1 }
+FUNCTION OpenObject{* obj: ObjectHandle; startTool: BOOLEAN): BOOLEAN *};
+
+{ Creates a window for the object (if necessary) and displays contents }
+{ Changes the icon to indicate that the object is open }
+
+VAR changed:   BOOLEAN;
+    docHdl:    TentryHdl;
+    savePort:  GrafPtr;
+    title:     FmaxStr;
+    thePassword: E_Name;
+    window:    WindowPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('OpenObject',WriteName(obj),'"  kind = ',obj^^.kind:1);
+
+IF obj = nilObject THEN
+   BEGIN
+   OpenObject := FALSE;  { This is probably an error? }
+   EXIT(OpenObject);
+   END;
+
+IF obj^^.kind in padSet THEN  { Can't open pads }
+   BEGIN
+   OpenObject := FALSE;
+   EXIT(OpenObject);
+   END;
+
+IF obj^^.isOpen THEN
+   BEGIN
+   OpenObject := TRUE;   { It's already open }
+   EXIT(OpenObject);
+   END;
+
+IF obj^^.split THEN
+   BEGIN                 { This is just a piece of a larger document }
+   ArgAlert(1,obj^^.nameHdl^^);
+   StopAlert(flrAlert,151);
+   EXIT(OpenObject);
+   END;
+
+IF obj^^.passworded AND (  (obj^^.kind IN containerSet)   {*** FI 327 ***}
+                        OR (startTool AND (NOT (obj^^.kind IN toolSet)))  ) THEN
+   IF GetPassword(obj^^.volHdl,obj^^.catRID,thePassword) THEN
+      obj^^.userPassword := thePassword
+   ELSE
+      EXIT(OpenObject);
+
+
+{ check that window rect is on screen }
+WITH obj^^.windowRect DO
+  IF (top <= titleHt) OR (top >= bottom) OR (left >= screenWidth) OR
+     (right <= 0) OR ((bottom - top) > (screenHt - titleHt)) THEN
+     BEGIN
+     IF dbgFiler THEN WRITELN('Invalid window rect - ',left,top,right,bottom);
+     SetRect(obj^^.windowRect,40,40,600,300);
+     END;
+
+{ Get the title.  Chooses title if icon title is empty }
+GetObjTitle(obj,FALSE,title);
+
+{ Set up the window, but don't display it yet }
+window := obj^^.objWindow;
+IF window = NIL THEN
+   BEGIN              { need to create a window }
+   window := NewWindow(obj,title);
+   obj^^.objWindow := window;
+   IF window = NIL THEN
+      BEGIN
+      OpenObject := FALSE;   { can't open any more windows, abort the operation }
+      EXIT(OpenObject);
+      END;
+   END
+ELSE
+   BEGIN  { Window already exists.  Adjust size and location. }
+   SetFldrTitle(window,title);
+   WITH obj^^.windowRect DO MoveFolder(window,left,top);
+   WITH obj^^.windowRect DO FolderSize(window,right-left,bottom-top,FALSE);
+   BringToFront(Pointer(ORD(window)),TRUE);
+   END;
+
+WITH obj^^ DO
+   BEGIN
+   setAside := FALSE;
+   isOpen := TRUE;
+   dirty  := TRUE;
+   state  := openState;
+   END;
+
+DrawObject(obj);       { redraw object as a ghost }
+ZoomObject(obj,TRUE);  { zoom up }
+ShowFolder(window);    { display the window, generates update event for window }
+
+IF obj^^.kind IN docToolSet THEN
+   BEGIN
+   FlushObject(obj);
+   IF obj^^.wasOpened THEN          { reattempt startup if orphan or setAside }
+      BEGIN
+      docHdl := WindowToDocEntry(obj^^.objWindow);
+      docHdl^^.docPassword := obj^^.userPassword;
+      IF docHdl^^.state IN [opened, toolOpened]
+      THEN obj^^.setAside := TRUE
+      ELSE StartDoc(docHdl,FALSE);
+      END
+   ELSE                             { never opened, try starting it up }
+      BEGIN
+      WITH obj^^ DO
+      OpenDoc(obj^^.volHdl,obj^^.catRID,window,docHdl,userPassword,startTool);
+      IF docHdl = NIL THEN   { couldn't allocate space for doc entry }
+         BEGIN
+         obj^^.isOpen := TRUE;    { so that close will work }
+         IF CloseObject(obj,FALSE,TRUE,FALSE) THEN;
+         EXIT(OpenObject);
+         END;
+      END
+   END
+ELSE IF IsContainer(obj) THEN       { Generate an object list for the contents }
+   BEGIN
+   WITH obj^^ DO
+      BEGIN
+      IF container = deskObject THEN
+         BEGIN
+         GetPort(savePort);
+         SetPort(window);
+         SetOrigin(scrollDh,scrollDv);
+         SetPort(savePort);
+         End
+      ELSE
+         BEGIN
+         hThumbPos := 0;
+         vThumbPos := 0;
+         scrollDh  := 0;
+         scrollDv  := 0;
+         END;
+      END;
+   IF obj = trashObject THEN
+      GenTrashContents
+   ELSE
+      IF GenContents(obj) THEN;
+   CheckContents(obj);              { make sure all icon locations are valid }
+   ValidWindow(window,TRUE);        { cancel update for window, draw it now }
+   DrawInsides(obj,FALSE);
+   END;
+
+obj^^.wasOpened := TRUE;
+OpenObject := TRUE;
+END;
+
+
+{$S flrCopy }
+PROCEDURE PasteIcons;
+VAR
+    err: INTEGER;
+    listHead: ObjectHandle;
+    son: ObjectHandle;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('PasteIcons');
+
+{ what is the destination object }
+refObj := activeObject;
+listHead := refObj^^.contents;
+son := listHead^^.prev;
+WHILE son <> listHead DO
+   BEGIN                      { should be only 0 or 1 hilited son }
+   IF son^^.state = hilited THEN refObj := son;
+   son := son^^.prev;
+   END;
+IF NOT (refObj^^.kind IN containerSet) THEN EXIT(PasteIcons);
+
+{ duplicate the referenced icons }
+refAbort := FALSE;
+ReadIconRefs (err, refProc, refWindow, refIconInfo, @PasteRef);
+IF err > 0 THEN
+   BEGIN
+   StopAlert(flrAlert, 158);
+   END;
+
+END;
+
+
+{$S flrCopy }
+PROCEDURE PasteRef;
+{ this proc is called once for each icon ref in the scrap during a paste }
+VAR catRec:   TcatRec;
+    dCatRID:  TcatRID;
+    diskGone: BOOLEAN;
+    dVolHdl:  TentryHdl;
+    err:      INTEGER;
+    iconName: FMaxStr;
+    newObj:   ObjectHandle;
+    objName:  FMaxStr;
+    offset:   INTEGER;
+    prefix:   Pathname;
+    reply:    FReason;
+    sCatRID:  TcatRID;
+    sVolHdl:  TentryHdl;
+
+    PROCEDURE AbortThisRef (err: INTEGER);
+    BEGIN
+    TellUserWhy (sVolHdl, dVolHdl, sCatRID, dCatRID, err, opCopy);
+    ArgAlert (1,refIconInfo.userName);
+    IF AskAlert (flrAlert, 155) = 1 THEN refAbort := TRUE;
+    EXIT(PasteRef);
+    END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WITH refIconInfo DO
+   WRITELN('NextRef: kind is ',kind:1,', tool is ',toolID:1,
+           ', userName is ',userName,', diskName is ',diskName);
+
+IF refAbort THEN EXIT(PasteRef);
+dVolHdl := refObj^^.volHdl;
+GetObjTitle(refObj,TRUE,objName);
+iconName := CONCAT('"',refIconInfo.userName,'"');
+ParamAlert(iconName,objName,'');
+WaitAlert(flrAlert,101);   { 'duplicating...' }
+IF refProc = My_ID THEN
+   BEGIN
+   PrefixInCat (err, offset, refIconInfo.diskName, sVolHdl, sCatRID);
+   IF err > 0 THEN AbortThisRef(fCantRead);
+   XferObject(err, sCatRID, refObj^^.catRID.uniqueID, sVolHdl, dVolHdl, TRUE, FALSE,
+              FALSE, FALSE, 0, dCatRID, diskGone);
+   IF err > 0 THEN AbortThisRef(err);
+   END
+ELSE
+   BEGIN       { we don't know about this object, ask creator to copy to new icon }
+   catRec := blankCatRec;
+   InsObjName (catRec, refIconInfo.userName);
+   WITH catRec DO BEGIN
+     parentID := refObj^^.catRID.uniqueID;
+     objKind  := refIconInfo.kind;
+     created  := Timestamp;
+     toolID   := refIconInfo.toolID;
+     END;
+   dVolHdl := refObj^^.volHdl;
+   AddCatRec (err, dVolHdl, catRec, TRUE, dCatRID);
+   IF err > 0 THEN AbortThisRef(fCantWrite);
+   FlushCat (dVolHdl);
+   GetObjPrefix (dVolHdl, dCatRID, prefix, TRUE);
+   SendFilerEvent (err, refProc, refWindow, fcCopy, prefix, 0,
+                   refIconInfo.diskName, refIconInfo.password, reply);
+   IF err > 0 THEN
+      BEGIN
+      IF ShredObject (dVolHdl, dCatRID, TRUE, TRUE) THEN;
+      AbortThisRef(err);
+      END;
+   END;
+
+
+EndWaitAlert;
+UpdateAll;
+
+{ display the new icon if its container is open }
+IF refObj^^.isOpen THEN
+   BEGIN
+   GetCatRec (err, dVolHdl, dCatRID, catRec);
+   IF err > 0 THEN AbortThisRef(fCantWrite);
+   ChoosePos(refObj, catRec.closedPt);
+   UpdCatRec(err, dVolHdl, dCatRID, catRec);
+   WITH catRec DO
+      newObj := MakeObject(refObj, refIconInfo.userName, objKind,toolId, closedPt, openRect,
+                           hilited, view, dVolHdl, dCatRID, created, modified, objSize,
+                           split<>nullInt2,props[iconPassWd]);
+   IF refObj^^.viewMode = spatialView THEN
+      DrawObject(newObj)
+   ELSE BEGIN
+      SortContents(refObj, refObj^^.viewMode);
+      DrawContents(refObj);
+      END;
+   END;
+END;
+
+
+{$S flrDm1 }
+PROCEDURE Pause{* hundredths: INTEGER *};
+VAR now,stopTime: LongInt;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('Pause');
+now := Time;
+stopTime := now + hundredths;
+IF (now < 0) OR (stopTime < 0) THEN EXIT(Pause);
+REPEAT UNTIL Time > StopTime;
+END;
+
+
+
+{$S flrAll }
+PROCEDURE PhotoContents{* obj: ObjectHandle; takePhoto: BOOLEAN *};
+{ creates window manager "pictures" for all descendants of obj}
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+listHead := obj^^.contents;
+son := listHead^^.next;
+WHILE son <> listHead DO
+   BEGIN
+   PhotoObject(son,takePhoto,TRUE);
+   son := son^^.next;
+   END;
+END;
+
+
+{$S flrAll }
+PROCEDURE PhotoObject{* obj: ObjectHandle; takePhoto: BOOLEAN; sonsAlso: BOOLEAN *};
+
+{ Creates or destroys a window manager "picture" for the object.  Pictures enable
+  the window manager to draw the contents of a window that needs refreshing in
+  the context of the current process.  This saves much time compared to sending
+  update events. }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj = nilObject THEN EXIT(PhotoObject);
+IF sonsAlso THEN PhotoContents(obj,takePhoto);
+
+IF obj^^.isOpen THEN
+   IF MyWindow(obj^^.objWindow) THEN
+      BEGIN
+      IF trcFiler THEN WRITELN('PhotoObject',WriteName(obj));
+      IF takePhoto THEN
+         BEGIN
+         WmOpenPicture(obj^^.objWindow);
+         takingPicture := TRUE;   { global flag to disable drawing shortcuts }
+         DrawInsides(obj,FALSE);
+         takingPicture := FALSE;
+         SetPort(Obj^^.objWindow);
+         WmClosePicture;
+         END
+      ELSE
+         WmKillPicture(obj^^.objWindow);
+      END;
+END;
+
+
+
+{$S dmMain }
+PROCEDURE ProcessTheEvent;
+
+{ This is where it all gets started.  Calls the appropriate routines based on the
+  the event kind.  Many of the routines use the variable "activeObject."
+  "activeObject" is a global object handle which points to the object record
+  associated with the active window.  It gets set to the appropriate object
+  record after an activate event and to nilObject after a deactivate event. }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ProcessTheEvent');
+
+IF SkipEvent THEN EXIT(ProcessTheEvent);       { Should this event be ignored? }
+
+IF (curEvent.what <> keyDown) THEN
+   UpdateText;   { Process any queued chars first }
+
+
+CASE curEvent.what OF
+
+   buttonDown:        { Mouse button went down }
+      DoBtnDownEvent;
+
+   buttonUp:          { Mouse button went up }
+      DoBtnUpEvent;
+
+   keyDown:           { A key has been typed }
+         DoKeyDownEvent;
+
+   folderDeactivate:  { The current window is to be deactivated }
+      DoDeactivateEvent;
+
+   folderActivate:    { A window of mine has become active }
+      DoActivateEvent;
+
+   folderUpdate:      { A piece of some window needs refreshing }
+      IF (InDialog) THEN
+         DoDiUpdate
+      ELSE
+         DoUpdateEvent;
+
+   folderMoved:       { A window has moved, adjust to keep scrollbars on screen }
+      DoMovedEvent;
+
+   diedEvent:         { A terminating application has sent this via "ImDying" }
+      BEGIN
+      IF (InDialog) THEN
+         DoDiFinished(FALSE{dont requeue event});
+      FinishTerminating;
+      END; {of CASE ITEM diedEvent}
+
+   abortEvent:        { Apple "." was typed }
+      IF (InDialog) THEN
+         DoDiFinished(FALSE)
+      ELSE
+        DoAbortEvent;
+
+   filerEvent:        { An application is trying to communicate }
+      BEGIN
+      IF (InDialog) THEN
+         DoDiFinished(FALSE);
+      DoFilerEvent;
+      END; {of CASE ITEM filerEvent}
+
+   catalogEvent:      { An application wants catalog info }
+      BEGIN
+      IF (InDialog) THEN
+         DoDiFinished(FALSE);
+      DoCatalogEvent;
+      END; {of CASE ITEM catalogEvent}
+
+   diskEvent:         { disk in/out, mouse unplugged, or power button }
+      BEGIN
+      IF (InDialog) THEN
+         DoDiFinished(FALSE);
+      DoDiskEvent;
+      END; {of CASE ITEM diskEvent}
+
+   OTHERWISE          { Unrecognized event.  Ignore it. }
+      IF dbgFiler THEN
+         WRITELN('Unknown event = ',curEvent.what:1);
+
+   END;
+END; {of PROC ProcessTheEvent}
+
+
+
+{$S flrClose }
+FUNCTION PutBackContents{* obj: ObjectHandle; whichStates: StateSet;
+                                               suspendDocs: BOOLEAN): BOOLEAN *};
+
+{ move all objects matching whichState to their filing home.  Any documents }
+{ are shut down according to "suspendDocs."  Bails out and returns FALSE if any }
+{ document refuses to be putback }
+
+VAR numPutBack: INTEGER;
+    son,nextSon,listHead,homeObj,theObj,putBackHome: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('PutBackContents',WriteName(obj));
+PutBackContents := FALSE;
+listHead := obj^^.contents;
+son := listHead^^.next;
+numPutBack := 0;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF UserAbort THEN EXIT(PutBackContents);
+   nextSon := son^^.next;
+   IF son^^.state IN whichStates THEN
+      BEGIN
+      IF NOT PutBackObject(son,TRUE,suspendDocs,FALSE,homeObj) THEN
+         EXIT(PutBackContents);
+      numPutBack := numPutBack + 1;
+      theObj := son;
+      putBackHome := homeObj;
+      END;
+   son := nextSon;
+   END;
+
+IF (numPutBack = 1) AND (NOT ClickedNewWindow) AND (NOT copyMode) THEN
+   BEGIN
+   IF homeObj^^.isOpen THEN
+      BEGIN
+      MakeObjActive(homeObj);
+      SelectObject(theObj,FALSE);
+      END
+   ELSE
+      BEGIN
+      MakeObjActive(homeObj^^.container);
+      SelectObject(homeObj,FALSE);
+      END
+   END;
+
+PutBackContents := TRUE;
+END;
+
+
+
+{$S flrClose }
+FUNCTION PutBackObject{* obj: ObjectHandle;
+                         sonsAlso: BOOLEAN;
+                         suspendDoc: BOOLEAN;
+                         selectHome: BOOLEAN;
+                         VAR homeObj: ObjectHandle): BOOLEAN *};
+
+{ Returns an object to its filing home.  Closes it first if it's open.  If it's }
+{ a document then it is shut down according to "suspendDoc".  Returns FALSE if a }
+{ document refuses to shut down. }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('PutBackObject',WriteName(obj));
+PutBackObject := FALSE;
+
+IF sonsAlso THEN
+   IF NOT PutBackContents(obj,allStates,suspendDoc) THEN EXIT(PutBackObject);
+
+IF NOT CloseObject(obj,FALSE,TRUE,suspendDoc) THEN EXIT(PutBackObject);
+
+FlushObject(obj);
+WalkHome(obj,homeObj);
+
+IF selectHome AND (NOT ClickedNewWindow) AND (NOT copyMode) THEN
+   BEGIN
+   IF homeObj^^.isOpen THEN
+      BEGIN
+      MakeObjActive(homeObj);
+      SelectObject(obj,FALSE);
+      END
+   ELSE
+      BEGIN
+      MakeObjActive(homeObj^^.container);
+      SelectObject(homeObj,FALSE);
+      END
+   END;
+
+PutBackObject := TRUE;
+END;
+
+
+
+{$S flrCopy }
+PROCEDURE ReferenceIcons {obj: ObjectHandle; whichState: ObjectState};
+VAR docNum: NumberStr;
+    err: INTEGER;
+    iconInfo: TIconRef;
+    iconPrefix: E_Name;
+    listHead: ObjectHandle;
+    son: ObjectHandle;
+    toolNum: NumberStr;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ReferenceIcons');
+
+listHead := obj^^.contents;
+
+{ pictures are used to get passwords, can't do it while creating the scrap picture }
+son := listHead^^.prev;
+WHILE son <> listHead DO
+   BEGIN
+   IF (son^^.state = hilited) AND (son^^.kind IN doctoolSet) THEN
+      IF NOT GetPassword (son^^.volHdl, son^^.catRID, son^^.userPassword) THEN
+         EXIT(ReferenceIcons);
+   son := son^^.prev;
+   END;
+
+{ place references to the selected objects in the scrap }
+StartIconRef (err, filerFolder);
+IF err > 0 THEN EXIT(ReferenceIcons);
+son := listHead^^.prev;
+WHILE son <> listHead DO
+   BEGIN
+   IF (son^^.state = hilited) AND (son^^.kind IN doctoolSet) THEN WITH iconInfo DO
+      BEGIN
+      kind := son^^.kind;
+      userName := son^^.nameHdl^^;
+      password := son^^.userPassword;
+      son^^.userPassword := '';
+      toolID := son^^.toolNumber;
+      IntToStr (son^^.toolNumber, toolNum);
+      IF kind = docKind THEN
+         BEGIN
+         IntToStr (son^^.catRID.uniqueID, docNum);
+         iconPrefix := CONCAT('{D',docNum,'T',toolNum,'}');
+         END
+      ELSE
+         iconPrefix := CONCAT('{T',toolNum,'}');
+      diskName := CONCAT('-',son^^.volHdl^^.devHdl^^.nameHdl^^,'-',iconPrefix);
+      IF trcFiler THEN WITH iconInfo DO
+         WRITELN('  adding ref for ',userName,' - ',diskName,', kind is ',kind:1);
+      AddIconRef (iconInfo);
+      END;
+   son := son^^.prev;
+   END;
+
+EndIconRef;
+END;
+
+
+
+{$S flrOpen  }
+PROCEDURE RemoveWindow{* obj: ObjectHandle; destroyIt: BOOLEAN *};
+{ Disposes of the window structures, handles special cases }
+VAR window,toBeActive: WindowPtr;
+    evHandle: EventHandle;
+    inControlChain: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('RemoveWindow',WriteName(obj));
+window := obj^^.objWindow;
+IF window = NIL THEN EXIT(RemoveWindow);
+
+  { scan the event queue checking for any activate/deactivates for this window,
+    recording the last one found }
+
+inControlChain := FALSE;
+
+evHandle := FirstEvent;
+WHILE evHandle <> NIL DO
+   BEGIN
+   IF evHandle^^.what = folderActivate THEN
+      BEGIN
+      toBeActive := evHandle^^.who;
+      IF evHandle^^.who = window THEN
+         inControlChain := TRUE;
+      END
+   ELSE IF evHandle^^.what = folderDeactivate THEN
+      BEGIN
+      toBeActive := evHandle^^.fromFolder;
+      IF (evHandle^^.who = window) OR (toBeActive = window) THEN
+         inControlChain := TRUE;
+      END;
+   evHandle := NextEvent(evHandle);
+   END;
+
+   { Destroy the window }
+
+IF destroyIt THEN DisposeFolder(window) ELSE HideFolder(window);
+
+   { Next, handle the horrible case in which this window is involved in some
+     sequence of activate aheads, i.e., user clicked ahead on other windows.
+     The fix for today is to flush all of the typeahead and to make the last
+     window clicked in become active (except if the last one was the one being
+     killed).
+   }
+
+IF inControlChain THEN
+   BEGIN
+   FlushTypeAhead(TRUE);                   { purge all activate aheads }
+   IF toBeActive = window THEN
+      toBeActive := filerFolder;
+   IF activeFolder = NIL THEN
+      WMStartDoc(toBeActive)               { just send activate to him }
+   ELSE
+      MakeFldrActive(toBeActive,whyNot);   { send deact to current active }
+   END;
+
+WITH obj^^ DO
+   BEGIN
+   isOpen := FALSE;
+   IF destroyIt THEN
+      BEGIN
+      objWindow := NIL;
+      wasOpened := FALSE;
+      END;
+   END;
+END;
+
+
+
+{$S flrDskOut }
+PROCEDURE RepairDisk{* diskObj: ObjectHandle *};
+{ Scavenges a disk }
+VAR err: INTEGER;
+    catRec: TcatRec;
+    deviceType: Tdevice;
+    deviceName: FMaxStr;
+    devHdl,newVolHdl: TentryHdl;
+    iconName: FMaxStr;
+    newName: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('RepairDisk',WriteName(diskObj));
+IF NOT (diskObj^^.kind IN diskSet) THEN EXIT(RepairDisk);
+
+devHdl := diskObj^^.volHdl^^.devHdl;
+WITH devHdl^^ DO
+   BEGIN
+   deviceName := userNmHdl^^;
+   deviceType := device;
+   END;
+
+IF diskObj^^.volHdl = bootVol THEN
+   BEGIN
+   ParamAlert(deviceName,'','');
+   StopAlert(flrAlert,113);   { Can't repair boot disk ... (for now) }
+   EXIT(RepairDisk);
+   END;
+
+
+IF NOT CleanUpDisk(diskObj,FALSE) THEN EXIT(RepairDisk);
+
+newName := ForeignDisk(diskObj);
+
+{ must unmount disk to run the scavenger }
+IF NOT UnmountAvolume(deviceType,FALSE {don't eject},FALSE,FALSE,221) THEN
+   BEGIN
+   EndWaitAlert;
+   EXIT(RepairDisk);
+   END;
+
+RepairVol(err,deviceType,newVolHdl);
+diskObj^^.volHdl := newVolHdl;
+diskObj^^.dirty  := TRUE;  { ensure that screen name will match catalog name }
+
+IF err > 0 THEN
+   BEGIN   { failed.  Remove disk icon and eject the disk }
+   KillObject(diskObj,TRUE,TRUE);
+   devHdl^^.objHdl := ORD(NIL);   { invalidate hdl to object }
+   DismountVol(deviceType,TRUE {eject},TRUE {resumeDocs});
+   EXIT(RepairDisk);
+   END;
+
+IF diskObj^^.volHdl^^.volState = sMounted THEN DrawTheIcon(diskObj);
+
+IF newName THEN
+   BEGIN
+   iconName := '';
+   IF (err <= 0) THEN    { change icon name if it was a foreign disk }
+      BEGIN
+      GetCatRec(err,newVolHdl,diskCatRID,catRec);
+      IF err <= 0 THEN
+         BEGIN
+         ExtObjName(catRec,iconName);
+         ChangeName(diskObj,iconName);
+         END;
+      END
+   ELSE
+      BEGIN
+      newVolHdl^^.volState := sBadCatalog;
+      iconName := '';             { Get alert from 756 if icon to be named }
+      ChangeName(diskObj,iconName);
+      END;
+   END;
+
+EndWaitAlert;
+END;
+
+
+{$S flrCat }
+FUNCTION RestoreDesktop{* whichVol: TentryHdl; newDisk: BOOLEAN;
+                          VAR diskObj: ObjectHandle): BOOLEAN *};
+{ restores desktop to state last saved }
+{ if newDisk is true, a disk object is created and its handle returned }
+{ leaves save file open, so that O/S will give error on open if we crash }
+VAR saveFile: PathName;
+    refnum: INTEGER;
+    saveRec: SaveStateRec;
+    recID: TcatRID;
+    err,schedErr: INTEGER;
+    objName: FMaxStr;
+    catRec: TcatRec;
+
+
+   PROCEDURE CantRestore;
+   BEGIN
+   ParamAlert(whichVol^^.devHdl^^.userNmHdl^^,'','');
+   NoteAlert(flrAlert,114);   { Unable to restore desktop ...}
+   UpdateAll;                 { repaint under alert box }
+   END;
+
+
+   PROCEDURE MakeSysObject(id: IdType; kind: ObjectKind; VAR obj: ObjectHandle);
+   { used to create predefined objects. e.g., disks, scrap, trash, etc. }
+   VAR pt: Point;
+       overlap: BOOLEAN;
+       oldDiskObj: ObjectHandle;
+   BEGIN
+   IF trcFiler THEN WRITELN('MakeSysObject');
+   recId.fatherId := idNil;
+   recId.uniqueId := id;
+   GetCatRec(err,whichVol,recId,catRec);
+
+   IF err <= 0 THEN
+      ExtObjName(catRec,objName)
+   ELSE
+      BEGIN   { couldn't fetch record for sys object, choose appropriate values }
+      catRec := blankCatRec;
+      WITH catRec DO
+         BEGIN
+         parentId := idNil;
+         selfId   := id;
+         objKind  := kind;
+         toolId   := deskTool;
+         IF id = idComputer THEN        { name can't be changed }
+            BEGIN
+            GetDefName(kind,objName);
+            toolId := configTool;
+            END
+         ELSE
+            IF (kind  IN diskSet) THEN
+               BEGIN
+               catRec.objKind := whichVol^^.devHdl^^.devKind;
+               IF (whichVol^^.volState <> sMounted) THEN objName := ''; { foreign disk, no catalog }
+               END
+            ELSE
+               GetString(755,@objName);    { "Unknown" }
+         InsObjName(catRec,objName);
+         END;
+      AddCatRec(err,whichVol,catRec,FALSE,recID);
+      END;
+
+   IF id = idDisk
+   THEN catRec.objKind := whichVol^^.devHdl^^.devKind
+   ELSE IF id = idComputer THEN
+      CASE thisMachine OF
+         lisa1: catRec.objKind := computerKind;
+         pepsi: catRec.objKind := comp2Kind;
+         END;
+
+   WITH catRec DO
+      obj := MakeObject(deskObject,objName,objKind,toolId,closedPt,openRect,
+                        normal,view,whichVol,recId,created,modified,objSize,
+                        split<>nullInt2,props[iconPassWd]);
+   IF obj = NIL THEN EXIT(RestoreDesktop);  { no heap space, bail out }
+
+   CheckObject(obj);
+
+   IF id = idDisk THEN whichVol^^.devHdl^^.objHdl := ORD(obj);  { record obj hdl in device entry }
+
+   DrawObject(obj);
+   AdjustObject(diskObj,TRUE);  { move to non-overlapping position }
+   END;
+
+
+   FUNCTION ReadContents(father: ObjectHandle): BOOLEAN;
+
+   { recursively restores desktop for "whichVol".  Returns TRUE if successful }
+
+   LABEL 1, 33;
+   VAR err: INTEGER;
+       son: ObjectHandle;
+       catRec: TcatRec;
+       objName: FmaxStr;
+       bytesRead: LongInt;
+       changed,createObj: BOOLEAN;
+   BEGIN
+   IF trcFiler THEN WRITELN('ReadContents',WriteName(father));
+   ReadContents := FALSE;
+
+   REPEAT
+   33:
+      Sched_Class(schedErr,FALSE);   { go preemptive, to allow background work }
+      Read_Data(err,refnum,ORD(@saveRec),SIZEOF(saveRec),bytesRead,sequential,0);
+      Sched_Class(schedErr,TRUE);
+
+      IF err > 0 THEN EXIT(ReadContents);
+
+      IF trcFiler THEN WITH saveRec DO
+         WRITELN(recID.fatherID,recID.uniqueID,deskLoc.h,deskLoc.v,openFlag,
+                 filedFlag);
+
+      IF saveRec.recID.fatherID = -1 THEN GOTO 1;   { end of file }
+
+      IF (saveRec.recID.uniqueID <= idComputer)     { if this is a system object... }
+      AND (saveRec.recID.uniqueID <> idDisk)        { but not a disk                }
+      AND (whichVol <> bootVol)                     { and not on the boot disk...   }
+      THEN GOTO 33;                                 { ...THEN ignore it             }
+
+      CheckLoc(deskObject,saveRec.deskLoc,changed); { make sure its on the desk }
+
+      { is it already on the desktop? }
+      son := SearchContents(deskObject,whichVol,saveRec.recID.uniqueID,TRUE,TRUE);
+
+      createObj := (son = nilObject);
+      IF createObj THEN   { create the object }
+         BEGIN
+         GetCatRec(err,whichVol,saveRec.recID,catRec);
+         IF err <> 0 THEN GOTO 33;                  { object may be gone }
+
+         WITH catRec DO
+            BEGIN
+            ExtObjName(catRec,objName);
+            recId.fatherId := parentId;
+            recId.uniqueId := selfId;
+            son := MakeObject(deskObject,objName,objKind,toolId,closedPt,openRect,
+                             normal,view,whichVol,recID,created,modified,objSize,
+                             split<>nullInt2,props[iconPassWd]);
+            IF son = NIL THEN EXIT(ReadContents);  { out of heap }
+            son^^.loc := saveRec.deskLoc;
+            END;
+         END;
+
+      IF changed THEN son^^.dirty := TRUE;
+      IF NOT saveRec.filedFlag THEN
+         BEGIN
+         IF NOT UnfileObject(son,saveRec.deskLoc) THEN
+            BEGIN
+            IF createObj THEN KillObject(son,TRUE,FALSE);  { back out }
+            GOTO 33;
+            END;
+         AdjustObject(son,TRUE);  { move to non-overlapping position }
+         END;
+
+      IF saveRec.openFlag THEN
+         IF OpenObject(son,FALSE) THEN
+            BEGIN
+            IF son^^.kind IN docToolSet THEN HideScroll(son); { draw border }
+            END
+         ELSE
+            GOTO 33;
+
+      IF NOT ReadContents(son) THEN EXIT(ReadContents);
+   UNTIL FALSE;
+
+   1: IF trcFiler THEN WRITELN('   exit ReadContents');
+   ReadContents := TRUE;
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('RestoreDesktop');
+RestoreDesktop := FALSE;
+IF whichVol = NIL THEN EXIT(RestoreDesktop);
+
+IF newDisk THEN
+   BEGIN
+
+   { display the disk object }
+   MakeSysObject(idDisk,whichVol^^.devHdl^^.devKind,diskObj);
+
+   { check for foreign disk }
+   IF whichVol^^.volState <> sMounted THEN
+      BEGIN
+      RestoreDesktop := TRUE;
+      EXIT (RestoreDesktop);
+      END;
+
+   { If this is the boot volume then display the "system" objects }
+   IF whichVol = bootVol THEN
+      BEGIN
+      MakeSysObject(idScrap,clipBdKind,scrapObject);
+      scrapObject^^.objWindow := scrapFolder;   { scrap window was created by W/M }
+      GetObjTitle(scrapObject,FALSE,objName);
+      SetFldrTitle(scrapFolder,objName);
+      MakeSysObject(idTrash,trashKind,trashObject);
+      MakeSysObject(idComputer,computerKind,configObject);
+
+      {$IFC network }
+      MakeSysObject(idInBox,inBox1Kind,inBoxObject);
+      MakeSysObject(idOutBox,outBox1Kind,outBoxObject);
+      {$ENDC }
+      END;
+   END;
+
+IF NOT whichVol^^.catOpen THEN EXIT(RestoreDesktop);
+saveFile := CONCAT('-',whichVol^^.devHdl^^.nameHdl^^,'-',desktopFile);
+
+Open(err,saveFile,refnum,[dRead,dWrite]);
+IF trcFiler THEN WRITELN('   opening "',saveFile,'" err = ',err:1);
+IF err <= 0 THEN
+   BEGIN
+   whichVol^^.saveRefNum := refnum;
+   IF NOT ReadContents(deskObject) THEN CantRestore;
+   UpdateObject(diskObj,FALSE);   { erase any ghost images for unfiled objects }
+   END
+ELSE
+   BEGIN
+   refNum := noFile;   { file was not opened }
+   { If file doesn't exist then assume new disk, don't give error message }
+   IF err <> 948 {not found} THEN
+      BEGIN
+      IF dbgFiler THEN IF err > 0 THEN
+         WRITELN('Error opening "',saveFile,'" OS err: ',err:1);
+      CantRestore;
+      END;
+   END;
+
+{ update the trashcan display if it is open }
+IF trashObject^^.isOpen AND (whichVol <> bootVol) THEN
+   BEGIN
+   trashObject^^.volHdl := whichVol;
+   IF GenContents(trashObj) THEN;     { add trash from this volume to the list }
+   trashObject^^.volHdl := bootVol;
+   DrawContents(trashObject);
+   END;
+
+RestoreDesktop := TRUE;
+END;
+
+
+
+{$S flrDm }
+FUNCTION  RoomForContents{* obj: ObjectHandle; whichState: ObjectState;
+                            volHdl: TentryHdl; VAR failVol: TentryHdl): BOOLEAN *};
+
+{ Returns TRUE if contents of "obj" in "whichState" fit on the given vol
+  volHdl = NIL => check same vol as son (used when copying objects on desktop)
+  Returns FALSE if insufficient space or if user pushes abort.  If insufficient
+  space then "failVol" contains the volume with insufficient space. }
+
+VAR son,listHead: ObjectHandle;
+    whichVol: TentryHdl;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('RoomForContents',WriteName(obj));
+RoomForContents := FALSE;
+
+listHead := obj^^.contents;
+son      := listHead^^.next;
+whichVol := volHdl;
+failVol  := NIL;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF UserAbort THEN EXIT(RoomForContents);
+   IF son^^.state = whichState THEN
+      BEGIN
+      IF volHdl = NIL THEN whichVol := son^^.volHdl;
+      IF NOT RoomForObject(son,whichVol) THEN
+         BEGIN
+         failVol := whichVol;
+         EXIT(RoomForContents);
+         END;
+      END;
+   son := son^^.next;
+   END;
+
+RoomForContents := TRUE;
+END;
+
+
+
+{$S flrDm }
+FUNCTION  RoomForObject{* obj: ObjectHandle; volHdl: TentryHdl): BOOLEAN *};
+{ returns TRUE if object (and filed descendants) will fit on the given volume }
+VAR devInfo: Fs_Info;
+    devName: Pathname;
+    devHdl: TentryHdl;
+    size,blocksNeeded: LongInt;
+    err: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('RoomForObject',WriteName(obj));
+RoomForObject := TRUE;
+
+   { Check if object is already on the volume }
+IF (obj^^.volHdl = volHdl) AND (NOT obj^^.toBeCopied) THEN EXIT(RoomForObject);
+
+   { get the size of the object }
+size := obj^^.size;
+IF IsContainer(obj) THEN size := size - UnfiledSize(obj);
+
+   { get the disk free space count }
+devHdl := volHdl^^.devHdl;
+devName := CONCAT('-',devHdl^^.nameHdl^^);
+Lookup(err,devName,devInfo);
+IF ErrorFound(warnError,-1019,err,devHdl) THEN EXIT(RoomForObject);
+
+   { If not enough room then try to free enough }
+IF size > devInfo.freeCount THEN
+   BEGIN
+   blocksNeeded := size - devInfo.freeCount;
+   RoomForObject := (ReclaimDiskSpace(volHdl,blocksNeeded) >= blocksNeeded);
+   END;
+
+IF trcFiler THEN WRITELN('   objSize:',size:1,'  freeSpace:',devInfo.freeCount:1);
+END;
+
+
+
+{$S flrClose }
+PROCEDURE SaveDesktop{* diskObj: ObjectHandle *};
+{ records the desktop state for all objects on the given volume }
+VAR saveFile: PathName;
+    err,schedErr,closeErr,refnum: INTEGER;
+    whichVol: TentryHdl;
+    saveRec: SaveStateRec;
+    bytesWritten: LongInt;
+
+
+   PROCEDURE CantSave;
+   BEGIN
+   IF dbgFiler THEN WRITELN('   O/S err: ',err:1);
+   ParamAlert(whichVol^^.devHdl^^.userNmHdl^^,'','');
+   NoteAlert(flrAlert,115);   { Unable to save desktop ...}
+   UpdateAll;                 { repaint under alert box }
+   END;
+
+
+   FUNCTION WriteContents(father: ObjectHandle): BOOLEAN;
+   { recursively writes out the desktop state for "whichVol" }
+   VAR son,listHead: ObjectHandle;
+       isFiled: BOOLEAN;
+   BEGIN
+   IF trcFiler THEN WRITELN('WriteContents',WriteName(father));
+   WriteContents := FALSE;
+   listHead := father^^.contents;
+   son := listHead^^.prev;
+
+   WHILE son <> listHead DO
+      BEGIN
+      isFiled := IsFather(son,father);
+      IF (son^^.volHdl = whichVol) AND (son^^.isOpen OR NOT isFiled) THEN
+         BEGIN
+         FlushObject(son);
+         WITH saveRec,son^^ DO
+            BEGIN
+            recID     := catRID;
+            deskLoc   := loc;
+            openFlag  := isOpen;
+            filedFlag := isfiled;
+            END;
+
+         Sched_Class(schedErr,FALSE);  { go preemptive, to allow background work }
+         Write_Data(err,refNum,ORD(@saveRec),SIZEOF(saveRec),bytesWritten,
+                    sequential,0);
+         Sched_Class(schedErr,TRUE);   { back to nopreemptive class }
+         IF err > 0 THEN EXIT(WriteContents);
+
+         IF trcFiler THEN WITH saveRec DO
+            WRITELN(recID.fatherID,recID.uniqueID,deskLoc.h,deskLoc.v,openFlag,
+                    filedFlag);
+
+         IF NOT WriteContents(son) THEN EXIT(WriteContents);
+         END;
+      son := son^^.prev;
+      END;
+
+   { terminate the list }
+   saveRec.recID.fatherID := -1;
+   Write_Data(err,refNum,ORD(@saveRec),SIZEOF(saveRec),bytesWritten,sequential,0);
+   IF err <> 0 THEN EXIT(WriteContents);
+
+   WriteContents := TRUE;
+   IF trcFiler THEN WRITELN('  exit WriteContents');
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SaveDeskTop',WriteName(diskObj));
+whichVol := diskObj^^.volHdl;
+IF whichVol = NIL THEN EXIT(SaveDesktop);
+IF whichVol^^.volState <> sMounted THEN EXIT (SaveDesktop);
+
+saveFile := CONCAT('-',whichVol^^.devHdl^^.nameHdl^^,'-',desktopFile);
+refNum   := whichVol^^.saveRefNum;   { get the refnum saved at restore time }
+
+IF refNum = noFile THEN
+   BEGIN
+   Open(err,saveFile,refnum,[dWrite]);
+   IF err = 948 { file doesn't exist } THEN
+      BEGIN
+      Make_File(err,saveFile,0);
+      IF err = 0 THEN Open(err,saveFile,refnum,[dWrite]);
+      END;
+   END
+ELSE
+   BEGIN     { position to start of already opened save file }
+   Write_Data(err,refNum,ORD(@saveRec),0,bytesWritten,absolute,0);
+   END;
+
+IF err <= 0 THEN   { file is open and ready to write }
+   BEGIN
+   ObjToBack(diskObj);   { ensure that disk object is written out first }
+   IF NOT WriteContents(deskObject) THEN CantSave;
+   IF err > 0 THEN Kill_Object(err,saveFile);
+   Truncate(err,refnum);
+   Close_Object(err,refnum);
+   END
+ELSE
+   BEGIN
+   IF dbgFiler THEN WRITELN('Error opening "',saveFile,'" = ',err:1);
+   CantSave;
+   END;
+
+IF diskObj^^.state = hilited THEN ObjToFront(diskObj,FALSE);
+whichVol^^.saveRefNum := noFile;
+END;
+
+
+
+{$S dmMain }
+FUNCTION ScrapIsText{: BOOLEAN};
+{ returns TRUE if the scrap contains text (only kind Desk can paste) }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+ScrapIsText := (scrapFE IN currScrapSet) OR (scrapCs IN currScrapSet);
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE ScrollContents{* obj: ObjectHandle; dh,dv,minH,minV,maxH,maxV: INTEGER;
+                           adjustThumb: BOOLEAN *};
+{ scrolls the window of the given object dh or dv pixels within the bounds given }
+{ positions the thumb if "adjustThumb" is TRUE }
+VAR window: WindowPtr;
+    contentRect,hRect,vRect: Rect;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ScrollContents  dh: ',dh:1,' dv: ',dv:1,
+                                        ' maxH: ',maxH:1,' maxV: ',maxV:1);
+   { determine bits to be scrolled }
+
+GetContentRect(obj,contentRect);
+WITH contentRect DO
+   BEGIN
+   { adjust dh,dv to boundaries }
+   IF dh < 0 THEN
+      BEGIN
+      IF right >= maxH THEN dh := 0 ELSE dh := Max(dh,right-maxH);
+      END
+   ELSE IF dh > 0 THEN
+      BEGIN
+      IF left <= minH  THEN dh := 0 ELSE  dh := Min(dh,left-minH);
+      END;
+
+   IF dv < 0 THEN
+      BEGIN
+      IF bottom >= maxV THEN dv := 0 ELSE dv := Max(dv,bottom-maxV);
+      END
+   ELSE IF dv > 0 THEN
+      BEGIN
+      IF top <= minV THEN dv := 0 ELSE dv := Min(dv,top-minV);
+      END;
+   END;
+
+
+IF obj^^.viewMode <> spatialView THEN
+   IF dv <> 0 THEN
+      dv := (dv DIV lineHt)*lineHt  { constrain to line boundaries }
+   ELSE
+      contentRect.top := contentRect.top - lineHt+1;  { allow titles to scroll }
+
+IF trcFiler THEN WRITELN('  adjusted dh: ',dh:1,' dv: ',dv:1);
+IF (dh = 0) AND (dv = 0) THEN EXIT(ScrollContents);
+
+GetPort(savePort);
+window := obj^^.objWindow;
+
+SetPort(window);
+ClipRect(contentRect);
+
+ScrollRect(contentRect,dh,dv,scrollRgn);
+
+WITH window^.portRect DO
+   SetOrigin(left-dh,top-dv);  { changes portRect }
+
+WITH obj^^,window^.portRect DO
+   BEGIN
+   scrollDh := left;
+   scrollDv := top;
+   END;
+
+OffsetRgn(scrollRgn,-dh,-dv);
+InvalidateRgn(window,scrollRgn);
+
+BeginUpdate(window);
+DrawContents(obj);
+EndUpdate(window);
+
+
+{ determine thumb position }
+IF adjustThumb THEN
+   BEGIN    { compute thumb position with content origin set }
+   IF dh <> 0 THEN obj^^.hThumbPos := ThumbHpos(obj,minH,maxH);
+   IF dv <> 0 THEN obj^^.vThumbPos := ThumbVpos(obj,minV,maxV);
+
+   IF obj = activeObject THEN
+      BEGIN
+      ScrollEnvironment(obj);
+      IF dh <> 0 THEN
+         BEGIN
+         SetUpMvThumb(hsbH);
+         MoveThumb(obj^^.hThumbPos);
+         END;
+      IF dv <> 0 THEN
+         BEGIN
+         SetUpMvThumb(hsbV);
+         MoveThumb(obj^^.vThumbPos);
+         END;
+      NormalEnvironment(obj);
+      END;
+   END;
+
+SetPort(savePort);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ScrollEnvironment{* obj: ObjectHandle *};
+{ sets port, origin, and clipping for scroll bar library routines }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+SetPort(obj^^.objWindow);
+SetOrigin(0,0);
+ClipRect(obj^^.objWindow^.portRect);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ScrollLimits{* obj: ObjectHandle;
+                         VAR minH,minV,maxH,maxV: INTEGER *};
+{ returns scrolling limits for a container.  Spatial view limits are determined }
+{ by the objects farthest to the right and bottom }
+VAR listHead,son: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ScrollLimits',WriteName(obj));
+minH := 0;
+minV := 0;
+
+IF obj^^.viewMode = spatialView THEN
+   BEGIN
+   maxH := 0;
+   maxV := 0;
+   listHead := obj^^.contents;
+   son := listHead^^.next;
+
+   WHILE son <> listHead DO
+      BEGIN
+      WITH son^^.loc DO
+         BEGIN
+         IF h > maxH THEN maxH := h;
+         IF v > maxV THEN maxV := v;
+         END;
+      son := son^^.next;
+      END;
+
+   { add a little extra }
+   maxH := maxH + 3*iconWidth;
+   maxV := maxV + 3*iconHt;
+   END
+ELSE
+   BEGIN
+   minV := minV + lineHt;  { adjust for column titles }
+   maxH := creatEnd + 20;
+   maxV := (CountContents(obj)+3)*lineHt;
+   END;
+END;
+
+
+
+{$S flrDm1 }
+PROCEDURE ScrollToRect{* obj: ObjectHandle; r: Rect *};
+
+{ Tries to scroll the content of "obj" so that "r" is visible.
+  Scrolls minimum number of pixels }
+
+LABEL 1,2;
+VAR c: Rect;
+    dTop,dBottom,dLeft,dRight,dh,dv,minH,minV,maxH,maxV: INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WITH r DO WRITELN('ScrollToRect.  r = ',left,top,right,bottom);
+IF obj = deskObject THEN EXIT(ScrollToRect);
+
+UpdateObject(obj,FALSE);  { ensure that window is updated before scrolling }
+GetContentRect(obj,c);
+dh := 0;
+dv := 0;
+
+   { determine vertical scroll }
+
+dTop    := c.top - r.top;
+dBottom := c.bottom - r.bottom;
+
+IF (dTop <= 0) AND (dBottom >= 0) THEN GOTO 1;   { c contains r }
+IF (dTop >= 0) AND (dBottom <= 0) THEN GOTO 1;   { r contains c }
+
+IF dTop >= 0 THEN
+   dv := MIN(dTop,dBottom)
+ELSE
+   dv := MAX(dTop,dBottom);
+
+IF obj^^.viewMode <> spatialView THEN
+   IF dv < 0 THEN
+      dv := ((dv - lineHt + 1) DIV lineHt)*lineHt;  { round to next line }
+
+1:
+
+   { determine horizontal scroll }
+
+dLeft  := c.left - r.left;
+dRight := c.right - r.right;
+
+IF (dLeft >= 0) AND (dRight <= 0) THEN GOTO 2;   { c contains r }
+IF (dLeft <= 0) AND (dRight >= 0) THEN GOTO 2;   { r contains c }
+
+IF dLeft >= 0 THEN
+   dh := MIN(dLeft,dRight)
+ELSE
+   dh := MAX(dLeft,dRight);
+
+2:
+
+IF (dh = 0) AND (dv = 0) THEN EXIT(ScrollToRect);
+
+   { scroll the window }
+
+ScrollLimits(obj,minH,minV,maxH,maxV);     { determine scroll limits }
+ScrollContents(obj,dh,dv,minH,minV,maxH,maxV,TRUE);
+END;
+
+
+
+{$S flrDm1 }
+FUNCTION SearchContents{* obj: ObjectHandle; hVol: TentryHdl; id: IDType;
+                              skipPlaceHolder,sonsAlso: BOOLEAN): ObjectHandle *};
+{ returns handle of descendant that has given values }
+LABEL 1;
+VAR son,listHead,result: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SearchContents',WriteName(obj));
+listHead := obj^^.contents;
+son := listHead^^.next;
+WHILE son <> listHead DO
+   BEGIN
+   result := SearchObject(son,hVol,id,skipPlaceHolder,sonsAlso);
+   IF result = nilObject THEN
+      son := son^^.next
+   ELSE
+      GOTO 1;
+   END;
+
+result := nilObject;
+1:
+SearchContents := result;
+END;
+
+
+
+{$S flrDm1 }
+FUNCTION SearchObject{* obj: ObjectHandle; hVol: TentryHdl; id: IDType;
+                              skipPlaceHolder,sonsAlso: BOOLEAN): ObjectHandle *};
+{ returns handle of obj or descendant that has given values }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SearchObject',WriteName(obj));
+WITH obj^^ DO
+  IF id = catRID.uniqueID THEN
+     IF (hVol = volHdl) OR (id = idTrash)THEN
+        IF (state <> placeHolder) OR
+          ((state = placeHolder) AND NOT skipPlaceHolder) THEN
+           BEGIN
+           SearchObject := obj;
+           EXIT(SearchObject);
+           END;
+
+IF sonsAlso THEN
+  SearchObject := SearchContents(obj,hVol,id,skipPlaceHolder,sonsAlso)
+ELSE
+  SearchObject := nilObject;
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE SelAllObjects{* container: ObjectHandle *};
+{ selects all objects in a container }
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SelAllObjects',WriteName(container));
+EndEdit;
+listHead := container^^.contents;
+son := listHead^^.prev;
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state = normal THEN
+      BEGIN
+      son^^.state := hilited;
+      DrawObject(son);
+      END;
+   son := son^^.prev;
+   END;
+AutoScroll(container,hilited);   { make the selection visible };
+END;
+
+
+
+{$S flrAll }
+PROCEDURE SelectContents{* obj: ObjectHandle; groupRect: Rect *};
+
+{ toggle selection state of all objects within groupRect,   }
+{ bring all selected objects to the front, and redraw as necessary }
+
+VAR son,prevSon,listHead,lastObject,topObject: ObjectHandle;
+    midPt: Point;
+    inRect,reDraw:  BOOLEAN;
+    partial:      BOOLEAN;
+    tallyCount:   INTEGER;   { how many things are selected }
+    tallySet:     KindSet;   { what kinds are selected }
+    tallyBBox,iconRect:    Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SelectContents',WriteName(obj));
+
+listHead := obj^^.contents;
+lastObject := listHead^^.next;
+son := listHead;
+prevSon := son^^.prev;
+
+WHILE son <> lastObject DO
+   BEGIN
+   son := prevSon;
+   prevSon := son^^.prev;
+
+   IF son^^.state IN [normal,hilited] THEN
+      BEGIN
+      GetIconRect(son,iconRect);
+      WITH son^^ DO
+         BEGIN
+         WITH iconRect DO
+            BEGIN
+            midPt.h := loc.h + left + ((right - left) DIV 2);
+            midPt.v := loc.v + top  + ((bottom - top) DIV 2);
+            END;
+
+         inRect := PtInRect(midPt,groupRect);
+         reDraw := inRect OR (state=hilited);
+
+         IF inRect THEN   { toggle selection state }
+            BEGIN
+            IF state = hilited THEN state := normal
+            ELSE IF state = normal THEN state := hilited;
+            END;
+
+         IF state = hilited THEN ObjToFront(son,FALSE);  { bring to front }
+         END;
+
+      IF reDraw THEN DrawObject(son);
+      END;
+   END;
+
+{ scan the selection }
+TallyContents(obj,hilited,FALSE,partial,tallyCount,tallySet,tallyBBox,topObject);
+IF tallyCount = 1 THEN SelectName(topObject,FALSE);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE SelectName{* obj: ObjectHandle; hitName: BOOLEAN *};
+{ Sets up name for editing }
+VAR savePort: GrafPtr;
+    dataPtr: PtrData;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SelectName',WriteName(obj));
+IF obj = editObject THEN EXIT(SelectName);       { already being edited }
+IF obj^^.toBeCopied THEN EXIT(Selectname);       { can't name until created }
+
+{ make sure screen is current now, in case of type-ahead }
+UpdateObject(obj^^.container,FALSE);
+
+{ Set up pointer to duplicate name if any }
+IF obj^^.container = deskObject THEN     { On desktop.  Look for placeholder }
+   edit2Object := GetPlaceHolder(obj)
+ELSE IF obj^^.state = placeHolder THEN   { This is a placeholder.  Look on desktop}
+   edit2Object :=
+      SearchContents(deskObject,obj^^.volHdl,obj^^.catRID.uniqueId,TRUE,FALSE)
+ELSE
+   edit2Object := nilObject;
+
+EndEdit;  { terminate editing of current field }
+
+{ copy name into field structure }
+WITH hCurFld^^ DO
+   BEGIN
+   curLen := LENGTH(obj^^.nameHdl^^);
+   coords := obj^^.nameRect;
+   protect := (obj^^.kind IN [toolKind,calcKind,clockKind,computerKind,comp2Kind]);
+   dataPtr := @obj^^.nameHdl^^;
+   {$R-}
+   MoveLeft(dataPtr^[1],curValue^^,curLen);
+
+   {$IFC flrDebug }
+      {$R+}
+   {$ENDC }
+
+   IF InSpatialView(obj) THEN
+      BEGIN
+      align := center;
+      fmtInfo^^[0].font := iconNamFont;
+      END
+   ELSE
+      BEGIN
+      align := left;
+      fmtInfo^^[0].font := listFont;
+      END;
+   END;
+
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+
+ClipName(obj);
+InitFstate(hCurFld,hCurFstate);
+SelectAll(hCurFld,hCurFstate,timeoutInterval);
+IF hCurFld^^.curLen = 0 THEN
+   HilightSel(hCurFld,hCurFstate,FALSE);   { disable caret if no name }
+
+IF hitName THEN      { buttoned down in name }
+   BEGIN
+   ObscureCursor;    { hide the cursor }
+   clickCount := 0;  { reset so that second click doesn't cause word select }
+   END;
+
+editObject := obj;
+
+GetStrg(obj^^.nameHdl,prevName);
+SetTimeout(noTimeout);
+
+SetPort(savePort);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE SelectObject{* obj: ObjectHandle; hitName: BOOLEAN *};
+{ de-selects all, selects new object, selects name for editing }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SelectObject',WriteName(obj));
+ChangeContents(obj^^.container,hilited,normal,0,0,TRUE);  { de-select all }
+
+IF obj^^.state = normal THEN
+   obj^^.state := hilited;
+
+ObjToFront(obj,TRUE);   { selected objects move to front }
+
+SelectName(obj,hitName);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE SetAttributes{* obj: ObjectHandle; VAR changed: BOOLEAN *};
+{ recomputes object attributes that may have changed.  Returns TRUE if change }
+VAR devPathName: PathName;
+    devInfo: Fs_Info;
+    catRec: TcatRec;
+    err: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SetAttributes',WriteName(obj));
+changed := FALSE;
+
+IF obj^^.kind IN diskSet THEN
+   BEGIN
+   devPathName := CONCAT('-',obj^^.volHdl^^.devHdl^^.nameHdl^^);
+   LookUp(err,devPathName,devInfo);
+   IF NOT ErrorFound(warnError,1024,err,obj^^.volHdl^^.devHdl) THEN WITH obj^^ DO
+      BEGIN
+      changed := (freeSpace <> devInfo.freeCount) OR
+                 (size <> devInfo.fs_size) OR
+                 (backedUp <> devInfo.DTVB);
+      freeSpace := devInfo.freeCount;
+      size      := devInfo.fs_size;
+      backedup  := devInfo.DTVB;
+      END;
+   END
+ELSE
+   BEGIN
+   GetCatRec(err,obj^^.volHdl,obj^^.catRID,catRec);
+   IF NOT ErrorFound(warnError,1023,err,obj^^.volHdl^^.devHdl) THEN WITH obj^^ DO
+      BEGIN
+      changed := (size <> catRec.objSize) OR (created <> catRec.created) OR
+                 (modified <> catRec.modified);
+      size     := catRec.objSize;
+      created  := catRec.created;
+      modified := catRec.modified;
+      END;
+   END;
+
+IF trcFiler THEN WRITELN('   changed = ',changed);
+END;
+
+
+
+{$S flrMisc }
+PROCEDURE SetHomePt{* obj: ObjectHandle; pt: Point *};
+{ records spatial location in catalog }
+VAR err: INTEGER;
+    theVol: TentryHdl;
+    theRID: TcatRID;
+    catRec: TcatRec;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SetHomePt',WriteName(obj));
+WITH obj^^ DO
+   BEGIN
+   theVol := volHdl;
+   theRID := catRID;
+   END;
+
+GetCatRec(err,theVol,theRID,catRec);
+IF ErrorFound(warnError,1010,err,theVol^^.devHdl) THEN EXIT(SetHomePt);
+
+catRec.closedPt := pt;
+UpdCatRec(err,theVol,theRID,catRec);
+IF ErrorFound(warnError,1011,err,theVol^^.devHdl) THEN;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE SetTimeout{* interval: INTEGER *};
+{ sets global "timeoutTime" so that timeout action will be taken }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SetTimeout: ',interval:1);
+IF interval = noTimeout THEN
+   timeoutTime := noTimeout
+ELSE
+   timeoutTime := Time + interval;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ShowFld{* pStr: PtrString; r: Rect; theAlign: INTEGER; theFont: TFam;
+                    theFace: Style; erase: BOOLEAN *};
+{ displays a string in a rectangle according to the alignment and font }
+VAR tempPtr: PtrString;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ShowFld "',pStr^,'"');
+tempPtr := Pointer(ORD(pStr)+1);
+
+WITH hShowFld^^ DO
+   BEGIN
+   curLen   := LENGTH(pStr^);
+   align    := theAlign;
+   coords   := r;
+   curValue := @tempPtr;
+   fmtInfo^^[0].font := theFont;
+   fmtInfo^^[0].face := theFace;
+   END;
+
+DrawField(hShowFld,NIL,FALSE,erase);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ShowFldAt{* pStr: PtrString; pt: Point; theAlign: INTEGER; font: TFam;
+                      VAR fldRect: Rect *};
+
+{ displays a string about a given point according to the alignment and font }
+{ returns the bounding box of the field drawn }
+
+VAR tempPtr: PtrString;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ShowFldAt');
+
+tempPtr := Pointer(ORD(pStr)+1);
+
+WITH hShowFld^^ DO
+   BEGIN
+   curLen   := LENGTH(pStr^);
+   align    := theAlign;
+   curValue := @tempPtr;
+   fmtInfo^^[0].font := font;
+   fmtInfo^^[0].face := [];
+   END;
+
+{ compute field rectangle at new point so that it can be erased }
+MoveField(hShowFld,NIL,pt);
+
+fldRect := hShowFld^^.coords;
+
+IF NOT Visible(fldRect) OR (LENGTH(pStr^) = 0) THEN EXIT(ShowFldAt);
+
+DrawFldAt(hShowFld,NIL,pt,FALSE,TRUE {erase});
+
+IF trcFiler THEN WITH fldRect DO WRITELN('   bbox: ',left,top,right,bottom);
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE ShowScrap;
+{ displays the content of the scrap }
+VAR err: INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ShowScrap');
+
+{ Try drawing as an icon ref }
+DrawRefScrap(err);
+IF err <= 0 THEN EXIT(ShowScrap);
+
+{ Try drawing as a text field }
+DrawScrap(err);
+IF err <= 0 THEN EXIT(ShowScrap);
+
+{ Try drawing as a picture }
+DrawUScrap(err);
+IF err <= 0 THEN EXIT(ShowScrap);
+
+{ Can't draw it.  Display message indicating required tool }
+DummyDisplay(scrapFolder);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ShowScroll{* obj: ObjectHandle *};
+{ draw scroll bars on the active window }
+LABEL 1;
+VAR hRect,vRect,tempRect: Rect;
+    window: WindowPtr;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ShowScroll');
+window := obj^^.objWindow;
+
+IF (window = filerFolder) OR (window = Nil) THEN EXIT(ShowScroll);
+GetPort(savePort);
+SetPort(window);
+SetOrigin(0,0);    { scroll bars always at fixed origin, don't scroll }
+
+FlushRects(hRect,vRect);   { get rectangles in which to draw scroll bars }
+
+{ Skip drawing scroll bars if wouldn't show }
+GetGrowRect(tempRect);
+UnionRect(vRect,tempRect,tempRect);
+IF NOT (Visible(hRect) OR Visible(tempRect)) THEN GOTO 1;
+
+ClipRect(window^.portRect);   { open up clipping }
+
+SetSbRect(hsbV,vRect);  { install the rectangles into the data structure }
+SetSbRect(hsbH,hRect);
+
+{ fill gap in scroll bar with light gray }
+WITH vRect DO
+   SetRect(tempRect,left,window^.portRect.top-1,right,top+1);
+FrameRect(tempRect);
+InsetRect(tempRect,1,1);
+FillRect(tempRect,ltGray);
+
+{ set the icons to be drawn in the scroll bars }
+IF obj^^.kind IN (docToolSet + [clipBdKind]) THEN
+   BEGIN
+   SetSbIcons(hsbV,[]);    { orphans have only the grow icon }
+   SetSbIcons(hsbH,[]);
+   END
+ELSE
+   BEGIN
+   SetSbIcons(hsbV,[iconArwA,iconArwB,iconThumb,iconPagA,iconPagB]);
+   SetSbIcons(hsbH,[iconArwA,iconArwB,iconThumb,iconPagA,iconPagB]);
+   SetThumb(hsbV,obj^^.vThumbPos);   { set the thumb position }
+   SetThumb(hsbH,obj^^.hThumbPos);
+   END;
+
+PaintSb(hsbV);       { draw the scroll bars }
+PaintSb(hsbH);
+PaintGrow;           { draw the grow icon }
+
+ValidScrollBars(window,TRUE);   { exclude scroll bars from possible update }
+
+1:
+SetOrigin(obj^^.scrollDh,obj^^.scrollDv);   { restore content origin }
+SetPort(savePort);
+END;
+
+
+
+{$S  flrOpen }
+PROCEDURE ShrinkHeap;
+
+{ Compacts the heap zone & heap data segment memory size.  Leaves some free space
+  in the heap so that a heap expansion is not immediately required upon activation.
+  This routine is called when another process is activated.  The purpose is to free
+  unused memory, and to minimize I/O time if the heap must be swapped out to disk.
+  256 bytes must be left free above the heap to prevent possible bus errors during
+  a string move.
+}
+
+VAR err: INTEGER;
+    dsInfo: DsInfoRec;
+    bytesFreed,newHeapSize,newMemSize,newDiskSize,deltaMemSize: LongInt;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+
+   { compact the heap zone }
+bytesFreed := CbShrinkHz(theHeap,MAX(theHeap^.cbFree-500,0));
+
+   { determine the new heap zone size }
+newHeapSize := CbOfHz(theHeap);
+
+IF dbgFiler THEN WRITELN('ShrinkHeap by: ',bytesFreed:1,'  to: ',newHeapSize:1);
+
+   { determine current data segment memory size }
+Info_DataSeg(err,flrHeapRefNum,dsInfo);
+
+{*** can't put up alert after receiving deact event (alert mgr architecture problem)
+IF ErrorFound(warnError,1032,err,bootVol^^.devHdl) THEN EXIT(ShrinkHeap);
+****}
+IF err <> 0 THEN EXIT(ShrinkHeap);
+
+deltaMemSize := dsInfo.mem_size - newHeapSize - 256;  { keep a 256 byte pad above the heap }
+
+   { shrink the data segment }
+Size_DataSeg(err,flrHeapRefNum,-deltaMemSize,newMemSize,0,newDiskSize);
+
+{*** can't put up alert after recieving deact event (alert mgr architecture problem)
+IF ErrorFound(warnError,1038,err,bootVol^^.devHdl) THEN EXIT(ShrinkHeap);
+***}
+END;
+
+
+
+{$S flrCold }
+PROCEDURE ShutDown;
+LABEL  30;
+VAR devHdl: TentryHdl;
+    externalDisks: Str255;
+    msg1Num: INTEGER;
+    msg2Num: INTEGER;
+    volHdl: TentryHdl;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ShutDown');
+
+externalDisks := 'GetAlert failed';
+GetAlert(flralert,147,@externalDisks);
+volHdl := firstVol;
+REPEAT
+   WITH volHdl^^.devHdl^^ DO
+   IF (device.slot < 10) OR (device.slot = 11) THEN GOTO 30;    { Found a mounted external disk }
+   volHdl := volHdl^^.nextHdl;
+   UNTIL volHdl = NIL;
+IF trcFiler THEN WRITELN('   no external disks found');
+externalDisks := '';             { Didn't find any mounted external fixed disks }
+
+30:
+
+IF appleOff THEN
+   BEGIN            { returning to selector shell }
+   msg1Num := 140;
+   msg2Num := 142;
+   END
+ELSE
+   BEGIN            { turning off }
+   msg1Num := 139;
+   msg2Num := 141;
+   END;
+
+ArgAlert(1,externalDisks);
+WaitAlert(flrAlert,msg1Num);  { Putting things away ... }
+
+EndEdit;   { terminate any editing }
+
+IF NOT MountAll(FALSE) THEN    { unmount all disks }
+   BEGIN
+   IF Abort THEN IF MountAll(TRUE) THEN;  { aborted shut down, remount disks }
+   EXIT(ShutDown);
+   END;
+
+{ process any updates now, since might not get another chance }
+UpdateAll;
+
+{ Give user one last chance to change mind }
+IF UserAbort THEN
+   BEGIN
+   IF MountAll(TRUE) THEN;  { aborted shut down, remount disks }
+   EXIT(ShutDown);
+   END;
+
+{$IFC flrJrnl }
+   StopPlayback;
+   StopRecord;
+{$ENDC }
+
+ArgAlert(1,externalDisks);
+WaitAlert(flrAlert,msg2Num);  { Shutting down ... }
+PowerItDown;
+
+EXIT(Desk);
+END;
+
+
+
+{$S dmMain }
+FUNCTION SkipEvent {* : BOOLEAN *};
+
+{ Filters out events after apple-period pressed.  When apple-period is pressed an
+  "abort event" is placed at the end of the event queue.  The function "Abort"
+  returns TRUE until the abort event comes to the head of the queue. }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SkipEvent');
+IF Abort THEN
+   SkipEvent := (curEvent.what IN [keyDown,buttonDown,buttonUp]) OR
+                ((curEvent.what = diskEvent) AND (curEvent.keyCap = powerCode))
+ELSE
+   SkipEvent := FALSE;
+END;
+
+
+
+{$S flrMisc }
+PROCEDURE SortContents{* obj: ObjectHandle; newView: viewType *};
+{ sorts the contents of obj according to the viewType }
+{ list is sorted in reverse order using a simple bubble sort }
+VAR numToSort,lastSwitched,j: INTEGER;
+    listHead,son,nextSon: ObjectHandle;
+
+
+   FUNCTION Switch(obj1,obj2: ObjectHandle; view: ViewType): BOOLEAN;
+   { returns TRUE if objects are out of order for given view }
+   VAR time1,time2: LongInt;
+   BEGIN
+   CASE view OF
+      alphaView:
+         BEGIN
+         Switch := (CompStrMagnitude(@obj1^^.nameHdl^^,
+                                     @obj2^^.nameHdl^^,TRUE) = -1);
+         END;
+      chronView:
+         BEGIN
+         time1 := obj1^^.modified;
+         IF (time1 = 0) OR (time1 = nullInt4) THEN time1 := obj1^^.created;
+         time2 := obj2^^.modified;
+         IF (time2 = 0) OR (time2 = nullInt4) THEN time2 := obj2^^.created;
+         Switch := (time1 > time2);  { most recent first }
+         END;
+      OTHERWISE
+         Switch := FALSE;
+      END;
+   END;
+
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('SortContents',WriteName(obj));
+listHead := obj^^.contents;
+numToSort := CountContents(obj);
+
+WHILE numToSort > 0 DO
+   BEGIN
+   lastSwitched := 0;
+   son := listhead^^.next;
+   IF trcFiler THEN WRITELN('   sort ',numToSort:1,' objects');
+   FOR j := 1 TO numToSort-1 DO
+      BEGIN
+      nextSon := son^^.next;
+      IF Switch(son,nextSon,newView) THEN WITH son^^ DO
+         BEGIN
+         IF trcFiler THEN WRITELN('     switching',WriteName(son),'" with',
+                                                   WriteName(nextSon));
+         { splice out at old location }
+         prev^^.next := next;
+         next^^.prev := prev;
+
+         { splice back in after next son }
+         prev := nextSon;
+         next := nextSon^^.next;
+         prev^^.next := son;
+         next^^.prev := son;
+
+         lastSwitched := j;
+           { same son is now next because of switch }
+         END
+      ELSE
+         son := nextSon;   { move to next in list }
+      END;
+   numToSort := lastSwitched;
+   END;
+END;
+
+
+
+{$IFC flrDebug }
+{$S flrDebug }
+PROCEDURE SplitObj{obj: ObjectHandle};
+LABEL 99;
+VAR actual: LONGINT;
+    catRec: TCatRec;
+    devName: E_Name;
+    devPathname: Pathname;
+    dfName: E_Name;
+    dfPathname: Pathname;
+    err: INTEGER;
+    labelRec: LabelFmt;
+    prefix: E_Name;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj^^.split THEN
+   BEGIN
+   WRITELN ('Object is already split');
+   EXIT(SplitObj);
+   END;
+
+WITH obj^^ DO GetCatRec(err,volHdl,catRID,catRec);
+IF err > 0 THEN GOTO 99;
+
+devName := obj^^.volHdl^^.devHdl^^.nameHdl^^;
+devPathname := CONCAT('-',devName);
+Reset_Catalog(err,devPathname);
+IF err > 0 THEN GOTO 99;
+Get_Next_Entry(err,prefix,dfName);
+WHILE err <= 0 DO
+   BEGIN
+   dfPathname := CONCAT(devPathname,'-',dfName);
+   Read_Label(err,dfPathname,ORD(@labelRec),SIZEOF(labelRec),actual);
+   IF err <= 0 THEN
+      BEGIN
+      labelRec.totalSize := obj^^.size;
+      labelRec.split := -1;
+      labelRec.version := labelVersion;
+      labelRec.parentID := 1;
+      Write_Label(err,dfPathname,ORD(@labelRec),SIZEOF(labelRec),actual);
+      END;
+   IF err > 0 THEN
+      BEGIN
+      IF dbgFiler THEN WRITELN ('ERROR splitting object: label err = ',err:1);
+      EXIT(SplitObj);
+      END;
+   Get_Next_Entry(err,prefix,dfName);
+   END;
+IF err <> 848 THEN GOTO 99;
+
+catRec.split := -1;
+WITH obj^^ DO UpdCatRec(err,volHdl,catRID,catRec);
+FlushCat(obj^^.volHdl);
+IF err > 0 THEN GOTO 99;
+
+obj^^.split := TRUE;
+obj^^.dirty := TRUE;
+
+99:
+WRITELN ('   exit SplitObj: err is ',err:1);
+END;
+{$ENDC }
+
+
+{$S flrClose }
+FUNCTION StopDoc{* obj: ObjectHandle; suspendDoc,forSure: BOOLEAN): BOOLEAN *};
+{ tells a document to shut down.  returns TRUE if successful }
+VAR err: INTEGER;
+    changed,alertUp: BOOLEAN;
+    title: FmaxStr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('StopDoc',WriteName(obj));
+IF NOT (obj^^.kind IN docToolSet) THEN EXIT(StopDoc);
+
+{ Give alert if creating new version }
+IF (obj^^.kind = docKind) AND LiveObject(obj) AND NOT suspendDoc THEN
+   BEGIN
+   GetObjTitle(obj,TRUE,title);
+   ParamAlert(title,'','');
+   WaitAlert(flrAlert,133);
+   alertUp := TRUE;
+   END
+ELSE
+   alertUp := FALSE;
+
+{ rewrite label on putback since apps probably don't copy label when
+  creating new versions }
+obj^^.updateLabel := obj^^.wasOpened;
+
+CloseDoc(err,obj^^.volHdl,obj^^.catRID,NOT suspendDoc,forSure);
+IF err <> 0 THEN
+   BEGIN
+   IF err <> fToolErr THEN        { message has already been given to user }
+      WITH obj^^ DO TellUser(volHdl,volHdl,catRID,catRID,err,opRefile);
+   StopDoc := FALSE;
+   EndWaitAlert;
+   EXIT(StopDoc);
+   END;
+
+RemoveWindow(obj,TRUE);
+
+IF alertUp THEN EndWaitAlert;
+StopDoc := TRUE;
+END;
+
+
+
+{$S dmMain }
+PROCEDURE TallyContents{* obj: ObjectHandle;
+                          whichState: ObjectState;
+                          namesAlso: BOOLEAN;
+                          VAR partial: BOOLEAN;
+                          VAR tallyCount: INTEGER;
+                          VAR tallySet: KindSet;
+                          VAR tallyBBox: Rect;
+                          VAR topObject: ObjecHandle *};
+{ tally up all the objects in whichState }
+{ return a count of objects, a set of kinds, and the bounding box }
+VAR son,listHead: ObjectHandle;
+    pos: Point;
+    r: Rect;
+    listView: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('TallyContents',WriteName(obj));
+partial := FALSE;
+tallyCount := 0;
+tallySet := [];
+SetRect(tallyBBOX,MAXINT,MAXINT,-MAXINT,-MAXINT);
+topObject := nilObject;
+listHead := obj^^.contents;
+son := listHead^^.prev;
+listView := obj^^.viewMode <> spatialView;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state = whichState THEN
+      BEGIN
+      IF listView AND namesAlso THEN
+         BEGIN
+         r := son^^.nameRect;
+         r.left := 0;
+         END
+      ELSE
+         BEGIN
+         GetVisLoc(son,FALSE,pos);
+         GetIconRect(son,r);
+         OffsetRect(r,pos.h,pos.v);
+         END;
+
+      WITH r DO
+         BEGIN
+         IF left   < tallyBBox.left   THEN tallyBBox.left   := left;
+         IF top    < tallyBBox.top    THEN tallyBBox.top    := top;
+         IF right  > tallyBBox.right  THEN tallyBBox.right  := right;
+         IF bottom > tallyBBox.bottom THEN tallyBBox.bottom := bottom;
+         END;
+      IF NOT listView AND namesAlso THEN WITH son^^.nameRect DO
+         BEGIN
+         IF left   < tallyBBox.left   THEN tallyBBox.left   := left;
+         IF top    < tallyBBox.top    THEN tallyBBox.top    := top;
+         IF right  > tallyBBox.right  THEN tallyBBox.right  := right;
+         IF bottom > tallyBBox.bottom THEN tallyBBox.bottom := bottom;
+         END;
+      tallyCount := tallyCount + 1;
+      tallySet := tallySet + [son^^.kind];
+      topObject := son;
+      IF son^^.split THEN partial := TRUE;
+      END;
+   son := son^^.prev;
+   END;
+
+IF tallyCount = 0 THEN
+   SetRect(tallyBBox,0,0,0,0);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE TearOffContents{* obj: ObjectHandle; whichState: ObjectState *};
+{ called to create new documents from selected stationery pads }
+LABEL 1;
+VAR son,prevSon,listHead,diskObj,newObj,lastCreated: ObjectHandle;
+    failVol: TentryHdl;
+    numCreated: INTEGER;
+    diskName: FmaxStr;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('TearOffContents',WriteName(obj));
+
+{ make sure new objects will fit on volume (or volumes if obj = desk,trash) }
+IF NOT RoomForContents(obj,whichState,NIL,failVol) THEN
+   BEGIN
+   IF failVol = NIL { aborted } THEN EXIT(TearOffContents);
+   diskObj := ObjFromVol(failVol);
+   GetObjTitle(diskObj,TRUE,diskName);
+   ArgAlert(1,diskName);
+   StopAlert(flrAlert,110);
+   EXIT(TearOffContents);
+   END;
+
+
+{ create new objects }
+listHead := obj^^.contents;
+son := listHead^^.prev;
+numCreated := 0;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF UserAbort THEN GOTO 1;
+   prevSon := son^^.prev;
+   IF son^^.state = whichState THEN
+      IF TearOffObject(son,newObj) THEN
+         BEGIN
+         son^^.volHdl^^.flush := TRUE;
+         numCreated := numCreated + 1;
+         lastCreated := newObj;
+         END
+      ELSE
+         GOTO 1;
+   son := prevSon;
+   END;
+
+1:
+IF numCreated = 0 THEN EXIT(TearOffContents);
+
+{ if only 1 object was created then hilight it's name to allow renaming }
+IF numCreated = 1 THEN SelectName(lastCreated,FALSE);
+
+AutoScroll(obj,hilited);   { make the selection visible };
+
+UpdateAttributes(lastCreated,TRUE {parentsOnly});
+
+FlushVols;                 { flush to disk in case of crash }
+EndWaitAlert;              { take down alert put up by TearOffObject }
+END;
+
+
+
+{$S flrDm }
+FUNCTION TearOffObject{* padObj: ObjectHandle; VAR newObj: ObjectHandle): BOOLEAN *};
+{ creates a new object on same disk as the given stationery. }
+VAR catRec: TcatRec;
+    dateStr:TTimeStr;
+    diskObj: ObjectHandle;
+    diskgone: BOOLEAN;
+    err: INTEGER;
+    foundOne: BOOLEAN;
+    newLoc: Point;
+    newHomeLoc: Point;
+    newKind: ObjectKind;
+    padName,diskName: FmaxStr;
+    seperator: STRING[1];
+    srcCatRID,newCatRID: TcatRID;
+    srcVol: TentryHdl;
+    timeStr: TTimeStr;
+    passwd: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('TearOffObject',WriteName(padObj));
+TearOffObject := FALSE;
+
+IF NOT (padObj^^.kind IN padSet) THEN EXIT(TearOffObject);
+
+{ update catalog for the pad }
+EndEdit;
+FlushObject(padObj);
+
+srcVol := padObj^^.volHdl;
+srcCatRID := padObj^^.catRID;
+
+IF NOT CheckPasswords (srcVol,srcCatRID,TRUE,foundOne) THEN EXIT(TearOffObject);
+GetCatRec(err,srcVol,srcCatRID,catRec);
+IF (catRec.objSize > 0) AND (err <= 0) THEN
+   BEGIN
+   diskObj := ObjFromVol(padObj^^.volHdl);
+   GetObjTitle(padObj,TRUE,padName);
+   GetObjTitle(diskObj,TRUE,diskName);
+   ParamAlert(padName,diskName,'');
+   IF padObj^^.kind = docPad THEN
+      WaitAlert(flrAlert,106)    { Creating new document ... }
+   {$IFC network }
+   ELSE IF padObj^^.kind = letterPad THEN
+      WaitAlert(flrAlert,108)    { Creating new envelope ... }
+   {$ENDC }
+   ELSE
+      WaitAlert(flrAlert,107);   { Creating new folder ... }
+   END;
+
+{ make a copy of the files represented by the stationery pad }
+XferObject(err,srcCatRID,srcCatRID.fatherID,srcVol,srcVol,TRUE,FALSE,FALSE,FALSE,0,newCatRID,
+          diskgone);
+IF err <> 0 THEN
+   BEGIN
+   TellUser (srcVol,srcVol,srcCatRID,srcCatRID,err,opCopy);
+   EXIT(TearOffObject);
+   END;
+
+{ fetch the newly created catalog entry }
+GetCatRec(err,srcVol,newCatRID,catRec);
+IF ErrorFound(warnError,1012,err,srcVol^^.devHdl) THEN
+   BEGIN
+   IF ShredObject(srcVol,newCatRID,FALSE,TRUE {can't abort}) THEN;
+   EXIT(TearOffObject);
+   END;
+
+{ build default name, add date }
+ExtObjName(catRec,padName);
+TimeToStr(FALSE, catRec.created, dateStr, timeStr);
+IF LENGTH(padName) > 0
+THEN seperator := ' '
+ELSE seperator := '';
+padName := CONCAT(padName,seperator,COPY(dateStr,1,LENGTH(dateStr)-3));
+InsObjName(catRec,padName);
+UpdCatRec(err,srcVol,newCatRID,catRec);
+
+{ create the new object icon }
+passwd := catRec.props[iconPassWd];
+WITH padObj^^ DO
+   BEGIN
+
+   newLoc.h := loc.h - 3;
+   newLoc.v := loc.v + 2;
+
+   IF kind = folderPad THEN
+      newKind := folderKind
+
+   {$IFC network }
+   ELSE IF kind = letterPad THEN
+      newKind := letterKind
+   {$ENDC }
+
+   ELSE
+      newKind := docKind;
+
+   newObj := MakeObject(container,padName,newKind,toolNumber,newLoc,windowRect,hilited,
+                        viewMode,srcVol,newCatRID,catRec.created,nullInt4,size,
+                        catRec.split<>nullInt2,passwd);
+   END;
+
+EndWaitAlert;
+UpdateAll;
+
+IF newObj = NIL THEN   { out of heap }
+   BEGIN       { delete files }
+   IF ShredObject(srcVol,newCatRID,FALSE,TRUE {can't abort}) THEN;
+   EXIT(TearOffObject);
+   END;
+
+{ deselect pad }
+padObj^^.state := normal;
+DrawObject(padObj);
+
+{ if created in a list then put in proper location }
+WITH padObj^^ DO
+IF InSpatialView(padObj) THEN
+   DrawObject(newObj)
+ELSE
+   BEGIN
+   SortContents(padObj^^.container,padObj^^.container^^.viewMode);
+   DrawContents(padObj^^.container);
+   END;
+
+AdjustObject(newObj,FALSE);    { make sure it doesn't overlap }
+
+{ if created on desk then choose a home location }
+IF newObj^^.container = deskObject THEN
+   BEGIN
+   IF NOT ChooseHome(newObj,newHomeLoc) THEN
+      BEGIN   { back out }
+      IF ShredObject(srcVol,newCatRID,FALSE,TRUE {can't abort}) THEN;
+      KillObject(newObj,TRUE,TRUE);
+      EXIT(TearOffObject);
+      END;
+   END
+ELSE
+   newHomeLoc := newObj^^.loc;
+
+{ update the new catalog entry to reflect new name, kind & location }
+newObj^^.dirty       := TRUE;
+newObj^^.updateLabel := TRUE;    { set flag to write redundant info }
+
+FlushObject(newObj);
+
+TearOffObject := TRUE;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE TextKey;
+
+{ Handles non-command keys (except for command backspace).  If nothing is selected
+  then an alert is given, otherwise the appropriate field editor call is made to
+  change the field data structure for the current field.  Note: no drawing is done
+  here.  A "timeout" is set so that as soon as no more events are available, the
+  edited field image will be drawn. }
+
+CONST ccUnknown = 0;
+      ccEnter   = 3;    { enter char code }
+      ccLeft    = 28;   { left arrow char code }
+      ccRight   = 29;   { right arrow char code }
+      ccUp      = 30;   { up arrow char code }
+      ccDown    = 31;   { down arrow char code }
+VAR err: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('TextKey');
+
+{branch to dialog code here}
+IF (InDialog) THEN
+   BEGIN
+   DiTextKey;
+   EXIT (TextKey);
+   END;
+
+IF activeObject = scrapObject THEN
+   BEGIN
+   StopAlert(flrAlert,117);  { cannot edit clipboard ... }
+   EXIT(TextKey);
+   END;
+
+IF editObject = nilObject THEN
+   BEGIN
+   StopAlert(flrAlert,122);  { no selection for typing ... }
+   EXIT(TextKey);
+   END;
+
+err := 0;
+
+CASE ORD(curEvent.ascii) OF
+
+   ccBS:       { backspace - comes in a variety of flavors }
+      BEGIN
+      IF curEvent.appleKey THEN
+         IF curEvent.shiftKey THEN
+            ForwardWord(hCurFld,hCurFstate,err)
+         ELSE
+            BackWord(hCurFld,hCurFstate,err)
+      ELSE
+         IF curEvent.shiftKey THEN
+            ForwardSpace(hCurFld,hCurFstate,err)
+         ELSE
+            BackSpace(hCurFld,hCurFstate,err);
+      END;
+
+   ccUnknown,ccEnter,ccHT,ccCR,ccLeft,ccRight,ccUp,ccDown:
+      Exit(TextKey);   { ignore these }
+
+   ccEsc:      { clear => erase contents of the field }
+      BEGIN
+      ClearField(hCurFld,hCurFstate,err);
+      END;
+
+   OTHERWISE   { character to be inserted into the field }
+      BEGIN
+      InsCh(curEvent.ascii,hCurFld,hCurFstate,err);
+      END;
+   END;
+
+
+IF err = 0 THEN
+   BEGIN
+   ObscureCursor;    { hide the cursor }
+   SetTimeout(0);    { cause chars to be drawn when typeahead buffer empties }
+
+   IF hCurFld^^.curLen > 0 THEN
+      BEGIN
+      SetPort(editObject^^.container^^.objWindow);
+      ClipName(editObject);
+      CaretOn(hCurFld,hCurFstate);           { keep the caret on while typing }
+      END;
+   END
+ELSE
+   FldEditError(err);
+END;
+
+
+
+{$S dmMain }
+FUNCTION TextSelected{* : BOOLEAN *};
+{ returns TRUE if text in an icon title field is selected }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+TextSelected := (editObject <> nilObject) AND
+                (hCurFstate^^.select.tyHilight = tyHiInvert);
+END;
+
+
+
+{$S flrDraw }
+FUNCTION ThumbHpos{* obj: ObjectHandle; minH,maxH: INTEGER): INTEGER *};
+{ computes the horizontal thumb position for a container }
+VAR contentRect: Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ThumbHpos',WriteName(obj));
+GetContentRect(obj,contentRect);
+WITH contentRect DO
+   BEGIN
+   IF left <= minH THEN
+      ThumbHpos := 0
+   ELSE IF right >= maxH THEN
+      ThumbHpos := maxThumb
+   ELSE
+      ThumbHpos := (left-minH)*maxThumb DIV ((maxH-minH)-(right-left));
+   END;
+END;
+
+
+
+{$S flrDraw }
+FUNCTION ThumbVpos{* obj: ObjectHandle; minV,maxV: INTEGER): INTEGER *};
+{ computes the vertical thumb position for a container }
+VAR contentRect: Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ThumbVpos',WriteName(obj));
+GetContentRect(obj,contentRect);
+WITH contentRect DO
+   BEGIN
+   IF top <= minV THEN
+      ThumbVpos := 0
+   ELSE IF (bottom >= maxV) OR
+           ((obj^^.viewMode <> spatialView) AND ((maxV - bottom) < lineHt)) THEN
+      ThumbVpos := maxThumb
+   ELSE
+      ThumbVpos := (top-minV)*maxThumb DIV ((maxV-minV)-(bottom-top));
+   END;
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE ToggleObject{* obj: ObjectHandle *};
+{ toggles the selection state of an object }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ToggleObject',WriteName(obj));
+WITH obj^^ DO
+   BEGIN
+   IF state = hilited THEN
+      BEGIN
+      state := normal;
+      DrawObject(obj);
+      END
+   ELSE IF state = normal THEN
+      BEGIN
+      state := hilited;
+      ObjToFront(obj,TRUE);   { hilited objects move to the front }
+      END;
+   END;
+END;
+
+
+{$S flrUtil  }
+FUNCTION UnfiledSize{* obj: ObjectHandle): LongInt *};
+{ Tallys the sizes of all objects on the desktop whose filing home is "obj" }
+VAR listHead,son: OBjectHandle;
+    total: LongInt;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UnfiledSize',WriteName(obj));
+listHead := deskObject^^.contents;
+son := listHead^^.next;
+total := 0;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF IsIn(obj^^.volHdl,son,obj) THEN total := total + son^^.size;
+   son := son^^.next;
+   END;
+
+UnfiledSize := total;
+IF trcFiler THEN WRITELN('   unfiled total = ',total:1);
+END;
+
+
+
+{$S flrDraw }
+FUNCTION UnfileObject{* obj: ObjectHandle; deskPt: Point): BOOLEAN *};
+{ animates icon being unfiled, moves it to the desktop }
+LABEL 1;
+VAR homeObj: ObjectHandle;
+    homePt: Point;
+    dh,dv: INTEGER;
+    joinflag: BOOLEAN;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UnfileObject',WriteName(obj));
+IF NOT (obj^^.kind IN putBackSet) THEN
+   BEGIN
+   UnfileObject := TRUE;
+   EXIT(UnfileObject);
+   END;
+
+{ find first visible ancestor & place to animate to }
+FindVisHome(obj,homeObj,homePt);
+
+{ convert desk location to global coords }
+GetPort(savePort);
+SetPort(deskObject^^.objWindow);
+LocalToGlobal(deskPt);
+
+{ compute deltas of global points }
+dh := deskPt.h - homePt.h;
+dv := deskPt.v - homePt.v;
+
+IF homeObj^^.isOpen THEN
+   ChangeObject(obj,limbo,0,0,TRUE)  { change to ghost as if dragging }
+ELSE
+   BEGIN
+   GlobalToLocal(homePt);     { animate icon from closed parent }
+   obj^^.loc := homePt;
+   END;
+
+WalkObject(obj,0,0,dh,dv,deskPort);   { animate object to desk location }
+
+IF homeObj^^.isOpen THEN
+   BEGIN
+   joinFlag := FALSE;
+   IF NOT MoveObject(obj,normal,dh,dv,deskObject,FALSE,FALSE,FALSE,joinflag) THEN
+      BEGIN
+      ChangeObject(obj,normal,0,0,TRUE);  { change back to normal }
+      UnfileObject := FALSE;
+      GOTO 1;
+      END;
+   END
+ELSE
+   BEGIN
+   GlobalToLocal(deskPt);   { restore desktop location }
+   obj^^.loc := deskPt;
+   DrawObject(obj);
+   END;
+
+UnfileObject := TRUE;
+1:
+SetPort(savePort);
+END;
+
+
+
+{$S flrClose }
+FUNCTION UnmountAvolume{* device: Tdevice; eject,restartDocs,recordDesktop, alertNum: INTEGER *};
+
+{ Removes unfiled objects whose home is on the given device from the desktop and
+  unmounts the volume.  Returns FALSE if  a document refuses to be put back. }
+
+VAR diskObj: ObjectHandle;
+    devHdl: TentryHdl;
+    fieldVar: TfieldVar;
+    isBootDev: BOOLEAN;
+    toolNode: HdlToolNode;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UnmountAvolume');
+UnmountAvolume := FALSE;
+IF UserAbort THEN EXIT(UnmountAvolume);
+
+   { find the device entry for this device }
+fieldVar.fieldType := dDevice;
+fieldVar.device := device;
+GetEntry(dev,NIL,NIL,fieldVar,devHdl);
+
+diskObj := Pointer(devHdl^^.objHdl);        { Get a handle to the object }
+isBootDev := (devHdl^^.volHdl = bootVol);   { Is this the boot device? }
+
+{ put away unfiled icons }
+IF diskObj <> NIL THEN
+   IF diskObj^^.volHdl <> NIL THEN  { make sure its mounted }
+      BEGIN
+      IF diskObj = editObject THEN EndEdit;
+      XorContents(xorSrcObj,limbo,xorDh,xorDv,xorWindow);  { erase icon outline images }
+      XorObject(xorObj,xorDh,xorDv,xorWindow);           { erase possible split/join image }
+      xorSrcObj := nilObject;
+      xorDstObj := nilObject;
+      xorObj    := nilObject;
+      xorWindow := NIL;
+      IF NOT CleanupDisk(diskObj,recordDesktop) THEN EXIT(UnmountAvolume);
+      END;
+
+IF (alertNum <> 0) THEN
+   IF devHdl^^.volHdl <> NIL  THEN
+      IF devHdl^^.volHdl^^.catOpen  THEN
+         BEGIN                          { put up wait alert only if catalog is open }
+         ArgAlert(1,devHdl^^.userNmHdl^^);
+         WaitAlert(flrAlert,alertNum);
+         END;
+
+IF NOT isBootDev THEN
+   BEGIN
+   toolNode := toolList;
+   IF devHdl^^.volHdl <> NIL THEN    { invalidate tool entries on this vol }
+      WHILE toolNode <> NIL DO
+         BEGIN
+         IF toolNode^^.whichVol = devHdl^^.volHdl THEN CloseFont(toolNode);
+         toolNode := toolNode^^.next;
+         END;
+   DismountVol(device,eject,FALSE {restartDocs});
+   END;
+
+{ remove the disk icon if ejecting the disk }
+IF (diskObj <> NIL) AND  NOT isBootDev THEN
+   BEGIN
+   diskObj^^.volHdl := NIL;   { mark as unmounted }
+   IF eject THEN
+      BEGIN
+      KillObject(diskObj,TRUE,TRUE);
+      devHdl^^.objHdl := ORD(NIL);
+      END;
+   END;
+
+
+UpdateAll;
+UnmountAvolume := TRUE;
+END;
+
+
+{$S flrAll }
+PROCEDURE UpdateAll;
+{ Handles updates for all windows managed by the Desk }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+UpdateObject(deskObject,TRUE {sons also});
+END;
+
+
+
+{$S flrDm1 }
+PROCEDURE UpdateAttributes{* obj: ObjectHandle; parentsOnly: BOOLEAN *};
+{ Update attributes from catalog for obj and it's parentage.  Possibly redraw
+  if in list and attributes have changed }
+VAR changed,inList: BOOLEAN;
+    whichObj,visParent,placeObj: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UpdateAttributes',WriteName(obj));
+IF parentsOnly THEN
+   FindVisParent(obj,whichObj)
+ELSE
+   whichObj := obj;
+
+WHILE whichObj <> deskObject DO
+   BEGIN
+   SetAttributes(whichObj,changed);
+   IF changed THEN
+      BEGIN
+      IF InListView(whichObj) THEN
+         UpdateRow(whichObj);
+      END;
+   IF whichObj^^.container = deskObject THEN
+      BEGIN
+      placeObj := GetPlaceHolder(whichObj);
+      IF placeObj <> nilObject THEN
+         BEGIN
+         SetAttributes(placeObj,changed);
+         IF changed AND InListView(placeObj) THEN
+            UpdateRow(placeObj);
+         END;
+      END;
+   FindVisParent(whichObj,visParent);
+   whichObj := visParent;
+   END;
+END;
+
+
+
+{$S flrAll }
+PROCEDURE UpdateContents{* obj: ObjectHandle *};
+{ processes any outstanding updates for all descendants }
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+listHead := obj^^.contents;
+son := listHead^^.next;
+WHILE son <> listHead DO
+   BEGIN
+   UpdateObject(son,TRUE);
+   son := son^^.next;
+   END;
+END;
+
+
+
+{$S dmMain }
+PROCEDURE UpdateCursor;
+{ changes cursor as appropriate }
+
+VAR contentRect : Rect;
+    pt          : Point;
+    whichCursor : INTEGER;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF (NOT InDialog) AND (editObject = nilObject) THEN EXIT(UpdateCursor);
+
+whichCursor := icrsInactive;
+GetMouse(pt);
+
+IF (NOT InDialog) THEN
+   BEGIN
+   SetPort(editObject^^.container^^.objWindow);
+   GetContentRect(editObject^^.container,contentRect);
+   IF PtInRect(pt,editObject^^.nameRect) THEN     { Over the name being edited? }
+      IF PtInRect(pt,contentRect) THEN            { Inside content area? }
+         IF PtInRgn(pt,thePort^.visRgn) THEN      { Over the visible portion }
+            whichCursor := icrsXIBeam;
+   END
+ELSE
+   BEGIN
+   IF (diBox.curSel <> nil) THEN
+      IF (diBox.curSel^^.info.tag = diField) THEN
+         IF PtInRgn(pt,diBox.curSel^^.bound) THEN
+            whichCursor := icrsXIBeam;
+    END;
+
+SetStdCursor(whichCursor);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE UpdateField;
+{ draws the current field and updates all copies }
+VAR name: FmaxStr;
+    oldNameWidth: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UpdateField');
+
+{ draw the name currently being edited }
+DrawName(editObject);
+
+{ Keep the name visible }
+ScrollToRect(editObject^^.container,editObject^^.nameRect);
+
+{ keep object name current }
+GetFldStr(hCurFld,hCurFstate,name);
+SetStrg(editObject^^.nameHdl,name);
+
+{ update window title if a window exits }
+IF editObject^^.objWindow <> NIL THEN
+   SetFldrTitle(editObject^^.objWindow,name);
+
+{ update window title if a window exits }
+IF edit2Object^^.objWindow <> NIL THEN
+   SetFldrTitle(edit2Object^^.objWindow,name);
+
+{ Update extra ghost image if one exists }
+IF edit2Object <> nilObject THEN ChangeName(edit2Object,name);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE UpdateObject{* obj: ObjectHandle; sonsAlso: BOOLEAN *};
+{ processes update for an object window, quits fast if nothing to update }
+VAR window: WindowPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF obj = nilObject THEN EXIT(UpdateObject);
+IF sonsAlso THEN UpdateContents(obj);   { update any opened in place }
+
+IF obj^^.isOpen THEN
+   BEGIN
+   IF trcFiler THEN WRITELN('UpdateObject',WriteName(obj));
+   window := obj^^.objWindow;
+   IF NOT MyWindow(window) THEN EXIT(UpdateObject);  { app is managing window }
+
+   BeginUpdate(window);  { W/M puts my update rgn into my visRgn }
+
+   IF NOT emptyRgn(window^.visRgn) THEN   { anything to update? }
+      DrawInsides(obj,(obj^^.objWindow = activeFolder));
+
+   EndUpdate(window);    { W/M restores my visRgn and sets my update rgn to empty }
+   END;
+END;
+
+
+
+{$S flrAll }
+PROCEDURE UpdateRec{* obj: ObjectHandle; VAR catRec: TcatRec *};
+{ updates a catalog record from object record }
+VAR name: FmaxStr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UpdateRec',WriteName(obj));
+GetStrg(obj^^.nameHdl,name);
+InsObjName(catRec,name);
+
+IF NOT obj^^.toBeCopied THEN
+   BEGIN
+   WITH obj^^ DO
+      BEGIN
+      catRec.view     := viewMode;
+      catRec.openRect := windowRect;
+      catRec.objKind  := kind;
+      END;
+   IF IsFather(obj,obj^^.container) THEN
+      catRec.closedPt := obj^^.loc;
+   END;
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE UpdateRow{* obj: ObjectHandle *};
+{ invalidates a row in the list view }
+VAR savePort: GrafPtr;
+    r: Rect;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('UpdateRow',WriteName(obj));
+IF InSpatialView(obj) THEN EXIT(UpdateRow);
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+
+WITH r DO
+   BEGIN
+   left := 0;
+   top := obj^^.listSeqNum*lineHt;
+   right := thePort^.portRect.right - dhSbox;
+   bottom := top + lineHt;
+   END;
+
+InvalRect(r);
+SetPort(savePort);
+END;
+
+
+{$S dmMain }
+PROCEDURE UpdateText;
+{ draws chars or blinks caret in current field if timeout }
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF ((NOT InDialog) AND (editObject = nilObject)) OR (timeoutTime = noTimeout) THEN EXIT(UpdateText);
+
+IF Time >= timeoutTime THEN
+   IF (NOT InDialog) THEN
+      BEGIN
+      IF NOT hCurFstate^^.valid THEN
+         BEGIN             { current field has changed, redraw it }
+         UpdateField;
+         END
+      ELSE
+         BEGIN             { time to blink the caret }
+         ClipName(editObject);
+         SetPort(editObject^^.container^^.objWindow);
+         BlinkCaret(hCurFld,hCurFstate,timeoutInterval);
+         SetTimeout(timeoutInterval);            { reset timeout for next blink }
+         END;
+      END {of IF THEN block}
+   ELSE
+      BEGIN
+      IF (diBox.curSel <> nil) THEN
+         IF (diBox.curSel^^.info.tag = diField) THEN
+            BEGIN
+            SetPort (dialogFolder);                     { why do I need this??? }
+            ClipRect (diBox.curSel^^.outline);
+            BlinkCaret (diBox.curSel^^.info.fieldHdl, diBox.curSel^^.info.fStateHdl, timeoutInterval);
+            SetTimeOut (timeoutInterval);
+            END;
+      END; {of IF ELSE block}
+
+END; {of PROC UpdateText}
+
+
+
+{$S flrDm1 }
+FUNCTION UserAbort{* : BOOLEAN *};
+{ Checks if user pressed abort (command ".").  Informs the user that the abort
+  was seen and acknowledged. }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF Abort THEN
+   BEGIN
+   StopAlert(flrAlert,255);  { operation aborted at your request ...}
+   UserAbort := TRUE;
+   END
+ELSE
+   UserAbort := FALSE;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ValidContents{* obj: ObjectHandle; whichState: ObjectState;
+                                                         good: BOOLEAN *};
+{ validate/invalidate the area under all objects of a given state }
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValidContents',WriteName(obj));
+listHead:=obj^^.contents;
+son:=listHead^^.prev;
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state=whichState THEN ValidObject(son,good);
+   son:=son^^.prev;
+   END;
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ValidIcon{* obj: ObjectHandle; good: BOOLEAN *};
+{ validate/invalidate the icon rect of an object }
+VAR iconRect: Rect;
+    pt: Point;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValidIcon',WriteName(obj));
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+
+IF InSpatialView(obj) THEN
+   BEGIN
+   GetIconRect(obj,iconRect);
+   OffsetRect(iconRect,obj^^.loc.h,obj^^.loc.v);
+   END
+ELSE
+   BEGIN
+   GetListPos(obj,TRUE,pt);
+   SetRect(iconRect,pt.h,pt.v,pt.h+tinyWidth,pt.v+tinyHt);
+   END;
+
+ValRect(iconRect,good);
+SetPort(savePort);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ValidName{* obj: ObjectHandle; good: BOOLEAN *};
+{ validate/invalidate the name rect of an object }
+VAR nameRect: Rect;
+    nameWidth: INTEGER;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValidName',WriteName(obj));
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+ValRect(obj^^.nameRect,good);
+SetPort(savePort);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ValidObject{* obj: ObjectHandle; good: BOOLEAN *};
+{ vaildate/invalidate the area under a given object }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValidObject',WriteName(obj));
+ValidIcon(obj,good);
+IF InSpatialView(obj) THEN ValidName(obj,good);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ValidScrollBars{* window : WindowPtr; good: BOOLEAN *};
+{ validate/invalidate scroll bar area }
+VAR hRect,vRect,growRect: Rect;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF (window = filerFolder) THEN EXIT(ValidScrollBars);
+IF trcFiler THEN WRITELN('ValidScrollBars');
+
+GetPort(savePort);
+SetPort(window);
+
+FlushRects(hRect,vRect);
+GetGrowRect(growRect);
+UnionRect(growRect,vRect,vRect);
+
+ValRect(vRect,good);
+ValRect(hRect,good);
+
+SetPort(savePort);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE ValidWindow{* window: WindowPtr; good: BOOLEAN *};
+{ validate/invalidate an entire window }
+VAR savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValidWindow');
+GetPort(savePort);
+SetPort(window);
+ValRect(window^.portRect,good);
+SetPort(savePort);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ValRect{* r: Rect; good: BOOLEAN *};
+{ validate/invalidate a rectangle }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ValRect');
+IF good THEN ValidRect(r) ELSE InvalRect(r);
+END;
+
+
+{$S flrAll }
+FUNCTION Visible{* r: Rect): BOOLEAN *};
+{ Returns TRUE if any of the given rectangle would be visible in the current
+  port.  Used to skip unnecessary drawing.  If creating a picture for skipping
+  update events then can skip drawing anything outside of the window bounds,
+  otherwise can skip anything that wouldn't be visible }
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF takingPicture THEN
+   Visible := SectRect(r,thePort^.portRect,r)
+ELSE
+   Visible := RectInRgn(r,thePort^.visRgn);
+END;
+
+
+
+{$S flrCopy }
+FUNCTION VolInContents{* obj: ObjectHandle; whichState: ObjectState; whichVol: TentryHdl): BOOLEAN *};
+{ Returns TRUE if any selected icon is on the given volume }
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+listHead := obj^^.contents;
+son := listHead^^.next;
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state = whichState THEN
+      IF son^^.volHdl = whichVol THEN
+         BEGIN
+         VolInContents := TRUE;
+         EXIT(VolInContents);
+         END;
+   son := son^^.next;
+   END;
+VolInContents := FALSE;
+END;
+
+
+
+{$S flrDraw }
+PROCEDURE WalkContents{* obj: ObjectHandle; whichState: ObjectState;
+                         dhStart,dvStart,dhStop,dvStop: INTEGER *};
+{ Drag the image of some icons, interpolating between start and stop deltas }
+{ No net change to the screen or icons }
+
+VAR dh,dv,step,nSteps,dist: LongInt;
+    partial: BOOLEAN;
+    tallyCount: INTEGER;
+    tallySet: KindSet;
+    tallyBBox: Rect;
+    topObject: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('WalkContents',WriteName(obj));
+
+TallyContents(obj,whichState,FALSE,partial,tallyCount,tallySet,tallyBBox,topObject);
+dist   := ABS(dhStart-dhStop) + (3*ABS(dvStart-dvStop) DIV 2);
+IF tallyCount = 0 THEN tallyCount := 1;
+nSteps := MAX(5,dist DIV (20*tallyCount));
+dh := dhStart;
+dv := dvStart;
+
+FOR step := 1 TO nSteps DO
+   BEGIN
+   XorContents(obj,whichState,dh,dv,deskPort);  { draw }
+   XorContents(obj,whichState,dh,dv,deskPort);  { erase }
+   dh := (dhStop*step + dhStart*(nSteps-step)) DIV nSteps;
+   dv := (dvStop*step + dvStart*(nSteps-step)) DIV nSteps;
+   END;
+END;
+
+
+
+{$S flrClose }
+PROCEDURE WalkHome{* obj: ObjectHandle; VAR homeObj: ObjectHandle *};
+{ animate icon moving to filing home }
+VAR savePort: GrafPtr;
+    curPt,destPt,deltaPt: Point;
+    dh,dv: INTEGER;
+    joinflag: BOOLEAN;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('WalkHome',WriteName(obj));
+
+{ determine destPt, either location in home or location of some parent icon }
+FindVisHome(obj,homeObj,destPt);
+
+IF trcFiler THEN WRITELN('   Global home pt = ',destPt.h,destPt.v);
+
+IF NOT (obj^^.kind IN putBackSet) OR (obj^^.container <> deskObject) THEN
+   EXIT(WalkHome);
+
+{ take care of any updates pending now, looks better }
+UpdateAll;
+
+{ change to limbo state as if user was dragging it }
+ChangeObject(obj,limbo,0,0,TRUE);
+
+GetPort(savePort);
+
+{ convert current location to global }
+curPt := obj^^.loc;
+SetPort(obj^^.container^^.objWindow);
+LocalToGlobal(curPt);
+
+
+{ animate the icon to its home }
+dh := destPt.h - curPt.h;
+dv := destPt.v - curPt.v;
+WalkObject(obj,0,0,dh,dv,deskPort);
+
+{ take care of new image }
+IF homeObj^^.isOpen THEN     { walked to home in open parent window }
+   BEGIN
+   joinFlag := FALSE;
+   IF MoveObject(obj,normal,dh,dv,homeObj,FALSE {chooseLoc},FALSE,FALSE,joinflag) THEN;
+   END
+ELSE      { walked to parent icon }
+   BEGIN
+   BlinkObject(homeObj);        { blink to show acceptance }
+   KillObject(obj,TRUE {sons},TRUE {erase});
+   END;
+
+SetPort(savePort);
+END;
+
+
+
+{$S flrDm }
+PROCEDURE WalkObject{* obj: ObjectHandle; dhStart,dvStart,dhStop,dvStop: INTEGER;
+                       whichWindow: WindowPtr *};
+
+{ Animates icon interpolating between start and stop deltas.  No net change to
+  screen. }
+
+VAR step,nSteps: LongInt;
+    dh,dv,dist: INTEGER;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('WalkObject',WriteName(obj));
+
+{ make steps proportional to distance "walked" }
+dist   := ABS(dhStart-dhStop) + (3*ABS(dvStart-dvStop) DIV 2);
+nSteps := MAX(5,dist DIV 20);
+
+dh := dhStart;
+dv := dvStart;
+
+FOR step := 1 TO nSteps DO
+   BEGIN
+   XorObject(obj,dh,dv,whichWindow);  { draw }
+   XorObject(obj,dh,dv,whichWindow);  { erase }
+   dh := (dhStop*step + dhStart*(nSteps-step)) DIV nSteps;
+   dv := (dvStop*step + dvStart*(nSteps-step)) DIV nSteps;
+   END;
+END;
+
+
+
+{$S flrAll }
+FUNCTION WhichObject{* container: ObjectHandle; r: Rect; ignoreNames: BOOLEAN;
+                       VAR hitName: BOOLEAN): ObjectHandle *};
+{ returns the topmost object pointed to in a given container, nilObject if none }
+VAR son,listHead: ObjectHandle;
+    iconRect,contentRect,dstRect: Rect;
+    isSpatial: BOOLEAN;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('WhichObject in',WriteName(container));
+hitName := FALSE;
+WhichObject := nilObject;  { not found }
+IF container = nilObject THEN EXIT(WhichObject);
+
+IF trcFiler THEN WITH r DO WRITELN('   hit rect: ',left,top,right,bottom);
+
+{ localize rect for this window }
+LocalToGlobal(r.topLeft);
+LocalToGlobal(r.botRight);
+GetPort(savePort);
+SetPort(container^^.objWindow);
+GlobalToLocal(r.topLeft);
+GlobalToLocal(r.botRight);
+SetPort(savePort);
+
+IF trcFiler THEN WITH r DO WRITELN('   Local hit rect: ',left,top,right,bottom);
+
+GetContentRect(container,contentRect);
+IF NOT SectRect(r,contentRect,dstRect) THEN EXIT(WhichObject);
+
+isSpatial := container^^.viewMode = spatialView;
+listHead := container^^.contents;
+son := listHead^^.next;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state <> limbo THEN
+      BEGIN
+      { compute bounding rectangle of the icon }
+      IF IsSpatial THEN
+         BEGIN
+         GetIconRect(son,iconRect);
+         WITH son^^.loc DO OffsetRect(iconRect,h,v);
+         END
+      ELSE WITH son^^.nameRect DO
+         SetRect(iconRect,0,top,nameStart-4,bottom);
+
+      IF SectRect(r,iconRect,dstRect) THEN     { check if in icon rectangle }
+         BEGIN
+         WhichObject := son;
+         IF trcFiler THEN WRITELN('   hit',WriteName(son));
+         EXIT(WhichObject);
+         END;
+
+      IF NOT ignoreNames THEN
+         IF SectRect(r,son^^.nameRect,dstRect) THEN  { check if in name rectangle }
+            BEGIN
+            whichObject := son;
+            hitName := TRUE;
+            IF trcFiler THEN WRITELN('   hit name of',WriteName(son));
+            EXIT(WhichObject);
+            END;
+      END;
+   son := son^^.next;
+   END;
+
+END;
+
+
+
+{$S flrDm }
+FUNCTION WhichWindow{* pt: Point): WindowPtr *};
+
+{ determines which window the given point is in (peeks into WM window list) }
+{ pt is assumed to be in local coords of current port }
+
+VAR window: WindowPeek;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('WhichWindow');
+WhichWindow := Nil;
+LocalToGlobal(pt);
+IF pt.v < menuHt THEN EXIT(WhichWindow);   { In menu bar }
+
+window := Pointer(ORD(alertFolder));
+
+WHILE window <> Nil DO WITH window^ DO
+   BEGIN
+   IF visible THEN
+     IF PtInRgn(pt,strucRgn) THEN
+       BEGIN
+       IF PtInRgn(pt,contRgn) THEN
+          WhichWindow := Pointer(ORD(window));
+       EXIT(whichWindow);
+       END;
+   window := nextWindow;
+   END;
+END;
+
+
+
+{$S flrDm1 }
+PROCEDURE WriteLabel{* obj: ObjectHandle *};
+{ stores info, such as name, in the O/S disk file label for recovery purposes }
+VAR err: INTEGER;
+    labelRec: LabelFmt;
+    diskName: FmaxStr;
+    whatKind: ObjectKind;
+    pCatRec: PtrCatRec;
+    docNumber: LongInt;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF NOT obj^^.updateLabel THEN EXIT(WriteLabel);
+
+whatKind := obj^^.kind;
+IF NOT (whatKind IN [docKind,docPad,toolKind,clockKind,calcKind,computerKind,comp2Kind,
+                     folderKind,folderPad,letterKind,letterPad]) THEN
+   EXIT(WriteLabel);
+IF trcFiler THEN WRITELN('WriteLabel',WriteName(obj));
+
+diskName := obj^^.volHdl^^.devHdl^^.nameHdl^^;
+
+PosCatRec(err,obj^^.volHdl,obj^^.catRID,pCatRec);
+IF err > 0 THEN EXIT(WriteLabel);
+
+IF obj^^.kind IN [toolKind,calcKind,clockKind,computerKind,comp2Kind] THEN
+   docNumber := 0
+ELSE
+   docNumber := obj^^.catRID.uniqueID;
+
+IF NOT LabelIO(FALSE,diskName,obj^^.toolNumber,docNumber,labelRec) THEN
+   BEGIN
+   LabelDefault(labelRec);
+   IF whatKind IN [folderKind,folderPad,letterKind,letterPad] THEN
+      MakeFolder (err, obj^^.volHdl, obj^^.catRID, NIL, posFirst{anything});
+   END;
+
+PosCatRec(err,obj^^.volHdl,obj^^.catRID,pCatRec);
+WITH labelRec DO
+   BEGIN
+   version  := labelVersion;
+   GetStrg(obj^^.nameHdl,name);
+   kind     := whatKind;
+   multiDoc := pCatRec^.props[manyDocs];
+   toolOnly := pCatRec^.props[noDocs];
+   windLoc  := obj^^.windowRect;
+   split    := pCatRec^.split;
+   parentID := pCatRec^.parentID;
+   END;
+
+IF LabelIO(TRUE,diskName,obj^^.toolNumber,docNumber,labelRec) THEN;
+END;
+
+
+
+{$S flrDebug }
+FUNCTION WriteName{* obj: ObjectHandle): CHAR *};
+{ Does a WRITE of the object's name }
+VAR name: FmaxStr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+{$IFC FlrDebug }
+IF obj^^.nameHdl = NIL THEN
+   name := ''
+ELSE
+   GetStrg(obj^^.nameHdl,name);
+WRITE(' "',name,'"');
+WriteName := ' ';
+{$ENDC }
+END;
+
+
+
+{$S flrAll }
+PROCEDURE XorContents{* obj: ObjectHandle; whichState: ObjectState;
+                        dh,dv: INTEGER; whichWindow: WindowPtr *};
+{ Xor all objects in whichState with an offset }
+VAR son,listHead: ObjectHandle;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('XorContents',WriteName(obj));
+IF whichWindow = NIL THEN EXIT(XorContents);
+
+listHead := obj^^.contents;
+son := listHead^^.prev;
+
+WHILE son <> listHead DO
+   BEGIN
+   IF son^^.state = whichState THEN XorObject(son,dh,dv,whichWindow);
+   son := son^^.prev;
+   END;
+END;
+
+
+
+{$S flrAll }
+PROCEDURE XorObject{* obj: ObjectHandle; dh,dv: INTEGER; whichWindow: WindowPtr *};
+{ draw an object in xor mode, offset dh,dv }
+VAR iconRect: Rect;
+    fldPt: Point;
+    nameBox: Rect;
+    pt: Point;
+    savePort: GrafPtr;
+    shapeFont,faceFont: TFam;
+    data,mask,overlay: CHAR;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('XorObject',WriteName(obj));
+IF whichWindow = NIL THEN EXIT(XorObject);
+IF obj = nilObject THEN EXIT(XorObject);
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+IF whichWindow <> deskPort THEN
+   IF whichWindow = obj^^.container^^.objWindow THEN
+      ClipContent(obj)
+   ELSE
+      ClipContent(xorDstObj);
+
+GetVisLoc(obj,FALSE,pt);   { get the icon location }
+pt.h := pt.h + dh;         { offset it by dh,dv }
+pt.v := pt.v + dv;
+nameBox := obj^^.nameRect; { get the title's bounding box }
+OffsetRect(nameBox,dh,dv);
+
+   { convert location to local coordinates of drawing window }
+
+LocalToGlobal(pt);
+LocalToGlobal(nameBox.topLeft);
+LocalToGlobal(nameBox.botRight);
+SetPort(whichWindow);
+GlobalToLocal(pt);
+GlobalToLocal(nameBox.topLeft);
+GlobalToLocal(nameBox.botRight);
+
+   { draw the icon in XOR mode }
+
+GetIcons(obj,shapeFont,mask,data,faceFont,overlay,iconRect);
+TextFont(shapeFont);
+TextMode(srcXor);
+MoveTo(pt.h,pt.v);
+DrawChar(data);
+
+   { draw the icon title's bounding box if name is not null }
+
+IF (ORD(obj^^.nameHdl^^[0]) > 0)
+AND (InSpatialView(obj)) THEN
+   BEGIN
+   PenPat(black);
+   PenMode(patXor);
+   FrameRect(nameBox);
+   PenNormal;
+   END;
+
+SetPort(savePort);
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ZoomObject{* obj: ObjectHandle; zoomUp: BOOLEAN *};
+
+{ Performs zoom effect when an object is opened or closed.  Zooming is done
+  by a set of rectangles moving between the icon position and the window. }
+
+VAR smallRect,contentRect: Rect;
+    savePort: GrafPtr;
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ZoomObject',WriteName(obj));
+
+{ Set small rectangle in center of icon }
+IF InSpatialView(obj) THEN WITH obj^^.loc DO
+   BEGIN
+   smallRect.left := h + icon2Width;       { large icon position }
+   smallRect.top  := v + icon2Ht;
+   END
+ELSE
+   BEGIN
+   GetListPos(obj,TRUE,smallRect.topLeft);     { small list view icon position }
+   smallRect.left := smallRect.left + 8;
+   smallRect.top  := smallRect.top  + 6;
+   END;
+
+{ restrict small rect to be within window content boundaries }
+GetContentRect(obj^^.container,contentRect);
+WITH contentRect DO
+   BEGIN
+   IF smallRect.top < top    THEN smallRect.top := top;
+   IF smallRect.top > bottom THEN smallRect.top := bottom;
+   IF smallRect.left < left  THEN smallRect.left := left;
+   IF smallRect.left > right THEN smallRect.left := right;
+   END;
+
+{ convert small rectangle to global coords }
+GetPort(savePort);
+SetPort(obj^^.container^^.objWindow);
+LocalToGlobal(smallRect.topLeft);
+SetPort(savePort);
+
+smallRect.botRight := smallRect.topLeft;        { small rect is actually a point }
+ZoomRect(smallRect,obj^^.windowRect,zoomUp);     { Shrink/expand rectangles }
+END;
+
+
+
+{$S flrAll }
+PROCEDURE ZoomRect{* VAR smallRect,bigRect: Rect; zoomUp: BOOLEAN *};
+
+{ Given two rectangles in global coords, interpolate one into the other, }
+{ making a zooming rectangle image on the screen.  The rectangles and the }
+{ screen image are not altered }
+
+CONST zoomSteps = 16;
+VAR rect1,rect2,rect3,rect4: Rect;
+    i,j: INTEGER;
+    savePort: GrafPtr;
+    fract,factor,one: Fixed;   { reals are too slow }
+
+   FUNCTION Blend(smallCoord,bigCoord: INTEGER): INTEGER;
+   VAR smallFix,bigFix,tempFix: Fixed;
+   BEGIN
+   smallFix := one * smallCoord;     { scale up to fixed point }
+   bigFix   := one * bigCoord;
+   tempFix  := FixMul(fract,bigFix) + FixMul(one-fract,smallFix);
+   Blend    := FixRound(tempFix);
+   END;
+
+BEGIN
+{$IFC flrDebug } IF trcCalls THEN ALogCall; {$ENDC};
+IF trcFiler THEN WRITELN('ZoomRect');
+GetPort(savePort);
+SetPort(deskPort);
+PenPat(gray);
+PenMode(notPatXor);
+
+one := 65536;   { fixed point 'const' }
+
+IF zoomUp THEN
+   BEGIN
+   rect1      := smallRect;
+   factor     := FixRatio(6,5);        { make bigger each time }
+   fract      := FixRatio(541,10000);  { 5/6 ^16 = 0.540877 }
+   END
+ELSE
+   BEGIN
+   rect1      := bigRect;
+   factor     := FixRatio(5,6);        { make smaller each time }
+   fract      := one;                  { start full size }
+   END;
+
+rect2 := rect1;
+rect3 := rect1;
+FrameRect(rect1);   { draw initial image }
+
+FOR i := 1 TO zoomSteps DO
+   BEGIN
+   rect4.left   := Blend(smallRect.left,bigRect.left);
+   rect4.right  := Blend(smallRect.right,bigRect.right);
+   rect4.top    := Blend(smallRect.top,bigRect.top);
+   rect4.bottom := Blend(smallRect.bottom,bigRect.bottom);
+
+   FrameRect(rect4);  { draw newest }
+   FrameRect(rect1);  { erase oldest }
+   rect1 := rect2;
+   rect2 := rect3;
+   rect3 := rect4;
+
+   fract := FixMul(fract,factor);  { bump interpolation fraction }
+   END;
+
+FrameRect(rect1);  { erase final image }
+FrameRect(rect2);
+FrameRect(rect3);
+PenNormal;
+
+SetPort(savePort);
+END;
+
+
+{$S  }
+BEGIN
+{$IFC flrDebug }
+debugStartup := FALSE;  { use debugger to change at startup if want tracing }
+{$ENDC }
+
+Initialize;
+DeskMgr;
+
+END.
+
+ÿ
